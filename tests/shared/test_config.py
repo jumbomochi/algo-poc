@@ -42,6 +42,15 @@ def test_load_config_env_override(tmp_path, monkeypatch):
     assert config.mode == "live"
 
 
+def test_load_config_nested_env_override(tmp_path, monkeypatch):
+    yaml_content = "mode: paper\ndatabase:\n  url: postgresql://old:old@localhost/old\n"
+    config_file = tmp_path / "test_config.yaml"
+    config_file.write_text(yaml_content)
+    monkeypatch.setenv("ALGO_DATABASE_URL", "postgresql://new:new@localhost/new")
+    config = load_config(str(config_file))
+    assert config.database.url == "postgresql://new:new@localhost/new"
+
+
 def test_load_config_missing_file():
     with pytest.raises(FileNotFoundError):
         load_config("/nonexistent/path.yaml")

@@ -82,6 +82,17 @@ class RedisConfig(BaseModel):
     url: str = "redis://localhost:6379/0"
 
 
+class NotificationsConfig(BaseModel):
+    slack_enabled: bool = False
+    email_enabled: bool = False
+    sms_enabled: bool = False
+
+
+class ObservabilityConfig(BaseModel):
+    prometheus_port: int = 9090
+    tracing_enabled: bool = False
+
+
 class AppConfig(BaseModel):
     mode: str = "paper"
     universe: UniverseConfig = Field(default_factory=UniverseConfig)
@@ -93,6 +104,8 @@ class AppConfig(BaseModel):
     ib: IBConfig = Field(default_factory=IBConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     redis: RedisConfig = Field(default_factory=RedisConfig)
+    notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
+    observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
 
 
 ENV_PREFIX = "ALGO_"
