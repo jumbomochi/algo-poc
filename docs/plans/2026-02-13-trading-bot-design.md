@@ -376,3 +376,137 @@ algo-poc/
 - Additional asset classes
 - Multiple concurrent strategies
 - Advanced ML models (ensembles, deep learning)
+
+---
+
+## Production Review Addendum (2026-02-13)
+
+This section captures review comments for productionization and clarifies control intent.
+
+### 1) Risk Control Intent: Hard vs Soft
+
+Threshold values in this document are indicative and tuned in configuration. Enforcement strictness is by control type:
+
+| Control Type | Examples | Enforcement |
+|--------------|----------|-------------|
+| Hard controls (strict, automated) | Stop-loss, drawdown circuit breaker, kill switch, critical margin protection | Immediate automated action; exits use market orders for certainty |
+| Soft controls (advisory / discretionary) | Profit-taking ceilings, soft concentration drift, non-critical trim opportunities | Alert-first and/or human-in-the-loop judgment before optional action |
+
+### 2) Decision Precedence (Deterministic)
+
+When multiple controls trigger at once, apply this order:
+
+1. Kill switch / circuit breaker
+2. Critical margin protection
+3. Stop-loss exits
+4. Hard compliance constraints (position, sector, total exposure)
+5. Soft/advisory controls (ceiling notifications, discretionary trims)
+
+Hard controls always override soft controls.
+
+### 3) Human-in-the-Loop Policy
+
+- Advisory actions must include recommended order parameters and rationale in API + notifications.
+- Manual decisions must be logged with actor, timestamp, reason, and resulting action.
+- Define response SLAs for market-hour alerts (e.g., advisory trim/ceiling events) and escalation paths.
+
+### 4) Point-in-Time Data Requirements
+
+To avoid lookahead leakage and ensure auditability, all fundamental/event records must carry:
+
+- `effective_at` (when the market could first know the fact)
+- `ingested_at` (when our system ingested it)
+- `source_revision` (vendor/document revision identifier)
+
+Backtest and live feature generation must use the same point-in-time filtering semantics.
+
+### 5) Message Bus Reliability Contract
+
+Redis Streams usage must define and implement:
+
+- Consumer groups per stream with explicit ack/retry behavior
+- Dead-letter stream for poison messages
+- Replay/recovery procedure after service restart
+- Idempotency keys for all decision-producing events (not only execution)
+
+### 6) Backtest/Live Parity Controls
+
+- Explicitly timestamp signal creation, recommendation emission, and order submission in simulation.
+- Track and report parity metrics between paper/live and simulator assumptions (fill rate, slippage, time-to-fill).
+- Gate production model/policy changes behind regression checks on historical + paper-trading scenarios.
+
+### 7) Security and Governance Hardening
+
+- Role-based access control for trade-control endpoints (`/kill`, policy overrides, manual order actions).
+- Immutable audit trail for all operator-initiated actions.
+- Secrets management and rotation policy for API and broker credentials.
+- Network restrictions (allowlist/VPN) for privileged operational endpoints.
+
+### 8) Observability
+
+Structured logging alone is insufficient for a microservices architecture.
+
+- **Metrics** — each service exposes Prometheus metrics (request latency, error rates, queue depth). Grafana dashboards for system health.
+- **Distributed tracing** — trace a signal from ingestion through recommendation to order fill. OpenTelemetry instrumentation across all services.
+- **System health alerts** (distinct from trading alerts) — service down, Redis unreachable, DB connection pool exhaustion, message consumer lag.
+
+### 9) Database Migration Strategy
+
+Seven services share PostgreSQL. Schema evolution must be coordinated.
+
+- Use Alembic for versioned migrations.
+- The `shared/models/` package owns the schema. Migrations live in a dedicated `migrations/` directory.
+- Migrations run as a separate step before service startup (not embedded in service boot).
+- Backward-compatible migrations only — no breaking changes without a multi-step rollout plan.
+
+### 10) Testing Strategy
+
+- **Unit tests** — per-service, mock Redis and PostgreSQL. Test signal computation, risk rule evaluation, order logic in isolation.
+- **Integration tests** — spin up Redis + PostgreSQL in Docker, run multi-service flows end-to-end (signal → recommendation → risk check → simulated execution).
+- **IB mock** — a fake IB gateway that implements the `ib_insync` interface for testing execution service without a live/paper IB connection.
+- **Backtest as regression suite** — run the full backtest as a CI gate; flag if key metrics (Sharpe, drawdown) deviate beyond tolerance from baseline.
+
+### 11) Service Startup Ordering
+
+Services have dependencies that must be respected.
+
+**Startup order:**
+1. PostgreSQL + Redis (infrastructure)
+2. Data Ingestion (populates streams)
+3. Signal Generation (consumes data streams)
+4. ML Model (consumes signal stream)
+5. Risk Management (consumes recommendations)
+6. Execution (consumes approved orders) — must not start accepting orders until Risk Management is healthy
+7. API + Notifications (monitoring, can start anytime after infrastructure)
+
+Docker Compose `depends_on` with health check conditions enforces this. Each service waits for its upstream dependencies to be healthy before processing messages.
+
+### 12) Market Hours Awareness
+
+A shared `market_calendar` module (using the `exchange_calendars` library) provides:
+
+- Market open/close times (including early close days)
+- Holiday schedule
+- `is_market_open()` helper used by all time-sensitive operations:
+  - Periodic risk scans (every 30 min during market hours only)
+  - Unfilled order cancellation (at market close, not arbitrary EOD)
+  - Data ingestion polling (active during market hours, reduced after hours)
+  - Notification urgency (critical alerts outside market hours still send SMS)
+
+### 13) IB Position Reconciliation
+
+The system's portfolio DB and IB's actual positions can drift (missed fills, manual trades in IB, corporate actions).
+
+- **Periodic reconciliation** — at market open and close, query IB for all positions and compare against portfolio DB.
+- **Discrepancy handling:**
+  - Minor (rounding, timing): auto-correct DB to match IB.
+  - Major (unknown position, missing position): alert + halt new trading until manually resolved.
+- **Corporate actions** — stock splits, mergers, symbol changes detected via IB events and reflected in DB.
+
+### 14) Universe Rebalancing
+
+The S&P 500 watchlist is not static.
+
+- **Quarterly review** — on S&P rebalance dates, update the YAML watchlist (manual or semi-automated via an index composition data source).
+- **Additions** — new tickers begin data ingestion immediately; signals need 1 year of history before the ML model can act on them (backfill required).
+- **Removals** — if the system holds a position in a removed ticker, it continues monitoring until the position is closed. The ticker is not abruptly dropped.
