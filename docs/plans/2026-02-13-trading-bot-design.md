@@ -558,3 +558,29 @@ PostgreSQL holds critical state: trade history, audit logs, model training data,
 - **Recovery objectives** — define and track RPO/RTO targets (e.g., RPO <= 15 min with WAL, RTO <= 2 hours for primary restore).
 - **Backup security** — encrypt backups at rest and in transit; document key ownership/rotation and restore access controls.
 - **Recovery playbook** — documented procedure for restoring from backup, including IB position reconciliation after recovery.
+
+### 19) Go-Live Promotion Gates
+
+Transitioning from paper to live trading requires passing all objective gates:
+
+- **Paper trading duration:** minimum 60 calendar days.
+- **Risk stability:** no circuit-breaker events in last 30 days.
+- **Drawdown bound:** paper max drawdown <= 12%.
+- **Execution quality:** median slippage <= 20 bps, failed-order rate <= 1%.
+- **Reliability:** no unresolved critical infrastructure alerts in last 14 days.
+- **Data integrity:** latest reconciliation checks pass with no unresolved major discrepancies.
+- **Model governance:** current model version approved and not in rollback/caution state.
+- **Backtest regression:** latest backtest with current model passes all metric thresholds.
+
+Promotion requires two-person approval (operator + reviewer) with a signed report. Automated gate script validates all criteria before mode switch is allowed.
+
+### 20) Live-to-Paper Rollback Policy
+
+Any of these triggers causes immediate rollback to paper mode:
+
+- Kill switch activation or circuit-breaker event in live mode.
+- IB reconciliation major discrepancy not resolved within SLA.
+- Critical observability outage impacting execution/risk services.
+- Sustained slippage/fill quality breach (e.g., 3 consecutive sessions).
+
+Rollback procedure is time-bound: halt trading → switch to paper → verify IB port → reconcile → investigate → document action items → resume paper only after documentation complete.

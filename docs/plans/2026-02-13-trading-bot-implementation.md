@@ -2636,6 +2636,53 @@ git commit -m "docs: add CLAUDE.md for development guidance"
 
 ---
 
+## Phase 11: Go-Live Readiness
+
+### Task 43: Paper-to-Live Promotion Gates and Rollback Playbook
+
+**Files:**
+- Create: `docs/operations/go-live-checklist.md`
+- Create: `docs/operations/rollback-playbook.md`
+- Create: `scripts/ops/go_live_gate.py`
+- Test: `tests/operations/test_go_live_gate.py`
+
+Define objective gates for promotion from paper to live trading. Live mode is blocked unless all gates pass.
+
+**Gate policy (all required):**
+- **Paper trading duration:** minimum 60 calendar days in paper mode.
+- **Risk stability:** no circuit-breaker events in the last 30 days.
+- **Drawdown bound:** paper max drawdown <= configured threshold (default 12%).
+- **Execution quality:** median slippage within tolerance (default <= 20 bps) and failed-order rate <= 1%.
+- **Reliability:** no unresolved critical alerts for Redis/PostgreSQL/IB connectivity in the last 14 days.
+- **Data integrity:** latest reconciliation checks pass with no unresolved major discrepancies.
+- **Model governance:** current model version approved and not in rollback/caution state.
+- **Backtest regression:** latest backtest run with current model passes all metric thresholds (Sharpe, drawdown, win rate within tolerance of baseline).
+
+**Promotion workflow:**
+1. Run `scripts/ops/go_live_gate.py --from paper --to live`.
+2. Script validates metrics from PostgreSQL/audit logs and writes a signed report to `docs/operations/reports/`.
+3. Require two-person approval recorded in `go-live-checklist.md` (operator + reviewer).
+4. Apply `ALGO_MODE=live` only after checklist sign-off.
+
+**Rollback triggers (any trigger causes immediate rollback to paper):**
+- Kill switch activation or circuit-breaker event in live mode.
+- IB reconciliation major discrepancy not resolved within SLA.
+- Critical observability outage impacting execution/risk services.
+- Slippage/fill quality breach sustained for configurable window (e.g., 3 consecutive sessions).
+
+**Rollback procedure (time-bound):**
+1. Set trading state to `HALTED`; publish kill event.
+2. Switch mode to paper (`ALGO_MODE=paper`) and redeploy affected services.
+3. Verify execution service is disconnected from live IB port and connected to paper port.
+4. Run reconciliation and incident triage; open incident report.
+5. Resume paper trading only after incident action items are documented.
+
+```bash
+git commit -m "docs: add go-live promotion gates and rollback playbook"
+```
+
+---
+
 ## Execution Order Summary
 
 | Phase | Tasks | Est. Commits |
@@ -2650,6 +2697,7 @@ git commit -m "docs: add CLAUDE.md for development guidance"
 | 8. Notifications | Tasks 35–36 | 2 |
 | 9. Backtesting | Tasks 37–38 | 2 |
 | 10. Infrastructure | Tasks 39–42 | 4 |
-| **Total** | **42 tasks** | **42 commits** |
+| 11. Go-Live Readiness | Task 43 | 1 |
+| **Total** | **43 tasks** | **43 commits** |
 
 Each task follows TDD: write failing test → verify failure → implement → verify pass → commit.
