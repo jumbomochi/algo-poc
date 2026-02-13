@@ -277,7 +277,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class RiskConfig(BaseModel):
@@ -314,13 +314,13 @@ class SignalStalenessConfig(BaseModel):
 
 
 class SignalsConfig(BaseModel):
-    staleness_thresholds: SignalStalenessConfig = SignalStalenessConfig()
+    staleness_thresholds: SignalStalenessConfig = Field(default_factory=SignalStalenessConfig)
 
 
 class MLModelConfig(BaseModel):
     retrain_cadence_months: int = 6
     target_forward_weeks: int = 8
-    target_buckets: dict[str, float] = {"sell": -0.05, "buy": 0.05}
+    target_buckets: dict[str, float] = Field(default_factory=lambda: {"sell": -0.05, "buy": 0.05})
     min_training_samples: int = 200
     regime_detection_enabled: bool = True
 
@@ -336,7 +336,7 @@ class DataIngestionConfig(BaseModel):
 
 class UniverseConfig(BaseModel):
     watchlist_source: str = "sp500"
-    custom_tickers: list[str] = []
+    custom_tickers: list[str] = Field(default_factory=list)
 
 
 class IBConfig(BaseModel):
@@ -356,15 +356,15 @@ class RedisConfig(BaseModel):
 
 class AppConfig(BaseModel):
     mode: str = "paper"
-    universe: UniverseConfig = UniverseConfig()
-    data_ingestion: DataIngestionConfig = DataIngestionConfig()
-    signals: SignalsConfig = SignalsConfig()
-    ml_model: MLModelConfig = MLModelConfig()
-    risk: RiskConfig = RiskConfig()
-    execution: ExecutionConfig = ExecutionConfig()
-    ib: IBConfig = IBConfig()
-    database: DatabaseConfig = DatabaseConfig()
-    redis: RedisConfig = RedisConfig()
+    universe: UniverseConfig = Field(default_factory=UniverseConfig)
+    data_ingestion: DataIngestionConfig = Field(default_factory=DataIngestionConfig)
+    signals: SignalsConfig = Field(default_factory=SignalsConfig)
+    ml_model: MLModelConfig = Field(default_factory=MLModelConfig)
+    risk: RiskConfig = Field(default_factory=RiskConfig)
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    ib: IBConfig = Field(default_factory=IBConfig)
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    redis: RedisConfig = Field(default_factory=RedisConfig)
 
 
 ENV_PREFIX = "ALGO_"
@@ -2248,8 +2248,8 @@ def test_unauthenticated_request_returns_401():
 def test_authenticated_request_succeeds():
     app = create_app()
     client = TestClient(app)
-    response = client.get("/api/v1/portfolio", headers={"X-API-Key": "test-key"})
-    assert response.status_code in (200, 404)  # not 401
+    response = client.get("/api/v1/auth-check", headers={"X-API-Key": "test-key"})
+    assert response.status_code == 200
 
 
 def test_kill_switch_requires_admin_role():
@@ -2261,6 +2261,8 @@ def test_kill_switch_requires_admin_role():
 ```
 
 **Step 2–5: Implement FastAPI app with API key auth and role-based access, test, commit**
+
+Add a minimal protected endpoint (`GET /api/v1/auth-check`) used only for auth smoke tests so authentication behavior can be asserted independently of business routes.
 
 ```bash
 git commit -m "feat: FastAPI app with RBAC authentication"
@@ -2386,7 +2388,7 @@ from backtest.simulator import SimulatedExecutor
 
 
 def test_limit_entry_fills_when_low_below_price():
-    executor = SimulatedExecutor(slippage_pct=0.1, commission_per_share=0.005)
+    executor = SimulatedExecutor(slippage_bps=10, commission_per_share=0.005)
     bar = {"date": date(2025, 1, 6), "open": 150.0, "high": 155.0, "low": 148.0, "close": 153.0}
     fill = executor.try_fill_limit_entry(limit_price=149.0, quantity=100, bar=bar)
     assert fill is not None
@@ -2395,14 +2397,14 @@ def test_limit_entry_fills_when_low_below_price():
 
 
 def test_limit_entry_does_not_fill_when_low_above_price():
-    executor = SimulatedExecutor(slippage_pct=0.1, commission_per_share=0.005)
+    executor = SimulatedExecutor(slippage_bps=10, commission_per_share=0.005)
     bar = {"date": date(2025, 1, 6), "open": 150.0, "high": 155.0, "low": 151.0, "close": 153.0}
     fill = executor.try_fill_limit_entry(limit_price=149.0, quantity=100, bar=bar)
     assert fill is None
 
 
 def test_market_exit_fills_at_next_open():
-    executor = SimulatedExecutor(slippage_pct=0.1, commission_per_share=0.005)
+    executor = SimulatedExecutor(slippage_bps=10, commission_per_share=0.005)
     bar = {"date": date(2025, 1, 7), "open": 152.0, "high": 155.0, "low": 150.0, "close": 153.0}
     fill = executor.fill_market_exit(quantity=100, bar=bar)
     assert fill["filled"] is True
@@ -2410,13 +2412,15 @@ def test_market_exit_fills_at_next_open():
 
 
 def test_commission_calculated():
-    executor = SimulatedExecutor(slippage_pct=0.0, commission_per_share=0.005)
+    executor = SimulatedExecutor(slippage_bps=0, commission_per_share=0.005)
     bar = {"date": date(2025, 1, 6), "open": 150.0, "high": 155.0, "low": 148.0, "close": 153.0}
     fill = executor.try_fill_limit_entry(limit_price=149.0, quantity=100, bar=bar)
     assert fill["commission"] == pytest.approx(0.50)  # 100 * 0.005
 ```
 
 **Step 2–5: Implement, test, commit**
+
+Use explicit slippage units in implementation (`slippage_bps`) to avoid percentage ambiguity in simulation logic.
 
 ```bash
 git commit -m "feat: simulated execution with slippage, commission, and margin interest"
@@ -2514,11 +2518,25 @@ services:
       interval: 5s
       retries: 5
 
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - ALGO_DATABASE_URL=postgresql://algo:algo@postgres:5432/algo_poc
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
   data-ingestion:
     build:
       context: .
       dockerfile: services/data_ingestion/Dockerfile
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -2533,8 +2551,10 @@ services:
       context: .
       dockerfile: services/signal_generation/Dockerfile
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       data-ingestion:
-        condition: service_healthy
+        condition: service_started
       postgres:
         condition: service_healthy
       redis:
@@ -2545,24 +2565,30 @@ services:
       context: .
       dockerfile: services/ml_model/Dockerfile
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       signal-generation:
-        condition: service_healthy
+        condition: service_started
 
   risk-management:
     build:
       context: .
       dockerfile: services/risk_management/Dockerfile
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       ml-model:
-        condition: service_healthy
+        condition: service_started
 
   execution:
     build:
       context: .
       dockerfile: services/execution/Dockerfile
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       risk-management:
-        condition: service_healthy
+        condition: service_started
 
   api:
     build:
@@ -2571,6 +2597,8 @@ services:
     ports:
       - "8000:8000"
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -2581,6 +2609,8 @@ services:
       context: .
       dockerfile: services/notifications/Dockerfile
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
 
@@ -2592,6 +2622,7 @@ volumes:
 
 Run: `docker compose config` (validates YAML)
 Run: `docker compose build` (builds all images)
+Run: `docker compose up migrate` (verifies schema migration completes successfully)
 
 **Step 3: Commit**
 
