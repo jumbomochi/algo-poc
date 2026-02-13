@@ -1,0 +1,74 @@
+mode: paper  # live | backtest | paper
+
+universe:
+  watchlist_source: sp500
+  custom_tickers: []
+
+data_ingestion:
+  market_data_source: ib
+  fundamentals_source: ib
+  events_source: alpha_vantage
+  polling_interval_minutes: 15
+  ib_rate_limit_per_sec: 45  # buffer below IB's 50/sec
+  backfill_years: 10
+
+signals:
+  staleness_thresholds:
+    market_data_grace_hours: 4  # hours after expected session close
+    fundamentals_days: 7
+    events_hours: 48
+
+ml_model:
+  retrain_cadence_months: 6
+  target_forward_weeks: 8
+  target_buckets:
+    sell: -0.05  # below -5% return
+    buy: 0.05    # above +5% return
+  min_training_samples: 200
+  regime_detection_enabled: true
+
+risk:
+  position_entry_limit_pct: 5.0      # % of NAV
+  sector_concentration_pct: 20.0      # % of NAV
+  total_exposure_limit_pct: 150.0     # % of NAV (margin)
+  stop_loss_trailing_pct: 15.0        # trailing stop %
+  drawdown_pause_pct: 10.0            # pause new buys
+  drawdown_circuit_breaker_pct: 20.0  # liquidate all
+  soft_ceiling_pct: 7.0               # notify only
+  hard_ceiling_pct: 15.0              # auto-trim to soft_ceiling
+  margin_warning_pct: 70.0            # of IB maintenance margin
+  margin_critical_pct: 85.0           # of IB maintenance margin
+  double_down_entry_limit_pct: 10.0   # of NAV
+  passive_scan_interval_minutes: 30
+  min_viable_fill_pct: 40.0           # partial fill threshold
+  portfolio_beta_alert_threshold: 1.5
+  correlation_alert_threshold: 0.7
+  correlation_min_lookback_days: 60
+
+execution:
+  entry_buffer_pct: 0.3          # limit order buffer
+  double_down_buffer_pct: 0.75   # wider buffer
+  reprice_interval_minutes: 60
+  max_reprice_attempts: 3
+  order_submission_lag_seconds: 5  # simulated lag for backtest
+
+ib:
+  host: "127.0.0.1"
+  live_port: 7496
+  paper_port: 7497
+  client_id: 1
+
+notifications:
+  slack_enabled: false
+  email_enabled: false
+  sms_enabled: false
+
+database:
+  url: "postgresql://algo:algo@localhost:5432/algo_poc"
+
+redis:
+  url: "redis://localhost:6379/0"
+
+observability:
+  prometheus_port: 9090
+  tracing_enabled: false
