@@ -12,6 +12,51 @@
 
 ---
 
+## Implementation Quality Controls
+
+Apply these controls across all phases/tasks.
+
+### Definition of Done (applies to every task)
+
+Before committing a task, verify:
+- Tests added/updated and passing for touched behavior.
+- Operational impact considered (metrics/logs/alerts where relevant).
+- Documentation updated (or explicitly marked not needed).
+- Rollback/recovery impact considered for any production-facing change.
+- Config defaults and migration impact reviewed for backward compatibility.
+
+### Operations Runbook Index
+
+Create and maintain `docs/operations/README.md` as the entry point for:
+- `go-live-checklist.md`
+- `rollback-playbook.md`
+- reconciliation procedures
+- incident response/escalation procedures
+
+### Dependency Version Pinning Policy
+
+For production-critical libraries (`ib_insync`, `lightgbm`, `sqlalchemy`, and broker/data client SDKs):
+- Pin to compatible release ranges with an upper bound in `pyproject.toml`.
+- Upgrade intentionally (scheduled dependency review), not ad hoc.
+- Record upgrade notes and validation results in PR/task documentation.
+
+### Redis Message Contract CI Gate
+
+Add contract tests that validate producer/consumer schema compatibility for all streams:
+- Required fields present and typed correctly.
+- Backward compatibility for additive schema changes.
+- Versioned message handling where breaking changes are unavoidable.
+
+Fail CI on contract incompatibility.
+
+### Timezone Policy
+
+Use UTC for all persisted timestamps and inter-service message timestamps.
+- Convert to user-facing timezone only at API/UI edges.
+- Market session logic uses exchange calendar + timezone-aware datetimes.
+
+---
+
 ## Phase 1: Project Foundation
 
 ### Task 1: Project Scaffolding
@@ -33,6 +78,8 @@
 - Create: `config/default.yaml`
 - Create: `config/.gitignore`
 - Create: `tests/__init__.py`
+- Create: `tests/contracts/__init__.py`
+- Create: `docs/operations/README.md`
 - Create: `.gitignore`
 
 **Step 1: Create pyproject.toml**
@@ -44,25 +91,25 @@ version = "0.1.0"
 description = "Automated US equities trading bot"
 requires-python = ">=3.12"
 dependencies = [
-    "sqlalchemy>=2.0",
-    "alembic>=1.13",
-    "psycopg2-binary>=2.9",
-    "redis>=5.0",
-    "pydantic>=2.0",
-    "pydantic-settings>=2.0",
-    "fastapi>=0.110",
-    "uvicorn>=0.27",
-    "httpx>=0.27",
-    "ib_insync>=0.9",
-    "lightgbm>=4.0",
-    "pandas>=2.0",
-    "numpy>=1.26",
-    "exchange-calendars>=4.0",
-    "pyyaml>=6.0",
-    "structlog>=24.0",
-    "opentelemetry-api>=1.20",
-    "opentelemetry-sdk>=1.20",
-    "prometheus-client>=0.20",
+    "sqlalchemy>=2.0,<3.0",
+    "alembic>=1.13,<2.0",
+    "psycopg2-binary>=2.9,<3.0",
+    "redis>=5.0,<6.0",
+    "pydantic>=2.0,<3.0",
+    "pydantic-settings>=2.0,<3.0",
+    "fastapi>=0.110,<1.0",
+    "uvicorn>=0.27,<1.0",
+    "httpx>=0.27,<1.0",
+    "ib_insync>=0.9,<1.0",
+    "lightgbm>=4.0,<5.0",
+    "pandas>=2.0,<3.0",
+    "numpy>=1.26,<3.0",
+    "exchange-calendars>=4.0,<5.0",
+    "pyyaml>=6.0,<7.0",
+    "structlog>=24.0,<25.0",
+    "opentelemetry-api>=1.20,<2.0",
+    "opentelemetry-sdk>=1.20,<2.0",
+    "prometheus-client>=0.20,<1.0",
 ]
 
 [project.optional-dependencies]
