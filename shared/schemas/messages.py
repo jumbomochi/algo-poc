@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any, Literal
 
@@ -9,11 +10,28 @@ from pydantic import BaseModel, Field
 class StreamSerializable(BaseModel):
     def to_stream_dict(self) -> dict[str, str]:
         data = self.model_dump(mode="json")
-        return {k: str(v) if not isinstance(v, str) else v for k, v in data.items()}
+        result: dict[str, str] = {}
+        for k, v in data.items():
+            if isinstance(v, str):
+                result[k] = v
+            elif isinstance(v, (dict, list)):
+                result[k] = json.dumps(v)
+            else:
+                result[k] = str(v)
+        return result
 
     @classmethod
     def from_stream_dict(cls, data: dict[str, str]):
-        return cls.model_validate(data)
+        parsed: dict[str, Any] = {}
+        for k, v in data.items():
+            if isinstance(v, str) and v.startswith(("{", "[")):
+                try:
+                    parsed[k] = json.loads(v)
+                except (json.JSONDecodeError, ValueError):
+                    parsed[k] = v
+            else:
+                parsed[k] = v
+        return cls.model_validate(parsed)
 
 
 class MarketDataMessage(StreamSerializable):
