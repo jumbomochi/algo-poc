@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, String, Text
+from sqlalchemy import JSON, DateTime, Index, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from shared.models.base import Base
@@ -8,6 +8,9 @@ from shared.models.base import Base
 
 class AuditLog(Base):
     __tablename__ = "audit_log"
+    __table_args__ = (
+        Index("ix_audit_service_timestamp", "service", "timestamp"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     timestamp: Mapped[datetime] = mapped_column(

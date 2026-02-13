@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, String
+from sqlalchemy import JSON, DateTime, Index, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from shared.models.base import Base
@@ -8,6 +8,9 @@ from shared.models.base import Base
 
 class FundamentalRecord(Base):
     __tablename__ = "fundamental_records"
+    __table_args__ = (
+        Index("ix_fundamental_ticker_type_effective", "ticker", "metric_type", "effective_at"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     ticker: Mapped[str] = mapped_column(String(10), nullable=False)

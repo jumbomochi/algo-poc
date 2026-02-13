@@ -32,6 +32,10 @@ class Position(Base):
 
 class Trade(Base):
     __tablename__ = "trades"
+    __table_args__ = (
+        Index("ix_trade_ticker_executed", "ticker", "executed_at"),
+        Index("ix_trade_recommendation", "recommendation_id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     ticker: Mapped[str] = mapped_column(String(10), nullable=False)
