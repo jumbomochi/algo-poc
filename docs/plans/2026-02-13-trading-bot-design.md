@@ -518,11 +518,12 @@ If a data source goes down, the ML model must not act on stale signals.
 
 - Every signal carries a `computed_at` timestamp.
 - Before assembling a feature vector, check each signal's age against configurable staleness thresholds:
-  - Market data: 24 hours
+  - Market data: since last expected market session close + configurable grace window (calendar-aware)
   - Fundamentals: 1 week
   - Events/news: 48 hours
 - If any signal exceeds its staleness threshold, mark the feature vector as incomplete.
 - Incomplete feature vectors: skip the ticker for that evaluation cycle and emit an alert. Do not feed stale data to the model.
+- Staleness evaluation must use the shared market calendar (weekends, holidays, early closes) to avoid false positives outside regular trading sessions.
 
 ### 16) Partial Fill Handling
 
@@ -530,7 +531,9 @@ Limit entry orders may be partially filled before timeout or cancellation.
 
 - Define a **minimum viable position size** (configurable, e.g., 40% of intended order size).
 - If a partial fill meets the minimum: keep the position, log the shortfall, do not re-attempt.
-- If a partial fill is below the minimum: close the partial position via market order and log as a failed entry.
+- If a partial fill is below the minimum:
+  - Close only when required by a hard risk/compliance rule or when notional is below minimum tradable lot constraints.
+  - Otherwise keep as an undersized position, mark for operator review, and suppress immediate liquidation churn.
 - All partial fill decisions are logged in the audit trail.
 
 ### 17) Correlation Risk
@@ -540,6 +543,8 @@ Sector concentration limits alone do not capture correlated exposure across sect
 - Track **portfolio-level beta** (vs SPY) using rolling 1-year regression.
 - Alert when portfolio beta exceeds a configurable threshold (e.g., 1.5).
 - Track **pairwise position correlation** — flag when more than 50% of positions have trailing correlation > 0.7.
+- Data sufficiency rule: require a minimum lookback window (configurable, e.g., 60 trading days) before computing beta/correlation for a position.
+- Fallback behavior: positions with insufficient history are excluded from hard counts and surfaced with low-confidence flags in dashboard/alerts.
 - These are advisory controls (soft) — alerts and dashboard visibility, not automated blocking. The operator decides whether to reduce correlated exposure.
 
 ### 18) Data Backup and Recovery
@@ -550,4 +555,6 @@ PostgreSQL holds critical state: trade history, audit logs, model training data,
 - **Point-in-time recovery** — enable WAL archiving for continuous backup, allowing recovery to any point in time.
 - **Backup verification** — weekly automated restore test to a scratch database to confirm backup integrity.
 - **Retention** — daily backups retained for 30 days, monthly snapshots retained for 1 year.
+- **Recovery objectives** — define and track RPO/RTO targets (e.g., RPO <= 15 min with WAL, RTO <= 2 hours for primary restore).
+- **Backup security** — encrypt backups at rest and in transit; document key ownership/rotation and restore access controls.
 - **Recovery playbook** — documented procedure for restoring from backup, including IB position reconciliation after recovery.
