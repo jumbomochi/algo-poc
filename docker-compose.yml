@@ -1,0 +1,143 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: algo_poc
+      POSTGRES_USER: algo
+      POSTGRES_PASSWORD: algo
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U algo"]
+      interval: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - ALGO_DATABASE_URL=postgresql://algo:algo@postgres:5432/algo_poc
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
+  data-ingestion:
+    build:
+      context: .
+      dockerfile: services/data_ingestion/Dockerfile
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - ALGO_MODE=paper
+      - ALGO_DATABASE_URL=postgresql://algo:algo@postgres:5432/algo_poc
+      - ALGO_REDIS_URL=redis://redis:6379/0
+
+  signal-generation:
+    build:
+      context: .
+      dockerfile: services/signal_generation/Dockerfile
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      data-ingestion:
+        condition: service_started
+    environment:
+      - ALGO_MODE=paper
+      - ALGO_DATABASE_URL=postgresql://algo:algo@postgres:5432/algo_poc
+      - ALGO_REDIS_URL=redis://redis:6379/0
+
+  ml-model:
+    build:
+      context: .
+      dockerfile: services/ml_model/Dockerfile
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      signal-generation:
+        condition: service_started
+    environment:
+      - ALGO_MODE=paper
+      - ALGO_DATABASE_URL=postgresql://algo:algo@postgres:5432/algo_poc
+      - ALGO_REDIS_URL=redis://redis:6379/0
+
+  risk-management:
+    build:
+      context: .
+      dockerfile: services/risk_management/Dockerfile
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      ml-model:
+        condition: service_started
+    environment:
+      - ALGO_MODE=paper
+      - ALGO_DATABASE_URL=postgresql://algo:algo@postgres:5432/algo_poc
+      - ALGO_REDIS_URL=redis://redis:6379/0
+
+  execution:
+    build:
+      context: .
+      dockerfile: services/execution/Dockerfile
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      risk-management:
+        condition: service_started
+    environment:
+      - ALGO_MODE=paper
+      - ALGO_DATABASE_URL=postgresql://algo:algo@postgres:5432/algo_poc
+      - ALGO_REDIS_URL=redis://redis:6379/0
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - ALGO_MODE=paper
+      - ALGO_DATABASE_URL=postgresql://algo:algo@postgres:5432/algo_poc
+      - ALGO_REDIS_URL=redis://redis:6379/0
+
+  notifications:
+    build:
+      context: .
+      dockerfile: services/notifications/Dockerfile
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      - ALGO_MODE=paper
+      - ALGO_DATABASE_URL=postgresql://algo:algo@postgres:5432/algo_poc
+      - ALGO_REDIS_URL=redis://redis:6379/0
+
+volumes:
+  pgdata:
