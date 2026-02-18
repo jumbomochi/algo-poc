@@ -241,3 +241,35 @@ class ExecutionServiceRunner:
             self._logger.info("Execution service interrupted")
         finally:
             await self.shutdown()
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    from shared.config import load_config
+
+    config = load_config("config/default.yaml")
+
+    async def main() -> None:
+        import redis.asyncio as aioredis
+
+        from services.execution.ib_executor import IBExecutor
+        from services.execution.order_manager import OrderManager
+        from shared.redis_client import RedisStreamClient
+
+        redis_conn = aioredis.from_url(config.redis.url)
+        redis_client = RedisStreamClient(redis_conn)
+        executor = IBExecutor(
+            host=config.ib.host,
+            port=config.ib.paper_port if config.mode != "live" else config.ib.live_port,
+            client_id=config.ib.client_id,
+        )
+        order_manager = OrderManager(
+            executor=executor, redis_client=redis_client, db_session=None
+        )
+        runner = ExecutionServiceRunner(
+            config=config, redis_client=redis_client, order_manager=order_manager
+        )
+        await runner.run()
+
+    asyncio.run(main())

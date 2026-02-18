@@ -107,3 +107,57 @@ class MLServiceRunner:
         )
 
         return recommendation
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    from shared.config import load_config
+    from shared.logging import get_logger
+
+    config = load_config("config/default.yaml")
+    logger = get_logger("ml_model")
+
+    async def main() -> None:
+        import redis.asyncio as aioredis
+
+        from shared.redis_client import RedisStreamClient
+        from shared.schemas.messages import SignalMessage
+
+        redis_conn = aioredis.from_url(config.redis.url)
+        redis_client = RedisStreamClient(redis_conn)
+        runner = MLServiceRunner(
+            config=config, redis_client=redis_client, db_session=None
+        )
+
+        STREAM = "stream:signals"
+        GROUP = "ml_model"
+        CONSUMER = "ml_worker_1"
+        await redis_client.create_consumer_group(STREAM, GROUP)
+
+        logger.info("ML model service started", mode=config.mode)
+
+        # Buffer signals per ticker
+        signal_buffer: dict[str, list[SignalMessage]] = {}
+
+        while True:
+            messages = await redis_client.read_group(
+                STREAM, GROUP, CONSUMER, count=10, block_ms=2000
+            )
+            for msg in messages:
+                try:
+                    signal = SignalMessage.from_stream_dict(msg.data)
+                    signal_buffer.setdefault(signal.ticker, []).append(signal)
+
+                    # Try to process when we have enough signals
+                    result = await runner.process_signals(
+                        signal.ticker, signal_buffer[signal.ticker]
+                    )
+                    if result is not None:
+                        signal_buffer[signal.ticker] = []
+
+                    await redis_client.ack(STREAM, GROUP, msg.message_id)
+                except Exception:
+                    logger.exception("ml_processing_error")
+
+    asyncio.run(main())

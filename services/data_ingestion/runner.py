@@ -115,3 +115,37 @@ class _StubEventsSource:
 
     async def get_events(self, ticker: str) -> list[dict[str, Any]]:
         return []
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    from shared.config import load_config
+
+    config = load_config("config/default.yaml")
+
+    async def main() -> None:
+        import redis.asyncio as aioredis
+
+        from services.data_ingestion.ib_client import IBClient
+        from shared.redis_client import RedisStreamClient
+
+        redis_conn = aioredis.from_url(config.redis.url)
+        redis_client = RedisStreamClient(redis_conn)
+        ib_client = IBClient(
+            host=config.ib.host,
+            port=config.ib.paper_port if config.mode != "live" else config.ib.live_port,
+            client_id=config.ib.client_id,
+        )
+        runner = DataIngestionRunner(
+            config=config, ib_client=ib_client, redis_client=redis_client, db_session=None
+        )
+
+        logger.info("Data ingestion service started", mode=config.mode)
+        tickers = config.universe.custom_tickers or []
+        while True:
+            if runner.is_market_active() or config.mode == "backtest":
+                await runner.run_cycle(tickers)
+            await asyncio.sleep(config.data_ingestion.polling_interval_minutes * 60)
+
+    asyncio.run(main())

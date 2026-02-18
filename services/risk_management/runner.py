@@ -381,3 +381,66 @@ class RiskServiceRunner:
             context=context or {},
         )
         await self._redis.publish(ALERTS_STREAM, alert.to_stream_dict())
+
+    async def run(self) -> None:
+        """Main event loop: read from streams and dispatch."""
+        await self.setup()
+        self._logger.info("Risk management service started")
+
+        try:
+            while True:
+                # Read recommendations
+                messages = await self._redis.read_group(
+                    RECOMMENDATIONS_STREAM,
+                    CONSUMER_GROUP,
+                    CONSUMER_NAME,
+                    count=10,
+                    block_ms=2000,
+                )
+                for msg in messages:
+                    try:
+                        rec = RecommendationMessage.from_stream_dict(msg.data)
+                        await self.process_recommendation(rec)
+                        await self._redis.ack(
+                            RECOMMENDATIONS_STREAM, CONSUMER_GROUP, msg.message_id
+                        )
+                    except Exception:
+                        self._logger.exception(
+                            "Error processing recommendation", message_id=msg.message_id
+                        )
+
+                # Read kill stream
+                kill_messages = await self._redis.read_group(
+                    KILL_STREAM, CONSUMER_GROUP, CONSUMER_NAME, count=1, block_ms=500
+                )
+                for msg in kill_messages:
+                    try:
+                        kill_msg = KillMessage.from_stream_dict(msg.data)
+                        await self.process_kill(kill_msg)
+                        await self._redis.ack(KILL_STREAM, CONSUMER_GROUP, msg.message_id)
+                    except Exception:
+                        self._logger.exception(
+                            "Error processing kill message", message_id=msg.message_id
+                        )
+        except (KeyboardInterrupt, Exception):
+            self._logger.info("Risk management service interrupted")
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    from shared.config import load_config
+
+    config = load_config("config/default.yaml")
+
+    async def main() -> None:
+        import redis.asyncio as aioredis
+
+        from shared.redis_client import RedisStreamClient
+
+        redis_conn = aioredis.from_url(config.redis.url)
+        redis_client = RedisStreamClient(redis_conn)
+        runner = RiskServiceRunner(config=config, redis_client=redis_client)
+        await runner.run()
+
+    asyncio.run(main())

@@ -110,3 +110,30 @@ class NotificationsServiceRunner:
         finally:
             self._running = False
             self._logger.info("Notifications service stopped")
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    from shared.config import load_config
+
+    config = load_config("config/default.yaml")
+
+    async def main() -> None:
+        import redis.asyncio as aioredis
+
+        from services.notifications.channels import EmailChannel, SlackChannel, SMSChannel
+        from services.notifications.dispatcher import NotificationDispatcher
+        from shared.redis_client import RedisStreamClient
+
+        redis_conn = aioredis.from_url(config.redis.url)
+        redis_client = RedisStreamClient(redis_conn)
+        dispatcher = NotificationDispatcher(
+            slack=SlackChannel(), email=EmailChannel(), sms=SMSChannel()
+        )
+        runner = NotificationsServiceRunner(
+            config=config, redis_client=redis_client, dispatcher=dispatcher
+        )
+        await runner.run()
+
+    asyncio.run(main())

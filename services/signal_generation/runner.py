@@ -227,3 +227,49 @@ def _parse_timestamp(ts: str | datetime) -> datetime:
     if isinstance(ts, datetime):
         return ts
     return datetime.fromisoformat(ts)
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    from shared.config import load_config
+
+    config = load_config("config/default.yaml")
+
+    async def main() -> None:
+        import redis.asyncio as aioredis
+
+        from shared.redis_client import RedisStreamClient
+
+        redis_conn = aioredis.from_url(config.redis.url)
+        redis_client = RedisStreamClient(redis_conn)
+        runner = SignalGenerationRunner(
+            config=config, redis_client=redis_client, db_session=None
+        )
+
+        logger.info("Signal generation service started", mode=config.mode)
+
+        STREAMS = {
+            "stream:market_data": runner.process_market_data,
+            "stream:fundamentals": runner.process_fundamentals,
+            "stream:events": runner.process_events,
+        }
+        GROUP = "signal_generation"
+        CONSUMER = "signal_worker_1"
+
+        for stream in STREAMS:
+            await redis_client.create_consumer_group(stream, GROUP)
+
+        while True:
+            for stream, handler in STREAMS.items():
+                messages = await redis_client.read_group(
+                    stream, GROUP, CONSUMER, count=10, block_ms=1000
+                )
+                for msg in messages:
+                    try:
+                        await handler(msg.data)
+                        await redis_client.ack(stream, GROUP, msg.message_id)
+                    except Exception:
+                        logger.exception("signal_processing_error", stream=stream)
+
+    asyncio.run(main())
