@@ -169,18 +169,22 @@ def make_signals_fn():
             pct_change = (current_price - entry_price) / entry_price
 
             should_sell = False
+            exit_reason = "unknown"
 
             # 1. Profit target hit
             if pct_change >= PROFIT_TARGET_PCT:
                 should_sell = True
+                exit_reason = "profit_target"
 
             # 2. Stop loss hit
             elif pct_change <= STOP_LOSS_PCT:
                 should_sell = True
+                exit_reason = "stop_loss"
 
             # 3. Time-based exit
             elif holding_bars >= MAX_HOLDING_BARS:
                 should_sell = True
+                exit_reason = "time_exit"
 
             # 4. Technical breakdown (more sensitive than original)
             else:
@@ -190,6 +194,7 @@ def make_signals_fn():
                     trend = trend_signal.compute(data)
                     if proximity.value < -0.1 and trend.value < -0.1:
                         should_sell = True
+                        exit_reason = "technical_breakdown"
                 except Exception:
                     pass
 
@@ -201,6 +206,7 @@ def make_signals_fn():
                     "limit_price": current_price,
                     "quantity": 0,  # full position
                     "sector": "Unknown",
+                    "exit_reason": exit_reason,
                 }
             return None
 
@@ -232,6 +238,11 @@ def make_signals_fn():
                 "limit_price": limit_price,
                 "quantity": quantity,
                 "sector": "Unknown",
+                "signals": {
+                    "proximity": {"value": proximity.value, "confidence": proximity.confidence},
+                    "strength": {"value": strength.value, "confidence": strength.confidence},
+                    "trend": {"value": trend.value, "confidence": trend.confidence},
+                },
             }
 
         return None

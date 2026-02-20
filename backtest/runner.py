@@ -13,6 +13,7 @@ class BacktestResult:
 
     trades: list[dict] = field(default_factory=list)
     portfolio_values: list[float] = field(default_factory=list)
+    dates: list = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
 
 
@@ -59,6 +60,7 @@ class BacktestRunner:
         positions: dict[str, _Position] = {}
         trades: list[dict] = []
         portfolio_values: list[float] = [self.initial_capital]
+        dates: list = []
 
         # Collect all unique dates across tickers, sorted
         all_dates = _collect_sorted_dates(bars_by_ticker)
@@ -107,6 +109,8 @@ class BacktestRunner:
                         "pnl": pnl,
                         "entry_commission": pos.entry_commission,
                         "exit_commission": fill["commission"],
+                        "entry_signals": pos.entry_signals,
+                        "exit_reason": signal.get("exit_reason", "unknown"),
                     })
 
                 elif action == "buy" and ticker not in positions:
@@ -143,6 +147,7 @@ class BacktestRunner:
                         entry_price=fill["fill_price"],
                         entry_date=fill["date"],
                         entry_commission=fill["commission"],
+                        entry_signals=signal.get("signals", {}),
                     )
 
             # End of day: compute portfolio value
@@ -155,6 +160,7 @@ class BacktestRunner:
                     # Use entry price as fallback if no bar for this date
                     nav += pos.entry_price * pos.quantity
             portfolio_values.append(nav)
+            dates.append(current_date)
 
         # Compute metrics
         metrics = BacktestMetrics.compute(
@@ -165,6 +171,7 @@ class BacktestRunner:
         return BacktestResult(
             trades=trades,
             portfolio_values=portfolio_values,
+            dates=dates,
             metrics=metrics,
         )
 
@@ -178,6 +185,7 @@ class _Position:
     entry_price: float
     entry_date: Any
     entry_commission: float
+    entry_signals: dict = field(default_factory=dict)
 
 
 def _collect_sorted_dates(bars_by_ticker: dict[str, list[dict]]) -> list:
