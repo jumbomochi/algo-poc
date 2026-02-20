@@ -8,3 +8,4 @@ dist/
 config/secrets.yaml
 *.db
 .env
+output/
