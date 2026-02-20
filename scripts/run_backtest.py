@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import os
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -298,6 +300,47 @@ def print_results(result, elapsed_seconds: float) -> None:
         print(f"  P&L:                   ${values[-1] - values[0]:>+12,.2f}")
 
 
+def save_results(
+    config: dict,
+    trades: list[dict],
+    portfolio_values: list[float],
+    dates: list,
+    metrics: dict,
+    bars: dict[str, list[dict]],
+    output_dir: str = "output",
+) -> str:
+    """Serialize backtest output to a timestamped JSON file.
+
+    Creates *output_dir* if it does not already exist, writes a JSON file
+    named ``backtest_YYYYMMDD_HHMMSS.json``, and returns the file path.
+    """
+
+    def _json_serializer(obj: Any) -> str:
+        if isinstance(obj, date):
+            return obj.isoformat()
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"backtest_{timestamp}.json"
+    path = os.path.join(output_dir, filename)
+
+    payload = {
+        "config": config,
+        "trades": trades,
+        "portfolio_values": portfolio_values,
+        "dates": dates,
+        "metrics": metrics,
+        "bars": bars,
+    }
+
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, default=_json_serializer)
+
+    print(f"Results saved to {path}")
+    return path
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run algo-poc backtest with IB data")
     parser.add_argument("--tickers", type=int, default=50,
@@ -312,6 +355,8 @@ def main():
                         help="Commission per share (default: 0.005)")
     parser.add_argument("--ib-host", default="127.0.0.1")
     parser.add_argument("--ib-port", type=int, default=7497)
+    parser.add_argument("--output-dir", default="output",
+                        help="Directory for output files (default: output)")
     args = parser.parse_args()
 
     tickers = SP500_TOP50[:args.tickers]
@@ -361,6 +406,24 @@ def main():
 
     # 4. Print results
     print_results(result, elapsed)
+
+    # 5. Save results to JSON
+    print("\nStep 5: Saving results...")
+    save_results(
+        config={
+            "tickers": tickers,
+            "years": args.years,
+            "initial_capital": args.capital,
+            "slippage_bps": args.slippage_bps,
+            "commission_per_share": args.commission,
+        },
+        trades=result.trades,
+        portfolio_values=result.portfolio_values,
+        dates=result.dates,
+        metrics=result.metrics,
+        bars=bars_by_ticker,
+        output_dir=args.output_dir,
+    )
 
 
 if __name__ == "__main__":
