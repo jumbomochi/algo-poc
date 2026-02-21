@@ -202,3 +202,88 @@ class SupportTrendSignal(Signal):
         confidence = max(0.0, r_squared)
 
         return SignalResult(value=value, confidence=confidence)
+
+
+class RSISignal(Signal):
+    """14-day Relative Strength Index mapped to a mean-reversion signal.
+
+    Oversold (RSI < 35) produces positive values (bullish for mean reversion).
+    Overbought (RSI > 65) produces negative values (bearish).
+
+    Scale:
+    *  1.0 = RSI at 0 (extremely oversold)
+    *  0.0 = RSI at 50 (neutral)
+    * -1.0 = RSI at 100 (extremely overbought)
+    """
+
+    name = "rsi"
+
+    def __init__(self, period: int = 14) -> None:
+        self.period = period
+
+    def compute(self, data: dict[str, Any]) -> SignalResult:
+        closes = np.asarray(data["close"], dtype=float)
+
+        if len(closes) < self.period + 1:
+            return SignalResult(value=0.0, confidence=0.0)
+
+        deltas = np.diff(closes[-(self.period + 1):])
+        gains = np.where(deltas > 0, deltas, 0.0)
+        losses = np.where(deltas < 0, -deltas, 0.0)
+
+        avg_gain = np.mean(gains)
+        avg_loss = np.mean(losses)
+
+        if avg_loss == 0:
+            rsi = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi = 100.0 - (100.0 / (1.0 + rs))
+
+        # Map RSI to signal value: RSI 50 -> 0, RSI 0 -> +1, RSI 100 -> -1
+        value = (50.0 - rsi) / 50.0
+
+        # Confidence: highest when RSI is at extremes (< 30 or > 70)
+        distance_from_center = abs(rsi - 50.0)
+        confidence = min(distance_from_center / 30.0, 1.0)
+
+        return SignalResult(value=value, confidence=confidence)
+
+
+class VolumeSignal(Signal):
+    """Compares current volume to the 20-day moving average.
+
+    Positive when volume is elevated (confirms institutional activity).
+    Neutral at 1x average, maximum at 3x average.
+
+    Scale:
+    *  1.0 = volume at 3x+ the 20-day average
+    *  0.0 = volume at 1x the 20-day average
+    * -1.0 = volume at 0 (no trading)
+    """
+
+    name = "volume_ratio"
+
+    def __init__(self, lookback: int = 20) -> None:
+        self.lookback = lookback
+
+    def compute(self, data: dict[str, Any]) -> SignalResult:
+        volumes = np.asarray(data["volume"], dtype=float)
+
+        if len(volumes) < self.lookback + 1:
+            return SignalResult(value=0.0, confidence=0.0)
+
+        avg_volume = np.mean(volumes[-(self.lookback + 1):-1])
+        if avg_volume == 0:
+            return SignalResult(value=0.0, confidence=0.0)
+
+        current_volume = float(volumes[-1])
+        ratio = current_volume / avg_volume
+
+        # Map ratio to signal: 1x -> 0, 3x -> +1, 0x -> -1
+        value = (ratio - 1.0) / 2.0
+
+        # Confidence: high when ratio is clearly above or below 1
+        confidence = min(abs(ratio - 1.0) / 1.0, 1.0)
+
+        return SignalResult(value=value, confidence=confidence)

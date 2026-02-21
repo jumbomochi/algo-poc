@@ -2,7 +2,7 @@ import pytest
 import numpy as np
 from datetime import date, timedelta
 from services.signal_generation.technical import (
-    SupportProximitySignal, SupportStrengthSignal, SupportTrendSignal, find_support_levels,
+    SupportProximitySignal, SupportStrengthSignal, SupportTrendSignal, RSISignal, find_support_levels,
 )
 
 def make_ohlcv(days=252, base_price=100.0):
@@ -44,3 +44,57 @@ def test_support_trend_signal():
     sig = SupportTrendSignal()
     result = sig.compute(data)
     assert -1.0 <= result.value <= 1.0
+
+def test_rsi_signal_oversold():
+    """RSI should be high (bullish) when price has been falling."""
+    data = make_ohlcv(days=252, base_price=100.0)
+    data["close"][-14:] = np.linspace(100, 70, 14)
+    sig = RSISignal()
+    result = sig.compute(data)
+    assert result.value > 0.3
+    assert result.confidence > 0.5
+
+def test_rsi_signal_overbought():
+    """RSI should be negative (bearish) when price has been rising."""
+    data = make_ohlcv(days=252, base_price=100.0)
+    data["close"][-14:] = np.linspace(100, 130, 14)
+    sig = RSISignal()
+    result = sig.compute(data)
+    assert result.value < 0
+
+def test_rsi_signal_needs_min_bars():
+    """RSI should return zero with insufficient data."""
+    data = make_ohlcv(days=10, base_price=100.0)
+    sig = RSISignal()
+    result = sig.compute(data)
+    assert result.value == 0.0
+    assert result.confidence == 0.0
+
+
+from services.signal_generation.technical import VolumeSignal
+
+def test_volume_signal_above_average():
+    """Volume signal should be positive when current volume > 1.5x average."""
+    data = make_ohlcv(days=252, base_price=100.0)
+    data["volume"] = np.full(252, 500_000)
+    data["volume"][-1] = 1_000_000
+    sig = VolumeSignal()
+    result = sig.compute(data)
+    assert result.value > 0.5
+    assert result.confidence > 0.5
+
+def test_volume_signal_below_average():
+    """Volume signal should be near zero when volume is below average."""
+    data = make_ohlcv(days=252, base_price=100.0)
+    data["volume"] = np.full(252, 500_000)
+    data["volume"][-1] = 200_000
+    sig = VolumeSignal()
+    result = sig.compute(data)
+    assert result.value < 0.0
+
+def test_volume_signal_needs_min_bars():
+    """Volume signal should return zero with insufficient data."""
+    data = make_ohlcv(days=5, base_price=100.0)
+    sig = VolumeSignal()
+    result = sig.compute(data)
+    assert result.value == 0.0
