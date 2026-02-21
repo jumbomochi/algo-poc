@@ -57,7 +57,7 @@ class BacktestRunner:
             BacktestResult with trades, portfolio_values, and metrics.
         """
         cash = self.initial_capital
-        positions: dict[str, _Position] = {}
+        positions: dict[str, list[_Lot]] = {}
         trades: list[dict] = []
         portfolio_values: list[float] = [self.initial_capital]
         dates: list = []
@@ -89,32 +89,34 @@ class BacktestRunner:
                 action = signal.get("action")
 
                 if action == "sell" and ticker in positions:
-                    # Exit position at market
-                    pos = positions.pop(ticker)
-                    fill = self.executor.fill_market_exit(
-                        quantity=pos.quantity, bar=bar
-                    )
-                    exit_value = fill["fill_price"] * fill["quantity"]
-                    entry_value = pos.entry_price * pos.quantity
-                    pnl = exit_value - entry_value - pos.entry_commission - fill["commission"]
-                    cash += exit_value - fill["commission"]
+                    # Exit all lots for this ticker
+                    lots = positions.pop(ticker)
+                    for lot in lots:
+                        fill = self.executor.fill_market_exit(
+                            quantity=lot.quantity, bar=bar
+                        )
+                        exit_value = fill["fill_price"] * fill["quantity"]
+                        entry_value = lot.entry_price * lot.quantity
+                        pnl = exit_value - entry_value - lot.entry_commission - fill["commission"]
+                        cash += exit_value - fill["commission"]
 
-                    trades.append({
-                        "ticker": ticker,
-                        "entry_date": pos.entry_date,
-                        "exit_date": fill["date"],
-                        "entry_price": pos.entry_price,
-                        "exit_price": fill["fill_price"],
-                        "quantity": pos.quantity,
-                        "pnl": pnl,
-                        "entry_commission": pos.entry_commission,
-                        "exit_commission": fill["commission"],
-                        "entry_signals": pos.entry_signals,
-                        "exit_reason": signal.get("exit_reason", "unknown"),
-                    })
+                        trades.append({
+                            "ticker": ticker,
+                            "entry_date": lot.entry_date,
+                            "exit_date": fill["date"],
+                            "entry_price": lot.entry_price,
+                            "exit_price": fill["fill_price"],
+                            "quantity": lot.quantity,
+                            "pnl": pnl,
+                            "entry_commission": lot.entry_commission,
+                            "exit_commission": fill["commission"],
+                            "entry_signals": lot.entry_signals,
+                            "exit_reason": signal.get("exit_reason", "unknown"),
+                        })
 
-                elif action == "buy" and ticker not in positions:
-                    # Check risk first
+                elif action == "buy":
+                    # Check risk with existing lot count
+                    existing_lots = positions.get(ticker, [])
                     limit_price = signal["limit_price"]
                     quantity = signal["quantity"]
                     sector = signal.get("sector", "Unknown")
@@ -123,7 +125,8 @@ class BacktestRunner:
                         cash, positions, bars_by_date, current_date
                     )
                     decision = risk_engine.check_entry(
-                        ticker, quantity, limit_price, sector, portfolio_state
+                        ticker, quantity, limit_price, sector, portfolio_state,
+                        existing_lots=len(existing_lots),
                     )
 
                     if not decision.approved:
@@ -141,7 +144,7 @@ class BacktestRunner:
 
                     cost = fill["fill_price"] * fill["quantity"] + fill["commission"]
                     cash -= cost
-                    positions[ticker] = _Position(
+                    lot = _Lot(
                         ticker=ticker,
                         quantity=fill["quantity"],
                         entry_price=fill["fill_price"],
@@ -149,16 +152,20 @@ class BacktestRunner:
                         entry_commission=fill["commission"],
                         entry_signals=signal.get("signals", {}),
                     )
+                    if ticker not in positions:
+                        positions[ticker] = []
+                    positions[ticker].append(lot)
 
-            # End of day: compute portfolio value
+            # End of day: compute portfolio value and update peak prices
             nav = cash
-            for ticker, pos in positions.items():
+            for ticker, lots in positions.items():
                 bar = bars_by_date.get((ticker, current_date))
-                if bar is not None:
-                    nav += bar["close"] * pos.quantity
-                else:
-                    # Use entry price as fallback if no bar for this date
-                    nav += pos.entry_price * pos.quantity
+                for lot in lots:
+                    if bar is not None:
+                        nav += bar["close"] * lot.quantity
+                        lot.peak_price = max(lot.peak_price, bar["close"])
+                    else:
+                        nav += lot.entry_price * lot.quantity
             portfolio_values.append(nav)
             dates.append(current_date)
 
@@ -177,8 +184,8 @@ class BacktestRunner:
 
 
 @dataclass
-class _Position:
-    """Internal position tracker."""
+class _Lot:
+    """Individual lot within a position."""
 
     ticker: str
     quantity: int
@@ -186,6 +193,11 @@ class _Position:
     entry_date: Any
     entry_commission: float
     entry_signals: dict = field(default_factory=dict)
+    peak_price: float = 0.0
+
+    def __post_init__(self):
+        if self.peak_price == 0.0:
+            self.peak_price = self.entry_price
 
 
 def _collect_sorted_dates(bars_by_ticker: dict[str, list[dict]]) -> list:
@@ -199,7 +211,7 @@ def _collect_sorted_dates(bars_by_ticker: dict[str, list[dict]]) -> list:
 
 def _make_simple_portfolio(
     cash: float,
-    positions: dict[str, _Position],
+    positions: dict[str, list[_Lot]],
     bars_by_date: dict,
     current_date: Any,
 ) -> Any:
@@ -212,15 +224,19 @@ def _make_simple_portfolio(
     from backtest._portfolio_state import SimplePortfolioState
 
     nav = cash
-    for ticker, pos in positions.items():
-        bar = bars_by_date.get((ticker, current_date))
-        price = bar["close"] if bar else pos.entry_price
-        nav += price * pos.quantity
+    all_positions = {}
+    for ticker, lots in positions.items():
+        total_qty = sum(lot.quantity for lot in lots)
+        all_positions[ticker] = {"quantity": total_qty}
+        for lot in lots:
+            bar = bars_by_date.get((ticker, current_date))
+            price = bar["close"] if bar else lot.entry_price
+            nav += price * lot.quantity
 
     return SimplePortfolioState(
         nav=nav,
         peak_nav=nav,
-        positions={t: {"quantity": p.quantity} for t, p in positions.items()},
+        positions=all_positions,
         sector_exposure={},
         total_exposure_pct=0.0,
         margin_utilization_pct=0.0,
