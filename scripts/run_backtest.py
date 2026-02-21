@@ -385,6 +385,35 @@ def make_momentum_signals_fn(
     return signals_fn
 
 
+def make_combined_signals_fn(
+    mean_reversion_fn: Callable[[str, list[dict]], dict | None],
+    momentum_fn: Callable[[str, list[dict]], dict | None],
+) -> Callable[[str, list[dict]], dict | None]:
+    """Compose mean-reversion and momentum signal functions.
+
+    Priority: sell signals first, then mean-reversion buys, then momentum buys.
+    """
+    def combined_fn(ticker: str, bars: list[dict]) -> dict | None:
+        mr_signal = mean_reversion_fn(ticker, bars)
+        mom_signal = momentum_fn(ticker, bars)
+
+        # Sell signals take highest priority from either strategy
+        if mr_signal and mr_signal.get("action") == "sell":
+            return mr_signal
+        if mom_signal and mom_signal.get("action") == "sell":
+            return mom_signal
+
+        # Buy: mean-reversion first (more selective), then momentum
+        if mr_signal and mr_signal.get("action") == "buy":
+            return mr_signal
+        if mom_signal and mom_signal.get("action") == "buy":
+            return mom_signal
+
+        return None
+
+    return combined_fn
+
+
 def _build_data(bars: list[dict]) -> dict[str, list]:
     """Build the data dict expected by signal classes."""
     return {
@@ -530,7 +559,14 @@ def main():
         total_exposure_limit_pct=100.0,
         max_lots_per_ticker=2,
     )
-    signals_fn = make_signals_fn(initial_capital=args.capital)
+    mr_signals_fn = make_signals_fn(initial_capital=args.capital)
+    mom_signals_fn = make_momentum_signals_fn(
+        bars_by_ticker=bars_by_ticker,
+        top_n=5,
+        lookback_days=126,
+        initial_capital=args.capital,
+    )
+    signals_fn = make_combined_signals_fn(mr_signals_fn, mom_signals_fn)
 
     # 3. Run backtest
     print("Step 3: Running backtest...")
