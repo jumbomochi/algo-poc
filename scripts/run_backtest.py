@@ -28,6 +28,9 @@ from services.signal_generation.technical import (
     SupportProximitySignal,
     SupportStrengthSignal,
     SupportTrendSignal,
+    RSISignal,
+    VolumeSignal,
+    find_support_levels,
 )
 
 # Top 50 S&P 500 by market cap (as of early 2025)
@@ -135,117 +138,146 @@ def fetch_bars_from_ib(
     return bars_by_ticker
 
 
-def make_signals_fn():
-    """Create a signal function that uses technical support-level analysis.
+def make_signals_fn(
+    position_size_pct: float = 0.07,
+    initial_capital: float = 100_000,
+    hard_stop_pct: float = 0.05,
+    trailing_stop_pct: float = 0.05,
+    max_lots: int = 2,
+):
+    """Create a signal function implementing mean-reversion on large-cap support levels.
 
-    Returns a callable matching BacktestRunner's signals_fn signature:
-        signals_fn(ticker, bars_so_far) -> signal dict or None
-
-    Tracks positions internally to enable profit-taking, stop-loss, and
-    time-based exits alongside the technical sell signal.
+    Entry (first lot): support proximity + RSI < 35 + volume > 1.5x avg + rising supports.
+    Entry (add-on lot): in profit + new support signal + RSI < 40 + volume confirmation.
+    Exit: 5% trailing stop from peak, or 5% hard stop from entry.
     """
     proximity_signal = SupportProximitySignal()
     strength_signal = SupportStrengthSignal()
     trend_signal = SupportTrendSignal()
+    rsi_signal = RSISignal()
+    volume_signal = VolumeSignal()
 
-    # Internal position tracking for exit logic
-    tracked: dict[str, dict] = {}  # ticker -> {entry_price, entry_idx}
-
-    PROFIT_TARGET_PCT = 0.08   # 8% profit target
-    STOP_LOSS_PCT = -0.05      # 5% stop loss
-    MAX_HOLDING_BARS = 40      # ~2 months max holding
+    # Per-ticker lot tracking: ticker -> list of {entry_price, entry_idx, peak_price}
+    tracked: dict[str, list[dict]] = {}
 
     def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
-        # Need at least 60 trading days of data
         if len(bars) < 60:
             return None
 
         current_price = bars[-1]["close"]
         bar_count = len(bars)
-        pos = tracked.get(ticker)
+        lots = tracked.get(ticker, [])
 
-        # === Exit logic (when we're tracking a position) ===
-        if pos is not None:
-            entry_price = pos["entry_price"]
-            holding_bars = bar_count - pos["entry_idx"]
-            pct_change = (current_price - entry_price) / entry_price
+        # === Exit logic: check each lot for trailing stop or hard stop ===
+        if lots:
+            # Update peak prices
+            for lot in lots:
+                lot["peak_price"] = max(lot["peak_price"], current_price)
 
             should_sell = False
             exit_reason = "unknown"
 
-            # 1. Profit target hit
-            if pct_change >= PROFIT_TARGET_PCT:
-                should_sell = True
-                exit_reason = "profit_target"
+            for lot in lots:
+                peak = lot["peak_price"]
+                entry = lot["entry_price"]
 
-            # 2. Stop loss hit
-            elif pct_change <= STOP_LOSS_PCT:
-                should_sell = True
-                exit_reason = "stop_loss"
+                # Hard stop: 5% below entry
+                if (current_price - entry) / entry <= -hard_stop_pct:
+                    should_sell = True
+                    exit_reason = "hard_stop"
+                    break
 
-            # 3. Time-based exit
-            elif holding_bars >= MAX_HOLDING_BARS:
-                should_sell = True
-                exit_reason = "time_exit"
-
-            # 4. Technical breakdown (more sensitive than original)
-            else:
-                data = _build_data(bars)
-                try:
-                    proximity = proximity_signal.compute(data)
-                    trend = trend_signal.compute(data)
-                    if proximity.value < -0.1 and trend.value < -0.1:
-                        should_sell = True
-                        exit_reason = "technical_breakdown"
-                except Exception:
-                    pass
+                # Trailing stop: 5% below peak
+                if peak > entry and (peak - current_price) / peak >= trailing_stop_pct:
+                    should_sell = True
+                    exit_reason = "trailing_stop"
+                    break
 
             if should_sell:
-                del tracked[ticker]
+                tracked.pop(ticker, None)
                 return {
                     "action": "sell",
                     "ticker": ticker,
                     "limit_price": current_price,
-                    "quantity": 0,  # full position
+                    "quantity": 0,
                     "sector": "Unknown",
                     "exit_reason": exit_reason,
                 }
-            return None
 
-        # === Buy logic (no position tracked) ===
+        # === Compute signals ===
         data = _build_data(bars)
         try:
             proximity = proximity_signal.compute(data)
             strength = strength_signal.compute(data)
             trend = trend_signal.compute(data)
+            rsi = rsi_signal.compute(data)
+            volume = volume_signal.compute(data)
         except Exception:
             return None
 
-        if (
-            proximity.value > 0.4
-            and proximity.confidence > 0.2
-            and strength.value > 0.0
-            and strength.confidence > 0.2
-            and trend.value > 0.0
-        ):
-            limit_price = current_price * 1.003
-            quantity = max(1, int(5000 / current_price))
-            tracked[ticker] = {
-                "entry_price": current_price,
-                "entry_idx": bar_count,
-            }
-            return {
-                "action": "buy",
-                "ticker": ticker,
-                "limit_price": limit_price,
-                "quantity": quantity,
-                "sector": "Unknown",
-                "signals": {
-                    "proximity": {"value": proximity.value, "confidence": proximity.confidence},
-                    "strength": {"value": strength.value, "confidence": strength.confidence},
-                    "trend": {"value": trend.value, "confidence": trend.confidence},
-                },
-            }
+        signal_snapshot = {
+            "proximity": {"value": proximity.value, "confidence": proximity.confidence},
+            "strength": {"value": strength.value, "confidence": strength.confidence},
+            "trend": {"value": trend.value, "confidence": trend.confidence},
+            "rsi": {"value": rsi.value, "confidence": rsi.confidence},
+            "volume": {"value": volume.value, "confidence": volume.confidence},
+        }
+
+        # === Add-on entry (already have lots, in profit) ===
+        if lots and len(lots) < max_lots:
+            avg_entry = sum(l["entry_price"] for l in lots) / len(lots)
+            in_profit = current_price > avg_entry
+
+            if (
+                in_profit
+                and proximity.value > 0.6
+                and strength.confidence > 0.5
+                and rsi.value > 0.2  # RSI < 40
+                and volume.value > 0.25  # volume > 1.5x avg
+                and trend.value >= 0.0
+            ):
+                support_levels = find_support_levels(data)
+                limit_price = support_levels[0] if support_levels else current_price
+                quantity = max(1, int(initial_capital * position_size_pct / current_price))
+                lots.append({
+                    "entry_price": current_price,
+                    "entry_idx": bar_count,
+                    "peak_price": current_price,
+                })
+                return {
+                    "action": "buy",
+                    "ticker": ticker,
+                    "limit_price": limit_price,
+                    "quantity": quantity,
+                    "sector": "Unknown",
+                    "signals": signal_snapshot,
+                }
+
+        # === First entry (no lots) ===
+        if not lots:
+            if (
+                proximity.value > 0.6
+                and strength.confidence > 0.5
+                and rsi.value > 0.3  # RSI < 35
+                and volume.value > 0.25  # volume > 1.5x avg
+                and trend.value >= 0.0
+            ):
+                support_levels = find_support_levels(data)
+                limit_price = support_levels[0] if support_levels else current_price
+                quantity = max(1, int(initial_capital * position_size_pct / current_price))
+                tracked[ticker] = [{
+                    "entry_price": current_price,
+                    "entry_idx": bar_count,
+                    "peak_price": current_price,
+                }]
+                return {
+                    "action": "buy",
+                    "ticker": ticker,
+                    "limit_price": limit_price,
+                    "quantity": quantity,
+                    "sector": "Unknown",
+                    "signals": signal_snapshot,
+                }
 
         return None
 
@@ -392,11 +424,12 @@ def main():
     )
     runner = BacktestRunner(executor=executor, initial_capital=args.capital)
     risk_engine = RiskEngine(
-        position_entry_limit_pct=5.0,
-        sector_concentration_pct=20.0,
-        total_exposure_limit_pct=150.0,
+        position_entry_limit_pct=7.0,
+        sector_concentration_pct=30.0,
+        total_exposure_limit_pct=100.0,
+        max_lots_per_ticker=2,
     )
-    signals_fn = make_signals_fn()
+    signals_fn = make_signals_fn(initial_capital=args.capital)
 
     # 3. Run backtest
     print("Step 3: Running backtest...")
