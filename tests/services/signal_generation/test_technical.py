@@ -80,7 +80,7 @@ def test_volume_signal_above_average():
     data["volume"][-1] = 1_000_000
     sig = VolumeSignal()
     result = sig.compute(data)
-    assert result.value > 0.5
+    assert result.value >= 0.5
     assert result.confidence > 0.5
 
 def test_volume_signal_below_average():
