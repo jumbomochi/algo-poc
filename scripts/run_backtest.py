@@ -17,7 +17,7 @@ import os
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -141,15 +141,14 @@ def fetch_bars_from_ib(
 def make_signals_fn(
     position_size_pct: float = 0.07,
     initial_capital: float = 100_000,
-    hard_stop_pct: float = 0.05,
-    trailing_stop_pct: float = 0.05,
+    trailing_stop_pct: float = 0.10,
     max_lots: int = 2,
 ):
     """Create a signal function implementing mean-reversion on large-cap support levels.
 
     Entry (first lot): support proximity + RSI < 35 + volume > 1.5x avg + rising supports.
     Entry (add-on lot): in profit + new support signal + RSI < 40 + volume confirmation.
-    Exit: 5% trailing stop from peak, or 5% hard stop from entry.
+    Exit: 5% trailing stop from peak (no hard stop, no holding period cap).
     """
     proximity_signal = SupportProximitySignal()
     strength_signal = SupportStrengthSignal()
@@ -181,13 +180,8 @@ def make_signals_fn(
                 peak = lot["peak_price"]
                 entry = lot["entry_price"]
 
-                # Hard stop: 5% below entry
-                if (current_price - entry) / entry <= -hard_stop_pct:
-                    should_sell = True
-                    exit_reason = "hard_stop"
-                    break
-
-                # Trailing stop: 5% below peak
+                # Trailing stop: only activates after position has been profitable.
+                # Losers are held until they recover — no hard stop, no time cap.
                 if peak > entry and (peak - current_price) / peak >= trailing_stop_pct:
                     should_sell = True
                     exit_reason = "trailing_stop"
@@ -230,11 +224,11 @@ def make_signals_fn(
 
             if (
                 in_profit
-                and proximity.value > 0.6
-                and strength.confidence > 0.5
-                and rsi.value > 0.2  # RSI < 40
-                and volume.value > 0.25  # volume > 1.5x avg
-                and trend.value >= 0.0
+                and proximity.value > 0.8
+                and strength.confidence > 0.7
+                and rsi.value > 0.3  # RSI < 35 (relaxed vs first entry)
+                and volume.value > 0.5  # volume > 2x avg
+                and trend.value > 0.0
             ):
                 support_levels = find_support_levels(data)
                 limit_price = support_levels[0] if support_levels else current_price
@@ -256,11 +250,11 @@ def make_signals_fn(
         # === First entry (no lots) ===
         if not lots:
             if (
-                proximity.value > 0.6
-                and strength.confidence > 0.5
-                and rsi.value > 0.3  # RSI < 35
-                and volume.value > 0.25  # volume > 1.5x avg
-                and trend.value >= 0.0
+                proximity.value > 0.8
+                and strength.confidence > 0.7
+                and rsi.value > 0.4  # RSI < 30 (deeply oversold)
+                and volume.value > 0.5  # volume > 2x avg
+                and trend.value > 0.0  # supports must be rising
             ):
                 support_levels = find_support_levels(data)
                 limit_price = support_levels[0] if support_levels else current_price
@@ -278,6 +272,113 @@ def make_signals_fn(
                     "sector": "Unknown",
                     "signals": signal_snapshot,
                 }
+
+        return None
+
+    return signals_fn
+
+
+def make_momentum_signals_fn(
+    bars_by_ticker: dict[str, list[dict]],
+    top_n: int = 5,
+    lookback_days: int = 126,
+    position_size_pct: float = 0.07,
+    initial_capital: float = 100_000,
+    trailing_stop_pct: float = 0.10,
+    max_lots: int = 2,
+):
+    """Create a momentum signal function based on 6-month relative strength.
+
+    Ranks all tickers by their return over the lookback period.
+    Buys the top N performers. Exits via trailing stop.
+    """
+    # Pre-compute date -> {ticker: close_price} for ranking
+    price_by_date: dict[Any, dict[str, float]] = {}
+    for ticker, bars in bars_by_ticker.items():
+        for bar in bars:
+            d = bar["date"]
+            if d not in price_by_date:
+                price_by_date[d] = {}
+            price_by_date[d][ticker] = bar["close"]
+
+    sorted_dates = sorted(price_by_date.keys())
+
+    # Pre-compute date -> list of top N tickers ranked by return descending
+    rankings_by_date: dict[Any, list[str]] = {}
+    for i, d in enumerate(sorted_dates):
+        if i < lookback_days:
+            continue
+        past_date = sorted_dates[i - lookback_days]
+        past_prices = price_by_date.get(past_date, {})
+        current_prices = price_by_date[d]
+
+        returns = []
+        for ticker in current_prices:
+            if ticker in past_prices and past_prices[ticker] > 0:
+                ret = (current_prices[ticker] - past_prices[ticker]) / past_prices[ticker]
+                returns.append((ticker, ret))
+
+        returns.sort(key=lambda x: x[1], reverse=True)
+        rankings_by_date[d] = [t for t, _ in returns[:top_n]]
+
+    # Per-ticker lot tracking for exits
+    tracked: dict[str, list[dict]] = {}
+
+    def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
+        if len(bars) < lookback_days + 1:
+            return None
+
+        current_bar = bars[-1]
+        current_price = current_bar["close"]
+        current_date = current_bar["date"]
+        bar_count = len(bars)
+        lots = tracked.get(ticker, [])
+
+        # === Exit logic: trailing stop (same as mean-reversion) ===
+        if lots:
+            for lot in lots:
+                lot["peak_price"] = max(lot["peak_price"], current_price)
+
+            should_sell = False
+            for lot in lots:
+                peak = lot["peak_price"]
+                entry = lot["entry_price"]
+                if peak > entry and (peak - current_price) / peak >= trailing_stop_pct:
+                    should_sell = True
+                    break
+
+            if should_sell:
+                tracked.pop(ticker, None)
+                return {
+                    "action": "sell",
+                    "ticker": ticker,
+                    "limit_price": current_price,
+                    "quantity": 0,
+                    "sector": "Unknown",
+                    "exit_reason": "trailing_stop",
+                }
+
+        # === Entry logic: buy if in top N and not already tracked ===
+        top_tickers = rankings_by_date.get(current_date, [])
+        if not lots and ticker in top_tickers:
+            quantity = max(1, int(initial_capital * position_size_pct / current_price))
+            tracked[ticker] = [{
+                "entry_price": current_price,
+                "entry_idx": bar_count,
+                "peak_price": current_price,
+            }]
+            return {
+                "action": "buy",
+                "ticker": ticker,
+                "limit_price": current_price,
+                "quantity": quantity,
+                "sector": "Unknown",
+                "signals": {
+                    "strategy": "momentum",
+                    "rank": top_tickers.index(ticker) + 1,
+                    "lookback_days": lookback_days,
+                },
+            }
 
         return None
 
