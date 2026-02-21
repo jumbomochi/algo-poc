@@ -45,6 +45,7 @@ class RiskEngine:
         stop_loss_trailing_pct: float = 15.0,
         drawdown_pause_pct: float = 10.0,
         drawdown_circuit_breaker_pct: float = 20.0,
+        max_lots_per_ticker: int | None = None,
     ):
         self.position_entry_limit_pct = position_entry_limit_pct
         self.sector_concentration_pct = sector_concentration_pct
@@ -52,6 +53,7 @@ class RiskEngine:
         self.stop_loss_trailing_pct = stop_loss_trailing_pct
         self.drawdown_pause_pct = drawdown_pause_pct
         self.drawdown_circuit_breaker_pct = drawdown_circuit_breaker_pct
+        self.max_lots_per_ticker = max_lots_per_ticker
 
     def check_entry(
         self,
@@ -60,13 +62,15 @@ class RiskEngine:
         price: float,
         sector: str,
         portfolio: PortfolioState,
+        existing_lots: int = 0,
     ) -> RiskDecision:
         """Check whether a proposed entry trade is allowed.
 
         Checks (in precedence order):
         1. Total exposure limit
-        2. Sector concentration limit
-        3. Position entry limit (scales down if over)
+        2. Max lots per ticker
+        3. Sector concentration limit
+        4. Position entry limit (scales down if over)
 
         Returns:
             RiskDecision with approved=True and adjusted_quantity, or
@@ -79,6 +83,17 @@ class RiskEngine:
                 reason=(
                     f"Total exposure {portfolio.total_exposure_pct:.1f}% "
                     f"exceeds limit {self.total_exposure_limit_pct:.1f}%"
+                ),
+                adjusted_quantity=0,
+            )
+
+        # Check max lots per ticker
+        if self.max_lots_per_ticker is not None and existing_lots >= self.max_lots_per_ticker:
+            return RiskDecision(
+                approved=False,
+                reason=(
+                    f"Max lots per ticker reached for {ticker}: "
+                    f"{existing_lots} >= {self.max_lots_per_ticker}"
                 ),
                 adjusted_quantity=0,
             )
