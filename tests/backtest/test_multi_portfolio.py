@@ -141,3 +141,25 @@ def test_aggregate_empty_results():
     assert agg["trades"] == []
     assert agg["dates"] == []
     assert agg["metrics"] == {}
+
+
+def test_universe_registry_has_required_keys():
+    """Universe registry defines tickers for each known strategy."""
+    from scripts.run_backtest import UNIVERSE_REGISTRY, SP500_TOP50, BEAR_TICKERS
+
+    assert "mean_reversion" in UNIVERSE_REGISTRY
+    assert "momentum" in UNIVERSE_REGISTRY
+    assert set(UNIVERSE_REGISTRY["mean_reversion"]) == set(SP500_TOP50)
+    assert set(SP500_TOP50).issubset(set(UNIVERSE_REGISTRY["momentum"]))
+    assert BEAR_TICKERS.issubset(set(UNIVERSE_REGISTRY["momentum"]))
+
+
+def test_universe_registry_union():
+    """get_union_universe returns deduplicated union of all strategy tickers."""
+    from scripts.run_backtest import get_union_universe
+
+    universe = get_union_universe(["mean_reversion", "momentum"])
+    # Should contain SP500 + BEAR_TICKERS, no duplicates
+    assert len(universe) == len(set(universe))
+    assert "AAPL" in universe
+    assert "SH" in universe

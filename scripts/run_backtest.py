@@ -58,6 +58,24 @@ SP500_TOP50 = [
 # Inverse ETFs for bear market plays
 BEAR_TICKERS = {"SH", "PSQ"}  # SH = inverse S&P 500, PSQ = inverse NASDAQ-100
 
+# Per-strategy ticker universes
+UNIVERSE_REGISTRY: dict[str, list[str]] = {
+    "mean_reversion": SP500_TOP50,
+    "momentum": SP500_TOP50 + [t for t in sorted(BEAR_TICKERS) if t not in SP500_TOP50],
+}
+
+
+def get_union_universe(strategy_names: list[str]) -> list[str]:
+    """Return deduplicated union of tickers across the given strategies."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for name in strategy_names:
+        for ticker in UNIVERSE_REGISTRY[name]:
+            if ticker not in seen:
+                seen.add(ticker)
+                result.append(ticker)
+    return result
+
 
 def fetch_bars_from_ib(
     tickers: list[str],
