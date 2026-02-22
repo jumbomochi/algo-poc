@@ -161,6 +161,8 @@ All strategy logic lives in `scripts/run_backtest.py`:
 | `make_sector_rotation_signals_fn()` | Sector rotation signal generator (top N sectors by 3-month return) |
 | `make_short_term_mr_signals_fn()` | Short-term mean-reversion (RSI(2) + Bollinger Band oversold bounces) |
 | `make_thematic_momentum_signals_fn()` | Thematic ETF momentum (top N above 50-day MA) |
+| `make_quality_value_signals_fn()` | Quality value (composite ROE/D-E/margin ranking) |
+| `make_earnings_drift_signals_fn()` | Earnings drift / PEAD (post-earnings surprise entry) |
 | `make_combined_signals_fn()` | Composes MR + momentum with sell priority (legacy, not used in multi-portfolio mode) |
 | `compute_regime_by_date()` | Market regime classification |
 | `compute_aggregate_metrics()` | Aggregate metrics across multiple portfolios |
@@ -175,8 +177,12 @@ Supporting infrastructure:
 | Module | Purpose |
 |---|---|
 | `services/signal_generation/technical.py` | Signal classes (SupportProximity, SupportStrength, SupportTrend, RSI, Volume, BollingerBand) |
+| `services/signal_generation/fundamental.py` | Signal classes (Valuation, Quality, Growth) |
+| `services/signal_generation/event.py` | Signal classes (EarningsSurprise, NewsSentiment, InsiderActivity) |
 | `services/risk_management/engine.py` | Risk engine (position limits, sector concentration, max lots) |
 | `backtest/runner.py` | Backtest engine (daily bar replay, order simulation, P&L tracking) |
+| `scripts/fetch_fundamentals.py` | Fundamentals data cache (yfinance fetcher, point-in-time lookup) |
+| `scripts/fetch_earnings.py` | Earnings data cache (yfinance fetcher, event window lookup) |
 | `scripts/visualize_backtest.py` | Plotly HTML report generation |
 
 ## Multi-Portfolio Infrastructure
@@ -226,17 +232,26 @@ With a single portfolio, the output format is identical to the original — same
 
 ### Current Portfolio Configuration
 
-The backtest runs five independent portfolios:
+The backtest runs seven independent portfolios:
 
 | Portfolio | Capital | Strategy | Risk Limits |
 |---|---|---|---|
-| `mean_reversion` | 16% of total | Support-level dip buying (S&P 50) | 15% entry, 120% exposure, 2 lots |
-| `momentum` | 24% of total | 6-month relative strength (S&P 50 + inverse ETFs) | 12% entry, 150% exposure, 1 lot |
-| `sector_rotation` | 16% of total | Top 3 sector ETFs by 3-month return | 20% entry, 100% exposure, 1 lot |
-| `short_term_mr` | 20% of total | RSI(2) + Bollinger Band oversold bounces (S&P 100) | 8% entry, 100% exposure, 1 lot |
-| `thematic_momentum` | 24% of total | Top 8 thematic ETFs above 50-day MA | 15% entry, 120% exposure, 1 lot |
+| `mean_reversion` | 14% of total | Support-level dip buying (S&P 50) | 15% entry, 120% exposure, 2 lots |
+| `momentum` | 20% of total | 6-month relative strength (S&P 50 + inverse ETFs) | 12% entry, 150% exposure, 1 lot |
+| `sector_rotation` | 14% of total | Top 3 sector ETFs by 3-month return | 20% entry, 100% exposure, 1 lot |
+| `quality_value` | 14% of total | Top 15 by ROE/D-E/margin composite (S&P 100) | 10% entry, 100% exposure, 1 lot |
+| `earnings_drift` | 17% of total | Post-earnings drift on >5% surprise (S&P 100) | 8% entry, 100% exposure, 1 lot |
+| `short_term_mr` | 11% of total | RSI(2) + Bollinger Band oversold bounces (S&P 100) | 8% entry, 100% exposure, 1 lot |
+| `thematic_momentum` | 10% of total | Top 8 thematic ETFs above 50-day MA | 15% entry, 120% exposure, 1 lot |
 
 Each strategy has independent capital, signal function, and risk engine. Strategies never compete for capital.
+
+Quality value and earnings drift require cached data from `data/cache/`. To populate:
+```bash
+python scripts/fetch_fundamentals.py  # Fetches quarterly financials from yfinance
+python scripts/fetch_earnings.py      # Fetches earnings dates/surprises from yfinance
+```
+If cache files are missing, these strategies will produce no signals (graceful degradation).
 
 ### Universe Registry
 
