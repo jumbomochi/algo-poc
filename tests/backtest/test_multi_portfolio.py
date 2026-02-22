@@ -163,3 +163,44 @@ def test_universe_registry_union():
     assert len(universe) == len(set(universe))
     assert "AAPL" in universe
     assert "SH" in universe
+
+
+def test_split_portfolios_run_independently():
+    """MR and momentum portfolios produce results with independent capital."""
+    from datetime import date
+
+    from backtest.runner import BacktestRunner
+    from backtest.simulator import SimulatedExecutor
+    from scripts.run_backtest import PortfolioConfig, compute_aggregate_metrics
+    from services.risk_management.engine import RiskEngine
+
+    bars = {
+        "AAPL": [
+            {"date": date(2024, 1, d), "open": 150.0 + d, "high": 152.0 + d,
+             "low": 149.0 + d, "close": 151.0 + d, "volume": 1000}
+            for d in range(1, 6)
+        ],
+        "MSFT": [
+            {"date": date(2024, 1, d), "open": 300.0 + d, "high": 302.0 + d,
+             "low": 299.0 + d, "close": 301.0 + d, "volume": 1000}
+            for d in range(1, 6)
+        ],
+    }
+
+    executor = SimulatedExecutor(slippage_bps=0, commission_per_share=0)
+
+    configs = {
+        "mr": PortfolioConfig("mr", 60_000, lambda t, b: None, RiskEngine()),
+        "mom": PortfolioConfig("mom", 40_000, lambda t, b: None, RiskEngine()),
+    }
+
+    results = {}
+    for name, pc in configs.items():
+        runner = BacktestRunner(executor=executor, initial_capital=pc.capital)
+        results[name] = runner.run(bars, pc.signals_fn, pc.risk_engine)
+
+    assert results["mr"].portfolio_values[0] == 60_000
+    assert results["mom"].portfolio_values[0] == 40_000
+
+    agg = compute_aggregate_metrics(results, configs)
+    assert agg["portfolio_values"][0] == 100_000

@@ -805,9 +805,9 @@ def main():
     print(f"  Commission: ${args.commission}/share")
     print()
 
-    # 1. Fetch data from IB (include inverse ETFs for bear market plays)
-    all_tickers = tickers + [t for t in BEAR_TICKERS if t not in tickers]
-    print(f"Step 1: Fetching historical data from IB Gateway ({len(tickers)} stocks + {len(BEAR_TICKERS)} inverse ETFs)...")
+    # 1. Fetch data from IB
+    all_tickers = get_union_universe(["mean_reversion", "momentum"])
+    print(f"Step 1: Fetching historical data from IB Gateway ({len(all_tickers)} tickers)...")
     bars_by_ticker = fetch_bars_from_ib(
         tickers=all_tickers,
         years=args.years,
@@ -844,18 +844,27 @@ def main():
         trailing_stop_pct=0.10,
         bear_tickers=BEAR_TICKERS,
     )
-    combined_fn = make_combined_signals_fn(mr_signals_fn, mom_signals_fn)
-
     portfolios: dict[str, PortfolioConfig] = {
-        "dual": PortfolioConfig(
-            name="dual",
-            capital=args.capital,
-            signals_fn=combined_fn,
+        "mean_reversion": PortfolioConfig(
+            name="mean_reversion",
+            capital=args.capital * 0.40,
+            signals_fn=mr_signals_fn,
+            risk_engine=RiskEngine(
+                position_entry_limit_pct=15.0,
+                sector_concentration_pct=30.0,
+                total_exposure_limit_pct=120.0,
+                max_lots_per_ticker=2,
+            ),
+        ),
+        "momentum": PortfolioConfig(
+            name="momentum",
+            capital=args.capital * 0.60,
+            signals_fn=mom_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=12.0,
                 sector_concentration_pct=30.0,
                 total_exposure_limit_pct=150.0,
-                max_lots_per_ticker=2,
+                max_lots_per_ticker=1,
             ),
         ),
     }
