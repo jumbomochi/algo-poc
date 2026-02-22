@@ -43,6 +43,9 @@ SP500_TOP50 = [
     "INTU", "CMCSA", "AMAT", "VZ", "NOW", "IBM", "AMGN",
 ]
 
+# Inverse ETFs for bear market plays
+BEAR_TICKERS = {"SH", "PSQ"}  # SH = inverse S&P 500, PSQ = inverse NASDAQ-100
+
 
 def fetch_bars_from_ib(
     tickers: list[str],
@@ -138,17 +141,64 @@ def fetch_bars_from_ib(
     return bars_by_ticker
 
 
+REGIME_PARAMS = {
+    "bull": {"trailing_stop_pct": 0.15, "max_loss_pct": 0.10},
+    "neutral": {"trailing_stop_pct": 0.12, "max_loss_pct": 0.08},
+    "bear": {"trailing_stop_pct": 0.08, "max_loss_pct": 0.05},
+}
+
+
+def compute_regime_by_date(
+    bars_by_ticker: dict[str, list[dict]],
+    ma_period: int = 200,
+    bull_threshold: float = 0.60,
+    bear_threshold: float = 0.40,
+) -> dict:
+    """Compute market regime for each date based on breadth.
+
+    Bull: >60% of stocks above their 200-day MA.
+    Bear: <40% above their 200-day MA.
+    Neutral: 40-60%.
+    """
+    above_ma: dict[Any, list[bool]] = {}
+    for ticker, bars in bars_by_ticker.items():
+        if len(bars) < ma_period:
+            continue
+        closes = [b["close"] for b in bars]
+        dates = [b["date"] for b in bars]
+        ma = np.convolve(closes, np.ones(ma_period) / ma_period, mode="valid")
+        for i, ma_val in enumerate(ma):
+            d = dates[ma_period - 1 + i]
+            if d not in above_ma:
+                above_ma[d] = []
+            above_ma[d].append(closes[ma_period - 1 + i] > ma_val)
+
+    regime_by_date = {}
+    for d, above_list in above_ma.items():
+        breadth = sum(above_list) / len(above_list)
+        if breadth > bull_threshold:
+            regime_by_date[d] = "bull"
+        elif breadth < bear_threshold:
+            regime_by_date[d] = "bear"
+        else:
+            regime_by_date[d] = "neutral"
+
+    return regime_by_date
+
+
 def make_signals_fn(
     position_size_pct: float = 0.07,
     initial_capital: float = 100_000,
     trailing_stop_pct: float = 0.10,
     max_lots: int = 2,
+    regime_by_date: dict | None = None,
 ):
     """Create a signal function implementing mean-reversion on large-cap support levels.
 
     Entry (first lot): support proximity + RSI < 35 + volume > 1.5x avg + rising supports.
     Entry (add-on lot): in profit + new support signal + RSI < 40 + volume confirmation.
-    Exit: 5% trailing stop from peak (no hard stop, no holding period cap).
+    Exit: regime-adaptive trailing stop from peak. No max loss (mean-reversion buys at
+    support — a further drop is expected before recovery).
     """
     proximity_signal = SupportProximitySignal()
     strength_signal = SupportStrengthSignal()
@@ -164,10 +214,18 @@ def make_signals_fn(
             return None
 
         current_price = bars[-1]["close"]
+        current_date = bars[-1]["date"]
         bar_count = len(bars)
         lots = tracked.get(ticker, [])
 
-        # === Exit logic: check each lot for trailing stop or hard stop ===
+        # Determine regime-adjusted trailing stop
+        if regime_by_date:
+            regime = regime_by_date.get(current_date, "neutral")
+            effective_trailing = REGIME_PARAMS[regime]["trailing_stop_pct"]
+        else:
+            effective_trailing = trailing_stop_pct
+
+        # === Exit logic: trailing stop only (no max loss for mean-reversion) ===
         if lots:
             # Update peak prices
             for lot in lots:
@@ -181,8 +239,7 @@ def make_signals_fn(
                 entry = lot["entry_price"]
 
                 # Trailing stop: only activates after position has been profitable.
-                # Losers are held until they recover — no hard stop, no time cap.
-                if peak > entry and (peak - current_price) / peak >= trailing_stop_pct:
+                if peak > entry and (peak - current_price) / peak >= effective_trailing:
                     should_sell = True
                     exit_reason = "trailing_stop"
                     break
@@ -285,12 +342,17 @@ def make_momentum_signals_fn(
     position_size_pct: float = 0.07,
     initial_capital: float = 100_000,
     trailing_stop_pct: float = 0.10,
+    max_loss_pct: float = 0.08,
     max_lots: int = 2,
+    regime_by_date: dict | None = None,
+    bear_tickers: set[str] | None = None,
 ):
     """Create a momentum signal function based on 6-month relative strength.
 
     Ranks all tickers by their return over the lookback period.
-    Buys the top N performers. Exits via trailing stop.
+    Buys the top N performers. Exits via trailing stop + max loss.
+    In bear markets, inverse ETFs (bear_tickers) naturally rank high and get selected.
+    When regime changes away from bear, inverse ETFs are force-exited.
     """
     # Pre-compute date -> {ticker: close_price} for ranking
     price_by_date: dict[Any, dict[str, float]] = {}
@@ -334,17 +396,46 @@ def make_momentum_signals_fn(
         bar_count = len(bars)
         lots = tracked.get(ticker, [])
 
-        # === Exit logic: trailing stop (same as mean-reversion) ===
+        # Determine regime-adjusted parameters
+        if regime_by_date:
+            regime = regime_by_date.get(current_date, "neutral")
+            effective_trailing = REGIME_PARAMS[regime]["trailing_stop_pct"]
+            effective_max_loss = REGIME_PARAMS[regime]["max_loss_pct"]
+        else:
+            regime = "neutral"
+            effective_trailing = trailing_stop_pct
+            effective_max_loss = max_loss_pct
+
+        # === Exit logic: trailing stop + max loss + regime-change exit ===
         if lots:
+            # Force-exit inverse ETFs when regime turns non-bear
+            is_bear_ticker = bear_tickers and ticker in bear_tickers
+            if is_bear_ticker and regime != "bear":
+                tracked.pop(ticker, None)
+                return {
+                    "action": "sell",
+                    "ticker": ticker,
+                    "limit_price": current_price,
+                    "quantity": 0,
+                    "sector": "Unknown",
+                    "exit_reason": "regime_change",
+                }
+
             for lot in lots:
                 lot["peak_price"] = max(lot["peak_price"], current_price)
 
             should_sell = False
+            exit_reason = "trailing_stop"
             for lot in lots:
                 peak = lot["peak_price"]
                 entry = lot["entry_price"]
-                if peak > entry and (peak - current_price) / peak >= trailing_stop_pct:
+                if peak > entry and (peak - current_price) / peak >= effective_trailing:
                     should_sell = True
+                    exit_reason = "trailing_stop"
+                    break
+                if (entry - current_price) / entry >= effective_max_loss:
+                    should_sell = True
+                    exit_reason = "max_loss"
                     break
 
             if should_sell:
@@ -355,7 +446,7 @@ def make_momentum_signals_fn(
                     "limit_price": current_price,
                     "quantity": 0,
                     "sector": "Unknown",
-                    "exit_reason": "trailing_stop",
+                    "exit_reason": exit_reason,
                 }
 
         # === Entry logic: buy if in top N and not already tracked ===
@@ -530,10 +621,11 @@ def main():
     print(f"  Commission: ${args.commission}/share")
     print()
 
-    # 1. Fetch data from IB
-    print("Step 1: Fetching historical data from IB Gateway...")
+    # 1. Fetch data from IB (include inverse ETFs for bear market plays)
+    all_tickers = tickers + [t for t in BEAR_TICKERS if t not in tickers]
+    print(f"Step 1: Fetching historical data from IB Gateway ({len(tickers)} stocks + {len(BEAR_TICKERS)} inverse ETFs)...")
     bars_by_ticker = fetch_bars_from_ib(
-        tickers=tickers,
+        tickers=all_tickers,
         years=args.years,
         host=args.ib_host,
         port=args.ib_port,
@@ -554,17 +646,25 @@ def main():
     )
     runner = BacktestRunner(executor=executor, initial_capital=args.capital)
     risk_engine = RiskEngine(
-        position_entry_limit_pct=7.0,
+        position_entry_limit_pct=14.0,
         sector_concentration_pct=30.0,
         total_exposure_limit_pct=100.0,
         max_lots_per_ticker=2,
     )
-    mr_signals_fn = make_signals_fn(initial_capital=args.capital)
+
+    mr_signals_fn = make_signals_fn(
+        position_size_pct=0.14,
+        initial_capital=args.capital,
+        trailing_stop_pct=0.10,
+    )
     mom_signals_fn = make_momentum_signals_fn(
         bars_by_ticker=bars_by_ticker,
-        top_n=5,
+        top_n=3,
         lookback_days=126,
+        position_size_pct=0.14,
         initial_capital=args.capital,
+        trailing_stop_pct=0.10,
+        bear_tickers=BEAR_TICKERS,
     )
     signals_fn = make_combined_signals_fn(mr_signals_fn, mom_signals_fn)
 
