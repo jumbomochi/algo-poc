@@ -163,6 +163,8 @@ All strategy logic lives in `scripts/run_backtest.py`:
 | `make_thematic_momentum_signals_fn()` | Thematic ETF momentum (top N above 50-day MA) |
 | `make_quality_value_signals_fn()` | Quality value (composite ROE/D-E/margin ranking) |
 | `make_earnings_drift_signals_fn()` | Earnings drift / PEAD (post-earnings surprise entry) |
+| `make_tail_risk_hedge_signals_fn()` | Tail-risk hedge: regime-based rotation between inverse/defensive ETFs |
+| `simulate_rebalancer()` | Post-processing: performance-adaptive weight rebalancing |
 | `make_combined_signals_fn()` | Composes MR + momentum with sell priority (legacy, not used in multi-portfolio mode) |
 | `compute_regime_by_date()` | Market regime classification |
 | `compute_aggregate_metrics()` | Aggregate metrics across multiple portfolios |
@@ -232,17 +234,18 @@ With a single portfolio, the output format is identical to the original — same
 
 ### Current Portfolio Configuration
 
-The backtest runs seven independent portfolios:
+The backtest runs eight independent portfolios:
 
 | Portfolio | Capital | Strategy | Risk Limits |
 |---|---|---|---|
-| `mean_reversion` | 14% of total | Support-level dip buying (S&P 50) | 15% entry, 120% exposure, 2 lots |
-| `momentum` | 20% of total | 6-month relative strength (S&P 50 + inverse ETFs) | 12% entry, 150% exposure, 1 lot |
-| `sector_rotation` | 14% of total | Top 3 sector ETFs by 3-month return | 20% entry, 100% exposure, 1 lot |
-| `quality_value` | 14% of total | Top 15 by ROE/D-E/margin composite (S&P 100) | 10% entry, 100% exposure, 1 lot |
-| `earnings_drift` | 17% of total | Post-earnings drift on >5% surprise (S&P 100) | 8% entry, 100% exposure, 1 lot |
-| `short_term_mr` | 11% of total | RSI(2) + Bollinger Band oversold bounces (S&P 100) | 8% entry, 100% exposure, 1 lot |
-| `thematic_momentum` | 10% of total | Top 8 thematic ETFs above 50-day MA | 15% entry, 120% exposure, 1 lot |
+| `mean_reversion` | 12% of total | Support-level dip buying (S&P 50) | 15% entry, 120% exposure, 2 lots |
+| `momentum` | 18% of total | 6-month relative strength (S&P 50 + inverse ETFs) | 12% entry, 150% exposure, 1 lot |
+| `sector_rotation` | 12% of total | Top 3 sector ETFs by 3-month return | 20% entry, 100% exposure, 1 lot |
+| `quality_value` | 12% of total | Top 15 by ROE/D-E/margin composite (S&P 100) | 10% entry, 100% exposure, 1 lot |
+| `earnings_drift` | 15% of total | Post-earnings drift on >5% surprise (S&P 100) | 8% entry, 100% exposure, 1 lot |
+| `short_term_mr` | 10% of total | RSI(2) + Bollinger Band oversold bounces (S&P 100) | 8% entry, 100% exposure, 1 lot |
+| `thematic_momentum` | 11% of total | Top 8 thematic ETFs above 50-day MA | 15% entry, 120% exposure, 1 lot |
+| `tail_risk_hedge` | 10% of total | Regime-based defensive rotation (inverse ETFs + GLD/TLT) | 25% entry, 100% exposure, 1 lot |
 
 Each strategy has independent capital, signal function, and risk engine. Strategies never compete for capital.
 
@@ -267,3 +270,22 @@ Each strategy defines its own ticker universe via `UNIVERSE_REGISTRY`. Bar data 
 | `short_term_mr` | S&P 500 top 100 | 100 |
 | `thematic_momentum` | Thematic ETFs | 25 |
 | `tail_risk_hedge` | Inverse + defensive ETFs | 5 |
+
+## Performance-Adaptive Rebalancer
+
+A post-processing simulation that re-weights strategy equity curves based on trailing performance.
+
+### How It Works
+
+After all portfolios run independently, `simulate_rebalancer()` takes their equity curves and:
+
+1. Every 21 trading days (~monthly), computes trailing 6-month Sharpe per strategy
+2. Strategies with above-median Sharpe gain weight; below-median lose weight
+3. Max shift: 5% per strategy per rebalance
+4. Floor: 5% per strategy (tail-risk hedge: 8%)
+5. Ceiling: 25% per strategy
+6. Weights re-normalized to sum to 1.0
+
+### Output
+
+Returns a rebalanced combined equity curve and weights history for analysis. This is an approximation valid at retail scale where position scaling has no market impact.
