@@ -15,6 +15,7 @@ from typing import Any
 
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from services.signal_generation.technical import find_support_levels
 
@@ -92,11 +93,6 @@ def _multi_summary_panel(data: dict[str, Any]) -> str:
     agg_metrics = data["aggregate"]["metrics"]
     config = data["config"]
     portfolios = data["portfolios"]
-
-    total_pnl = sum(
-        sum(t["pnl"] for t in p["trades"])
-        for p in portfolios.values()
-    )
 
     # Aggregate metric cards
     cards = [
@@ -414,8 +410,6 @@ def _multi_equity_curve(
 
 def _strategy_comparison_chart(data: dict[str, Any]) -> str:
     """3-panel bar chart comparing Total Return, Sharpe, Max DD across strategies."""
-    from plotly.subplots import make_subplots
-
     portfolios = data["portfolios"]
     names = list(portfolios.keys())
     colors = [STRATEGY_COLORS[i % len(STRATEGY_COLORS)] for i in range(len(names))]
@@ -619,48 +613,8 @@ def _trade_chart(trade: dict[str, Any], bars: list[dict[str, Any]]) -> str:
 _NAV_JS = """
 <script>
 function filterTrades() {
-    var ticker = document.getElementById('ticker-filter').value;
-    var sort = document.getElementById('sort-select').value;
-    var cards = Array.from(document.querySelectorAll('.trade-card'));
-
-    // Show/hide based on ticker filter
-    cards.forEach(function(card) {
-        if (ticker === 'all' || card.getAttribute('data-ticker') === ticker) {
-            card.style.display = '';
-        } else {
-            card.style.display = 'none';
-        }
-    });
-
-    // Sort visible cards
-    var container = document.getElementById('trade-container');
-    var visible = cards.filter(function(c) { return c.style.display !== 'none'; });
-
-    visible.sort(function(a, b) {
-        if (sort === 'date') {
-            return a.getAttribute('data-date').localeCompare(b.getAttribute('data-date'));
-        } else if (sort === 'pnl-best') {
-            return parseFloat(b.getAttribute('data-pnl')) - parseFloat(a.getAttribute('data-pnl'));
-        } else if (sort === 'pnl-worst') {
-            return parseFloat(a.getAttribute('data-pnl')) - parseFloat(b.getAttribute('data-pnl'));
-        } else if (sort === 'ticker') {
-            return a.getAttribute('data-ticker').localeCompare(b.getAttribute('data-ticker'));
-        }
-        return 0;
-    });
-
-    visible.forEach(function(card) {
-        container.appendChild(card);
-    });
-}
-</script>
-"""
-
-
-_MULTI_NAV_JS = """
-<script>
-function filterTrades() {
-    var portfolio = document.getElementById('portfolio-filter').value;
+    var portfolioEl = document.getElementById('portfolio-filter');
+    var portfolio = portfolioEl ? portfolioEl.value : 'all';
     var ticker = document.getElementById('ticker-filter').value;
     var sort = document.getElementById('sort-select').value;
     var cards = Array.from(document.querySelectorAll('.trade-card'));
@@ -826,7 +780,7 @@ th, td {{ padding: 8px; text-align: left; }}
     parts.append("</div>")  # section
 
     # Navigation JS (multi-portfolio version)
-    parts.append(_MULTI_NAV_JS)
+    parts.append(_NAV_JS)
 
     parts.append("</body>\n</html>")
 
