@@ -36,6 +36,8 @@ class PortfolioConfig:
     capital: float
     signals_fn: Callable[[str, list[dict]], dict | None]
     risk_engine: RiskEngine
+from scripts.fetch_fundamentals import load_fundamentals_cache, build_fundamentals_lookup, SECTOR_MAP
+from scripts.fetch_earnings import load_earnings_cache, build_earnings_lookup
 from services.signal_generation.technical import (
     SupportProximitySignal,
     SupportStrengthSignal,
@@ -1367,6 +1369,7 @@ def main():
     all_tickers = get_union_universe([
         "mean_reversion", "momentum", "sector_rotation",
         "short_term_mr", "thematic_momentum",
+        "quality_value", "earnings_drift",
     ])
     print(f"Step 1: Fetching historical data from IB Gateway ({len(all_tickers)} tickers)...")
     bars_by_ticker = fetch_bars_from_ib(
@@ -1383,6 +1386,22 @@ def main():
     total_bars = sum(len(v) for v in bars_by_ticker.values())
     print(f"\nTotal bars loaded: {total_bars:,} across {len(bars_by_ticker)} tickers")
 
+    # Load cached fundamentals and earnings data
+    fundamentals_cache = load_fundamentals_cache("data/cache/fundamentals.json")
+    earnings_cache = load_earnings_cache("data/cache/earnings.json")
+    fundamentals_lookup = build_fundamentals_lookup(fundamentals_cache)
+    earnings_lookup = build_earnings_lookup(earnings_cache, window_days=2)
+
+    if fundamentals_cache:
+        print(f"  Loaded fundamentals for {len(fundamentals_cache)} tickers")
+    else:
+        print("  WARNING: No fundamentals cache found. Run: python scripts/fetch_fundamentals.py")
+
+    if earnings_cache:
+        print(f"  Loaded earnings for {len(earnings_cache)} tickers")
+    else:
+        print("  WARNING: No earnings cache found. Run: python scripts/fetch_earnings.py")
+
     # 2. Set up backtest components
     print("\nStep 2: Initializing backtest engine...")
     executor = SimulatedExecutor(
@@ -1393,7 +1412,7 @@ def main():
     # Build portfolio configurations
     mr_signals_fn = make_signals_fn(
         position_size_pct=0.12,
-        initial_capital=args.capital * 0.16,
+        initial_capital=args.capital * 0.14,
         trailing_stop_pct=0.10,
     )
     mom_signals_fn = make_momentum_signals_fn(
@@ -1401,7 +1420,7 @@ def main():
         top_n=5,
         lookback_days=126,
         position_size_pct=0.12,
-        initial_capital=args.capital * 0.24,
+        initial_capital=args.capital * 0.20,
         trailing_stop_pct=0.10,
         bear_tickers=BEAR_TICKERS,
     )
@@ -1410,12 +1429,12 @@ def main():
         top_n=3,
         lookback_days=63,
         position_size_pct=0.20,
-        initial_capital=args.capital * 0.16,
+        initial_capital=args.capital * 0.14,
         trailing_stop_pct=0.08,
     )
     st_mr_signals_fn = make_short_term_mr_signals_fn(
         position_size_pct=0.08,
-        initial_capital=args.capital * 0.20,
+        initial_capital=args.capital * 0.11,
         max_hold_days=5,
     )
     thematic_signals_fn = make_thematic_momentum_signals_fn(
@@ -1423,13 +1442,29 @@ def main():
         top_n=8,
         lookback_days=63,
         position_size_pct=0.15,
-        initial_capital=args.capital * 0.24,
+        initial_capital=args.capital * 0.10,
         trailing_stop_pct=0.10,
+    )
+    qv_signals_fn = make_quality_value_signals_fn(
+        fundamentals_lookup=fundamentals_lookup,
+        sector_map=SECTOR_MAP,
+        top_n=15,
+        position_size_pct=0.10,
+        initial_capital=args.capital * 0.14,
+        trailing_stop_pct=0.12,
+    )
+    ed_signals_fn = make_earnings_drift_signals_fn(
+        earnings_lookup=earnings_lookup,
+        surprise_threshold_pct=5.0,
+        max_hold_days=20,
+        position_size_pct=0.08,
+        initial_capital=args.capital * 0.17,
+        trailing_stop_pct=0.06,
     )
     portfolios: dict[str, PortfolioConfig] = {
         "mean_reversion": PortfolioConfig(
             name="mean_reversion",
-            capital=args.capital * 0.16,
+            capital=args.capital * 0.14,
             signals_fn=mr_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=15.0,
@@ -1440,7 +1475,7 @@ def main():
         ),
         "momentum": PortfolioConfig(
             name="momentum",
-            capital=args.capital * 0.24,
+            capital=args.capital * 0.20,
             signals_fn=mom_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=12.0,
@@ -1451,7 +1486,7 @@ def main():
         ),
         "sector_rotation": PortfolioConfig(
             name="sector_rotation",
-            capital=args.capital * 0.16,
+            capital=args.capital * 0.14,
             signals_fn=sector_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=20.0,
@@ -1462,7 +1497,7 @@ def main():
         ),
         "short_term_mr": PortfolioConfig(
             name="short_term_mr",
-            capital=args.capital * 0.20,
+            capital=args.capital * 0.11,
             signals_fn=st_mr_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=8.0,
@@ -1473,12 +1508,34 @@ def main():
         ),
         "thematic_momentum": PortfolioConfig(
             name="thematic_momentum",
-            capital=args.capital * 0.24,
+            capital=args.capital * 0.10,
             signals_fn=thematic_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=15.0,
                 sector_concentration_pct=50.0,
                 total_exposure_limit_pct=120.0,
+                max_lots_per_ticker=1,
+            ),
+        ),
+        "quality_value": PortfolioConfig(
+            name="quality_value",
+            capital=args.capital * 0.14,
+            signals_fn=qv_signals_fn,
+            risk_engine=RiskEngine(
+                position_entry_limit_pct=10.0,
+                sector_concentration_pct=30.0,
+                total_exposure_limit_pct=100.0,
+                max_lots_per_ticker=1,
+            ),
+        ),
+        "earnings_drift": PortfolioConfig(
+            name="earnings_drift",
+            capital=args.capital * 0.17,
+            signals_fn=ed_signals_fn,
+            risk_engine=RiskEngine(
+                position_entry_limit_pct=8.0,
+                sector_concentration_pct=30.0,
+                total_exposure_limit_pct=100.0,
                 max_lots_per_ticker=1,
             ),
         ),
