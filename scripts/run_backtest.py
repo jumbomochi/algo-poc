@@ -1228,6 +1228,122 @@ def compute_aggregate_metrics(
     }
 
 
+def simulate_rebalancer(
+    strategy_curves: dict[str, list[float]],
+    initial_weights: dict[str, float],
+    rebalance_interval_days: int = 21,
+    lookback_days: int = 126,
+    max_shift_pct: float = 0.05,
+    floor_pct: float = 0.05,
+    ceiling_pct: float = 0.25,
+    special_floors: dict[str, float] | None = None,
+) -> dict:
+    """Simulate monthly performance-adaptive capital reallocation.
+
+    Takes per-strategy daily equity curves (all same length) and initial
+    weights, then every *rebalance_interval_days* (after a warm-up of
+    *lookback_days*) shifts capital toward strategies with above-median
+    trailing Sharpe ratios, subject to floor/ceiling constraints.
+
+    Returns a dict with:
+      - rebalanced_values: combined equity curve (list[float])
+      - weights_history: list of {day_index, weights} dicts
+    """
+    if special_floors is None:
+        special_floors = {}
+
+    strategy_names = list(strategy_curves.keys())
+    n_strategies = len(strategy_names)
+    n_days = len(next(iter(strategy_curves.values())))
+
+    # --- Compute daily returns for each strategy ---
+    # returns[s][d] is the return on day d (d=0 corresponds to day index 1)
+    returns: dict[str, list[float]] = {}
+    for name in strategy_names:
+        curve = strategy_curves[name]
+        strat_returns = []
+        for d in range(1, n_days):
+            if curve[d - 1] != 0:
+                strat_returns.append(curve[d] / curve[d - 1] - 1.0)
+            else:
+                strat_returns.append(0.0)
+        returns[name] = strat_returns
+
+    # --- Initialise weights ---
+    current_weights = {name: initial_weights[name] for name in strategy_names}
+    weights_history: list[dict] = [
+        {"day_index": 0, "weights": dict(current_weights)},
+    ]
+
+    # --- Build combined equity curve ---
+    combined_value = sum(
+        strategy_curves[name][0] * current_weights[name]
+        for name in strategy_names
+    )
+    rebalanced_values: list[float] = [combined_value]
+
+    for d in range(1, n_days):
+        # d is the day index; returns index is d-1
+        daily_combined_return = sum(
+            current_weights[name] * returns[name][d - 1]
+            for name in strategy_names
+        )
+        combined_value *= 1.0 + daily_combined_return
+        rebalanced_values.append(combined_value)
+
+        # --- Rebalance check ---
+        if d >= lookback_days and d % rebalance_interval_days == 0:
+            # Compute trailing Sharpe for each strategy
+            sharpes: dict[str, float] = {}
+            for name in strategy_names:
+                window = returns[name][d - lookback_days : d]
+                mean_ret = sum(window) / len(window)
+                variance = sum((r - mean_ret) ** 2 for r in window) / len(window)
+                std_ret = variance ** 0.5
+                if std_ret > 1e-12:
+                    sharpes[name] = (mean_ret / std_ret) * (252 ** 0.5)
+                else:
+                    sharpes[name] = 0.0
+
+            # Find median Sharpe
+            sorted_sharpes = sorted(sharpes.values())
+            mid = n_strategies // 2
+            if n_strategies % 2 == 1:
+                median_sharpe = sorted_sharpes[mid]
+            else:
+                median_sharpe = (sorted_sharpes[mid - 1] + sorted_sharpes[mid]) / 2.0
+
+            # Adjust weights
+            for name in strategy_names:
+                diff = sharpes[name] - median_sharpe
+                adjustment = min(max_shift_pct, abs(diff) * 0.01)
+                if diff > 0:
+                    current_weights[name] += adjustment
+                elif diff < 0:
+                    current_weights[name] -= adjustment
+
+            # Enforce floor/ceiling and normalise (two passes)
+            for _pass in range(2):
+                for name in strategy_names:
+                    floor = special_floors.get(name, floor_pct)
+                    current_weights[name] = max(current_weights[name], floor)
+                    current_weights[name] = min(current_weights[name], ceiling_pct)
+
+                total = sum(current_weights.values())
+                if total > 0:
+                    for name in strategy_names:
+                        current_weights[name] /= total
+
+            weights_history.append(
+                {"day_index": d, "weights": dict(current_weights)},
+            )
+
+    return {
+        "rebalanced_values": rebalanced_values,
+        "weights_history": weights_history,
+    }
+
+
 def print_results(result, elapsed_seconds: float) -> None:
     """Print backtest results in a readable format."""
     m = result.metrics
