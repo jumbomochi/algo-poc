@@ -16,14 +16,26 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
 import numpy as np
 
-from backtest.runner import BacktestRunner
+from backtest.metrics import BacktestMetrics
+from backtest.runner import BacktestResult, BacktestRunner
 from backtest.simulator import SimulatedExecutor
 from services.risk_management.engine import RiskEngine
+
+
+@dataclass
+class PortfolioConfig:
+    """Configuration for a single portfolio in a multi-portfolio backtest."""
+
+    name: str
+    capital: float
+    signals_fn: Callable[[str, list[dict]], dict | None]
+    risk_engine: RiskEngine
 from services.signal_generation.technical import (
     SupportProximitySignal,
     SupportStrengthSignal,
@@ -516,6 +528,58 @@ def _build_data(bars: list[dict]) -> dict[str, list]:
     }
 
 
+def compute_aggregate_metrics(
+    results: dict[str, BacktestResult],
+    portfolio_configs: dict[str, PortfolioConfig],
+) -> dict:
+    """Aggregate metrics across multiple portfolio backtest results.
+
+    Sums portfolio_values element-wise, pools all trades (tagged with portfolio
+    name), and computes combined metrics from the aggregate equity curve.
+
+    Returns dict with keys: portfolio_values, trades, dates, metrics.
+    """
+    if not results:
+        return {
+            "portfolio_values": [],
+            "trades": [],
+            "dates": [],
+            "metrics": {},
+        }
+
+    # All portfolios share the same bar data, so dates are identical.
+    # Use the first result's dates as reference.
+    first_result = next(iter(results.values()))
+    dates = first_result.dates
+
+    # Sum portfolio_values element-wise across all portfolios
+    combined_values = [0.0] * len(first_result.portfolio_values)
+    for result in results.values():
+        for i, v in enumerate(result.portfolio_values):
+            combined_values[i] += v
+
+    # Pool all trades, tagging each with its portfolio name
+    combined_trades: list[dict] = []
+    for name, result in results.items():
+        for trade in result.trades:
+            tagged = dict(trade)
+            tagged["portfolio"] = name
+            combined_trades.append(tagged)
+
+    # Compute metrics from the combined equity curve and pooled trades
+    metrics = BacktestMetrics.compute(
+        portfolio_values=combined_values,
+        trades=combined_trades,
+    )
+
+    return {
+        "portfolio_values": combined_values,
+        "trades": combined_trades,
+        "dates": dates,
+        "metrics": metrics,
+    }
+
+
 def print_results(result, elapsed_seconds: float) -> None:
     """Print backtest results in a readable format."""
     m = result.metrics
@@ -553,6 +617,63 @@ def print_results(result, elapsed_seconds: float) -> None:
         print(f"  P&L:                   ${values[-1] - values[0]:>+12,.2f}")
 
 
+def print_multi_portfolio_results(
+    results: dict[str, BacktestResult],
+    portfolio_configs: dict[str, PortfolioConfig],
+    aggregate: dict,
+    elapsed_seconds: float,
+) -> None:
+    """Print multi-portfolio backtest results."""
+    print("\n" + "=" * 70)
+    print("  MULTI-PORTFOLIO BACKTEST RESULTS")
+    print("=" * 70)
+
+    # Per-portfolio summary
+    for name, result in results.items():
+        m = result.metrics
+        config = portfolio_configs[name]
+        values = result.portfolio_values
+        pnl = values[-1] - values[0] if len(values) > 1 else 0.0
+        print(f"\n  --- {name} (${config.capital:,.0f} capital) ---")
+        print(f"    Total Return:        {m['total_return']:>10.2%}")
+        print(f"    Sharpe Ratio:        {m['sharpe_ratio']:>10.2f}")
+        print(f"    Max Drawdown:        {m['max_drawdown']:>10.2%}")
+        print(f"    Win Rate:            {m['win_rate']:>10.2%}")
+        print(f"    Total Trades:        {m['total_trades']:>10d}")
+        print(f"    P&L:                 ${pnl:>+12,.2f}")
+
+    # Aggregate section
+    agg_m = aggregate["metrics"]
+    agg_values = aggregate["portfolio_values"]
+    if agg_m:
+        print(f"\n  --- AGGREGATE ---")
+        print(f"    Total Return:        {agg_m['total_return']:>10.2%}")
+        print(f"    Sharpe Ratio:        {agg_m['sharpe_ratio']:>10.2f}")
+        print(f"    Max Drawdown:        {agg_m['max_drawdown']:>10.2%}")
+        print(f"    Win Rate:            {agg_m['win_rate']:>10.2%}")
+        print(f"    Total Trades:        {agg_m['total_trades']:>10d}")
+        if len(agg_values) > 1:
+            print(f"    Starting Capital:    ${agg_values[0]:>12,.2f}")
+            print(f"    Final Value:         ${agg_values[-1]:>12,.2f}")
+            print(f"    P&L:                 ${agg_values[-1] - agg_values[0]:>+12,.2f}")
+
+    # Top winners/losers from pooled trades
+    all_trades = aggregate["trades"]
+    if all_trades:
+        sorted_trades = sorted(all_trades, key=lambda t: t["pnl"], reverse=True)
+        print(f"\n  Top 5 Winners (all portfolios):")
+        for t in sorted_trades[:5]:
+            print(f"    {t['ticker']:>6s}  {t['pnl']:>+10.2f}  "
+                  f"[{t['portfolio']}]  ({t['entry_date']} -> {t['exit_date']})")
+        print(f"\n  Top 5 Losers (all portfolios):")
+        for t in sorted_trades[-5:]:
+            print(f"    {t['ticker']:>6s}  {t['pnl']:>+10.2f}  "
+                  f"[{t['portfolio']}]  ({t['entry_date']} -> {t['exit_date']})")
+
+    print(f"\n  Runtime:               {elapsed_seconds:>10.1f}s")
+    print("=" * 70)
+
+
 def save_results(
     config: dict,
     trades: list[dict],
@@ -584,6 +705,51 @@ def save_results(
         "portfolio_values": portfolio_values,
         "dates": dates,
         "metrics": metrics,
+        "bars": bars,
+    }
+
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, default=_json_serializer)
+
+    print(f"Results saved to {path}")
+    return path
+
+
+def save_multi_portfolio_results(
+    config: dict,
+    results: dict[str, BacktestResult],
+    portfolio_configs: dict[str, PortfolioConfig],
+    aggregate: dict,
+    bars: dict[str, list[dict]],
+    output_dir: str = "output",
+) -> str:
+    """Serialize multi-portfolio backtest output to a timestamped JSON file."""
+
+    def _json_serializer(obj: Any) -> str:
+        if isinstance(obj, date):
+            return obj.isoformat()
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"backtest_multi_{timestamp}.json"
+    path = os.path.join(output_dir, filename)
+
+    portfolios_payload = {}
+    for name, result in results.items():
+        pc = portfolio_configs[name]
+        portfolios_payload[name] = {
+            "config": {"capital": pc.capital},
+            "trades": result.trades,
+            "portfolio_values": result.portfolio_values,
+            "dates": result.dates,
+            "metrics": result.metrics,
+        }
+
+    payload = {
+        "config": config,
+        "portfolios": portfolios_payload,
+        "aggregate": aggregate,
         "bars": bars,
     }
 
@@ -644,14 +810,8 @@ def main():
         slippage_bps=args.slippage_bps,
         commission_per_share=args.commission,
     )
-    runner = BacktestRunner(executor=executor, initial_capital=args.capital)
-    risk_engine = RiskEngine(
-        position_entry_limit_pct=12.0,
-        sector_concentration_pct=30.0,
-        total_exposure_limit_pct=150.0,
-        max_lots_per_ticker=2,
-    )
 
+    # Build portfolio configurations
     mr_signals_fn = make_signals_fn(
         position_size_pct=0.12,
         initial_capital=args.capital,
@@ -666,34 +826,70 @@ def main():
         trailing_stop_pct=0.10,
         bear_tickers=BEAR_TICKERS,
     )
-    signals_fn = make_combined_signals_fn(mr_signals_fn, mom_signals_fn)
+    combined_fn = make_combined_signals_fn(mr_signals_fn, mom_signals_fn)
 
-    # 3. Run backtest
-    print("Step 3: Running backtest...")
+    portfolios: dict[str, PortfolioConfig] = {
+        "dual": PortfolioConfig(
+            name="dual",
+            capital=args.capital,
+            signals_fn=combined_fn,
+            risk_engine=RiskEngine(
+                position_entry_limit_pct=12.0,
+                sector_concentration_pct=30.0,
+                total_exposure_limit_pct=150.0,
+                max_lots_per_ticker=2,
+            ),
+        ),
+    }
+
+    # 3. Run backtest for each portfolio
+    print(f"Step 3: Running backtest ({len(portfolios)} portfolio(s))...")
     t0 = time.time()
-    result = runner.run(bars_by_ticker, signals_fn, risk_engine)
+    results: dict[str, BacktestResult] = {}
+    for name, pc in portfolios.items():
+        print(f"  Running portfolio '{name}' (${pc.capital:,.0f})...")
+        runner = BacktestRunner(executor=executor, initial_capital=pc.capital)
+        results[name] = runner.run(bars_by_ticker, pc.signals_fn, pc.risk_engine)
     elapsed = time.time() - t0
 
     # 4. Print results
-    print_results(result, elapsed)
+    if len(portfolios) == 1:
+        # Single portfolio: backward-compatible output
+        result = next(iter(results.values()))
+        print_results(result, elapsed)
+    else:
+        aggregate = compute_aggregate_metrics(results, portfolios)
+        print_multi_portfolio_results(results, portfolios, aggregate, elapsed)
 
     # 5. Save results to JSON
     print("\nStep 5: Saving results...")
-    save_results(
-        config={
-            "tickers": tickers,
-            "years": args.years,
-            "initial_capital": args.capital,
-            "slippage_bps": args.slippage_bps,
-            "commission_per_share": args.commission,
-        },
-        trades=result.trades,
-        portfolio_values=result.portfolio_values,
-        dates=result.dates,
-        metrics=result.metrics,
-        bars=bars_by_ticker,
-        output_dir=args.output_dir,
-    )
+    base_config = {
+        "tickers": tickers,
+        "years": args.years,
+        "initial_capital": args.capital,
+        "slippage_bps": args.slippage_bps,
+        "commission_per_share": args.commission,
+    }
+    if len(portfolios) == 1:
+        result = next(iter(results.values()))
+        save_results(
+            config=base_config,
+            trades=result.trades,
+            portfolio_values=result.portfolio_values,
+            dates=result.dates,
+            metrics=result.metrics,
+            bars=bars_by_ticker,
+            output_dir=args.output_dir,
+        )
+    else:
+        save_multi_portfolio_results(
+            config=base_config,
+            results=results,
+            portfolio_configs=portfolios,
+            aggregate=aggregate,
+            bars=bars_by_ticker,
+            output_dir=args.output_dir,
+        )
 
 
 if __name__ == "__main__":

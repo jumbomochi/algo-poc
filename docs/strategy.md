@@ -160,6 +160,10 @@ All strategy logic lives in `scripts/run_backtest.py`:
 | `make_momentum_signals_fn()` | Momentum/relative-strength signal generator |
 | `make_combined_signals_fn()` | Composes both strategies with sell priority |
 | `compute_regime_by_date()` | Market regime classification |
+| `compute_aggregate_metrics()` | Aggregate metrics across multiple portfolios |
+| `print_multi_portfolio_results()` | Print per-portfolio + aggregate results |
+| `save_multi_portfolio_results()` | Save multi-portfolio results to JSON |
+| `PortfolioConfig` | Dataclass: name, capital, signals_fn, risk_engine |
 | `REGIME_PARAMS` | Regime-specific parameter overrides |
 | `BEAR_TICKERS` | Inverse ETF tickers for bear market plays |
 
@@ -171,3 +175,59 @@ Supporting infrastructure:
 | `services/risk_management/engine.py` | Risk engine (position limits, sector concentration, max lots) |
 | `backtest/runner.py` | Backtest engine (daily bar replay, order simulation, P&L tracking) |
 | `scripts/visualize_backtest.py` | Plotly HTML report generation |
+
+## Multi-Portfolio Infrastructure
+
+The backtest supports running multiple independent portfolios, each with its own capital allocation, signal function, and risk engine. This allows strategies to be tested in isolation without competing for capital.
+
+### How It Works
+
+Each portfolio is defined by a `PortfolioConfig` with:
+
+- **name** — identifier used in output and trade tagging
+- **capital** — independent capital allocation
+- **signals_fn** — any callable matching `(ticker, bars) -> signal | None`
+- **risk_engine** — independent `RiskEngine` instance with its own limits
+
+Bar data is fetched once and shared across all portfolios. Each portfolio gets its own `BacktestRunner` instance. Results are collected independently and then aggregated.
+
+### Aggregation
+
+- **Equity curves** are summed element-wise (the combined portfolio value at each date)
+- **Trades** are pooled and tagged with a `"portfolio"` key for attribution
+- **Aggregate Sharpe** is computed from the combined equity curve — not averaged across portfolios, which would be mathematically incorrect
+
+### Adding a New Strategy
+
+To add a new portfolio, add an entry to the `portfolios` dict in `main()`:
+
+```python
+portfolios: dict[str, PortfolioConfig] = {
+    "dual": PortfolioConfig(
+        name="dual",
+        capital=args.capital,
+        signals_fn=combined_fn,
+        risk_engine=RiskEngine(
+            position_entry_limit_pct=12.0,
+            sector_concentration_pct=30.0,
+            total_exposure_limit_pct=150.0,
+            max_lots_per_ticker=2,
+        ),
+    ),
+    "experimental": PortfolioConfig(
+        name="experimental",
+        capital=50_000,
+        signals_fn=my_new_signals_fn,
+        risk_engine=RiskEngine(
+            position_entry_limit_pct=20.0,
+            total_exposure_limit_pct=100.0,
+        ),
+    ),
+}
+```
+
+When multiple portfolios are configured, the output automatically switches to multi-portfolio format with per-portfolio summaries, aggregate metrics, and a combined JSON output file.
+
+### Backward Compatibility
+
+With a single portfolio, the output format is identical to the original — same `print_results()` and `save_results()` functions are used. Multi-portfolio output only activates when 2+ portfolios are configured.
