@@ -1617,6 +1617,10 @@ def main():
     parser.add_argument("--ib-port", type=int, default=7497)
     parser.add_argument("--output-dir", default="output",
                         help="Directory for output files (default: output)")
+    parser.add_argument("--ml-filter", default=None,
+                        help="Path to trained signal quality model (LightGBM .txt file)")
+    parser.add_argument("--ml-threshold", type=float, default=0.55,
+                        help="ML filter confidence threshold (default: 0.55)")
     args = parser.parse_args()
 
     tickers = SP500_TOP50[:args.tickers]
@@ -1824,6 +1828,23 @@ def main():
             ),
         ),
     }
+
+    # 2b. Apply ML signal filter if requested
+    if args.ml_filter:
+        import lightgbm as lgb
+        ml_model = lgb.Booster(model_file=args.ml_filter)
+        print(f"  ML filter: {args.ml_filter} (threshold={args.ml_threshold})")
+        for name, pc in list(portfolios.items()):
+            portfolios[name] = PortfolioConfig(
+                name=pc.name,
+                capital=pc.capital,
+                signals_fn=make_ml_filtered_signals_fn(
+                    pc.signals_fn, ml_model,
+                    threshold=args.ml_threshold,
+                    strategy_name=name,
+                ),
+                risk_engine=pc.risk_engine,
+            )
 
     # 3. Run backtest for each portfolio
     print(f"Step 3: Running backtest ({len(portfolios)} portfolio(s))...")

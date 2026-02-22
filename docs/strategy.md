@@ -165,6 +165,7 @@ All strategy logic lives in `scripts/run_backtest.py`:
 | `make_earnings_drift_signals_fn()` | Earnings drift / PEAD (post-earnings surprise entry) |
 | `make_tail_risk_hedge_signals_fn()` | Tail-risk hedge: regime-based rotation between inverse/defensive ETFs |
 | `simulate_rebalancer()` | Post-processing: performance-adaptive weight rebalancing |
+| `make_ml_filtered_signals_fn()` | ML quality filter wrapper: scores buy signals, suppresses low-confidence |
 | `make_combined_signals_fn()` | Composes MR + momentum with sell priority (legacy, not used in multi-portfolio mode) |
 | `compute_regime_by_date()` | Market regime classification |
 | `compute_aggregate_metrics()` | Aggregate metrics across multiple portfolios |
@@ -188,6 +189,8 @@ Supporting infrastructure:
 | `scripts/visualize_backtest.py` | Plotly HTML report generation |
 | `scripts/run_paper.py` | Daily paper trading runner (reuses backtest signal functions) |
 | `scripts/paper_state.py` | Paper trading state persistence (positions, trades, cash per portfolio) |
+| `scripts/train_signal_model.py` | Walk-forward ML model training for signal quality scoring |
+| `backtest/feature_extractor.py` | Trade feature enrichment and extraction for ML training |
 
 ## Multi-Portfolio Infrastructure
 
@@ -330,3 +333,47 @@ State persists positions, trade history, and cash per portfolio between runs. Th
 ### Stream Message Tagging
 
 `ApprovedOrderMessage` and `FillMessage` include an optional `portfolio` field for strategy attribution. This enables per-strategy P&L tracking in the live pipeline.
+
+## ML Signal Quality Scoring
+
+An optional ML layer that scores buy signals and suppresses low-confidence ones.
+
+### Training Pipeline
+
+1. Run a 10-year backtest — trades are automatically enriched with bar-derived features (returns, volatility, regime)
+2. `scripts/train_signal_model.py` trains a LightGBM binary classifier via walk-forward cross-validation
+
+```bash
+# Run backtest and save results
+python scripts/run_backtest.py --years 10 --save data/backtest_results.json
+
+# Train signal quality model
+python scripts/train_signal_model.py --results data/backtest_results.json
+```
+
+### Using the ML Filter
+
+```bash
+# Run backtest with ML filter applied to all strategies
+python scripts/run_backtest.py --years 10 --ml-filter data/models/signal_quality_model.txt
+
+# Adjust confidence threshold (higher = more selective)
+python scripts/run_backtest.py --years 10 --ml-filter data/models/signal_quality_model.txt --ml-threshold 0.6
+```
+
+### How It Works
+
+- `make_ml_filtered_signals_fn()` wraps any signal function
+- Buy signals are scored by the model using entry_signals + bar-derived features
+- Signals with P(profitable) < threshold are suppressed
+- Sell signals always pass through (never blocks exits)
+- The model is trained on pooled trades across all 8 strategies with strategy as a categorical feature
+- Walk-forward validation prevents overfitting (train on past, test on future)
+
+### Features Used
+
+| Source | Features |
+|---|---|
+| Entry signals | All numeric values from `signal["signals"]` dict, flattened |
+| Bar-derived | 5-day return, 20-day return, 20-day volatility, volume ratio |
+| Context | Portfolio/strategy name (categorical), market regime (categorical) |
