@@ -288,3 +288,39 @@ def test_split_portfolios_aggregate_metrics_are_valid():
     assert agg["portfolio_values"][0] == 100_000
     # All trades should be tagged
     assert all("portfolio" in t for t in agg["trades"])
+
+
+def test_five_portfolios_aggregate_correctly():
+    """Five portfolios with no-op signals produce correct aggregate starting capital."""
+    from datetime import date
+
+    from backtest.runner import BacktestRunner
+    from backtest.simulator import SimulatedExecutor
+    from scripts.run_backtest import PortfolioConfig, compute_aggregate_metrics
+    from services.risk_management.engine import RiskEngine
+
+    bars = {
+        "AAPL": [
+            {"date": date(2024, 1, d), "open": 150.0, "high": 152.0,
+             "low": 149.0, "close": 151.0, "volume": 1000}
+            for d in range(1, 6)
+        ],
+    }
+    executor = SimulatedExecutor(slippage_bps=0, commission_per_share=0)
+
+    # 5 portfolios with different allocations summing to 100k
+    allocations = {"mr": 16_000, "mom": 24_000, "sector": 16_000,
+                   "st_mr": 20_000, "thematic": 24_000}
+    configs = {
+        name: PortfolioConfig(name, capital, lambda t, b: None, RiskEngine())
+        for name, capital in allocations.items()
+    }
+
+    results = {}
+    for name, pc in configs.items():
+        runner = BacktestRunner(executor=executor, initial_capital=pc.capital)
+        results[name] = runner.run(bars, pc.signals_fn, pc.risk_engine)
+
+    agg = compute_aggregate_metrics(results, configs)
+    assert agg["portfolio_values"][0] == 100_000
+    assert len(results) == 5
