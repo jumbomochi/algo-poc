@@ -58,10 +58,42 @@ SP500_TOP50 = [
 # Inverse ETFs for bear market plays
 BEAR_TICKERS = {"SH", "PSQ"}  # SH = inverse S&P 500, PSQ = inverse NASDAQ-100
 
+# Inverse/defensive ETFs for tail-risk hedge
+DEFENSIVE_TICKERS = ["SH", "PSQ", "SDS", "TLT", "GLD"]
+
+# SPDR sector ETFs
+SECTOR_ETFS = [
+    "XLK", "XLE", "XLF", "XLV", "XLY", "XLP",
+    "XLI", "XLB", "XLU", "XLRE", "XLC",
+]
+
+# Thematic ETFs
+THEMATIC_ETFS = [
+    "ARKK", "TAN", "HACK", "BOTZ", "LIT", "CIBR", "SKYY", "DRIV",
+    "FINX", "GAMR", "HERO", "IDRV", "CLOU", "WCLD", "SNSR", "PRNT",
+    "IZRL", "GNOM", "ARKG", "ARKQ", "ARKW", "ARKF", "ICLN", "QCLN", "PBW",
+]
+
+# S&P 500 extended (top 100 for short-term MR)
+SP500_TOP100 = SP500_TOP50 + [
+    "CAT", "MS", "NEE", "LOW", "UPS", "SPGI", "RTX", "HON", "ELV",
+    "BLK", "SYK", "BKNG", "MDLZ", "ADP", "VRTX", "SCHW", "GILD",
+    "AMT", "REGN", "LRCX", "PANW", "BSX", "CB", "MMC", "KLAC",
+    "TMUS", "SHW", "SO", "EQIX", "MO", "PGR", "ZTS", "CME",
+    "CI", "DUK", "ICE", "SNPS", "CL", "AON", "MCO", "WM",
+    "CDNS", "TGT", "BDX", "NOC", "APH", "ITW", "FI", "HUM",
+]
+
 # Per-strategy ticker universes
 UNIVERSE_REGISTRY: dict[str, list[str]] = {
     "mean_reversion": SP500_TOP50,
     "momentum": SP500_TOP50 + [t for t in sorted(BEAR_TICKERS) if t not in SP500_TOP50],
+    "sector_rotation": SECTOR_ETFS,
+    "quality_value": SP500_TOP100,
+    "earnings_drift": SP500_TOP100,
+    "short_term_mr": SP500_TOP100,
+    "thematic_momentum": THEMATIC_ETFS,
+    "tail_risk_hedge": DEFENSIVE_TICKERS,
 }
 
 
