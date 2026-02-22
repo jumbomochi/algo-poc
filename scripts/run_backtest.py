@@ -1106,6 +1106,76 @@ def make_earnings_drift_signals_fn(
     return signals_fn
 
 
+def make_tail_risk_hedge_signals_fn(
+    regime_by_date: dict,
+    position_size_pct: float = 0.25,
+    initial_capital: float = 100_000,
+):
+    """Create a tail-risk hedge signal function.
+
+    Rotates between inverse ETFs and defensive assets based on market regime.
+    Bull: 50% GLD + 50% TLT
+    Neutral: 40% GLD + 40% TLT + 20% SH
+    Bear: 40% SH + 30% PSQ + 20% SDS + 10% GLD
+    Regime change triggers full rotation (sell all, re-buy per new allocation).
+    """
+    ALLOCATIONS = {
+        "bull": {"GLD": 0.50, "TLT": 0.50},
+        "neutral": {"GLD": 0.40, "TLT": 0.40, "SH": 0.20},
+        "bear": {"SH": 0.40, "PSQ": 0.30, "SDS": 0.20, "GLD": 0.10},
+    }
+
+    tracked: dict[str, dict] = {}  # ticker -> {entry_price, regime_at_entry}
+
+    def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
+        if len(bars) < 2:
+            return None
+
+        current_price = bars[-1]["close"]
+        current_date = bars[-1]["date"]
+        regime = regime_by_date.get(current_date, "bull")
+
+        lot = tracked.get(ticker)
+
+        # Detect regime change and sell existing positions
+        if lot is not None and lot["regime_at_entry"] != regime:
+            tracked.pop(ticker, None)
+            return {
+                "action": "sell",
+                "ticker": ticker,
+                "limit_price": current_price,
+                "quantity": 0,
+                "sector": "Unknown",
+                "exit_reason": "regime_change",
+            }
+
+        # Entry: buy if ticker is in current regime allocation and not already held
+        allocation = ALLOCATIONS.get(regime, {})
+        if lot is None and ticker in allocation:
+            weight = allocation[ticker]
+            quantity = max(1, int(initial_capital * position_size_pct * weight / current_price))
+            tracked[ticker] = {
+                "entry_price": current_price,
+                "regime_at_entry": regime,
+            }
+            return {
+                "action": "buy",
+                "ticker": ticker,
+                "limit_price": current_price,
+                "quantity": quantity,
+                "sector": "Unknown",
+                "signals": {
+                    "strategy": "tail_risk_hedge",
+                    "regime": regime,
+                    "weight": weight,
+                },
+            }
+
+        return None
+
+    return signals_fn
+
+
 def compute_aggregate_metrics(
     results: dict[str, BacktestResult],
     portfolio_configs: dict[str, PortfolioConfig],
