@@ -21,6 +21,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
 import numpy as np
+import pandas as pd
 
 from backtest.feature_extractor import enrich_trades
 from backtest.metrics import BacktestMetrics
@@ -1175,6 +1176,81 @@ def make_tail_risk_hedge_signals_fn(
         return None
 
     return signals_fn
+
+
+def make_ml_filtered_signals_fn(
+    inner_fn: Callable[[str, list[dict]], dict | None],
+    model,
+    threshold: float = 0.5,
+    strategy_name: str = "unknown",
+) -> Callable[[str, list[dict]], dict | None]:
+    """Wrap a signal function with ML quality scoring.
+
+    Buy signals are scored by the model. If P(profitable) < threshold,
+    the signal is suppressed. Sell signals and None always pass through.
+
+    Args:
+        inner_fn: Original signal function to wrap.
+        model: Trained LightGBM Booster with predict() method.
+        threshold: Minimum model confidence to pass a buy signal.
+        strategy_name: Portfolio/strategy name for the feature vector.
+    """
+    def filtered_signals_fn(ticker: str, bars: list[dict]) -> dict | None:
+        signal = inner_fn(ticker, bars)
+        if signal is None:
+            return None
+
+        # Always pass sell signals
+        if signal.get("action") != "buy":
+            return signal
+
+        # Build feature vector for the model
+        row: dict = {"portfolio": strategy_name}
+
+        # Flatten signal features
+        signals = signal.get("signals", {})
+        for key, val in signals.items():
+            if isinstance(val, dict):
+                for subkey, subval in val.items():
+                    if isinstance(subval, (int, float)):
+                        row[f"signal_{key}_{subkey}"] = subval
+            elif isinstance(val, (int, float)):
+                row[f"signal_{key}"] = val
+
+        # Bar-derived features (from recent bars)
+        if len(bars) >= 21:
+            closes = [b["close"] for b in bars[-21:]]
+            volumes = [b["volume"] for b in bars[-21:]]
+
+            row["bar_return_5d"] = (closes[-1] - closes[-6]) / closes[-6]
+            row["bar_return_20d"] = (closes[-1] - closes[0]) / closes[0]
+
+            daily_rets = [
+                (closes[i] - closes[i - 1]) / closes[i - 1]
+                for i in range(1, len(closes))
+            ]
+            row["bar_vol_20d"] = float(np.std(daily_rets))
+
+            avg_vol = np.mean(volumes[:-1])
+            row["bar_volume_ratio"] = float(volumes[-1] / avg_vol) if avg_vol > 0 else 1.0
+
+        # Create DataFrame matching model's expected features
+        feature_names = model.feature_name()
+        feature_row = {name: row.get(name, np.nan) for name in feature_names}
+        df = pd.DataFrame([feature_row])
+
+        # Convert categorical columns
+        for col in df.select_dtypes(include=["object"]).columns:
+            df[col] = df[col].astype("category")
+
+        # Score
+        score = model.predict(df)[0]
+
+        if score >= threshold:
+            return signal
+        return None
+
+    return filtered_signals_fn
 
 
 def compute_aggregate_metrics(
