@@ -1015,6 +1015,95 @@ def make_quality_value_signals_fn(
     return signals_fn
 
 
+def make_earnings_drift_signals_fn(
+    earnings_lookup: Callable[[str, date], dict | None],
+    surprise_threshold_pct: float = 5.0,
+    max_hold_days: int = 20,
+    position_size_pct: float = 0.08,
+    initial_capital: float = 100_000,
+    trailing_stop_pct: float = 0.06,
+):
+    """Create an earnings drift (PEAD) signal function.
+
+    Entry: Earnings surprise > threshold (beat estimate by N%+), within 2 days of announcement.
+    Exit: Fixed hold period (20 trading days) or trailing stop 6%.
+    """
+    tracked: dict[str, dict] = {}
+
+    def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
+        if len(bars) < 5:
+            return None
+
+        current_price = bars[-1]["close"]
+        current_date = bars[-1]["date"]
+        bar_count = len(bars)
+        lot = tracked.get(ticker)
+
+        # Exit logic
+        if lot is not None:
+            lot["peak_price"] = max(lot["peak_price"], current_price)
+            bars_held = bar_count - lot["entry_idx"]
+
+            # Time exit
+            if bars_held >= max_hold_days:
+                tracked.pop(ticker, None)
+                return {
+                    "action": "sell",
+                    "ticker": ticker,
+                    "limit_price": current_price,
+                    "quantity": 0,
+                    "sector": "Unknown",
+                    "exit_reason": "time_exit",
+                }
+
+            # Trailing stop
+            peak = lot["peak_price"]
+            entry = lot["entry_price"]
+            if peak > entry and (peak - current_price) / peak >= trailing_stop_pct:
+                tracked.pop(ticker, None)
+                return {
+                    "action": "sell",
+                    "ticker": ticker,
+                    "limit_price": current_price,
+                    "quantity": 0,
+                    "sector": "Unknown",
+                    "exit_reason": "trailing_stop",
+                }
+
+            return None
+
+        # Entry logic: check for recent earnings event
+        event = earnings_lookup(ticker, current_date)
+        if event is None:
+            return None
+
+        surprise = event.get("surprise_pct", 0.0)
+        if surprise < surprise_threshold_pct:
+            return None
+
+        quantity = max(1, int(initial_capital * position_size_pct / current_price))
+        tracked[ticker] = {
+            "entry_price": current_price,
+            "entry_idx": bar_count,
+            "peak_price": current_price,
+        }
+        return {
+            "action": "buy",
+            "ticker": ticker,
+            "limit_price": current_price,
+            "quantity": quantity,
+            "sector": "Unknown",
+            "signals": {
+                "strategy": "earnings_drift",
+                "surprise_pct": surprise,
+                "actual_eps": event.get("actual_eps"),
+                "estimate_eps": event.get("estimate_eps"),
+            },
+        }
+
+    return signals_fn
+
+
 def compute_aggregate_metrics(
     results: dict[str, BacktestResult],
     portfolio_configs: dict[str, PortfolioConfig],
