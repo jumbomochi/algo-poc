@@ -793,6 +793,132 @@ def make_short_term_mr_signals_fn(
     return signals_fn
 
 
+def make_thematic_momentum_signals_fn(
+    bars_by_ticker: dict[str, list[dict]],
+    top_n: int = 8,
+    lookback_days: int = 63,
+    ma_period: int = 50,
+    position_size_pct: float = 0.15,
+    initial_capital: float = 100_000,
+    trailing_stop_pct: float = 0.10,
+    max_loss_pct: float = 0.08,
+):
+    """Create a thematic momentum signal function.
+
+    Ranks thematic ETFs by 3-month return. Buys top N that are above
+    their 50-day MA. Exits via trailing stop, max loss, or MA cross below.
+    """
+    # Pre-compute date -> {ticker: close_price}
+    price_by_date: dict[Any, dict[str, float]] = {}
+    for ticker, bars in bars_by_ticker.items():
+        for bar in bars:
+            d = bar["date"]
+            if d not in price_by_date:
+                price_by_date[d] = {}
+            price_by_date[d][ticker] = bar["close"]
+
+    sorted_dates = sorted(price_by_date.keys())
+
+    # Pre-compute date -> top N tickers by return
+    rankings_by_date: dict[Any, list[str]] = {}
+    for i, d in enumerate(sorted_dates):
+        if i < lookback_days:
+            continue
+        past_date = sorted_dates[i - lookback_days]
+        past_prices = price_by_date.get(past_date, {})
+        current_prices = price_by_date[d]
+
+        returns = []
+        for ticker in current_prices:
+            if ticker in past_prices and past_prices[ticker] > 0:
+                ret = (current_prices[ticker] - past_prices[ticker]) / past_prices[ticker]
+                returns.append((ticker, ret))
+
+        returns.sort(key=lambda x: x[1], reverse=True)
+        rankings_by_date[d] = [t for t, _ in returns[:top_n]]
+
+    tracked: dict[str, list[dict]] = {}
+
+    def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
+        min_bars = max(lookback_days + 1, ma_period + 1)
+        if len(bars) < min_bars:
+            return None
+
+        current_price = bars[-1]["close"]
+        current_date = bars[-1]["date"]
+        bar_count = len(bars)
+        lots = tracked.get(ticker, [])
+
+        # Compute 50-day MA
+        closes = [b["close"] for b in bars[-ma_period:]]
+        ma_50 = sum(closes) / len(closes)
+        above_ma = current_price > ma_50
+
+        # Exit logic
+        if lots:
+            for lot in lots:
+                lot["peak_price"] = max(lot["peak_price"], current_price)
+
+            should_sell = False
+            exit_reason = "unknown"
+
+            # MA cross below: exit if price drops below 50-day MA
+            if not above_ma:
+                should_sell = True
+                exit_reason = "ma_cross_below"
+
+            if not should_sell:
+                for lot in lots:
+                    peak = lot["peak_price"]
+                    entry = lot["entry_price"]
+                    if peak > entry and (peak - current_price) / peak >= trailing_stop_pct:
+                        should_sell = True
+                        exit_reason = "trailing_stop"
+                        break
+                    if (entry - current_price) / entry >= max_loss_pct:
+                        should_sell = True
+                        exit_reason = "max_loss"
+                        break
+
+            if should_sell:
+                tracked.pop(ticker, None)
+                return {
+                    "action": "sell",
+                    "ticker": ticker,
+                    "limit_price": current_price,
+                    "quantity": 0,
+                    "sector": "Unknown",
+                    "exit_reason": exit_reason,
+                }
+
+        # Entry: in top N AND above 50-day MA
+        top_tickers = rankings_by_date.get(current_date, [])
+        if not lots and ticker in top_tickers and above_ma:
+            quantity = max(1, int(initial_capital * position_size_pct / current_price))
+            tracked[ticker] = [{
+                "entry_price": current_price,
+                "entry_idx": bar_count,
+                "peak_price": current_price,
+            }]
+            return {
+                "action": "buy",
+                "ticker": ticker,
+                "limit_price": current_price,
+                "quantity": quantity,
+                "sector": "Unknown",
+                "signals": {
+                    "strategy": "thematic_momentum",
+                    "rank": top_tickers.index(ticker) + 1,
+                    "lookback_days": lookback_days,
+                    "above_ma_50": True,
+                },
+            }
+
+        return None
+
+    return signals_fn
+
+
 def compute_aggregate_metrics(
     results: dict[str, BacktestResult],
     portfolio_configs: dict[str, PortfolioConfig],
