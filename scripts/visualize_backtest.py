@@ -27,6 +27,11 @@ DARK_BG = "#1e1e2e"
 BODY_BG = "#121212"
 TEXT_COLOR = "#fff"
 
+STRATEGY_COLORS = [
+    "#4ecdc4", "#ff6b6b", "#ffd93d", "#6bcb77",
+    "#4d96ff", "#ff922b", "#845ef7", "#f06595",
+]
+
 # ---------------------------------------------------------------------------
 # Summary stats panel
 # ---------------------------------------------------------------------------
@@ -64,6 +69,96 @@ def _summary_panel(data: dict[str, Any]) -> str:
         '<div style="display:flex;flex-wrap:wrap;gap:12px;margin:20px 0;">\n'
         f"{html_cards}"
         "</div>\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Format detection
+# ---------------------------------------------------------------------------
+
+
+def _is_multi_portfolio(data: dict[str, Any]) -> bool:
+    """Return True if data uses the multi-portfolio JSON format."""
+    return "portfolios" in data and isinstance(data["portfolios"], dict)
+
+
+# ---------------------------------------------------------------------------
+# Multi-portfolio summary panel
+# ---------------------------------------------------------------------------
+
+
+def _multi_summary_panel(data: dict[str, Any]) -> str:
+    """Return an HTML block with aggregate summary cards and per-strategy table."""
+    agg_metrics = data["aggregate"]["metrics"]
+    config = data["config"]
+    portfolios = data["portfolios"]
+
+    total_pnl = sum(
+        sum(t["pnl"] for t in p["trades"])
+        for p in portfolios.values()
+    )
+
+    # Aggregate metric cards
+    cards = [
+        ("Total Return", f"{agg_metrics.get('total_return', 0):.2%}"),
+        ("Sharpe Ratio", f"{agg_metrics.get('sharpe_ratio', 0):.2f}"),
+        ("Max Drawdown", f"{agg_metrics.get('max_drawdown', 0):.2%}"),
+        ("Win Rate", f"{agg_metrics.get('win_rate', 0):.2%}"),
+        ("Total Trades", f"{agg_metrics.get('total_trades', 0)}"),
+        ("Strategies", f"{len(portfolios)}"),
+        ("Total Capital", f"${config.get('total_capital', 0):,.0f}"),
+    ]
+
+    html_cards = ""
+    for label, value in cards:
+        html_cards += (
+            f'<div style="background:{DARK_BG};border-radius:8px;padding:16px 20px;'
+            f'min-width:140px;text-align:center;">'
+            f'<div style="font-size:12px;color:#aaa;margin-bottom:4px;">{label}</div>'
+            f'<div style="font-size:22px;font-weight:bold;color:{TEXT_COLOR};">{value}</div>'
+            f"</div>\n"
+        )
+
+    # Per-strategy metrics table
+    table_rows = ""
+    for name, pdata in portfolios.items():
+        m = pdata["metrics"]
+        cap = pdata["config"].get("capital", 0)
+        strat_pnl = sum(t["pnl"] for t in pdata.get("trades", []))
+        table_rows += (
+            f"<tr>"
+            f"<td>{name}</td>"
+            f"<td>${cap:,.0f}</td>"
+            f"<td>{m.get('total_return', 0):.2%}</td>"
+            f"<td>{m.get('sharpe_ratio', 0):.2f}</td>"
+            f"<td>{m.get('max_drawdown', 0):.2%}</td>"
+            f"<td>{m.get('win_rate', 0):.2%}</td>"
+            f"<td>{m.get('total_trades', 0)}</td>"
+            f"<td>${strat_pnl:+,.2f}</td>"
+            f"</tr>\n"
+        )
+
+    table_html = (
+        '<table style="width:100%;border-collapse:collapse;margin-top:16px;">'
+        "<thead><tr>"
+        '<th style="text-align:left;padding:8px;border-bottom:1px solid #444;">Strategy</th>'
+        '<th style="text-align:left;padding:8px;border-bottom:1px solid #444;">Capital</th>'
+        '<th style="text-align:left;padding:8px;border-bottom:1px solid #444;">Return</th>'
+        '<th style="text-align:left;padding:8px;border-bottom:1px solid #444;">Sharpe</th>'
+        '<th style="text-align:left;padding:8px;border-bottom:1px solid #444;">Max DD</th>'
+        '<th style="text-align:left;padding:8px;border-bottom:1px solid #444;">Win Rate</th>'
+        '<th style="text-align:left;padding:8px;border-bottom:1px solid #444;">Trades</th>'
+        '<th style="text-align:left;padding:8px;border-bottom:1px solid #444;">P&amp;L</th>'
+        "</tr></thead>"
+        f"<tbody>{table_rows}</tbody>"
+        "</table>"
+    )
+
+    return (
+        '<div style="display:flex;flex-wrap:wrap;gap:12px;margin:20px 0;">\n'
+        f"{html_cards}"
+        "</div>\n"
+        f"{table_html}\n"
     )
 
 
@@ -247,6 +342,108 @@ def _trade_pnl_histogram(data: dict[str, Any]) -> str:
         title="Trade PnL Distribution",
         xaxis_title="PnL ($)",
         yaxis_title="Count",
+        template="plotly_dark",
+        paper_bgcolor=BODY_BG,
+        plot_bgcolor=DARK_BG,
+        height=350,
+    )
+    return fig.to_html(full_html=False, include_plotlyjs=False)
+
+
+# ---------------------------------------------------------------------------
+# Multi-portfolio charts
+# ---------------------------------------------------------------------------
+
+
+def _multi_equity_curve(
+    data: dict[str, Any], include_plotlyjs: str | bool
+) -> str:
+    """Plotly multi-line equity chart: one thin line per strategy + bold aggregate."""
+    portfolios = data["portfolios"]
+    agg = data["aggregate"]
+    agg_dates = agg["dates"]
+    agg_values = agg["portfolio_values"][1:]
+    initial = agg["portfolio_values"][0]
+
+    fig = go.Figure()
+
+    # Per-strategy lines
+    for idx, (name, pdata) in enumerate(portfolios.items()):
+        color = STRATEGY_COLORS[idx % len(STRATEGY_COLORS)]
+        vals = pdata["portfolio_values"][1:]
+        dates = pdata["dates"]
+        fig.add_trace(go.Scatter(
+            x=dates,
+            y=vals,
+            mode="lines",
+            name=name,
+            line=dict(color=color, width=1.5),
+            opacity=0.7,
+        ))
+
+    # Aggregate line (bold white on top)
+    fig.add_trace(go.Scatter(
+        x=agg_dates,
+        y=agg_values,
+        mode="lines",
+        name="Aggregate",
+        line=dict(color="#ffffff", width=3),
+    ))
+
+    # Initial capital reference
+    fig.add_hline(
+        y=initial,
+        line_dash="dash",
+        line_color="#888",
+        annotation_text=f"Initial: ${initial:,.0f}",
+        annotation_font_color="#aaa",
+    )
+
+    fig.update_layout(
+        title="Equity Curve",
+        xaxis_title="Date",
+        yaxis_title="NAV ($)",
+        template="plotly_dark",
+        paper_bgcolor=BODY_BG,
+        plot_bgcolor=DARK_BG,
+        height=450,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig.to_html(full_html=False, include_plotlyjs=include_plotlyjs)
+
+
+def _strategy_comparison_chart(data: dict[str, Any]) -> str:
+    """3-panel bar chart comparing Total Return, Sharpe, Max DD across strategies."""
+    from plotly.subplots import make_subplots
+
+    portfolios = data["portfolios"]
+    names = list(portfolios.keys())
+    colors = [STRATEGY_COLORS[i % len(STRATEGY_COLORS)] for i in range(len(names))]
+
+    returns = [portfolios[n]["metrics"].get("total_return", 0) * 100 for n in names]
+    sharpes = [portfolios[n]["metrics"].get("sharpe_ratio", 0) for n in names]
+    max_dds = [portfolios[n]["metrics"].get("max_drawdown", 0) * 100 for n in names]
+
+    fig = make_subplots(
+        rows=1, cols=3,
+        subplot_titles=["Total Return (%)", "Sharpe Ratio", "Max Drawdown (%)"],
+    )
+
+    fig.add_trace(
+        go.Bar(x=names, y=returns, marker_color=colors, showlegend=False),
+        row=1, col=1,
+    )
+    fig.add_trace(
+        go.Bar(x=names, y=sharpes, marker_color=colors, showlegend=False),
+        row=1, col=2,
+    )
+    fig.add_trace(
+        go.Bar(x=names, y=max_dds, marker_color=colors, showlegend=False),
+        row=1, col=3,
+    )
+
+    fig.update_layout(
+        title="Strategy Comparison",
         template="plotly_dark",
         paper_bgcolor=BODY_BG,
         plot_bgcolor=DARK_BG,
@@ -460,28 +657,193 @@ function filterTrades() {
 """
 
 
+_MULTI_NAV_JS = """
+<script>
+function filterTrades() {
+    var portfolio = document.getElementById('portfolio-filter').value;
+    var ticker = document.getElementById('ticker-filter').value;
+    var sort = document.getElementById('sort-select').value;
+    var cards = Array.from(document.querySelectorAll('.trade-card'));
+
+    // Show/hide based on portfolio and ticker filter
+    cards.forEach(function(card) {
+        var matchPortfolio = portfolio === 'all' || card.getAttribute('data-portfolio') === portfolio;
+        var matchTicker = ticker === 'all' || card.getAttribute('data-ticker') === ticker;
+        card.style.display = (matchPortfolio && matchTicker) ? '' : 'none';
+    });
+
+    // Sort visible cards
+    var container = document.getElementById('trade-container');
+    var visible = cards.filter(function(c) { return c.style.display !== 'none'; });
+
+    visible.sort(function(a, b) {
+        if (sort === 'date') {
+            return a.getAttribute('data-date').localeCompare(b.getAttribute('data-date'));
+        } else if (sort === 'pnl-best') {
+            return parseFloat(b.getAttribute('data-pnl')) - parseFloat(a.getAttribute('data-pnl'));
+        } else if (sort === 'pnl-worst') {
+            return parseFloat(a.getAttribute('data-pnl')) - parseFloat(b.getAttribute('data-pnl'));
+        } else if (sort === 'ticker') {
+            return a.getAttribute('data-ticker').localeCompare(b.getAttribute('data-ticker'));
+        }
+        return 0;
+    });
+
+    visible.forEach(function(card) {
+        container.appendChild(card);
+    });
+}
+</script>
+"""
+
+
 # ---------------------------------------------------------------------------
-# Main entry point
+# Multi-portfolio report generator
 # ---------------------------------------------------------------------------
 
 
-def generate_report(json_path: str, output_path: str = "") -> str:
-    """Read a backtest JSON file and generate an interactive HTML report.
+def _generate_multi_report(data: dict[str, Any], output_path: str) -> str:
+    """Generate an HTML report for multi-portfolio backtest data."""
+    agg = data["aggregate"]
+    portfolios = data["portfolios"]
+    bars = data.get("bars", {})
 
-    Args:
-        json_path: Path to the backtest JSON file.
-        output_path: Path for the output HTML file. If empty, uses the JSON
-            filename with a ``.html`` extension.
+    all_trades = agg.get("trades", [])
+    trades_sorted = sorted(all_trades, key=lambda t: t.get("entry_date", ""))
 
-    Returns:
-        The path of the generated HTML file.
-    """
-    with open(json_path) as f:
-        data = json.load(f)
+    # Collect unique tickers and portfolio names
+    tickers = sorted({t["ticker"] for t in trades_sorted})
+    portfolio_names = sorted(portfolios.keys())
 
-    if not output_path:
-        output_path = str(Path(json_path).with_suffix(".html"))
+    parts: list[str] = []
 
+    # HTML head
+    parts.append(f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Multi-Portfolio Backtest Report</title>
+<style>
+body {{ background: {BODY_BG}; color: {TEXT_COLOR}; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; }}
+h1, h2, h3 {{ color: {TEXT_COLOR}; }}
+.section {{ margin: 30px 0; }}
+.controls {{ display: flex; gap: 16px; align-items: center; margin: 20px 0; }}
+.controls select {{ background: {DARK_BG}; color: {TEXT_COLOR}; border: 1px solid #444; border-radius: 4px; padding: 6px 12px; font-size: 14px; }}
+.trade-card {{ background: {DARK_BG}; border-radius: 8px; padding: 16px; margin: 16px 0; }}
+table {{ color: {TEXT_COLOR}; }}
+th, td {{ padding: 8px; text-align: left; }}
+</style>
+</head>
+<body>
+<h1>Multi-Portfolio Backtest Report</h1>
+""")
+
+    # Aggregate summary panel + per-strategy table
+    parts.append('<div class="section">')
+    parts.append("<h2>Aggregate Summary</h2>")
+    parts.append(_multi_summary_panel(data))
+    parts.append("</div>")
+
+    # Multi equity curves
+    parts.append('<div class="section">')
+    parts.append(_multi_equity_curve(data, include_plotlyjs="cdn"))
+    parts.append("</div>")
+
+    # Aggregate drawdown (reuse _drawdown_chart with aggregate data)
+    parts.append('<div class="section">')
+    parts.append(_drawdown_chart(agg))
+    parts.append("</div>")
+
+    # Strategy comparison chart
+    parts.append('<div class="section">')
+    parts.append(_strategy_comparison_chart(data))
+    parts.append("</div>")
+
+    # Monthly returns heatmap (from aggregate data)
+    parts.append('<div class="section">')
+    parts.append(_monthly_returns_heatmap(agg))
+    parts.append("</div>")
+
+    # Trade PnL histogram (from aggregate trades)
+    parts.append('<div class="section">')
+    parts.append(_trade_pnl_histogram(agg))
+    parts.append("</div>")
+
+    # --- Trade-level charts with portfolio filter ---
+    parts.append('<div class="section">')
+    parts.append("<h2>Individual Trades</h2>")
+
+    # Navigation controls with portfolio filter
+    portfolio_options = '<option value="all">All Portfolios</option>\n'
+    for pname in portfolio_names:
+        portfolio_options += f'<option value="{pname}">{pname}</option>\n'
+
+    ticker_options = '<option value="all">All Tickers</option>\n'
+    for t in tickers:
+        ticker_options += f'<option value="{t}">{t}</option>\n'
+
+    parts.append(f"""
+<div class="controls">
+    <label>Portfolio:
+        <select id="portfolio-filter" onchange="filterTrades()">
+            {portfolio_options}
+        </select>
+    </label>
+    <label>Ticker:
+        <select id="ticker-filter" onchange="filterTrades()">
+            {ticker_options}
+        </select>
+    </label>
+    <label>Sort:
+        <select id="sort-select" onchange="filterTrades()">
+            <option value="date">By Date</option>
+            <option value="pnl-best">By PnL (Best)</option>
+            <option value="pnl-worst">By PnL (Worst)</option>
+            <option value="ticker">By Ticker</option>
+        </select>
+    </label>
+</div>
+""")
+
+    parts.append('<div id="trade-container">')
+    for trade in trades_sorted:
+        ticker = trade["ticker"]
+        pnl = trade["pnl"]
+        entry_date = trade.get("entry_date", "")
+        portfolio = trade.get("portfolio", "unknown")
+        ticker_bars = bars.get(ticker, [])
+
+        chart_html = _trade_chart(trade, ticker_bars)
+
+        parts.append(
+            f'<div class="trade-card" data-ticker="{ticker}" '
+            f'data-pnl="{pnl}" data-date="{entry_date}" '
+            f'data-portfolio="{portfolio}">'
+        )
+        parts.append(chart_html)
+        parts.append("</div>")
+    parts.append("</div>")  # trade-container
+    parts.append("</div>")  # section
+
+    # Navigation JS (multi-portfolio version)
+    parts.append(_MULTI_NAV_JS)
+
+    parts.append("</body>\n</html>")
+
+    html = "\n".join(parts)
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(output_path).write_text(html)
+    print(f"Report saved to {output_path}")
+    return output_path
+
+
+# ---------------------------------------------------------------------------
+# Single-portfolio report generator
+# ---------------------------------------------------------------------------
+
+
+def _generate_single_report(data: dict[str, Any], output_path: str) -> str:
+    """Generate an HTML report for single-portfolio backtest data."""
     trades = data.get("trades", [])
     bars = data.get("bars", {})
 
@@ -519,7 +881,7 @@ h1, h2, h3 {{ color: {TEXT_COLOR}; }}
     parts.append(_summary_panel(data))
     parts.append("</div>")
 
-    # Equity curve (first chart — include Plotly JS via CDN)
+    # Equity curve (first chart -- include Plotly JS via CDN)
     parts.append('<div class="section">')
     parts.append(_equity_curve(data, include_plotlyjs="cdn"))
     parts.append("</div>")
@@ -594,6 +956,35 @@ h1, h2, h3 {{ color: {TEXT_COLOR}; }}
     Path(output_path).write_text(html)
     print(f"Report saved to {output_path}")
     return output_path
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+
+def generate_report(json_path: str, output_path: str = "") -> str:
+    """Read a backtest JSON file and generate an interactive HTML report.
+
+    Supports both single-portfolio and multi-portfolio JSON formats.
+
+    Args:
+        json_path: Path to the backtest JSON file.
+        output_path: Path for the output HTML file. If empty, uses the JSON
+            filename with a ``.html`` extension.
+
+    Returns:
+        The path of the generated HTML file.
+    """
+    with open(json_path) as f:
+        data = json.load(f)
+
+    if not output_path:
+        output_path = str(Path(json_path).with_suffix(".html"))
+
+    if _is_multi_portfolio(data):
+        return _generate_multi_report(data, output_path)
+    return _generate_single_report(data, output_path)
 
 
 # ---------------------------------------------------------------------------
