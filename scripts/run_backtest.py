@@ -1556,6 +1556,7 @@ def main():
         "mean_reversion", "momentum", "sector_rotation",
         "short_term_mr", "thematic_momentum",
         "quality_value", "earnings_drift",
+        "tail_risk_hedge",
     ])
     print(f"Step 1: Fetching historical data from IB Gateway ({len(all_tickers)} tickers)...")
     bars_by_ticker = fetch_bars_from_ib(
@@ -1588,6 +1589,10 @@ def main():
     else:
         print("  WARNING: No earnings cache found. Run: python scripts/fetch_earnings.py")
 
+    # Compute market regime for regime-dependent strategies
+    regime_by_date = compute_regime_by_date(bars_by_ticker)
+    print(f"  Computed regime for {len(regime_by_date)} trading days")
+
     # 2. Set up backtest components
     print("\nStep 2: Initializing backtest engine...")
     executor = SimulatedExecutor(
@@ -1598,7 +1603,7 @@ def main():
     # Build portfolio configurations
     mr_signals_fn = make_signals_fn(
         position_size_pct=0.12,
-        initial_capital=args.capital * 0.14,
+        initial_capital=args.capital * 0.12,
         trailing_stop_pct=0.10,
     )
     mom_signals_fn = make_momentum_signals_fn(
@@ -1606,7 +1611,7 @@ def main():
         top_n=5,
         lookback_days=126,
         position_size_pct=0.12,
-        initial_capital=args.capital * 0.20,
+        initial_capital=args.capital * 0.18,
         trailing_stop_pct=0.10,
         bear_tickers=BEAR_TICKERS,
     )
@@ -1615,12 +1620,12 @@ def main():
         top_n=3,
         lookback_days=63,
         position_size_pct=0.20,
-        initial_capital=args.capital * 0.14,
+        initial_capital=args.capital * 0.12,
         trailing_stop_pct=0.08,
     )
     st_mr_signals_fn = make_short_term_mr_signals_fn(
         position_size_pct=0.08,
-        initial_capital=args.capital * 0.11,
+        initial_capital=args.capital * 0.10,
         max_hold_days=5,
     )
     thematic_signals_fn = make_thematic_momentum_signals_fn(
@@ -1628,7 +1633,7 @@ def main():
         top_n=8,
         lookback_days=63,
         position_size_pct=0.15,
-        initial_capital=args.capital * 0.10,
+        initial_capital=args.capital * 0.11,
         trailing_stop_pct=0.10,
     )
     qv_signals_fn = make_quality_value_signals_fn(
@@ -1636,7 +1641,7 @@ def main():
         sector_map=SECTOR_MAP,
         top_n=15,
         position_size_pct=0.10,
-        initial_capital=args.capital * 0.14,
+        initial_capital=args.capital * 0.12,
         trailing_stop_pct=0.12,
     )
     ed_signals_fn = make_earnings_drift_signals_fn(
@@ -1644,13 +1649,18 @@ def main():
         surprise_threshold_pct=5.0,
         max_hold_days=20,
         position_size_pct=0.08,
-        initial_capital=args.capital * 0.17,
+        initial_capital=args.capital * 0.15,
         trailing_stop_pct=0.06,
+    )
+    tail_risk_signals_fn = make_tail_risk_hedge_signals_fn(
+        regime_by_date=regime_by_date,
+        position_size_pct=0.25,
+        initial_capital=args.capital * 0.10,
     )
     portfolios: dict[str, PortfolioConfig] = {
         "mean_reversion": PortfolioConfig(
             name="mean_reversion",
-            capital=args.capital * 0.14,
+            capital=args.capital * 0.12,
             signals_fn=mr_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=15.0,
@@ -1661,7 +1671,7 @@ def main():
         ),
         "momentum": PortfolioConfig(
             name="momentum",
-            capital=args.capital * 0.20,
+            capital=args.capital * 0.18,
             signals_fn=mom_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=12.0,
@@ -1672,7 +1682,7 @@ def main():
         ),
         "sector_rotation": PortfolioConfig(
             name="sector_rotation",
-            capital=args.capital * 0.14,
+            capital=args.capital * 0.12,
             signals_fn=sector_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=20.0,
@@ -1683,7 +1693,7 @@ def main():
         ),
         "short_term_mr": PortfolioConfig(
             name="short_term_mr",
-            capital=args.capital * 0.11,
+            capital=args.capital * 0.10,
             signals_fn=st_mr_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=8.0,
@@ -1694,7 +1704,7 @@ def main():
         ),
         "thematic_momentum": PortfolioConfig(
             name="thematic_momentum",
-            capital=args.capital * 0.10,
+            capital=args.capital * 0.11,
             signals_fn=thematic_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=15.0,
@@ -1705,7 +1715,7 @@ def main():
         ),
         "quality_value": PortfolioConfig(
             name="quality_value",
-            capital=args.capital * 0.14,
+            capital=args.capital * 0.12,
             signals_fn=qv_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=10.0,
@@ -1716,11 +1726,22 @@ def main():
         ),
         "earnings_drift": PortfolioConfig(
             name="earnings_drift",
-            capital=args.capital * 0.17,
+            capital=args.capital * 0.15,
             signals_fn=ed_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=8.0,
                 sector_concentration_pct=30.0,
+                total_exposure_limit_pct=100.0,
+                max_lots_per_ticker=1,
+            ),
+        ),
+        "tail_risk_hedge": PortfolioConfig(
+            name="tail_risk_hedge",
+            capital=args.capital * 0.10,
+            signals_fn=tail_risk_signals_fn,
+            risk_engine=RiskEngine(
+                position_entry_limit_pct=25.0,
+                sector_concentration_pct=50.0,
                 total_exposure_limit_pct=100.0,
                 max_lots_per_ticker=1,
             ),
@@ -1745,6 +1766,32 @@ def main():
     else:
         aggregate = compute_aggregate_metrics(results, portfolios)
         print_multi_portfolio_results(results, portfolios, aggregate, elapsed)
+
+        # Run rebalancer simulation
+        strategy_curves = {name: result.portfolio_values for name, result in results.items()}
+        total_capital = sum(pc.capital for pc in portfolios.values())
+        initial_weights = {name: pc.capital / total_capital for name, pc in portfolios.items()}
+        rebalancer_result = simulate_rebalancer(
+            strategy_curves=strategy_curves,
+            initial_weights=initial_weights,
+            rebalance_interval_days=21,
+            lookback_days=126,
+            max_shift_pct=0.05,
+            floor_pct=0.05,
+            ceiling_pct=0.25,
+            special_floors={"tail_risk_hedge": 0.08},
+        )
+
+        # Print rebalancer comparison
+        if rebalancer_result["weights_history"]:
+            reb_values = rebalancer_result["rebalanced_values"]
+            if len(reb_values) > 1:
+                reb_return = (reb_values[-1] - reb_values[0]) / reb_values[0]
+                print(f"\n  Rebalancer simulation:")
+                print(f"    Static total return:      {aggregate['metrics']['total_return']:>10.2%}")
+                print(f"    Rebalanced total return:  {reb_return:>10.2%}")
+                final_w = rebalancer_result["weights_history"][-1]["weights"]
+                print(f"    Final weights: {', '.join(f'{n}: {w:.1%}' for n, w in sorted(final_w.items()))}")
 
     # 5. Save results to JSON
     print("\nStep 5: Saving results...")
