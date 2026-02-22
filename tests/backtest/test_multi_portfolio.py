@@ -362,3 +362,40 @@ def test_seven_portfolios_aggregate_correctly():
     agg = compute_aggregate_metrics(results, configs)
     assert agg["portfolio_values"][0] == 100_000
     assert len(results) == 7
+
+
+def test_eight_portfolios_aggregate():
+    """Eight independent portfolios aggregate correctly."""
+    from backtest.runner import BacktestResult
+    from scripts.run_backtest import PortfolioConfig, compute_aggregate_metrics
+    from services.risk_management.engine import RiskEngine
+
+    def noop_fn(ticker, bars):
+        return None
+
+    configs = {}
+    results = {}
+    for i, name in enumerate([
+        "mean_reversion", "momentum", "sector_rotation", "quality_value",
+        "earnings_drift", "short_term_mr", "thematic_momentum", "tail_risk_hedge",
+    ]):
+        configs[name] = PortfolioConfig(
+            name=name,
+            capital=10_000 + i * 1_000,
+            signals_fn=noop_fn,
+            risk_engine=RiskEngine(),
+        )
+        results[name] = BacktestResult(
+            trades=[],
+            portfolio_values=[10_000 + i * 1_000, 10_500 + i * 1_000],
+            dates=["2024-01-01", "2024-01-02"],
+            metrics={"total_return": 0.05, "sharpe_ratio": 1.0,
+                     "max_drawdown": 0.02, "win_rate": 0.5,
+                     "total_trades": 0, "avg_holding_period_days": 0},
+        )
+
+    agg = compute_aggregate_metrics(results, configs)
+    assert len(agg["portfolio_values"]) == 2
+    # Sum of initial values: 10k + 11k + 12k + 13k + 14k + 15k + 16k + 17k = 108k
+    assert agg["portfolio_values"][0] == sum(10_000 + i * 1_000 for i in range(8))
+    assert len(agg["trades"]) == 0
