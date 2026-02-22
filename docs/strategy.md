@@ -191,6 +191,7 @@ Supporting infrastructure:
 | `scripts/paper_state.py` | Paper trading state persistence (positions, trades, cash per portfolio) |
 | `scripts/train_signal_model.py` | Walk-forward ML model training for signal quality scoring |
 | `backtest/feature_extractor.py` | Trade feature enrichment and extraction for ML training |
+| `backtest/aggregate_risk.py` | Cross-portfolio risk monitor (drawdown alerts, circuit breaker, divergence) |
 
 ## Multi-Portfolio Infrastructure
 
@@ -377,3 +378,29 @@ python scripts/run_backtest.py --years 10 --ml-filter data/models/signal_quality
 | Entry signals | All numeric values from `signal["signals"]` dict, flattened |
 | Bar-derived | 5-day return, 20-day return, 20-day volatility, volume ratio |
 | Context | Portfolio/strategy name (categorical), market regime (categorical) |
+
+## Cross-Portfolio Safety Monitoring
+
+An aggregate risk monitor runs after each backtest and during paper trading status checks.
+
+### Checks
+
+| Check | Threshold | Level | Action |
+|---|---|---|---|
+| Aggregate drawdown | -15% from peak | Warning | Alert only |
+| Aggregate circuit breaker | -22% from peak | Critical | Freeze new entries |
+| Strategy divergence | 2x historical max drawdown | Warning | Flag strategy |
+
+### Backtest Output
+
+Risk alerts are printed after multi-portfolio results:
+
+```
+  Risk Alerts (2):
+     > [WARNING] Aggregate drawdown alert: 16.2% exceeds 15.0% threshold.
+     > [WARNING] Strategy divergence: 'momentum' drawdown 25.0% is 2.5x its historical max (10.0%).
+```
+
+### Paper Trading
+
+Risk alerts appear in `--status` output when aggregate equity drops below thresholds.
