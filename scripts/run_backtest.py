@@ -919,6 +919,102 @@ def make_thematic_momentum_signals_fn(
     return signals_fn
 
 
+def make_quality_value_signals_fn(
+    fundamentals_lookup: Callable[[str, date], dict | None],
+    sector_map: dict[str, str],
+    top_n: int = 15,
+    position_size_pct: float = 0.10,
+    initial_capital: float = 100_000,
+    trailing_stop_pct: float = 0.12,
+):
+    """Create a quality value signal function.
+
+    Ranks stocks by a composite quality-value score (ROE, D/E, margin).
+    Entry: composite score in top N.
+    Exit: trailing stop.
+    """
+    tracked: dict[str, list[dict]] = {}
+    scores_cache: dict[str, float] = {}
+
+    def _compute_quality_score(fundamentals: dict) -> float:
+        """Compute composite quality-value score. Higher = better."""
+        roe = fundamentals.get("roe", 0.0)
+        debt_equity = fundamentals.get("debt_equity", 0.0)
+        margin = fundamentals.get("profit_margin", 0.0)
+
+        roe_score = roe / 0.20
+        de_score = max(0.0, 1.0 - debt_equity / 2.0)
+        margin_score = margin / 0.25
+
+        return (roe_score + de_score + margin_score) / 3.0
+
+    def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
+        if len(bars) < 5:
+            return None
+
+        current_price = bars[-1]["close"]
+        current_date = bars[-1]["date"]
+        bar_count = len(bars)
+        lots = tracked.get(ticker, [])
+
+        fundamentals = fundamentals_lookup(ticker, current_date)
+        if fundamentals is None:
+            return None
+
+        # Exit logic: trailing stop
+        if lots:
+            for lot in lots:
+                lot["peak_price"] = max(lot["peak_price"], current_price)
+
+            for lot in lots:
+                peak = lot["peak_price"]
+                entry = lot["entry_price"]
+                if peak > entry and (peak - current_price) / peak >= trailing_stop_pct:
+                    tracked.pop(ticker, None)
+                    return {
+                        "action": "sell",
+                        "ticker": ticker,
+                        "limit_price": current_price,
+                        "quantity": 0,
+                        "sector": sector_map.get(ticker, "Unknown"),
+                        "exit_reason": "trailing_stop",
+                    }
+
+        # Compute quality score and update cache
+        score = _compute_quality_score(fundamentals)
+        scores_cache[ticker] = score
+
+        if len(scores_cache) < 3:
+            return None
+
+        ranked = sorted(scores_cache.items(), key=lambda x: x[1], reverse=True)
+        top_tickers = [t for t, _ in ranked[:top_n]]
+
+        if not lots and ticker in top_tickers:
+            quantity = max(1, int(initial_capital * position_size_pct / current_price))
+            tracked[ticker] = [{
+                "entry_price": current_price,
+                "entry_idx": bar_count,
+                "peak_price": current_price,
+            }]
+            return {
+                "action": "buy",
+                "ticker": ticker,
+                "limit_price": current_price,
+                "quantity": quantity,
+                "sector": sector_map.get(ticker, "Unknown"),
+                "signals": {
+                    "strategy": "quality_value",
+                    "quality_score": round(score, 3),
+                    "rank": top_tickers.index(ticker) + 1,
+                },
+            }
+
+        return None
+
+    return signals_fn
+
+
 def compute_aggregate_metrics(
     results: dict[str, BacktestResult],
     portfolio_configs: dict[str, PortfolioConfig],
