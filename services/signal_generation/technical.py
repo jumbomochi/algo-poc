@@ -287,3 +287,52 @@ class VolumeSignal(Signal):
         confidence = min(abs(ratio - 1.0) / 1.0, 1.0)
 
         return SignalResult(value=value, confidence=confidence)
+
+
+class BollingerBandSignal(Signal):
+    """Bollinger Band signal for mean-reversion.
+
+    Measures where price sits relative to the Bollinger Bands.
+    Below lower band = bullish (oversold), above upper band = bearish (overbought).
+
+    Scale:
+    *  1.0 = price at or below lower band (2 std below MA)
+    *  0.0 = price at middle band (MA)
+    * -1.0 = price at or above upper band (2 std above MA)
+    """
+
+    name = "bollinger_band"
+
+    def __init__(self, period: int = 20, num_std: float = 2.0) -> None:
+        self.period = period
+        self.num_std = num_std
+
+    def compute(self, data: dict[str, Any]) -> SignalResult:
+        closes = np.asarray(data["close"], dtype=float)
+
+        if len(closes) < self.period + 1:
+            return SignalResult(value=0.0, confidence=0.0)
+
+        window = closes[-(self.period + 1):-1]
+        ma = float(np.mean(window))
+        std = float(np.std(window))
+
+        current = float(closes[-1])
+
+        # Use a minimum std of 1% of MA so bands are never zero-width
+        min_std = ma * 0.01 if ma != 0 else 1e-8
+        effective_std = max(std, min_std)
+
+        upper = ma + self.num_std * effective_std
+        lower = ma - self.num_std * effective_std
+        band_width = upper - lower
+
+        # Map position to [-1, 1]: lower band -> +1, upper band -> -1
+        position = (ma - current) / (band_width / 2.0)
+        value = max(-1.0, min(1.0, position))
+
+        # Confidence: high when outside bands
+        distance = abs(current - ma) / (self.num_std * effective_std)
+        confidence = min(distance / 1.0, 1.0)
+
+        return SignalResult(value=value, confidence=confidence)
