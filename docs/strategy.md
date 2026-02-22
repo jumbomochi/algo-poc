@@ -186,6 +186,8 @@ Supporting infrastructure:
 | `scripts/fetch_fundamentals.py` | Fundamentals data cache (yfinance fetcher, point-in-time lookup) |
 | `scripts/fetch_earnings.py` | Earnings data cache (yfinance fetcher, event window lookup) |
 | `scripts/visualize_backtest.py` | Plotly HTML report generation |
+| `scripts/run_paper.py` | Daily paper trading runner (reuses backtest signal functions) |
+| `scripts/paper_state.py` | Paper trading state persistence (positions, trades, cash per portfolio) |
 
 ## Multi-Portfolio Infrastructure
 
@@ -289,3 +291,42 @@ After all portfolios run independently, `simulate_rebalancer()` takes their equi
 ### Output
 
 Returns a rebalanced combined equity curve and weights history for analysis. This is an approximation valid at retail scale where position scaling has no market impact.
+
+## Paper Trading
+
+A daily runner script (`scripts/run_paper.py`) reuses the exact same signal functions from the backtest for paper trading against IB Gateway.
+
+### Setup
+
+```bash
+# Initialize paper trading state
+python scripts/run_paper.py --init --capital 100000
+
+# Populate data caches (if not already done)
+python scripts/fetch_fundamentals.py
+python scripts/fetch_earnings.py
+```
+
+### Daily Run
+
+```bash
+# Run daily signals (requires IB Gateway on paper port 7497)
+python scripts/run_paper.py
+
+# Check current positions
+python scripts/run_paper.py --status
+```
+
+### How It Works
+
+1. Loads persisted state from `data/paper_state.json`
+2. Fetches latest bars from IB Gateway (1 year of history for signal warmup)
+3. Runs all 8 signal functions (identical to backtest)
+4. Prints generated buy/sell signals with portfolio attribution
+5. Saves updated state
+
+State persists positions, trade history, and cash per portfolio between runs. The signal functions maintain their own internal state (tracked positions, rankings) which is rebuilt from historical bars each run.
+
+### Stream Message Tagging
+
+`ApprovedOrderMessage` and `FillMessage` include an optional `portfolio` field for strategy attribution. This enables per-strategy P&L tracking in the live pipeline.
