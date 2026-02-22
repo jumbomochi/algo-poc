@@ -578,6 +578,117 @@ def _build_data(bars: list[dict]) -> dict[str, list]:
     }
 
 
+def make_sector_rotation_signals_fn(
+    bars_by_ticker: dict[str, list[dict]],
+    top_n: int = 3,
+    lookback_days: int = 63,
+    position_size_pct: float = 0.20,
+    initial_capital: float = 100_000,
+    trailing_stop_pct: float = 0.08,
+    regime_by_date: dict | None = None,
+):
+    """Create a sector rotation signal function.
+
+    Ranks sector ETFs by 3-month return and buys the top N.
+    In bear regime, rotates to defensive sectors only (XLU, XLP, XLV).
+    Exits via trailing stop or when sector drops out of top N.
+    """
+    defensive_sectors = {"XLU", "XLP", "XLV"}
+
+    # Pre-compute date -> {ticker: close_price} for ranking
+    price_by_date: dict[Any, dict[str, float]] = {}
+    for ticker, bars in bars_by_ticker.items():
+        for bar in bars:
+            d = bar["date"]
+            if d not in price_by_date:
+                price_by_date[d] = {}
+            price_by_date[d][ticker] = bar["close"]
+
+    sorted_dates = sorted(price_by_date.keys())
+
+    # Pre-compute date -> list of top N tickers ranked by return
+    rankings_by_date: dict[Any, list[str]] = {}
+    for i, d in enumerate(sorted_dates):
+        if i < lookback_days:
+            continue
+        past_date = sorted_dates[i - lookback_days]
+        past_prices = price_by_date.get(past_date, {})
+        current_prices = price_by_date[d]
+
+        returns = []
+        for ticker in current_prices:
+            if ticker in past_prices and past_prices[ticker] > 0:
+                ret = (current_prices[ticker] - past_prices[ticker]) / past_prices[ticker]
+                returns.append((ticker, ret))
+
+        # In bear regime, only consider defensive sectors
+        regime = "neutral"
+        if regime_by_date:
+            regime = regime_by_date.get(d, "neutral")
+
+        if regime == "bear":
+            returns = [(t, r) for t, r in returns if t in defensive_sectors]
+
+        returns.sort(key=lambda x: x[1], reverse=True)
+        rankings_by_date[d] = [t for t, _ in returns[:top_n]]
+
+    tracked: dict[str, list[dict]] = {}
+
+    def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
+        if len(bars) < lookback_days + 1:
+            return None
+
+        current_price = bars[-1]["close"]
+        current_date = bars[-1]["date"]
+        bar_count = len(bars)
+        lots = tracked.get(ticker, [])
+
+        # Exit: trailing stop
+        if lots:
+            for lot in lots:
+                lot["peak_price"] = max(lot["peak_price"], current_price)
+
+            for lot in lots:
+                peak = lot["peak_price"]
+                entry = lot["entry_price"]
+                if peak > entry and (peak - current_price) / peak >= trailing_stop_pct:
+                    tracked.pop(ticker, None)
+                    return {
+                        "action": "sell",
+                        "ticker": ticker,
+                        "limit_price": current_price,
+                        "quantity": 0,
+                        "sector": "Unknown",
+                        "exit_reason": "trailing_stop",
+                    }
+
+        # Entry: buy if in top N and not already tracked
+        top_tickers = rankings_by_date.get(current_date, [])
+        if not lots and ticker in top_tickers:
+            quantity = max(1, int(initial_capital * position_size_pct / current_price))
+            tracked[ticker] = [{
+                "entry_price": current_price,
+                "entry_idx": bar_count,
+                "peak_price": current_price,
+            }]
+            return {
+                "action": "buy",
+                "ticker": ticker,
+                "limit_price": current_price,
+                "quantity": quantity,
+                "sector": "Unknown",
+                "signals": {
+                    "strategy": "sector_rotation",
+                    "rank": top_tickers.index(ticker) + 1,
+                    "lookback_days": lookback_days,
+                },
+            }
+
+        return None
+
+    return signals_fn
+
+
 def compute_aggregate_metrics(
     results: dict[str, BacktestResult],
     portfolio_configs: dict[str, PortfolioConfig],
