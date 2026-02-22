@@ -92,6 +92,7 @@ class ApprovedOrderMessage(StreamSerializable):
     limit_price: float | None = None
     recommendation_id: str
     risk_adjustments: dict[str, Any] = Field(default_factory=dict)
+    portfolio: str | None = None
 
 
 class FillMessage(StreamSerializable):
@@ -103,6 +104,7 @@ class FillMessage(StreamSerializable):
     commission: float
     recommendation_id: str
     order_id: str
+    portfolio: str | None = None
 
 
 class AlertMessage(StreamSerializable):
