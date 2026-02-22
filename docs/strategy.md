@@ -186,7 +186,7 @@ Supporting infrastructure:
 | `backtest/runner.py` | Backtest engine (daily bar replay, order simulation, P&L tracking) |
 | `scripts/fetch_fundamentals.py` | Fundamentals data cache (yfinance fetcher, point-in-time lookup) |
 | `scripts/fetch_earnings.py` | Earnings data cache (yfinance fetcher, event window lookup) |
-| `scripts/visualize_backtest.py` | Plotly HTML report generation |
+| `scripts/visualize_backtest.py` | Plotly HTML report generation (single + multi-portfolio) |
 | `scripts/run_paper.py` | Daily paper trading runner (reuses backtest signal functions) |
 | `scripts/paper_state.py` | Paper trading state persistence (positions, trades, cash per portfolio) |
 | `scripts/train_signal_model.py` | Walk-forward ML model training for signal quality scoring |
@@ -237,6 +237,18 @@ When multiple portfolios are configured, the output automatically switches to mu
 ### Backward Compatibility
 
 With a single portfolio, the output format is identical to the original — same `print_results()` and `save_results()` functions are used. Multi-portfolio output only activates when 2+ portfolios are configured.
+
+### Visualization
+
+The HTML report (`scripts/visualize_backtest.py`) auto-detects single vs multi-portfolio JSON format:
+
+- **Single-portfolio:** equity curve, drawdown, monthly heatmap, trade PnL histogram, per-trade candlesticks
+- **Multi-portfolio:** all of the above plus per-strategy equity curve overlay, strategy comparison bar charts (return/Sharpe/max DD), per-strategy metrics table, and portfolio filter on trade charts
+
+Generate a report:
+```bash
+python scripts/visualize_backtest.py output/backtest_multi_20260223_120000.json
+```
 
 ### Current Portfolio Configuration
 
