@@ -212,6 +212,7 @@ REGIME_PARAMS = {
     "bull": {"trailing_stop_pct": 0.15, "max_loss_pct": 0.10},
     "neutral": {"trailing_stop_pct": 0.12, "max_loss_pct": 0.08},
     "bear": {"trailing_stop_pct": 0.08, "max_loss_pct": 0.05},
+    "crash": {"trailing_stop_pct": 0.04, "max_loss_pct": 0.02},
 }
 
 
@@ -220,12 +221,14 @@ def compute_regime_by_date(
     ma_period: int = 200,
     bull_threshold: float = 0.60,
     bear_threshold: float = 0.40,
+    crash_threshold: float = 0.10,
 ) -> dict:
     """Compute market regime for each date based on breadth.
 
     Bull: >60% of stocks above their 200-day MA.
-    Bear: <40% above their 200-day MA.
     Neutral: 40-60%.
+    Bear: <40% above their 200-day MA.
+    Crash: <10% above their 200-day MA (>90% below).
     """
     above_ma: dict[Any, list[bool]] = {}
     for ticker, bars in bars_by_ticker.items():
@@ -245,6 +248,8 @@ def compute_regime_by_date(
         breadth = sum(above_list) / len(above_list)
         if breadth > bull_threshold:
             regime_by_date[d] = "bull"
+        elif breadth < crash_threshold:
+            regime_by_date[d] = "crash"
         elif breadth < bear_threshold:
             regime_by_date[d] = "bear"
         else:
