@@ -891,11 +891,12 @@ def main():
     # 5. Save results to JSON
     print("\nStep 5: Saving results...")
     base_config = {
-        "tickers": tickers,
+        "tickers": all_tickers,
         "years": args.years,
         "initial_capital": args.capital,
         "slippage_bps": args.slippage_bps,
         "commission_per_share": args.commission,
+        "portfolios": {name: pc.capital for name, pc in portfolios.items()},
     }
     if len(portfolios) == 1:
         result = next(iter(results.values()))
