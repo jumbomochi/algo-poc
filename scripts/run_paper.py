@@ -23,6 +23,7 @@ from scripts.run_backtest import (
     compute_regime_by_date,
     fetch_bars_from_ib,
     get_union_universe,
+    make_crash_freeze_signals_fn,
     make_earnings_drift_signals_fn,
     make_momentum_signals_fn,
     make_quality_value_signals_fn,
@@ -111,7 +112,7 @@ def build_portfolios(
         signals_fn=make_quality_value_signals_fn(
             fundamentals_lookup=fundamentals_lookup, sector_map=SECTOR_MAP,
             top_n=15, position_size_pct=0.10, initial_capital=qv_cap,
-            trailing_stop_pct=0.12,
+            trailing_stop_pct=0.12, regime_by_date=regime_by_date,
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=10.0, sector_concentration_pct=30.0,
@@ -126,7 +127,7 @@ def build_portfolios(
         signals_fn=make_earnings_drift_signals_fn(
             earnings_lookup=earnings_lookup, surprise_threshold_pct=5.0,
             max_hold_days=20, position_size_pct=0.08, initial_capital=ed_cap,
-            trailing_stop_pct=0.06,
+            trailing_stop_pct=0.06, regime_by_date=regime_by_date,
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=8.0, sector_concentration_pct=30.0,
@@ -154,7 +155,7 @@ def build_portfolios(
         signals_fn=make_thematic_momentum_signals_fn(
             bars_by_ticker=bars_by_ticker, top_n=8, lookback_days=63,
             position_size_pct=0.15, initial_capital=them_cap,
-            trailing_stop_pct=0.10,
+            trailing_stop_pct=0.10, regime_by_date=regime_by_date,
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=15.0, sector_concentration_pct=50.0,
@@ -175,6 +176,17 @@ def build_portfolios(
             total_exposure_limit_pct=100.0, max_lots_per_ticker=1,
         ),
     )
+
+    # Level 3: Crash entry freeze — block new buys during crash regime
+    for name, pc in list(portfolios.items()):
+        if name == "tail_risk_hedge":
+            continue
+        portfolios[name] = PortfolioConfig(
+            name=pc.name,
+            capital=pc.capital,
+            signals_fn=make_crash_freeze_signals_fn(pc.signals_fn, regime_by_date),
+            risk_engine=pc.risk_engine,
+        )
 
     return portfolios
 

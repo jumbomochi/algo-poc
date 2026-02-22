@@ -416,3 +416,14 @@ Risk alerts are printed after multi-portfolio results:
 ### Paper Trading
 
 Risk alerts appear in `--status` output when aggregate equity drops below thresholds.
+
+### Level 3: Tail-Risk Override
+
+| Condition | Regime | Action |
+|---|---|---|
+| Breadth < 10% (>90% below 200-day MA) | Crash | Freeze all new entries except tail-risk hedge |
+| Breadth < 40% | Bear | Tighten all trailing stops by 2 percentage points |
+
+Crash entry freeze is applied as a wrapper (`make_crash_freeze_signals_fn`) around each strategy's signal function. The tail-risk hedge continues operating during crashes, providing downside protection.
+
+Bear-regime stop tightening reduces trailing stop percentages by 2pp (e.g., 10% -> 8%, 12% -> 10%) to lock in gains faster during volatile conditions. Crash regime uses even tighter stops (4% trailing, 2% max loss) via REGIME_PARAMS.
