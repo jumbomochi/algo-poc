@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 import numpy as np
 
+from backtest.feature_extractor import enrich_trades
 from backtest.metrics import BacktestMetrics
 from backtest.runner import BacktestResult, BacktestRunner
 from backtest.simulator import SimulatedExecutor
@@ -1757,6 +1758,10 @@ def main():
         runner = BacktestRunner(executor=executor, initial_capital=pc.capital)
         results[name] = runner.run(bars_by_ticker, pc.signals_fn, pc.risk_engine)
     elapsed = time.time() - t0
+
+    # Enrich trades with bar-derived features (for ML training)
+    for name, result in results.items():
+        enrich_trades(result.trades, bars_by_ticker, regime_by_date)
 
     # 4. Print results
     if len(portfolios) == 1:
