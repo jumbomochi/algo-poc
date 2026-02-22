@@ -34,6 +34,7 @@ from scripts.run_backtest import (
 )
 from scripts.fetch_fundamentals import load_fundamentals_cache, build_fundamentals_lookup, SECTOR_MAP
 from scripts.fetch_earnings import load_earnings_cache, build_earnings_lookup
+from backtest.aggregate_risk import AggregateRiskMonitor
 from services.risk_management.engine import RiskEngine
 
 
@@ -221,6 +222,21 @@ def print_status(state: PaperTradingState) -> None:
     print(f"    Equity:     ${total_equity:>12,.2f}")
     print(f"    P&L:        ${total_equity - total_capital:>+12,.2f}")
     print(f"    Positions:  {total_positions}")
+
+    # Risk monitoring
+    risk_monitor = AggregateRiskMonitor(
+        alert_drawdown_pct=15.0,
+        circuit_breaker_pct=22.0,
+    )
+    # Check aggregate drawdown from capital
+    aggregate_values = [total_capital, total_equity]
+    risk_alerts = risk_monitor.check_aggregate_drawdown(aggregate_values)
+    if risk_alerts:
+        print(f"\n  RISK ALERTS:")
+        for alert in risk_alerts:
+            icon = "!!" if alert["level"] == "critical" else " >"
+            print(f"    {icon} [{alert['level'].upper()}] {alert['message']}")
+
     print("=" * 60)
 
 
