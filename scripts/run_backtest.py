@@ -689,6 +689,110 @@ def make_sector_rotation_signals_fn(
     return signals_fn
 
 
+def make_short_term_mr_signals_fn(
+    position_size_pct: float = 0.08,
+    initial_capital: float = 100_000,
+    max_hold_days: int = 5,
+    rsi_period: int = 2,
+    rsi_entry_threshold: float = 0.8,
+    bb_period: int = 20,
+    bb_num_std: float = 2.0,
+):
+    """Create a short-term mean-reversion signal function.
+
+    Entry: RSI(2) < 10 AND price touches lower Bollinger Band AND volume > 1.5x avg.
+    Exit: RSI(2) > 70 OR max_hold_days elapsed (whichever first). No trailing stop.
+    """
+    from services.signal_generation.technical import BollingerBandSignal
+
+    rsi_signal = RSISignal(period=rsi_period)
+    bb_signal = BollingerBandSignal(period=bb_period, num_std=bb_num_std)
+    volume_signal = VolumeSignal()
+
+    tracked: dict[str, dict] = {}  # ticker -> {entry_idx, entry_price}
+
+    def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
+        min_bars = max(bb_period + 1, 25)
+        if len(bars) < min_bars:
+            return None
+
+        current_price = bars[-1]["close"]
+        bar_count = len(bars)
+        lot = tracked.get(ticker)
+
+        # Exit logic
+        if lot is not None:
+            bars_held = bar_count - lot["entry_idx"]
+
+            # Time exit
+            if bars_held >= max_hold_days:
+                tracked.pop(ticker, None)
+                return {
+                    "action": "sell",
+                    "ticker": ticker,
+                    "limit_price": current_price,
+                    "quantity": 0,
+                    "sector": "Unknown",
+                    "exit_reason": "time_exit",
+                }
+
+            # RSI recovery exit
+            data = _build_data(bars)
+            rsi = rsi_signal.compute(data)
+            if rsi.value < -0.4:  # RSI(2) > 70
+                tracked.pop(ticker, None)
+                return {
+                    "action": "sell",
+                    "ticker": ticker,
+                    "limit_price": current_price,
+                    "quantity": 0,
+                    "sector": "Unknown",
+                    "exit_reason": "rsi_recovery",
+                }
+
+            return None
+
+        # Entry logic
+        data = _build_data(bars)
+        try:
+            rsi = rsi_signal.compute(data)
+            bb = bb_signal.compute(data)
+            volume = volume_signal.compute(data)
+        except Exception:
+            return None
+
+        # RSI(2) < 10 maps to rsi.value > 0.8
+        # BB touch: bb.value > 0.5 means price is near/below lower band
+        # Volume > 1.5x avg: volume.value > 0.25
+        if (
+            rsi.value > rsi_entry_threshold
+            and bb.value > 0.5
+            and volume.value > 0.25
+        ):
+            quantity = max(1, int(initial_capital * position_size_pct / current_price))
+            tracked[ticker] = {
+                "entry_price": current_price,
+                "entry_idx": bar_count,
+            }
+            return {
+                "action": "buy",
+                "ticker": ticker,
+                "limit_price": current_price,
+                "quantity": quantity,
+                "sector": "Unknown",
+                "signals": {
+                    "strategy": "short_term_mr",
+                    "rsi_2": rsi.value,
+                    "bb": bb.value,
+                    "volume": volume.value,
+                },
+            }
+
+        return None
+
+    return signals_fn
+
+
 def compute_aggregate_metrics(
     results: dict[str, BacktestResult],
     portfolio_configs: dict[str, PortfolioConfig],
