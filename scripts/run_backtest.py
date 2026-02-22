@@ -1184,6 +1184,31 @@ def make_tail_risk_hedge_signals_fn(
     return signals_fn
 
 
+def make_crash_freeze_signals_fn(
+    inner_fn: Callable[[str, list[dict]], dict | None],
+    regime_by_date: dict,
+) -> Callable[[str, list[dict]], dict | None]:
+    """Wrap a signal function to freeze new entries during crash regime.
+
+    Buy signals are suppressed when the current regime is 'crash'.
+    Sell signals always pass through (exits are never blocked).
+    """
+    def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
+        signal = inner_fn(ticker, bars)
+        if signal is None:
+            return None
+
+        if signal.get("action") == "buy":
+            current_date = bars[-1]["date"]
+            regime = regime_by_date.get(current_date, "neutral")
+            if regime == "crash":
+                return None
+
+        return signal
+
+    return signals_fn
+
+
 def make_ml_filtered_signals_fn(
     inner_fn: Callable[[str, list[dict]], dict | None],
     model,
@@ -1834,6 +1859,17 @@ def main():
             ),
         ),
     }
+
+    # Level 3: Crash entry freeze — block new buys during crash regime
+    for name, pc in list(portfolios.items()):
+        if name == "tail_risk_hedge":
+            continue  # Tail-risk hedge operates during crashes
+        portfolios[name] = PortfolioConfig(
+            name=pc.name,
+            capital=pc.capital,
+            signals_fn=make_crash_freeze_signals_fn(pc.signals_fn, regime_by_date),
+            risk_engine=pc.risk_engine,
+        )
 
     # 2b. Apply ML signal filter if requested
     if args.ml_filter:
