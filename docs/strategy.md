@@ -202,32 +202,47 @@ Bar data is fetched once and shared across all portfolios. Each portfolio gets i
 To add a new portfolio, add an entry to the `portfolios` dict in `main()`:
 
 ```python
-portfolios: dict[str, PortfolioConfig] = {
-    "dual": PortfolioConfig(
-        name="dual",
-        capital=args.capital,
-        signals_fn=combined_fn,
-        risk_engine=RiskEngine(
-            position_entry_limit_pct=12.0,
-            sector_concentration_pct=30.0,
-            total_exposure_limit_pct=150.0,
-            max_lots_per_ticker=2,
-        ),
+portfolios["sector_rotation"] = PortfolioConfig(
+    name="sector_rotation",
+    capital=args.capital * 0.12,
+    signals_fn=sector_rotation_signals_fn,
+    risk_engine=RiskEngine(
+        position_entry_limit_pct=20.0,
+        total_exposure_limit_pct=100.0,
     ),
-    "experimental": PortfolioConfig(
-        name="experimental",
-        capital=50_000,
-        signals_fn=my_new_signals_fn,
-        risk_engine=RiskEngine(
-            position_entry_limit_pct=20.0,
-            total_exposure_limit_pct=100.0,
-        ),
-    ),
-}
+)
 ```
+
+Also add the strategy's universe to `UNIVERSE_REGISTRY` and its ticker list.
 
 When multiple portfolios are configured, the output automatically switches to multi-portfolio format with per-portfolio summaries, aggregate metrics, and a combined JSON output file.
 
 ### Backward Compatibility
 
 With a single portfolio, the output format is identical to the original — same `print_results()` and `save_results()` functions are used. Multi-portfolio output only activates when 2+ portfolios are configured.
+
+### Current Portfolio Configuration
+
+The backtest runs two independent portfolios by default:
+
+| Portfolio | Capital | Strategy | Risk Limits |
+|---|---|---|---|
+| `mean_reversion` | 40% of total | Support-level dip buying | 15% entry, 120% exposure, 2 lots |
+| `momentum` | 60% of total | 6-month relative strength | 12% entry, 150% exposure, 1 lot |
+
+This replaces the previous combined dual strategy. The two strategies no longer compete for capital — momentum signals are never rejected because mean-reversion filled the portfolio.
+
+### Universe Registry
+
+Each strategy defines its own ticker universe via `UNIVERSE_REGISTRY`. Bar data is fetched once for the union of all universes. Currently defined universes:
+
+| Strategy | Universe | Ticker Count |
+|---|---|---|
+| `mean_reversion` | S&P 500 top 50 | 50 |
+| `momentum` | S&P 500 top 50 + inverse ETFs | 52 |
+| `sector_rotation` | SPDR sector ETFs | 11 |
+| `quality_value` | S&P 500 top 100 | 100 |
+| `earnings_drift` | S&P 500 top 100 | 100 |
+| `short_term_mr` | S&P 500 top 100 | 100 |
+| `thematic_momentum` | Thematic ETFs | 25 |
+| `tail_risk_hedge` | Inverse + defensive ETFs | 5 |
