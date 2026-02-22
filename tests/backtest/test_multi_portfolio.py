@@ -204,3 +204,87 @@ def test_split_portfolios_run_independently():
 
     agg = compute_aggregate_metrics(results, configs)
     assert agg["portfolio_values"][0] == 100_000
+
+
+def test_universe_registry_has_future_strategy_keys():
+    """Universe registry defines tickers for all planned strategies."""
+    from scripts.run_backtest import UNIVERSE_REGISTRY
+
+    expected_strategies = [
+        "mean_reversion", "momentum", "sector_rotation",
+        "quality_value", "earnings_drift", "short_term_mr",
+        "thematic_momentum", "tail_risk_hedge",
+    ]
+    for strategy in expected_strategies:
+        assert strategy in UNIVERSE_REGISTRY, f"Missing universe for {strategy}"
+        assert len(UNIVERSE_REGISTRY[strategy]) > 0, f"Empty universe for {strategy}"
+
+
+def test_universe_registry_no_duplicates_within_strategy():
+    """Each strategy's universe has no duplicate tickers."""
+    from scripts.run_backtest import UNIVERSE_REGISTRY
+
+    for name, tickers in UNIVERSE_REGISTRY.items():
+        assert len(tickers) == len(set(tickers)), f"Duplicates in {name}"
+
+
+def test_split_portfolios_aggregate_metrics_are_valid():
+    """Split MR + Momentum portfolios produce valid aggregate metrics."""
+    from datetime import date
+
+    from backtest.runner import BacktestRunner
+    from backtest.simulator import SimulatedExecutor
+    from scripts.run_backtest import PortfolioConfig, compute_aggregate_metrics
+    from services.risk_management.engine import RiskEngine
+
+    # Simple signal: buy AAPL on day 2, sell on day 5
+    call_count = {"n": 0}
+
+    def simple_buy_sell(ticker, bars):
+        if ticker != "AAPL" or len(bars) < 2:
+            return None
+        call_count["n"] += 1
+        if len(bars) == 2:
+            return {
+                "action": "buy", "ticker": ticker,
+                "limit_price": bars[-1]["close"],
+                "quantity": 5, "sector": "Tech",
+            }
+        if len(bars) == 5:
+            return {
+                "action": "sell", "ticker": ticker,
+                "limit_price": bars[-1]["close"],
+                "quantity": 0, "sector": "Tech",
+            }
+        return None
+
+    bars = {
+        "AAPL": [
+            {"date": date(2024, 1, d), "open": 150.0, "high": 155.0,
+             "low": 148.0, "close": 150.0 + d, "volume": 50000}
+            for d in range(1, 8)
+        ],
+    }
+
+    executor = SimulatedExecutor(slippage_bps=0, commission_per_share=0)
+
+    configs = {
+        "strat_a": PortfolioConfig("strat_a", 60_000, simple_buy_sell, RiskEngine()),
+        "strat_b": PortfolioConfig("strat_b", 40_000, simple_buy_sell, RiskEngine()),
+    }
+
+    results = {}
+    for name, pc in configs.items():
+        runner = BacktestRunner(executor=executor, initial_capital=pc.capital)
+        results[name] = runner.run(bars, pc.signals_fn, pc.risk_engine)
+
+    agg = compute_aggregate_metrics(results, configs)
+
+    # Aggregate should have valid metrics
+    assert agg["metrics"]["total_trades"] >= 0
+    assert -1.0 <= agg["metrics"]["total_return"] <= 10.0
+    assert 0.0 <= agg["metrics"]["max_drawdown"] <= 1.0
+    # Aggregate portfolio values should start at combined capital
+    assert agg["portfolio_values"][0] == 100_000
+    # All trades should be tagged
+    assert all("portfolio" in t for t in agg["trades"])
