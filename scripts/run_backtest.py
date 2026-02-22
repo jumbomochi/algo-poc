@@ -646,22 +646,22 @@ def main():
     )
     runner = BacktestRunner(executor=executor, initial_capital=args.capital)
     risk_engine = RiskEngine(
-        position_entry_limit_pct=14.0,
+        position_entry_limit_pct=12.0,
         sector_concentration_pct=30.0,
-        total_exposure_limit_pct=100.0,
+        total_exposure_limit_pct=150.0,
         max_lots_per_ticker=2,
     )
 
     mr_signals_fn = make_signals_fn(
-        position_size_pct=0.14,
+        position_size_pct=0.12,
         initial_capital=args.capital,
         trailing_stop_pct=0.10,
     )
     mom_signals_fn = make_momentum_signals_fn(
         bars_by_ticker=bars_by_ticker,
-        top_n=3,
+        top_n=5,
         lookback_days=126,
-        position_size_pct=0.14,
+        position_size_pct=0.12,
         initial_capital=args.capital,
         trailing_stop_pct=0.10,
         bear_tickers=BEAR_TICKERS,

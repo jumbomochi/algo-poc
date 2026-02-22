@@ -4,7 +4,7 @@
 
 A dual-strategy system that trades the top 50 S&P 500 stocks by market cap, combining mean-reversion (buying dips at support) with relative-strength momentum (buying sustained uptrends). Both strategies share a common risk engine and trailing stop exit mechanism. Inverse ETFs (SH, PSQ) are included in the momentum universe for natural bear market hedging.
 
-**10-year backtest (2016-2026):** 18.0% CAGR, Sharpe 1.47, 16.14% max drawdown, $100k -> $523k.
+**10-year backtest (2016-2026):** 19.1% CAGR, Sharpe 1.51, 17.89% max drawdown, $100k -> $576k.
 
 ## Strategy 1: Mean-Reversion
 
@@ -42,13 +42,13 @@ Early iterations included an 8% max loss stop. It destroyed win rate (52% -> 43%
 
 ### Entry Logic
 
-Ranks all tickers (including inverse ETFs) by their 6-month (126 trading day) return. Buys the top 3 performers that aren't already held.
+Ranks all tickers (including inverse ETFs) by their 6-month (126 trading day) return. Buys the top 5 performers that aren't already held.
 
 | Parameter | Value | Rationale |
 |---|---|---|
 | Lookback | 126 days (6 months) | Standard institutional momentum window |
-| Top N | 3 | Concentrated on strongest performers only |
-| Re-ranking | Daily | Rankings update every bar, but entries only when a stock freshly enters the top 3 |
+| Top N | 5 | Broad enough to deploy capital across more positions |
+| Re-ranking | Daily | Rankings update every bar, but entries only when a stock freshly enters the top 5 |
 
 ### Exit Logic
 
@@ -77,25 +77,38 @@ Both strategies maintain independent internal state (tracked positions with entr
 
 | Parameter | Value | Purpose |
 |---|---|---|
-| Position size | 14% of NAV | Large enough to capture meaningful P&L per trade |
-| Position entry limit | 14% of NAV | Risk engine caps any single entry |
+| Position size | 12% of NAV | Balances meaningful P&L per trade with diversification |
+| Position entry limit | 12% of NAV | Risk engine caps any single entry |
 | Sector concentration | 30% | No more than 30% in one sector |
-| Total exposure | 100% | No margin/leverage |
+| Total exposure | 150% | Allows up to 150% gross exposure for more capital deployment |
 | Max lots per ticker | 2 | Allows pyramiding but prevents over-concentration |
 | Trailing stop | 10% | Exits winners that reverse; only after profitable |
 
-### Why 14% Position Size
+### Position Size and Exposure Optimization
 
-The position size was the single most impactful parameter for returns while maintaining Sharpe ratio. Progression during tuning:
+The current 12% / 150% / top 5 configuration was found by optimizing across two dimensions: position size (raw returns) and diversification (risk-adjusted returns via top_n and exposure limit).
 
-| Position Size | CAGR | Sharpe | Max DD |
-|---|---|---|---|
-| 7% | 14.2% | 1.45 | 13.23% |
-| 10% | 14.9% | 1.46 | 14.31% |
-| 12% | 16.5% | 1.47 | 15.31% |
-| 14% | 18.0% | 1.47 | 16.14% |
+**Phase 1 — Position size scaling (top_n=3, 100% exposure):**
 
-Sharpe held constant at ~1.47 as position size increased from 10% to 14% because the signal quality is high — larger bets on the same good signals scale returns linearly without increasing the variance ratio.
+| Position Size | CAGR | Sharpe | Max DD | Trades |
+|---|---|---|---|---|
+| 7% | 14.2% | 1.45 | 13.23% | 458 |
+| 10% | 14.9% | 1.46 | 14.31% | 458 |
+| 12% | 16.5% | 1.47 | 15.31% | 458 |
+| 14% | 18.0% | 1.47 | 16.14% | 458 |
+
+Sharpe held constant at ~1.47 as position size increased, but the concentrated 14% config maxed out at ~7 positions and left momentum signals rejected when fully allocated.
+
+**Phase 2 — Diversification optimization (higher exposure + top_n):**
+
+| Config | CAGR | Sharpe | Max DD | Trades |
+|---|---|---|---|---|
+| 5% / 150% / top 3 | 9.6% | 1.46 | 10.15% | 458 |
+| 10% / 120% / top 3 | 14.9% | 1.47 | 14.28% | 458 |
+| 10% / 150% / top 5 | 17.2% | 1.51 | 16.84% | 631 |
+| 12% / 150% / top 5 | 19.1% | 1.51 | 17.89% | 631 |
+
+The key insight: increasing top_n from 3 to 5 was what unlocked the extra exposure capacity. With top_n=3, signal frequency was too low to fill more than ~7 positions regardless of exposure limit. Top_n=5 generated 631 trades (vs 458), deployed more capital, and improved Sharpe from 1.47 to 1.51 through better diversification.
 
 ## Regime Detection
 
@@ -131,7 +144,7 @@ The trailing stop only activates after `peak > entry`. This prevents the trailin
 
 ### Momentum Complements Mean-Reversion
 
-Mean-reversion has dead years (2019, 2023) where stocks trend up without pulling back to support. Momentum captures these sustained trends. Together they cover both market behaviors, adding ~270% to the 10-year return (+7.71% mean-reversion-only -> +423.82% combined).
+Mean-reversion has dead years (2019, 2023) where stocks trend up without pulling back to support. Momentum captures these sustained trends. Together they cover both market behaviors, adding ~470% to the 10-year return (+7.71% mean-reversion-only -> +476.18% combined).
 
 ### Simple Composition Over Complex Blending
 
