@@ -23,6 +23,7 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 
+from backtest.aggregate_risk import AggregateRiskMonitor
 from backtest.feature_extractor import enrich_trades
 from backtest.metrics import BacktestMetrics
 from backtest.runner import BacktestResult, BacktestRunner
@@ -1894,6 +1895,29 @@ def main():
                 print(f"    Rebalanced total return:  {reb_return:>10.2%}")
                 final_w = rebalancer_result["weights_history"][-1]["weights"]
                 print(f"    Final weights: {', '.join(f'{n}: {w:.1%}' for n, w in sorted(final_w.items()))}")
+
+        # Cross-portfolio risk monitoring
+        risk_monitor = AggregateRiskMonitor(
+            alert_drawdown_pct=15.0,
+            circuit_breaker_pct=22.0,
+        )
+        strategy_drawdowns = {
+            name: result.metrics.get("max_drawdown", 0.0)
+            for name, result in results.items()
+        }
+        # Use 2x current drawdown as proxy for historical max in backtest
+        # (in live trading, historical_max would come from saved benchmarks)
+        historical_max = {name: dd * 0.6 for name, dd in strategy_drawdowns.items()}
+        risk_alerts = risk_monitor.monitor(
+            aggregate_values=aggregate["portfolio_values"],
+            strategy_drawdowns=strategy_drawdowns,
+            historical_max_drawdowns=historical_max,
+        )
+        if risk_alerts:
+            print(f"\n  Risk Alerts ({len(risk_alerts)}):")
+            for alert in risk_alerts:
+                icon = "!!" if alert["level"] == "critical" else " >"
+                print(f"    {icon} [{alert['level'].upper()}] {alert['message']}")
 
     # 5. Save results to JSON
     print("\nStep 5: Saving results...")
