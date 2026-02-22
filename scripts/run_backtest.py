@@ -812,6 +812,7 @@ def make_thematic_momentum_signals_fn(
     initial_capital: float = 100_000,
     trailing_stop_pct: float = 0.10,
     max_loss_pct: float = 0.08,
+    regime_by_date: dict | None = None,
 ):
     """Create a thematic momentum signal function.
 
@@ -859,6 +860,15 @@ def make_thematic_momentum_signals_fn(
         bar_count = len(bars)
         lots = tracked.get(ticker, [])
 
+        # Determine regime-adjusted trailing stop and max loss
+        effective_trailing = trailing_stop_pct
+        effective_max_loss = max_loss_pct
+        if regime_by_date:
+            regime = regime_by_date.get(current_date, "neutral")
+            if regime in ("bear", "crash"):
+                effective_trailing = max(trailing_stop_pct - 0.02, 0.02)
+                effective_max_loss = max(max_loss_pct - 0.02, 0.02)
+
         # Compute 50-day MA
         closes = [b["close"] for b in bars[-ma_period:]]
         ma_50 = sum(closes) / len(closes)
@@ -881,11 +891,11 @@ def make_thematic_momentum_signals_fn(
                 for lot in lots:
                     peak = lot["peak_price"]
                     entry = lot["entry_price"]
-                    if peak > entry and (peak - current_price) / peak >= trailing_stop_pct:
+                    if peak > entry and (peak - current_price) / peak >= effective_trailing:
                         should_sell = True
                         exit_reason = "trailing_stop"
                         break
-                    if (entry - current_price) / entry >= max_loss_pct:
+                    if (entry - current_price) / entry >= effective_max_loss:
                         should_sell = True
                         exit_reason = "max_loss"
                         break
@@ -936,6 +946,7 @@ def make_quality_value_signals_fn(
     position_size_pct: float = 0.10,
     initial_capital: float = 100_000,
     trailing_stop_pct: float = 0.12,
+    regime_by_date: dict | None = None,
 ):
     """Create a quality value signal function.
 
@@ -971,6 +982,13 @@ def make_quality_value_signals_fn(
         if fundamentals is None:
             return None
 
+        # Determine regime-adjusted trailing stop
+        effective_trailing = trailing_stop_pct
+        if regime_by_date:
+            regime = regime_by_date.get(current_date, "neutral")
+            if regime in ("bear", "crash"):
+                effective_trailing = max(trailing_stop_pct - 0.02, 0.02)
+
         # Exit logic: trailing stop
         if lots:
             for lot in lots:
@@ -979,7 +997,7 @@ def make_quality_value_signals_fn(
             for lot in lots:
                 peak = lot["peak_price"]
                 entry = lot["entry_price"]
-                if peak > entry and (peak - current_price) / peak >= trailing_stop_pct:
+                if peak > entry and (peak - current_price) / peak >= effective_trailing:
                     tracked.pop(ticker, None)
                     return {
                         "action": "sell",
@@ -1032,6 +1050,7 @@ def make_earnings_drift_signals_fn(
     position_size_pct: float = 0.08,
     initial_capital: float = 100_000,
     trailing_stop_pct: float = 0.06,
+    regime_by_date: dict | None = None,
 ):
     """Create an earnings drift (PEAD) signal function.
 
@@ -1048,6 +1067,13 @@ def make_earnings_drift_signals_fn(
         current_date = bars[-1]["date"]
         bar_count = len(bars)
         lot = tracked.get(ticker)
+
+        # Determine regime-adjusted trailing stop
+        effective_trailing = trailing_stop_pct
+        if regime_by_date:
+            regime = regime_by_date.get(current_date, "neutral")
+            if regime in ("bear", "crash"):
+                effective_trailing = max(trailing_stop_pct - 0.02, 0.02)
 
         # Exit logic
         if lot is not None:
@@ -1069,7 +1095,7 @@ def make_earnings_drift_signals_fn(
             # Trailing stop
             peak = lot["peak_price"]
             entry = lot["entry_price"]
-            if peak > entry and (peak - current_price) / peak >= trailing_stop_pct:
+            if peak > entry and (peak - current_price) / peak >= effective_trailing:
                 tracked.pop(ticker, None)
                 return {
                     "action": "sell",
@@ -1747,6 +1773,7 @@ def main():
         position_size_pct=0.15,
         initial_capital=args.capital * 0.11,
         trailing_stop_pct=0.10,
+        regime_by_date=regime_by_date,
     )
     qv_signals_fn = make_quality_value_signals_fn(
         fundamentals_lookup=fundamentals_lookup,
@@ -1755,6 +1782,7 @@ def main():
         position_size_pct=0.10,
         initial_capital=args.capital * 0.12,
         trailing_stop_pct=0.12,
+        regime_by_date=regime_by_date,
     )
     ed_signals_fn = make_earnings_drift_signals_fn(
         earnings_lookup=earnings_lookup,
@@ -1763,6 +1791,7 @@ def main():
         position_size_pct=0.08,
         initial_capital=args.capital * 0.15,
         trailing_stop_pct=0.06,
+        regime_by_date=regime_by_date,
     )
     tail_risk_signals_fn = make_tail_risk_hedge_signals_fn(
         regime_by_date=regime_by_date,
