@@ -6,19 +6,164 @@ A dual-strategy system that trades the top 50 S&P 500 stocks by market cap, comb
 
 **10-year backtest (2016-2026):** 19.1% CAGR, Sharpe 1.51, 17.89% max drawdown, $100k -> $576k.
 
+## Signal Computation Details
+
+All signals produce a `SignalResult(value, confidence)` where both are floats in [-1, 1] and [0, 1] respectively. The entry conditions check either `value` or `confidence` depending on the signal.
+
+### Support Level Detection (`find_support_levels`)
+
+Before any support-based signal can be computed, the system first identifies historical support price levels:
+
+1. **Extract local minima** from the last 252 days of daily lows. A local minimum is a day where `low[i] < low[i-1]` AND `low[i] < low[i+1]` (a "valley" in the price chart).
+
+2. **Cluster nearby minima** — if two lows are within 2% of each other's price, they belong to the same support zone. The algorithm walks through sorted minima and groups them greedily.
+
+3. **Score by touch count** — clusters with more minima (more "tests" of that price level) are ranked higher.
+
+4. **Return zone averages** — each cluster's average price becomes a support level, sorted by touch count descending (strongest first).
+
+**Example:** If AAPL had daily lows of $145.20, $145.80, $144.90, and $146.10 across different dates, these are all within 2% of ~$145.50, so they form a single support zone at ~$145.50 with 4 touches.
+
+### Support Proximity Signal
+
+Measures how close the current price is to the nearest support level below it.
+
+**Calculation:**
+```
+pct_distance = (current_close - nearest_support) / nearest_support
+value = 1.0 - (pct_distance / 0.05)
+confidence = max(0.0, 1.0 - abs(pct_distance) / 0.05)
+```
+
+| Scenario | pct_distance | value | confidence |
+|---|---|---|---|
+| Price exactly at support | 0% | 1.0 | 1.0 |
+| Price 1% above support | 1% | 0.8 | 0.8 |
+| Price 2.5% above support | 2.5% | 0.5 | 0.5 |
+| Price 5% above support | 5% | 0.0 | 0.0 |
+
+**Entry threshold: value > 0.8** means price must be within 1% of the nearest support level.
+
+### Support Strength Signal
+
+Measures how many times price has "tested" (bounced off) the nearest support level.
+
+**Calculation:**
+```
+touches = count of all daily lows within 2% of the nearest support level
+value = min(touches / 10, 1.0) * 2 - 1     # maps to [-1, +1]
+confidence = min(touches / 3, 1.0)           # 3 touches = full confidence
+```
+
+| Touches | value | confidence |
+|---|---|---|
+| 0 | -1.0 | 0.00 |
+| 1 | -0.8 | 0.33 |
+| 2 | -0.6 | 0.67 |
+| 3 | -0.4 | 1.00 |
+| 5 | 0.0 | 1.00 |
+| 10+ | 1.0 | 1.00 |
+
+**Entry threshold: confidence > 0.7** means the nearest support level must have been tested at least 3 times (daily lows landing within 2% of the support price on at least 3 separate days in the last 252 trading days).
+
+**Why confidence, not value?** The `value` indicates how heavily tested the level is (3 touches vs 10 touches), while `confidence` indicates whether there's *enough* evidence that the level is real. A support with 3 touches is reliable enough — we don't need 10 touches to act.
+
+**Note:** The visualization chart displays `Strength: X.XX` — this shows `confidence`, which is the field checked by the entry condition.
+
+### Support Trend Signal
+
+Measures whether support levels (the "floor" under the stock) are rising or falling over time.
+
+**Calculation:**
+1. Find all local minima in the low price series (same method as support level detection).
+2. Run linear regression on the minima: `y = slope * x + intercept` where x is the bar index and y is the low price.
+3. Normalize slope as percentage of mean price: `slope_pct = slope / mean(y)`.
+4. Map to signal: `value = slope_pct / 0.10` (a 10% rise over the lookback maps to 1.0).
+5. Confidence = R-squared of the regression (how well a straight line fits the minima).
+
+| Scenario | value | confidence |
+|---|---|---|
+| Supports rising 10%+ over period | 1.0 | High (if trend is clean) |
+| Supports flat | 0.0 | Low (no clear trend) |
+| Supports falling 10%+ | -1.0 | High (if trend is clean) |
+
+**Entry threshold: value > 0.0** means support levels must be trending upward (higher lows over time). This filters out stocks in downtrends where support keeps breaking.
+
+### RSI Signal (14-day)
+
+Standard Relative Strength Index mapped to a mean-reversion signal.
+
+**Calculation:**
+```
+RSI = 100 - 100 / (1 + avg_gain / avg_loss)     # standard 14-day RSI
+value = (50 - RSI) / 50                           # maps RSI to [-1, +1]
+confidence = min(abs(RSI - 50) / 30, 1.0)         # extreme RSI = high confidence
+```
+
+| RSI | value | confidence | Interpretation |
+|---|---|---|---|
+| 0 | +1.0 | 1.0 | Extremely oversold |
+| 20 | +0.6 | 1.0 | Very oversold |
+| 30 | +0.4 | 0.67 | Oversold (entry threshold) |
+| 50 | 0.0 | 0.0 | Neutral |
+| 70 | -0.4 | 0.67 | Overbought |
+
+**Entry threshold: value > 0.4** corresponds to RSI < 30 (deeply oversold). This ensures we're buying genuine fear, not just a mild pullback.
+
+### Volume Signal
+
+Compares today's volume to the 20-day average volume.
+
+**Calculation:**
+```
+ratio = current_volume / avg_volume_20d
+value = (ratio - 1.0) / 2.0                       # maps to [-1, +1]
+confidence = min(abs(ratio - 1.0) / 1.0, 1.0)
+```
+
+| Volume Ratio | value | confidence | Interpretation |
+|---|---|---|---|
+| 0x (no volume) | -0.5 | 1.0 | Dead stock |
+| 1x (average) | 0.0 | 0.0 | Normal trading |
+| 2x | +0.5 | 1.0 | Elevated — threshold |
+| 3x+ | +1.0 | 1.0 | Very elevated |
+
+**Entry threshold: value > 0.5** means volume must be at least 2x the 20-day average. Elevated volume at support indicates institutional buying (accumulation) or capitulation selling that often marks a bottom.
+
+### Bollinger Band Signal
+
+Used by the Short-Term Mean-Reversion strategy (not the main MR strategy). Measures where price sits relative to Bollinger Bands (20-day MA +/- 2 standard deviations).
+
+**Calculation:**
+```
+upper = MA(20) + 2 * std(20)
+lower = MA(20) - 2 * std(20)
+position = (MA - current_price) / (band_width / 2)
+value = clamp(position, -1, +1)
+confidence = min(distance_from_MA / (2 * std), 1.0)
+```
+
+| Price Position | value | Interpretation |
+|---|---|---|
+| At lower band | +1.0 | Oversold — buy signal |
+| At middle (MA) | 0.0 | Neutral |
+| At upper band | -1.0 | Overbought |
+
+---
+
 ## Strategy 1: Mean-Reversion
 
 ### Entry Logic
 
 Buys large-cap stocks when they pull back to historically tested support levels with high-conviction confirmation signals. All five conditions must be met simultaneously:
 
-| Signal | Threshold | What It Measures |
-|---|---|---|
-| Support Proximity | > 0.8 | Price is very close to a detected support level |
-| Support Strength | confidence > 0.7 | The support level has been tested multiple times |
-| RSI (14-day) | signal > 0.4 (RSI < 30) | Stock is deeply oversold |
-| Volume | signal > 0.5 (volume > 2x avg) | Institutional activity / capitulation |
-| Support Trend | signal > 0.0 | Support levels are rising over time |
+| Signal | Threshold | What It Checks | Plain English |
+|---|---|---|---|
+| Support Proximity | value > 0.8 | Price within 1% of support | Stock is sitting right on a support level |
+| Support Strength | confidence > 0.7 | At least 3 touches of support | That support level has held at least 3 times before |
+| RSI (14-day) | value > 0.4 (RSI < 30) | Deeply oversold | Stock is in the bottom 30% of its recent range |
+| Volume | value > 0.5 (volume > 2x avg) | 2x average volume | Unusual trading activity (capitulation or accumulation) |
+| Support Trend | value > 0.0 | Rising supports | The stock's floor is rising over time (higher lows) |
 
 These thresholds are deliberately strict. The strategy only trades when all five signals align, resulting in ~8 mean-reversion trades per year. This selectivity is critical to performance — relaxing any threshold significantly degrades risk-adjusted returns.
 

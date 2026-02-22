@@ -574,7 +574,7 @@ def _trade_chart(trade: dict[str, Any], bars: list[dict[str, Any]]) -> str:
 
     pnl_color = GREEN if pnl >= 0 else RED
 
-    # Subtitle: signal values at entry
+    # Subtitle: signal values at entry (show confidence where that's the threshold)
     prox = entry_signals.get("proximity", {})
     strength = entry_signals.get("strength", {})
     trend = entry_signals.get("trend", {})
@@ -582,7 +582,9 @@ def _trade_chart(trade: dict[str, Any], bars: list[dict[str, Any]]) -> str:
     if prox:
         subtitle_parts.append(f"Proximity: {prox.get('value', 0):.2f}")
     if strength:
-        subtitle_parts.append(f"Strength: {strength.get('value', 0):.2f}")
+        subtitle_parts.append(
+            f"Strength: {strength.get('confidence', 0):.2f}"
+        )
     if trend:
         subtitle_parts.append(
             f"Trend: {trend.get('value', 0):.2f} (conf={trend.get('confidence', 0):.2f})"
