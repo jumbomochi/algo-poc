@@ -15,7 +15,7 @@ class SimulatedExecutor:
     def try_fill_limit_entry(
         self,
         limit_price: float,
-        quantity: int,
+        quantity: float,
         bar: dict,
     ) -> dict | None:
         """Attempt to fill a limit buy entry order against a bar.
@@ -44,7 +44,7 @@ class SimulatedExecutor:
 
     def fill_market_exit(
         self,
-        quantity: int,
+        quantity: float,
         bar: dict,
     ) -> dict:
         """Fill a market sell exit order at the bar's open.

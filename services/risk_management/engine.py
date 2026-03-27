@@ -11,7 +11,7 @@ class RiskDecision:
 
     approved: bool
     reason: str
-    adjusted_quantity: int = 0
+    adjusted_quantity: float = 0
 
 
 @dataclass
@@ -114,8 +114,8 @@ class RiskEngine:
         max_position_value = portfolio.nav * (self.position_entry_limit_pct / 100.0)
         proposed_value = quantity * price
         if proposed_value > max_position_value:
-            adjusted_quantity = int(math.floor(max_position_value / price))
-            if adjusted_quantity <= 0:
+            adjusted_quantity = round(max_position_value / price, 4)
+            if adjusted_quantity < 0.0001:
                 return RiskDecision(
                     approved=False,
                     reason=(

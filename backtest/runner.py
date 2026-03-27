@@ -188,7 +188,7 @@ class _Lot:
     """Individual lot within a position."""
 
     ticker: str
-    quantity: int
+    quantity: float
     entry_price: float
     entry_date: Any
     entry_commission: float

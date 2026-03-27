@@ -361,7 +361,7 @@ def make_signals_fn(
             ):
                 support_levels = find_support_levels(data)
                 limit_price = support_levels[0] if support_levels else current_price
-                quantity = max(1, int(initial_capital * position_size_pct / current_price))
+                quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
                 lots.append({
                     "entry_price": current_price,
                     "entry_idx": bar_count,
@@ -387,7 +387,7 @@ def make_signals_fn(
             ):
                 support_levels = find_support_levels(data)
                 limit_price = support_levels[0] if support_levels else current_price
-                quantity = max(1, int(initial_capital * position_size_pct / current_price))
+                quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
                 tracked[ticker] = [{
                     "entry_price": current_price,
                     "entry_idx": bar_count,
@@ -524,7 +524,7 @@ def make_momentum_signals_fn(
         # === Entry logic: buy if in top N and not already tracked ===
         top_tickers = rankings_by_date.get(current_date, [])
         if not lots and ticker in top_tickers:
-            quantity = max(1, int(initial_capital * position_size_pct / current_price))
+            quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
             tracked[ticker] = [{
                 "entry_price": current_price,
                 "entry_idx": bar_count,
@@ -675,7 +675,7 @@ def make_sector_rotation_signals_fn(
         # Entry: buy if in top N and not already tracked
         top_tickers = rankings_by_date.get(current_date, [])
         if not lots and ticker in top_tickers:
-            quantity = max(1, int(initial_capital * position_size_pct / current_price))
+            quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
             tracked[ticker] = [{
                 "entry_price": current_price,
                 "entry_idx": bar_count,
@@ -779,7 +779,7 @@ def make_short_term_mr_signals_fn(
             and bb.value > 0.5
             and volume.value > 0.25
         ):
-            quantity = max(1, int(initial_capital * position_size_pct / current_price))
+            quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
             tracked[ticker] = {
                 "entry_price": current_price,
                 "entry_idx": bar_count,
@@ -914,7 +914,7 @@ def make_thematic_momentum_signals_fn(
         # Entry: in top N AND above 50-day MA
         top_tickers = rankings_by_date.get(current_date, [])
         if not lots and ticker in top_tickers and above_ma:
-            quantity = max(1, int(initial_capital * position_size_pct / current_price))
+            quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
             tracked[ticker] = [{
                 "entry_price": current_price,
                 "entry_idx": bar_count,
@@ -1019,7 +1019,7 @@ def make_quality_value_signals_fn(
         top_tickers = [t for t, _ in ranked[:top_n]]
 
         if not lots and ticker in top_tickers:
-            quantity = max(1, int(initial_capital * position_size_pct / current_price))
+            quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
             tracked[ticker] = [{
                 "entry_price": current_price,
                 "entry_idx": bar_count,
@@ -1117,7 +1117,7 @@ def make_earnings_drift_signals_fn(
         if surprise < surprise_threshold_pct:
             return None
 
-        quantity = max(1, int(initial_capital * position_size_pct / current_price))
+        quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
         tracked[ticker] = {
             "entry_price": current_price,
             "entry_idx": bar_count,
@@ -1187,7 +1187,7 @@ def make_tail_risk_hedge_signals_fn(
         allocation = ALLOCATIONS.get(regime, {})
         if lot is None and ticker in allocation:
             weight = allocation[ticker]
-            quantity = max(1, int(initial_capital * position_size_pct * weight / current_price))
+            quantity = round(max(0.0001, initial_capital * position_size_pct * weight / current_price), 4)
             tracked[ticker] = {
                 "entry_price": current_price,
                 "regime_at_entry": regime,
