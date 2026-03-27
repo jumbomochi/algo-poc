@@ -41,6 +41,7 @@ class BacktestRunner:
         bars_by_ticker: dict[str, list[dict]],
         signals_fn: Callable[[str, list[dict]], dict | None],
         risk_engine: Any,
+        trade_start_date: Any = None,
     ) -> BacktestResult:
         """Run a backtest over the provided bar data.
 
@@ -52,6 +53,9 @@ class BacktestRunner:
                 quantity, sector (for buys).
             risk_engine: Object with check_entry(ticker, quantity, price,
                 sector, portfolio) -> decision with .approved, .adjusted_quantity.
+            trade_start_date: If set, only allow new buy entries on or after this
+                date. Earlier bars are still fed to signals_fn for indicator
+                warm-up. Sell signals for existing positions are always processed.
 
         Returns:
             BacktestResult with trades, portfolio_values, and metrics.
@@ -115,6 +119,9 @@ class BacktestRunner:
                         })
 
                 elif action == "buy":
+                    # Skip new entries before trade_start_date
+                    if trade_start_date is not None and current_date < trade_start_date:
+                        continue
                     # Check risk with existing lot count
                     existing_lots = positions.get(ticker, [])
                     limit_price = signal["limit_price"]

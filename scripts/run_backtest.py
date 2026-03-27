@@ -1678,13 +1678,22 @@ def main():
                         help="Path to trained signal quality model (LightGBM .txt file)")
     parser.add_argument("--ml-threshold", type=float, default=0.55,
                         help="ML filter confidence threshold (default: 0.55)")
+    parser.add_argument("--start-date", type=str, default=None,
+                        help="Only open new trades on or after this date (YYYY-MM-DD). "
+                             "Earlier data is still used for indicator warm-up.")
     args = parser.parse_args()
+
+    trade_start_date = None
+    if args.start_date:
+        trade_start_date = date.fromisoformat(args.start_date)
 
     tickers = SP500_TOP50[:args.tickers]
     print(f"Backtest Configuration:")
     print(f"  Tickers: {len(tickers)} (top S&P 500)")
     print(f"  History:  {args.years} years")
     print(f"  Capital:  ${args.capital:,.0f}")
+    if trade_start_date:
+        print(f"  Trade start: {trade_start_date}")
     print(f"  Slippage: {args.slippage_bps} bps")
     print(f"  Commission: ${args.commission}/share")
     print()
@@ -1924,7 +1933,7 @@ def main():
     for name, pc in portfolios.items():
         print(f"  Running portfolio '{name}' (${pc.capital:,.0f})...")
         runner = BacktestRunner(executor=executor, initial_capital=pc.capital)
-        results[name] = runner.run(bars_by_ticker, pc.signals_fn, pc.risk_engine)
+        results[name] = runner.run(bars_by_ticker, pc.signals_fn, pc.risk_engine, trade_start_date=trade_start_date)
     elapsed = time.time() - t0
 
     # Enrich trades with bar-derived features (for ML training)
