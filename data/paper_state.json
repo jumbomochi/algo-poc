@@ -1,0 +1,60 @@
+{
+  "portfolios": {
+    "mean_reversion": {
+      "capital": 12000.0,
+      "cash": 12000.0,
+      "positions": {},
+      "trades": [],
+      "equity_history": []
+    },
+    "momentum": {
+      "capital": 18000.0,
+      "cash": 18000.0,
+      "positions": {},
+      "trades": [],
+      "equity_history": []
+    },
+    "sector_rotation": {
+      "capital": 12000.0,
+      "cash": 12000.0,
+      "positions": {},
+      "trades": [],
+      "equity_history": []
+    },
+    "quality_value": {
+      "capital": 12000.0,
+      "cash": 12000.0,
+      "positions": {},
+      "trades": [],
+      "equity_history": []
+    },
+    "earnings_drift": {
+      "capital": 15000.0,
+      "cash": 15000.0,
+      "positions": {},
+      "trades": [],
+      "equity_history": []
+    },
+    "short_term_mr": {
+      "capital": 10000.0,
+      "cash": 10000.0,
+      "positions": {},
+      "trades": [],
+      "equity_history": []
+    },
+    "thematic_momentum": {
+      "capital": 11000.0,
+      "cash": 11000.0,
+      "positions": {},
+      "trades": [],
+      "equity_history": []
+    },
+    "tail_risk_hedge": {
+      "capital": 10000.0,
+      "cash": 10000.0,
+      "positions": {},
+      "trades": [],
+      "equity_history": []
+    }
+  }
+}
