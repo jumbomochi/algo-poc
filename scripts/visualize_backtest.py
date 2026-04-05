@@ -451,8 +451,15 @@ def _strategy_comparison_chart(data: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _trade_chart(trade: dict[str, Any], bars: list[dict[str, Any]]) -> str:
-    """Candlestick chart for a single trade with entry/exit markers and support levels."""
+def _fig_to_compact_json(fig: go.Figure) -> str:
+    """Serialize a Plotly figure to JSON, stripping the bulky template."""
+    fig_dict = json.loads(fig.to_json())
+    fig_dict.get("layout", {}).pop("template", None)
+    return json.dumps(fig_dict, separators=(",", ":"))
+
+
+def _trade_figure(trade: dict[str, Any], bars: list[dict[str, Any]]) -> go.Figure | None:
+    """Build a Plotly figure for a single trade (candlestick + entry/exit + support)."""
     ticker = trade["ticker"]
     entry_date = trade["entry_date"]
     exit_date = trade["exit_date"]
@@ -469,9 +476,6 @@ def _trade_chart(trade: dict[str, Any], bars: list[dict[str, Any]]) -> str:
         try:
             return bar_dates.index(target_date)
         except ValueError:
-            # Fallback: find closest date
-            diffs = [abs(hash(d) - hash(target_date)) for d in bar_dates]
-            # Actually compare as strings — dates are YYYY-MM-DD so string comparison works
             closest = min(range(len(bar_dates)), key=lambda i: abs(
                 (int(bar_dates[i].replace("-", "")) - int(target_date.replace("-", "")))
             ))
@@ -486,7 +490,7 @@ def _trade_chart(trade: dict[str, Any], bars: list[dict[str, Any]]) -> str:
     window_bars = bars[start_idx:end_idx + 1]
 
     if not window_bars:
-        return ""
+        return None
 
     w_dates = [b["date"] for b in window_bars]
     w_open = [b["open"] for b in window_bars]
@@ -544,7 +548,6 @@ def _trade_chart(trade: dict[str, Any], bars: list[dict[str, Any]]) -> str:
         }
         try:
             all_levels = find_support_levels(support_data)
-            # Filter to levels within visible price range
             price_min = min(w_low)
             price_max = max(w_high)
             visible_levels = [lvl for lvl in all_levels if price_min <= lvl <= price_max]
@@ -605,6 +608,14 @@ def _trade_chart(trade: dict[str, Any], bars: list[dict[str, Any]]) -> str:
         xaxis_rangeslider_visible=False,
         height=450,
     )
+    return fig
+
+
+def _trade_chart(trade: dict[str, Any], bars: list[dict[str, Any]]) -> str:
+    """Candlestick chart HTML for a single trade."""
+    fig = _trade_figure(trade, bars)
+    if fig is None:
+        return ""
     return fig.to_html(full_html=False, include_plotlyjs=False)
 
 
@@ -614,41 +625,116 @@ def _trade_chart(trade: dict[str, Any], bars: list[dict[str, Any]]) -> str:
 
 _NAV_JS = """
 <script>
-function filterTrades() {
+var PAGE_SIZE = 20;
+var currentPage = 0;
+var filteredIndices = [];
+var renderedPlots = {};
+
+function getFilteredAndSorted() {
     var portfolioEl = document.getElementById('portfolio-filter');
     var portfolio = portfolioEl ? portfolioEl.value : 'all';
-    var ticker = document.getElementById('ticker-filter').value;
-    var sort = document.getElementById('sort-select').value;
-    var cards = Array.from(document.querySelectorAll('.trade-card'));
+    var tickerEl = document.getElementById('ticker-filter');
+    var ticker = tickerEl ? tickerEl.value : 'all';
+    var sortEl = document.getElementById('sort-select');
+    var sort = sortEl ? sortEl.value : 'date';
 
-    // Show/hide based on portfolio and ticker filter
-    cards.forEach(function(card) {
-        var matchPortfolio = portfolio === 'all' || card.getAttribute('data-portfolio') === portfolio;
-        var matchTicker = ticker === 'all' || card.getAttribute('data-ticker') === ticker;
-        card.style.display = (matchPortfolio && matchTicker) ? '' : 'none';
-    });
+    // Filter trade metadata
+    var indices = [];
+    for (var i = 0; i < TRADE_META.length; i++) {
+        var m = TRADE_META[i];
+        var matchPortfolio = portfolio === 'all' || m.portfolio === portfolio;
+        var matchTicker = ticker === 'all' || m.ticker === ticker;
+        if (matchPortfolio && matchTicker) indices.push(i);
+    }
 
-    // Sort visible cards
-    var container = document.getElementById('trade-container');
-    var visible = cards.filter(function(c) { return c.style.display !== 'none'; });
-
-    visible.sort(function(a, b) {
-        if (sort === 'date') {
-            return a.getAttribute('data-date').localeCompare(b.getAttribute('data-date'));
-        } else if (sort === 'pnl-best') {
-            return parseFloat(b.getAttribute('data-pnl')) - parseFloat(a.getAttribute('data-pnl'));
-        } else if (sort === 'pnl-worst') {
-            return parseFloat(a.getAttribute('data-pnl')) - parseFloat(b.getAttribute('data-pnl'));
-        } else if (sort === 'ticker') {
-            return a.getAttribute('data-ticker').localeCompare(b.getAttribute('data-ticker'));
-        }
+    // Sort
+    indices.sort(function(a, b) {
+        var ma = TRADE_META[a], mb = TRADE_META[b];
+        if (sort === 'date') return ma.date.localeCompare(mb.date);
+        if (sort === 'pnl-best') return mb.pnl - ma.pnl;
+        if (sort === 'pnl-worst') return ma.pnl - mb.pnl;
+        if (sort === 'ticker') return ma.ticker.localeCompare(mb.ticker);
         return 0;
     });
-
-    visible.forEach(function(card) {
-        container.appendChild(card);
-    });
+    return indices;
 }
+
+function purgeRendered() {
+    for (var id in renderedPlots) {
+        var el = document.getElementById(id);
+        if (el && typeof Plotly !== 'undefined') Plotly.purge(el);
+    }
+    renderedPlots = {};
+}
+
+function renderPage() {
+    purgeRendered();
+    var container = document.getElementById('trade-container');
+    container.innerHTML = '';
+
+    var start = currentPage * PAGE_SIZE;
+    var end = Math.min(start + PAGE_SIZE, filteredIndices.length);
+
+    for (var i = start; i < end; i++) {
+        var idx = filteredIndices[i];
+        var m = TRADE_META[idx];
+        var plotId = 'plot-' + idx;
+        var card = document.createElement('div');
+        card.className = 'trade-card';
+        card.innerHTML = '<div id="' + plotId + '" style="height:450px;width:100%;"></div>';
+        container.appendChild(card);
+
+        var fig = TRADE_FIGURES[idx];
+        if (fig && typeof Plotly !== 'undefined') {
+            var layout = Object.assign({template: 'plotly_dark'}, fig.layout);
+            Plotly.newPlot(plotId, fig.data, layout, {responsive: true});
+            renderedPlots[plotId] = true;
+        }
+    }
+
+    updatePaginationInfo();
+}
+
+function updatePaginationInfo() {
+    var totalPages = Math.max(1, Math.ceil(filteredIndices.length / PAGE_SIZE));
+    var info = document.getElementById('page-info');
+    if (info) {
+        info.textContent = 'Page ' + (currentPage + 1) + ' of ' + totalPages +
+            ' (' + filteredIndices.length + ' trades)';
+    }
+    var prevBtn = document.getElementById('prev-btn');
+    var nextBtn = document.getElementById('next-btn');
+    if (prevBtn) prevBtn.disabled = currentPage === 0;
+    if (nextBtn) nextBtn.disabled = currentPage >= totalPages - 1;
+}
+
+function filterTrades() {
+    currentPage = 0;
+    filteredIndices = getFilteredAndSorted();
+    renderPage();
+}
+
+function prevPage() {
+    if (currentPage > 0) {
+        currentPage--;
+        renderPage();
+        document.getElementById('trade-container').scrollIntoView({behavior: 'smooth'});
+    }
+}
+
+function nextPage() {
+    var totalPages = Math.ceil(filteredIndices.length / PAGE_SIZE);
+    if (currentPage < totalPages - 1) {
+        currentPage++;
+        renderPage();
+        document.getElementById('trade-container').scrollIntoView({behavior: 'smooth'});
+    }
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    filteredIndices = getFilteredAndSorted();
+    renderPage();
+});
 </script>
 """
 
@@ -758,10 +844,19 @@ th, td {{ padding: 8px; text-align: left; }}
             <option value="ticker">By Ticker</option>
         </select>
     </label>
+    <div style="display:flex;gap:8px;align-items:center;margin-left:auto;">
+        <button id="prev-btn" onclick="prevPage()"
+            style="background:{DARK_BG};color:{TEXT_COLOR};border:1px solid #444;border-radius:4px;padding:6px 14px;cursor:pointer;">&laquo; Prev</button>
+        <span id="page-info" style="font-size:13px;color:#aaa;min-width:160px;text-align:center;">Page 1</span>
+        <button id="next-btn" onclick="nextPage()"
+            style="background:{DARK_BG};color:{TEXT_COLOR};border:1px solid #444;border-radius:4px;padding:6px 14px;cursor:pointer;">Next &raquo;</button>
+    </div>
 </div>
 """)
 
-    parts.append('<div id="trade-container">')
+    # Build figure JSON array and trade metadata for JS-side rendering
+    trade_meta: list[dict[str, Any]] = []
+    trade_figures: list[str] = []  # JSON strings
     for trade in trades_sorted:
         ticker = trade["ticker"]
         pnl = trade["pnl"]
@@ -769,19 +864,24 @@ th, td {{ padding: 8px; text-align: left; }}
         portfolio = trade.get("portfolio", "unknown")
         ticker_bars = bars.get(ticker, [])
 
-        chart_html = _trade_chart(trade, ticker_bars)
+        fig = _trade_figure(trade, ticker_bars)
+        trade_meta.append({
+            "ticker": ticker,
+            "pnl": pnl,
+            "date": entry_date,
+            "portfolio": portfolio,
+        })
+        trade_figures.append(_fig_to_compact_json(fig) if fig else "null")
 
-        parts.append(
-            f'<div class="trade-card" data-ticker="{ticker}" '
-            f'data-pnl="{pnl}" data-date="{entry_date}" '
-            f'data-portfolio="{portfolio}">'
-        )
-        parts.append(chart_html)
-        parts.append("</div>")
-    parts.append("</div>")  # trade-container
+    parts.append("<script>")
+    parts.append(f"var TRADE_META = {json.dumps(trade_meta, separators=(',', ':'))};")
+    parts.append("var TRADE_FIGURES = [" + ",".join(trade_figures) + "];")
+    parts.append("</script>")
+
+    parts.append('<div id="trade-container"></div>')
     parts.append("</div>")  # section
 
-    # Navigation JS (multi-portfolio version)
+    # Navigation JS (renders charts on demand from TRADE_FIGURES)
     parts.append(_NAV_JS)
 
     parts.append("</body>\n</html>")
@@ -881,25 +981,40 @@ h1, h2, h3 {{ color: {TEXT_COLOR}; }}
             <option value="ticker">By Ticker</option>
         </select>
     </label>
+    <div style="display:flex;gap:8px;align-items:center;margin-left:auto;">
+        <button id="prev-btn" onclick="prevPage()"
+            style="background:{DARK_BG};color:{TEXT_COLOR};border:1px solid #444;border-radius:4px;padding:6px 14px;cursor:pointer;">&laquo; Prev</button>
+        <span id="page-info" style="font-size:13px;color:#aaa;min-width:160px;text-align:center;">Page 1</span>
+        <button id="next-btn" onclick="nextPage()"
+            style="background:{DARK_BG};color:{TEXT_COLOR};border:1px solid #444;border-radius:4px;padding:6px 14px;cursor:pointer;">Next &raquo;</button>
+    </div>
 </div>
 """)
 
-    parts.append('<div id="trade-container">')
+    # Build figure JSON array and trade metadata for JS-side rendering
+    trade_meta: list[dict[str, Any]] = []
+    trade_figures: list[str] = []
     for trade in trades_sorted:
         ticker = trade["ticker"]
         pnl = trade["pnl"]
         entry_date = trade.get("entry_date", "")
         ticker_bars = bars.get(ticker, [])
 
-        chart_html = _trade_chart(trade, ticker_bars)
+        fig = _trade_figure(trade, ticker_bars)
+        trade_meta.append({
+            "ticker": ticker,
+            "pnl": pnl,
+            "date": entry_date,
+            "portfolio": "",
+        })
+        trade_figures.append(_fig_to_compact_json(fig) if fig else "null")
 
-        parts.append(
-            f'<div class="trade-card" data-ticker="{ticker}" '
-            f'data-pnl="{pnl}" data-date="{entry_date}">'
-        )
-        parts.append(chart_html)
-        parts.append("</div>")
-    parts.append("</div>")  # trade-container
+    parts.append("<script>")
+    parts.append(f"var TRADE_META = {json.dumps(trade_meta, separators=(',', ':'))};")
+    parts.append("var TRADE_FIGURES = [" + ",".join(trade_figures) + "];")
+    parts.append("</script>")
+
+    parts.append('<div id="trade-container"></div>')
     parts.append("</div>")  # section
 
     # Navigation JS
