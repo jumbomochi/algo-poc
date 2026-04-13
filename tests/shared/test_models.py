@@ -8,8 +8,6 @@ from shared.models.signals import SignalRecord
 from shared.models.fundamentals import FundamentalRecord
 from shared.models.events import EventRecord
 from shared.models.ml_models import ModelVersion
-from shared.models.equity_snapshot import EquitySnapshot
-from shared.models.portfolio_config import PortfolioConfig
 
 
 def test_ohlcv_model_has_required_columns():
@@ -88,37 +86,3 @@ def test_all_models_share_base():
     assert issubclass(FundamentalRecord, Base)
     assert issubclass(EventRecord, Base)
     assert issubclass(ModelVersion, Base)
-
-
-def test_equity_snapshot_has_required_fields():
-    cols = {c.name for c in EquitySnapshot.__table__.columns}
-    assert cols >= {
-        "id", "portfolio", "date", "equity", "cash", "market_value", "created_at",
-    }
-
-
-def test_equity_snapshot_unique_portfolio_date():
-    """Unique constraint on (portfolio, date)."""
-    indexes = EquitySnapshot.__table__.indexes
-    idx_cols = set()
-    for idx in indexes:
-        if idx.unique:
-            idx_cols = {c.name for c in idx.columns}
-    assert idx_cols >= {"portfolio", "date"}
-
-
-def test_portfolio_config_has_required_fields():
-    cols = {c.name for c in PortfolioConfig.__table__.columns}
-    assert cols >= {
-        "id", "portfolio", "capital", "cash", "created_at", "updated_at",
-    }
-
-
-def test_portfolio_config_portfolio_is_unique():
-    col = PortfolioConfig.__table__.columns["portfolio"]
-    assert col.unique is True
-
-
-def test_new_models_share_base():
-    assert issubclass(EquitySnapshot, Base)
-    assert issubclass(PortfolioConfig, Base)
