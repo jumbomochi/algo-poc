@@ -3,7 +3,7 @@
 
 Reuses the exact same signal functions from the backtest system.
 Fetches latest bars from IB Gateway, runs all 8 signal functions,
-and prints resulting signals. State persists to JSON between runs.
+and prints resulting signals. State persists to PostgreSQL between runs.
 
 Usage:
     python scripts/run_paper.py --init            # Initialize fresh state
@@ -15,6 +15,14 @@ from __future__ import annotations
 import argparse
 import sys
 from datetime import date
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from shared.config import load_config
+from shared.models.portfolio_config import PortfolioConfig as PortfolioConfigModel
+from shared.models.portfolio import Position, Trade
+from shared.models.equity_snapshot import EquitySnapshot
 
 from scripts.paper_state import PaperTradingState
 from scripts.run_backtest import (
@@ -37,9 +45,6 @@ from scripts.fetch_fundamentals import load_fundamentals_cache, build_fundamenta
 from scripts.fetch_earnings import load_earnings_cache, build_earnings_lookup
 from backtest.aggregate_risk import AggregateRiskMonitor
 from services.risk_management.engine import RiskEngine
-
-
-DEFAULT_STATE_PATH = "data/paper_state.json"
 
 CAPITAL_ALLOCATIONS = {
     "mean_reversion": 0.12,
@@ -201,24 +206,25 @@ def print_status(state: PaperTradingState) -> None:
     total_capital = 0.0
     total_positions = 0
 
-    for name, pf in state.portfolios.items():
-        cash = pf["cash"]
-        positions = pf["positions"]
+    for name in state.get_portfolio_names():
+        capital = state.get_capital(name)
+        cash = state.get_cash(name)
+        positions = state.get_positions(name)
         n_pos = len(positions)
         total_positions += n_pos
-        total_capital += pf["capital"]
+        total_capital += capital
 
         market_value = sum(
-            pos["quantity"] * pos["entry_price"]
+            pos["quantity"] * pos["avg_entry_price"]
             for pos in positions.values()
         )
         equity = cash + market_value
         total_equity += equity
-        pnl = equity - pf["capital"]
-        n_trades = len(pf["trades"])
+        pnl = equity - capital
+        n_trades = len(state.get_trades(name))
 
         print(f"\n  --- {name} ---")
-        print(f"    Capital:    ${pf['capital']:>12,.2f}")
+        print(f"    Capital:    ${capital:>12,.2f}")
         print(f"    Cash:       ${cash:>12,.2f}")
         print(f"    Equity:     ${equity:>12,.2f}")
         print(f"    P&L:        ${pnl:>+12,.2f}")
@@ -227,7 +233,7 @@ def print_status(state: PaperTradingState) -> None:
 
         if positions:
             for ticker, pos in positions.items():
-                print(f"      {ticker:>6s}  {pos['quantity']:>4d} shares @ ${pos['entry_price']:.2f}")
+                print(f"      {ticker:>6s}  {pos['quantity']:>8.4f} shares @ ${pos['avg_entry_price']:.2f}")
 
     print(f"\n  --- TOTAL ---")
     print(f"    Capital:    ${total_capital:>12,.2f}")
@@ -264,6 +270,12 @@ def run_daily(
     signals_generated: list[dict] = []
     today = date.today()
 
+    # Build current prices from latest bar close
+    current_prices: dict[str, float] = {}
+    for ticker, bars in bars_by_ticker.items():
+        if bars:
+            current_prices[ticker] = bars[-1]["close"]
+
     for name, pc in portfolios.items():
         universe = list(bars_by_ticker.keys())
 
@@ -283,62 +295,132 @@ def run_daily(
                 qty = signal.get("quantity", 0)
 
                 if action == "buy":
-                    print(f"  BUY  {ticker:>6s}  {qty:>4d} @ ${price:>8.2f}  [{name}]")
+                    entry_signals = {
+                        k: v for k, v in signal.items()
+                        if k not in ("action", "limit_price", "quantity", "portfolio", "date")
+                    }
+                    state.record_fill(
+                        portfolio=name,
+                        ticker=ticker,
+                        action="buy",
+                        quantity=qty,
+                        price=price,
+                        fill_date=today,
+                        entry_signals=entry_signals,
+                    )
+                    print(f"  BUY  {ticker:>6s}  {qty:>8.4f} @ ${price:>8.2f}  [{name}]")
                 elif action == "sell":
                     reason = signal.get("exit_reason", "signal")
+                    state.record_fill(
+                        portfolio=name,
+                        ticker=ticker,
+                        action="sell",
+                        quantity=qty,
+                        price=price,
+                        fill_date=today,
+                        exit_reason=reason,
+                    )
                     print(f"  SELL {ticker:>6s}             @ ${price:>8.2f}  [{name}] ({reason})")
+
+        # After all signals for this portfolio, update peaks and record snapshot
+        state.update_peak_prices(name, current_prices)
+        equity = state.compute_equity(name, current_prices)
+        cash = state.get_cash(name)
+        market_value = equity - cash
+        state.record_equity_snapshot(name, today, equity, cash, market_value)
+
+    # Record aggregate equity snapshot
+    total_equity = 0.0
+    total_cash = 0.0
+    for name in state.get_portfolio_names():
+        total_equity += state.compute_equity(name, current_prices)
+        total_cash += state.get_cash(name)
+    total_market_value = total_equity - total_cash
+    state.record_equity_snapshot("_aggregate", today, total_equity, total_cash, total_market_value)
 
     return signals_generated
 
 
+def make_db_session(db_url: str) -> Session:
+    """Create a SQLAlchemy session from a database URL."""
+    engine = create_engine(db_url)
+    session_factory = sessionmaker(bind=engine)
+    return session_factory()
+
+
 def main():
+    # Load default DB URL from config (may fail if config file missing, that's OK)
+    try:
+        default_db_url = load_config("config/default.yaml").database.url
+    except Exception:
+        default_db_url = "postgresql://algo:algo@localhost:5432/algo_poc"
+
     parser = argparse.ArgumentParser(description="Daily paper trading runner")
     parser.add_argument("--capital", type=float, default=100_000,
                         help="Total capital (default: 100000)")
-    parser.add_argument("--state-file", default=DEFAULT_STATE_PATH,
-                        help="Path to state JSON file")
+    parser.add_argument("--db-url", default=default_db_url,
+                        help="PostgreSQL database URL")
     parser.add_argument("--years", type=int, default=1,
                         help="Years of historical bars for signal warmup (default: 1)")
     parser.add_argument("--init", action="store_true",
                         help="Initialize fresh paper trading state")
     parser.add_argument("--status", action="store_true",
                         help="Print current status and exit")
+    parser.add_argument("--reset", action="store_true",
+                        help="Wipe all paper trading state tables")
     parser.add_argument("--ib-host", default="127.0.0.1")
     parser.add_argument("--ib-port", type=int, default=7497)
     args = parser.parse_args()
 
+    session = make_db_session(args.db_url)
+
+    # --reset: wipe all paper state tables
+    if args.reset:
+        confirm = input("This will DELETE all paper trading data. Type 'yes' to confirm: ")
+        if confirm.strip().lower() != "yes":
+            print("Aborted.")
+            return
+        session.execute(EquitySnapshot.__table__.delete())
+        session.execute(Trade.__table__.delete())
+        session.execute(Position.__table__.delete())
+        session.execute(PortfolioConfigModel.__table__.delete())
+        session.commit()
+        print("All paper trading state wiped.")
+        session.close()
+        return
+
     # --init: create fresh state
     if args.init:
         capitals = {name: args.capital * pct for name, pct in CAPITAL_ALLOCATIONS.items()}
-        state = PaperTradingState.create_new(capitals, args.state_file)
-        state.save()
-        print(f"Initialized paper trading state at {args.state_file}")
+        PaperTradingState.create_new(capitals, session)
+        session.commit()
+        print(f"Initialized paper trading state in database")
         print(f"Total capital: ${args.capital:,.0f}")
         for name, cap in capitals.items():
             print(f"  {name}: ${cap:,.0f}")
+        session.close()
         return
 
     # --status: print current state
     if args.status:
         try:
-            state = PaperTradingState.load(args.state_file)
-        except FileNotFoundError:
-            print(f"No state file found at {args.state_file}")
-            print("Run with --init to create one.")
+            state = PaperTradingState.load(session)
+        except ValueError as e:
+            print(str(e))
             sys.exit(1)
         print_status(state)
+        session.close()
         return
 
     # Daily run
     try:
-        state = PaperTradingState.load(args.state_file)
-    except FileNotFoundError:
-        print(f"No state file found at {args.state_file}")
-        print("Run with --init to create one.")
+        state = PaperTradingState.load(session)
+    except ValueError as e:
+        print(str(e))
         sys.exit(1)
 
     print(f"Paper Trading Daily Run - {date.today()}")
-    print(f"State loaded from {args.state_file}")
+    print(f"State loaded from database")
 
     # Fetch bars from IB
     all_tickers = get_union_universe(list(CAPITAL_ALLOCATIONS.keys()))
@@ -381,9 +463,10 @@ def main():
     else:
         print("\nNo signals generated today")
 
-    # Save state
-    state.save()
-    print(f"\nState saved to {args.state_file}")
+    # Commit state to database
+    session.commit()
+    print(f"\nState committed to database")
+    session.close()
 
 
 if __name__ == "__main__":
