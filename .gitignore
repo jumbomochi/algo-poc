@@ -9,3 +9,5 @@ config/secrets.yaml
 *.db
 .env
 output/
+.DS_Store
+data/cache/*.json
