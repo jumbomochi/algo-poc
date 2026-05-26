@@ -1,10 +1,24 @@
 # Trading Strategy: Dual Mean-Reversion + Momentum
 
+> **⚠ Historical document — superseded 2026-05-26.**
+> This file describes the original dual-strategy design and the per-signal math
+> that still applies. **The mean-reversion sleeve has been dropped from the
+> active portfolio** along with `short_term_mr` after both posted negative
+> trade-level expectancy. The signal-computation sections below are still
+> accurate and used by the surviving momentum / sector-rotation / thematic /
+> quality-value / earnings-drift / tail-risk sleeves.
+>
+> For the **current** portfolio config (allocations, performance, source
+> files), see [`docs/strategies/portfolio-2026-05.md`](strategies/portfolio-2026-05.md).
+> For **why** the mean-reversion sleeves were dropped and the conditions for
+> reviving them, see [`docs/strategies/mean-reversion-failure-analysis.md`](strategies/mean-reversion-failure-analysis.md).
+
 ## Overview
 
 A dual-strategy system that trades the top 50 S&P 500 stocks by market cap, combining mean-reversion (buying dips at support) with relative-strength momentum (buying sustained uptrends). Both strategies share a common risk engine and trailing stop exit mechanism. Inverse ETFs (SH, PSQ) are included in the momentum universe for natural bear market hedging.
 
 **10-year backtest (2016-2026):** 19.1% CAGR, Sharpe 1.51, 17.89% max drawdown, $100k -> $576k.
+*(Original dual-strategy numbers from prior to the multi-portfolio expansion. The current 6-sleeve aggregate is 17.98% CAGR / Sharpe 1.97 / Max DD 10.85% / $100K → $520K — see portfolio-2026-05.md.)*
 
 ## Signal Computation Details
 

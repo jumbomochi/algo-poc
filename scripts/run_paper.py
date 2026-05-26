@@ -36,8 +36,6 @@ from scripts.run_backtest import (
     make_momentum_signals_fn,
     make_quality_value_signals_fn,
     make_sector_rotation_signals_fn,
-    make_short_term_mr_signals_fn,
-    make_signals_fn,
     make_tail_risk_hedge_signals_fn,
     make_thematic_momentum_signals_fn,
 )
@@ -46,15 +44,19 @@ from scripts.fetch_earnings import load_earnings_cache, build_earnings_lookup
 from backtest.aggregate_risk import AggregateRiskMonitor
 from services.risk_management.engine import RiskEngine
 
+# Capital allocations across the 6 active sleeves.
+# mean_reversion and short_term_mr were dropped 2026-05-26 after both posted
+# negative trade-level expectancy over the 9.97-year backtest. Their $22K
+# combined allocation was redistributed proportionally across the survivors
+# (each weight scaled by 100/78). See docs/strategies/mean-reversion-failure-
+# analysis.md for the analysis and the macro conditions under which to revive.
 CAPITAL_ALLOCATIONS = {
-    "mean_reversion": 0.12,
-    "momentum": 0.18,
-    "sector_rotation": 0.12,
-    "quality_value": 0.12,
-    "earnings_drift": 0.15,
-    "short_term_mr": 0.10,
-    "thematic_momentum": 0.11,
-    "tail_risk_hedge": 0.10,
+    "momentum": 0.2308,
+    "sector_rotation": 0.1538,
+    "thematic_momentum": 0.1410,
+    "quality_value": 0.1538,
+    "earnings_drift": 0.1923,
+    "tail_risk_hedge": 0.1283,
 }
 
 
@@ -65,21 +67,14 @@ def build_portfolios(
     fundamentals_lookup,
     earnings_lookup,
 ) -> dict[str, PortfolioConfig]:
-    """Build all 8 portfolio configs (same params as backtest main())."""
-    portfolios = {}
+    """Build the 6 active portfolio configs (same params as backtest main()).
 
-    mr_cap = capital * CAPITAL_ALLOCATIONS["mean_reversion"]
-    portfolios["mean_reversion"] = PortfolioConfig(
-        name="mean_reversion",
-        capital=mr_cap,
-        signals_fn=make_signals_fn(
-            position_size_pct=0.12, initial_capital=mr_cap, trailing_stop_pct=0.10,
-        ),
-        risk_engine=RiskEngine(
-            position_entry_limit_pct=15.0, sector_concentration_pct=30.0,
-            total_exposure_limit_pct=120.0, max_lots_per_ticker=2,
-        ),
-    )
+    mean_reversion and short_term_mr were dropped 2026-05-26 — their signal-fn
+    definitions remain in scripts/run_backtest.py for future revival but are
+    no longer instantiated here. See docs/strategies/mean-reversion-failure-
+    analysis.md for revival conditions.
+    """
+    portfolios = {}
 
     mom_cap = capital * CAPITAL_ALLOCATIONS["momentum"]
     portfolios["momentum"] = PortfolioConfig(
@@ -133,19 +128,6 @@ def build_portfolios(
             earnings_lookup=earnings_lookup, surprise_threshold_pct=5.0,
             max_hold_days=20, position_size_pct=0.08, initial_capital=ed_cap,
             trailing_stop_pct=0.06, regime_by_date=regime_by_date,
-        ),
-        risk_engine=RiskEngine(
-            position_entry_limit_pct=8.0, sector_concentration_pct=30.0,
-            total_exposure_limit_pct=100.0, max_lots_per_ticker=1,
-        ),
-    )
-
-    stmr_cap = capital * CAPITAL_ALLOCATIONS["short_term_mr"]
-    portfolios["short_term_mr"] = PortfolioConfig(
-        name="short_term_mr",
-        capital=stmr_cap,
-        signals_fn=make_short_term_mr_signals_fn(
-            position_size_pct=0.08, initial_capital=stmr_cap, max_hold_days=5,
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=8.0, sector_concentration_pct=30.0,
