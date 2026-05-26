@@ -95,6 +95,13 @@ def _multi_summary_panel(data: dict[str, Any]) -> str:
     portfolios = data["portfolios"]
 
     # Aggregate metric cards
+    # Total capital = sum of per-portfolio allocations (config['portfolios'] is a
+    # dict of name -> capital). Fall back to top-level initial_capital for older
+    # JSONs that didn't write the portfolios map.
+    total_capital = (
+        sum(config.get("portfolios", {}).values())
+        or config.get("initial_capital", 0)
+    )
     cards = [
         ("Total Return", f"{agg_metrics.get('total_return', 0):.2%}"),
         ("Sharpe Ratio", f"{agg_metrics.get('sharpe_ratio', 0):.2f}"),
@@ -102,7 +109,7 @@ def _multi_summary_panel(data: dict[str, Any]) -> str:
         ("Win Rate", f"{agg_metrics.get('win_rate', 0):.2%}"),
         ("Total Trades", f"{agg_metrics.get('total_trades', 0)}"),
         ("Strategies", f"{len(portfolios)}"),
-        ("Total Capital", f"${config.get('total_capital', 0):,.0f}"),
+        ("Total Capital", f"${total_capital:,.0f}"),
     ]
 
     html_cards = ""
@@ -120,7 +127,13 @@ def _multi_summary_panel(data: dict[str, Any]) -> str:
     for name, pdata in portfolios.items():
         m = pdata["metrics"]
         cap = pdata["config"].get("capital", 0)
-        strat_pnl = sum(t["pnl"] for t in pdata.get("trades", []))
+        # Use mark-to-market P&L (final portfolio value minus starting capital) so the
+        # column matches the Total Return % shown alongside it. Summing trades["pnl"]
+        # would only count *closed* trades and exclude unrealized P&L in still-open
+        # positions at end of backtest, producing rows that look internally
+        # inconsistent (e.g. 790% return but a P&L that doesn't equal 790% × cap).
+        pv = pdata.get("portfolio_values") or []
+        strat_pnl = (pv[-1] - cap) if pv else 0.0
         table_rows += (
             f"<tr>"
             f"<td>{name}</td>"
