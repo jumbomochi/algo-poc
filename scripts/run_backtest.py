@@ -1681,6 +1681,10 @@ def main():
     parser.add_argument("--start-date", type=str, default=None,
                         help="Only open new trades on or after this date (YYYY-MM-DD). "
                              "Earlier data is still used for indicator warm-up.")
+    parser.add_argument("--bars-from-json", type=str, default=None,
+                        help="Path to a prior backtest results JSON. Skips the IB fetch "
+                             "and loads the cached bars from that file. Useful when IB "
+                             "Gateway is unavailable or for fast iteration.")
     args = parser.parse_args()
 
     trade_start_date = None
@@ -1699,19 +1703,39 @@ def main():
     print()
 
     # 1. Fetch data from IB
+    # NOTE: mean_reversion and short_term_mr removed 2026-05-26 — see
+    # docs/strategies/mean-reversion-failure-analysis.md
     all_tickers = get_union_universe([
-        "mean_reversion", "momentum", "sector_rotation",
-        "short_term_mr", "thematic_momentum",
+        "momentum", "sector_rotation",
+        "thematic_momentum",
         "quality_value", "earnings_drift",
         "tail_risk_hedge",
     ])
-    print(f"Step 1: Fetching historical data from IB Gateway ({len(all_tickers)} tickers)...")
-    bars_by_ticker = fetch_bars_from_ib(
-        tickers=all_tickers,
-        years=args.years,
-        host=args.ib_host,
-        port=args.ib_port,
-    )
+    if args.bars_from_json:
+        print(f"Step 1: Loading cached bars from {args.bars_from_json}...")
+        with open(args.bars_from_json) as f:
+            cached = json.load(f)
+        bars_raw = cached.get("bars") or {}
+        all_set = set(all_tickers)
+        bars_by_ticker = {
+            ticker: [
+                {**b, "date": date.fromisoformat(b["date"])}
+                for b in bars
+            ]
+            for ticker, bars in bars_raw.items()
+            if ticker in all_set
+        }
+        missing = [t for t in all_tickers if t not in bars_by_ticker]
+        if missing:
+            print(f"  WARNING: {len(missing)} required tickers missing from cache: {', '.join(missing[:10])}{'...' if len(missing) > 10 else ''}")
+    else:
+        print(f"Step 1: Fetching historical data from IB Gateway ({len(all_tickers)} tickers)...")
+        bars_by_ticker = fetch_bars_from_ib(
+            tickers=all_tickers,
+            years=args.years,
+            host=args.ib_host,
+            port=args.ib_port,
+        )
 
     if not bars_by_ticker:
         print("ERROR: No data fetched. Is IB Gateway running?")
@@ -1747,18 +1771,18 @@ def main():
         commission_per_share=args.commission,
     )
 
-    # Build portfolio configurations
-    mr_signals_fn = make_signals_fn(
-        position_size_pct=0.12,
-        initial_capital=args.capital * 0.12,
-        trailing_stop_pct=0.10,
-    )
+    # Build portfolio configurations.
+    # NOTE: mean_reversion and short_term_mr sleeves dropped 2026-05-26 after both posted
+    # negative expectancy over the 9.97-year backtest. Their signal functions
+    # (make_signals_fn, make_short_term_mr_signals_fn) remain in this file for future
+    # revival. See docs/strategies/mean-reversion-failure-analysis.md for the failure
+    # analysis and the conditions under which the sleeves should be re-enabled.
     mom_signals_fn = make_momentum_signals_fn(
         bars_by_ticker=bars_by_ticker,
         top_n=5,
         lookback_days=126,
         position_size_pct=0.12,
-        initial_capital=args.capital * 0.18,
+        initial_capital=args.capital * 0.2308,
         trailing_stop_pct=0.10,
         bear_tickers=BEAR_TICKERS,
     )
@@ -1767,20 +1791,15 @@ def main():
         top_n=3,
         lookback_days=63,
         position_size_pct=0.20,
-        initial_capital=args.capital * 0.12,
+        initial_capital=args.capital * 0.1538,
         trailing_stop_pct=0.08,
-    )
-    st_mr_signals_fn = make_short_term_mr_signals_fn(
-        position_size_pct=0.08,
-        initial_capital=args.capital * 0.10,
-        max_hold_days=5,
     )
     thematic_signals_fn = make_thematic_momentum_signals_fn(
         bars_by_ticker=bars_by_ticker,
         top_n=8,
         lookback_days=63,
         position_size_pct=0.15,
-        initial_capital=args.capital * 0.11,
+        initial_capital=args.capital * 0.1410,
         trailing_stop_pct=0.10,
         regime_by_date=regime_by_date,
     )
@@ -1789,7 +1808,7 @@ def main():
         sector_map=SECTOR_MAP,
         top_n=15,
         position_size_pct=0.10,
-        initial_capital=args.capital * 0.12,
+        initial_capital=args.capital * 0.1538,
         trailing_stop_pct=0.12,
         regime_by_date=regime_by_date,
     )
@@ -1798,30 +1817,19 @@ def main():
         surprise_threshold_pct=5.0,
         max_hold_days=20,
         position_size_pct=0.08,
-        initial_capital=args.capital * 0.15,
+        initial_capital=args.capital * 0.1923,
         trailing_stop_pct=0.06,
         regime_by_date=regime_by_date,
     )
     tail_risk_signals_fn = make_tail_risk_hedge_signals_fn(
         regime_by_date=regime_by_date,
         position_size_pct=0.25,
-        initial_capital=args.capital * 0.10,
+        initial_capital=args.capital * 0.1283,
     )
     portfolios: dict[str, PortfolioConfig] = {
-        "mean_reversion": PortfolioConfig(
-            name="mean_reversion",
-            capital=args.capital * 0.12,
-            signals_fn=mr_signals_fn,
-            risk_engine=RiskEngine(
-                position_entry_limit_pct=15.0,
-                sector_concentration_pct=30.0,
-                total_exposure_limit_pct=120.0,
-                max_lots_per_ticker=2,
-            ),
-        ),
         "momentum": PortfolioConfig(
             name="momentum",
-            capital=args.capital * 0.18,
+            capital=args.capital * 0.2308,
             signals_fn=mom_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=12.0,
@@ -1832,7 +1840,7 @@ def main():
         ),
         "sector_rotation": PortfolioConfig(
             name="sector_rotation",
-            capital=args.capital * 0.12,
+            capital=args.capital * 0.1538,
             signals_fn=sector_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=20.0,
@@ -1841,20 +1849,9 @@ def main():
                 max_lots_per_ticker=1,
             ),
         ),
-        "short_term_mr": PortfolioConfig(
-            name="short_term_mr",
-            capital=args.capital * 0.10,
-            signals_fn=st_mr_signals_fn,
-            risk_engine=RiskEngine(
-                position_entry_limit_pct=8.0,
-                sector_concentration_pct=30.0,
-                total_exposure_limit_pct=100.0,
-                max_lots_per_ticker=1,
-            ),
-        ),
         "thematic_momentum": PortfolioConfig(
             name="thematic_momentum",
-            capital=args.capital * 0.11,
+            capital=args.capital * 0.1410,
             signals_fn=thematic_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=15.0,
@@ -1865,7 +1862,7 @@ def main():
         ),
         "quality_value": PortfolioConfig(
             name="quality_value",
-            capital=args.capital * 0.12,
+            capital=args.capital * 0.1538,
             signals_fn=qv_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=10.0,
@@ -1876,7 +1873,7 @@ def main():
         ),
         "earnings_drift": PortfolioConfig(
             name="earnings_drift",
-            capital=args.capital * 0.15,
+            capital=args.capital * 0.1923,
             signals_fn=ed_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=8.0,
@@ -1887,7 +1884,7 @@ def main():
         ),
         "tail_risk_hedge": PortfolioConfig(
             name="tail_risk_hedge",
-            capital=args.capital * 0.10,
+            capital=args.capital * 0.1283,
             signals_fn=tail_risk_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=25.0,
