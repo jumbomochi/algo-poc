@@ -1,9 +1,9 @@
 # Active Portfolio Configuration — 2026-05
 
-**Status:** Current as of 2026-05-26 (paper-trading)
+**Status:** Current as of 2026-05-26; **figures refreshed 2026-06-14** (sanity-check rerun on fresh IB data)
 **Capital basis:** $100,000 reference
-**Backtest horizon:** 2016-05-31 → 2026-05-22 (9.97 years, 2,510 trading days)
-**Backtest JSON:** `output/backtest_multi_20260526_235302.json`
+**Backtest horizon:** 2016-05-31 → 2026-06-13 (~10.0 years)
+**Backtest JSON:** `output/backtest_multi_20260614_090335.json` (prior: `backtest_multi_20260526_235302.json`)
 
 This document describes the **active sleeves** used by both
 `scripts/run_backtest.py` and `scripts/run_paper.py`. For the historical
@@ -35,27 +35,32 @@ see `docs/strategy.md`. For why two sleeves were dropped, see
 
 ### Aggregate
 
+Figures below are the **2026-06-14 refresh** (prior 2026-05-26 values in parentheses
+where they differ — all within noise).
+
 | Metric | Value |
 |---|---:|
-| Total return | **+420.4%** |
-| **CAGR** | **17.98%** |
+| Total return | **+427.1%** (was +420.4%) |
+| **CAGR** | **~17.9%** |
 | Sharpe ratio | 1.97 |
-| Max drawdown | 10.85% |
-| Win rate | 53.82% |
-| Total trades | 4,262 |
+| Max drawdown | 10.89% (was 10.85%) |
+| Win rate | 53.86% |
+| Total trades | 4,330 (was 4,262) |
 | Starting capital | $100,000 |
-| Final value | $520,442.64 |
+| Final value | $527,116.57 |
 
 ### Per-sleeve
 
-| Sleeve | Return | CAGR | Sharpe | Max DD | Win % | Trades |
-|---|---:|---:|---:|---:|---:|---:|
-| thematic_momentum | +835.2% | 25.13% | 1.88 | 12.6% | 50.5% | 1,351 |
-| sector_rotation | +790.0% | 24.51% | 1.80 | 14.3% | 60.8% | 571 |
-| momentum | +495.6% | 19.59% | 1.57 | 14.8% | 50.6% | 639 |
-| earnings_drift | +254.9% | 13.54% | 1.44 | 8.2% | 60.2% | 1,207 |
-| quality_value | +118.8% | 8.17% | 0.85 | 21.3% | 59.3% | 108 |
-| tail_risk_hedge | −4.1% | −0.42% | −0.08 | 14.3% | 39.4% | 386 |
+Refreshed 2026-06-14 (return / Sharpe / max DD / trades):
+
+| Sleeve | Return | Sharpe | Max DD | Trades |
+|---|---:|---:|---:|---:|
+| thematic_momentum | +856.96% | 1.94 | 12.54% | 1,357 |
+| sector_rotation | +793.32% | 1.80 | 14.43% | 582 |
+| momentum | +506.92% | 1.53 | 14.88% | 644 |
+| earnings_drift | +254.74% | 1.44 | 8.16% | 1,249 |
+| quality_value | +123.64% | 0.87 | 21.30% | 112 |
+| tail_risk_hedge | −5.65% | −0.12 | 14.50% | 386 |
 
 ---
 
