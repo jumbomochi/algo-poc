@@ -106,12 +106,20 @@ window. Compare to expected trade frequency per sleeve.
 
 ---
 
-## Recommended daily wiring
+## Daily wiring (deployed)
 
-The script is designed for one cron / launchd invocation per day, after the
-paper-trading run has written that day's `equity_snapshots` row.
+The script runs once per day via launchd, after the paper-trading run has
+written that day's `equity_snapshots` row. The deployed job is:
 
-**Suggested order on a typical SGT-timezone host (US market closes at 04:00 SGT next day):**
+- **Label:** `local.algo-divergence-monitor` (loaded; runs 04:45 SGT, Tue–Sat)
+- **Wrapper:** `~/ibc/run_divergence.sh` — handles the exit-code routing below
+- **Plist:** `~/Library/LaunchAgents/local.algo-divergence-monitor.plist`
+- **Version-controlled copies + install/reload steps:** `deploy/launchd/`
+- **Logs:** `~/ibc/logs/divergence_YYYYMMDD.log`
+- **Prometheus textfile:** `~/ibc/metrics/divergence.prom` (node_exporter not yet
+  installed — repoint at its textfile collector once it is)
+
+**Order on this SGT-timezone host (US market closes at 04:00 SGT next day):**
 
 | Time (SGT) | Job | Why |
 |---|---|---|
