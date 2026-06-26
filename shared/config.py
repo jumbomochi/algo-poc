@@ -113,6 +113,7 @@ ENV_MAP: dict[str, str] = {
     "ALGO_MODE": "mode",
     "ALGO_DATABASE_URL": "database.url",
     "ALGO_REDIS_URL": "redis.url",
+    "ALGO_IB_HOST": "ib.host",  # containers set this to host.docker.internal
 }
 
 

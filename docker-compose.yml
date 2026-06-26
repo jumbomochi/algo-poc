@@ -46,10 +46,14 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - ALGO_MODE=paper
       - ALGO_DATABASE_URL=postgresql://algo:algo@postgres:5432/algo_poc
       - ALGO_REDIS_URL=redis://redis:6379/0
+      # IB Gateway runs on the host, not in a container; reach it via the host alias.
+      - ALGO_IB_HOST=host.docker.internal
 
   signal-generation:
     build:
@@ -102,10 +106,14 @@ services:
         condition: service_completed_successfully
       risk-management:
         condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - ALGO_MODE=paper
       - ALGO_DATABASE_URL=postgresql://algo:algo@postgres:5432/algo_poc
       - ALGO_REDIS_URL=redis://redis:6379/0
+      # IB Gateway runs on the host, not in a container; reach it via the host alias.
+      - ALGO_IB_HOST=host.docker.internal
 
   api:
     build:
