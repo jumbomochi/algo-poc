@@ -25,6 +25,30 @@ automated assessment; record the results alongside manual verification.
 - Days elapsed: ______
 - Paper start date: ______
 
+#### Documented exception — 2026-07-01 (IB Gateway outages)
+
+The "continuous" requirement has two known breaks in the daily paper-run record,
+both caused by the IB Gateway parking on a stuck login modal after a nightly
+re-login (the port-7497 disconnect):
+
+- **~2026-06-08 → 06-14** — daily 04:15 SGT run failed; restored by manual re-login.
+- **~2026-06-22 → 06-25** — same failure mode; restored by `launchctl kickstart`.
+
+Additionally, the **service-stack** paper run (data_ingestion → … → execution
+against IB paper — the path that produces Gates 4–6 metrics) was first brought up
+**2026-06-24**; prior history came from the `run_paper.py` *simulation*, which does
+not exercise the live order path.
+
+**Remediation in place:** `local.algo-gateway-watchdog` (kickstarts the Gateway
+after two consecutive 7497 failures) now prevents the stuck-modal outage from
+recurring unattended. See `deploy/launchd/` and the
+[divergence monitor](divergence-monitor.md) for the daily continuity check.
+
+**Decision required (two-person sign-off):** treat the continuous-60-day clock as
+**restarting 2026-06-24** (service-stack start), rather than counting the gapped
+simulation history. Record the accepted start date and rationale in the sign-off
+section below.
+
 ### Gate 2 — Risk Stability
 
 - [ ] **Zero** circuit-breaker events in the last 30 days.

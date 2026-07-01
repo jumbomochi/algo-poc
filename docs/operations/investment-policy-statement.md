@@ -114,12 +114,12 @@ satisfied in live trading.** Drawdown discipline is the cap.
 
 **Deployment path:**
 
-1. **Smoke test — $5,000, ~2 months.** First real-money deployment. Purpose is to
-   validate execution, reconciliation, slippage, and the daily ops loop on live
-   fills — *not* to prove return. Success = the operational gates behave, not a P&L
-   target.
-2. **Scale up** in steps thereafter (e.g. $25K → $50K → $100K → beyond), each step
-   contingent on:
+1. **Smoke test — 5,000 SGD (~$3,700 USD), ~2 months.** First real-money
+   deployment; wired 2026-06-16. Purpose is to validate execution, reconciliation,
+   slippage, and the daily ops loop on live fills — *not* to prove return. Success =
+   the operational gates behave, not a P&L target.
+2. **Scale up** in steps thereafter (illustratively ~25K → ~50K → ~100K SGD →
+   beyond), each step contingent on:
    - All 8 [go-live / continuation gates](go-live-checklist.md) passing at the
      current size.
    - [Divergence monitor](divergence-monitor.md) reporting **OK** for a sustained
@@ -132,6 +132,24 @@ satisfied in live trading.** Drawdown discipline is the cap.
 
 If at any size the drawdown limits are breached, scaling **stops** and the relevant
 § 6 / § 7 action applies. Scaling only resumes after a clean re-clear of the gates.
+
+### Funding currency & FX
+
+Capital is wired in **SGD**, but the system trades **USD-denominated** US-listed
+instruments (§ 4). Each deployment therefore carries an FX leg (SGD→USD, via IBKR
+auto-conversion or a manual `IDEALPRO` trade). Consequences for this policy:
+
+- **NAV is measured in USD**, the trading currency. All percent-based limits in § 6
+  and the drawdown/retirement triggers in § 7 apply to the **USD** NAV, so they are
+  unaffected by SGD/USD moves. The SGD figures above are funding amounts; the
+  USD-equivalent at conversion is the working capital the limits act on.
+- **SGD/USD FX risk** sits *outside* the strategy's measured P&L — a falling USD
+  erodes SGD-terms returns independently of system performance. This is an accepted,
+  unhedged exposure of holding a USD book funded in SGD; it is **not** a reason to
+  halt under § 7 (which concerns deployed-capital drawdown, measured in USD).
+- IBKR also provides access to non-US venues (e.g. LSE). This system does **not**
+  trade them; any such use is outside this IPS and would require a § 9 universe
+  amendment.
 
 ---
 
@@ -189,9 +207,10 @@ deployed system capital reaches −25%.**
 ## 8. Monitoring & review cadence
 
 - **Daily (automated):** the [divergence monitor](divergence-monitor.md) runs after
-  the paper/live signal job. Two-axis OK/WARNING/BREACH classification; exits non-zero
-  on breach for alerting. *(Pending: launchd plist for the daily run — see handoff
-  open items.)*
+  the paper/live signal job (launchd job `local.algo-divergence-monitor`, 04:45 SGT
+  Tue–Sat; see `deploy/launchd/`). Two-axis OK/WARNING/BREACH classification; exits
+  non-zero on breach for alerting. A `local.algo-gateway-watchdog` job keeps the IB
+  Gateway connection self-healing.
 - **Monthly (operator):** formal review. Agenda:
   1. Divergence-monitor history for the month (any WARNING/BREACH days, and why).
   2. Live performance vs backtest expectation; live max drawdown vs the § 6 bounds.
@@ -221,11 +240,16 @@ deployed system capital reaches −25%.**
 
 ## 10. Tax & accounting notes
 
-- Trades are US-listed equities/ETFs executed via Interactive Brokers.
+- Trades are US-listed equities/ETFs executed via Interactive Brokers; capital is
+  funded in **SGD** and converted to **USD** to trade (§ 5).
 - Tax residency and the resulting treatment (withholding, capital-gains reporting,
   wash-sale handling) are the operator's responsibility and **not** automated by the
-  system. *(Open: confirm residency-specific reporting requirements before scaling
-  past the smoke test.)*
+  system. As a non-US person, a **W-8BEN** governs US withholding (notably ~30% on
+  US dividends; the tail_risk_hedge and sector sleeves hold dividend-paying ETFs).
+  *(Open: confirm Singapore-residency reporting + W-8BEN on file before scaling past
+  the smoke test.)*
+- **SGD/USD FX gains/losses** on the cash leg are a separate line from strategy P&L
+  and may have their own tax treatment; track conversions for records.
 - The system's churn dropped ~60% (10,657 → 4,262 trades over the backtest) after
   the 2026-05 refactor, which is favorable for after-tax returns, but realized
   short-term gains remain the dominant tax characteristic of a momentum-tilted book.
@@ -239,6 +263,7 @@ deployed system capital reaches −25%.**
 | Date | Change | Rationale |
 |---|---|---|
 | 2026-06-11 | Initial adoption | Phase-1 prerequisite. Capital: no fixed cap, drawdown-gated, $5K smoke test first. Retire at −25% deployed. Monthly review. |
+| 2026-06-30 | Currency reconciliation (§ 5, § 8, § 10) | Smoke test funded as 5,000 SGD (wired 2026-06-16), not USD; added funding-currency/FX section (NAV measured in USD, SGD/USD FX is unhedged and outside § 7); W-8BEN / SGD-residency tax notes; refreshed monitoring note now that the divergence + gateway-watchdog launchd jobs are deployed. |
 
 ### Appendix A — revival conditions for dropped sleeves
 
