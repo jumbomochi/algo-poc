@@ -19,6 +19,11 @@ METRICS_DIR="$HOME/ibc/metrics"
 LOG_FILE="$LOG_DIR/divergence_$(date +%Y%m%d).log"
 PROM_FILE="$METRICS_DIR/divergence.prom"
 
+# The paper DB is the dockerized postgres on a machine-local port (see
+# docker-compose.override.yml); config/default.yaml's localhost:5432 default
+# points at nothing on this machine.
+export ALGO_DATABASE_URL="postgresql://algo:algo@localhost:55432/algo_poc"
+
 mkdir -p "$LOG_DIR" "$METRICS_DIR"
 
 echo "$(date): Starting daily divergence monitor" >> "$LOG_FILE"

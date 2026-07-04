@@ -5,10 +5,17 @@ host. The **live** copies are deployed outside the repo:
 
 | Repo copy | Deployed to |
 |---|---|
+| `run_paper.sh` | `~/ibc/run_paper.sh` (chmod +x) — 04:15 SGT daily paper run |
 | `run_divergence.sh` | `~/ibc/run_divergence.sh` (chmod +x) |
 | `local.algo-divergence-monitor.plist` | `~/Library/LaunchAgents/local.algo-divergence-monitor.plist` |
 | `gateway_watchdog.sh` | `~/ibc/gateway_watchdog.sh` (chmod +x) |
 | `local.algo-gateway-watchdog.plist` | `~/Library/LaunchAgents/local.algo-gateway-watchdog.plist` |
+
+Both `run_paper.sh` and `run_divergence.sh` export
+`ALGO_DATABASE_URL=postgresql://algo:algo@localhost:55432/algo_poc` — the
+dockerized paper DB on its machine-local override port. The stock
+`config/default.yaml` URL (localhost:5432) points at nothing on this host;
+this was why every nightly paper run failed from April through July 2026.
 
 These are tracked here so the wiring is version-controlled and survives a
 machine rebuild. If you edit a deployed copy, sync it back here (and vice-versa).
