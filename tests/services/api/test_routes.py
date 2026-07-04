@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from unittest.mock import AsyncMock
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -10,8 +13,15 @@ VIEWER_HEADERS = {"X-API-Key": "viewer-key"}
 
 
 @pytest.fixture()
-def client():
-    app = create_app()
+def redis_client():
+    mock = AsyncMock()
+    mock.publish = AsyncMock(return_value=b"1700000000000-0")
+    return mock
+
+
+@pytest.fixture()
+def client(redis_client):
+    app = create_app(redis_client=redis_client)
     return TestClient(app)
 
 
@@ -134,10 +144,46 @@ class TestKillEndpoint:
         assert data["status"] == "triggered"
         assert "triggered_by" in data
         assert "timestamp" in data
+        assert "message_id" in data
 
     def test_kill_requires_auth(self, client):
         response = client.post("/api/v1/kill")
         assert response.status_code == 401
+
+    def test_kill_publishes_kill_message_to_stream(self, client, redis_client):
+        """The whole point of the endpoint: a KillMessage must land on stream:kill."""
+        response = client.post(
+            "/api/v1/kill",
+            headers=ADMIN_HEADERS,
+            json={"reason": "rollback: test incident"},
+        )
+        assert response.status_code == 200
+
+        redis_client.publish.assert_awaited_once()
+        stream, payload = redis_client.publish.call_args.args
+        assert stream == "stream:kill"
+        assert payload["reason"] == "rollback: test incident"
+        assert payload["triggered_by"].endswith("***")
+        assert "timestamp" in payload
+
+    def test_kill_default_reason_without_body(self, client, redis_client):
+        client.post("/api/v1/kill", headers=ADMIN_HEADERS)
+        _, payload = redis_client.publish.call_args.args
+        assert payload["reason"] == "manual kill via API"
+
+    def test_kill_returns_503_when_redis_missing(self):
+        """A kill that cannot reach the stream must not report success."""
+        app = create_app(redis_client=None)
+        no_redis_client = TestClient(app)
+        response = no_redis_client.post("/api/v1/kill", headers=ADMIN_HEADERS)
+        assert response.status_code == 503
+
+    def test_kill_returns_503_when_publish_fails(self, redis_client):
+        redis_client.publish.side_effect = ConnectionError("redis down")
+        app = create_app(redis_client=redis_client)
+        failing_client = TestClient(app)
+        response = failing_client.post("/api/v1/kill", headers=ADMIN_HEADERS)
+        assert response.status_code == 503
 
 
 # ---------------------------------------------------------------------------

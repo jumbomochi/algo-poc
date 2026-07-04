@@ -27,16 +27,23 @@ Execute each step in order. Target completion: **under 15 minutes** for steps
 ### Step 1 — Halt Trading (T+0)
 
 1. Set trading state to **HALTED**.
-2. Publish a kill event to `stream:kill`:
+2. Publish a kill event to `stream:kill` (auth is an admin API key in the
+   `X-API-Key` header — set `ALGO_API_KEY` from the `API_KEYS` env of the api
+   service):
    ```bash
    # Via API
    curl -X POST http://localhost:8000/api/v1/kill \
-     -H "Authorization: Bearer $OPERATOR_TOKEN" \
+     -H "X-API-Key: $ALGO_API_KEY" \
+     -H "Content-Type: application/json" \
      -d '{"reason": "rollback: <brief description>"}'
+   # Expect HTTP 200 with a "message_id" — a 503 means the kill did NOT
+   # reach the stream; fall back to publishing directly:
+   #   docker compose exec redis redis-cli XADD stream:kill '*' \
+   #     timestamp "$(date -u +%FT%TZ)" triggered_by manual reason rollback
    ```
 3. Verify the kill switch is active:
    ```bash
-   curl http://localhost:8000/api/v1/status
+   curl -H "X-API-Key: $ALGO_API_KEY" http://localhost:8000/api/v1/risk/status
    # Confirm: "kill_switch_active": true
    ```
 
@@ -89,10 +96,11 @@ Execute each step in order. Target completion: **under 15 minutes** for steps
 
 ### Step 5 — Resume Paper Trading (T+15 min)
 
-1. Deactivate the kill switch:
+1. Deactivate the kill switch. **There is no API endpoint for this yet** (by
+   design it should be harder than activating): restart the risk-management
+   service, which starts with the kill switch inactive:
    ```bash
-   curl -X POST http://localhost:8000/api/v1/kill/deactivate \
-     -H "Authorization: Bearer $OPERATOR_TOKEN"
+   docker compose restart risk-management
    ```
 2. Verify paper trading resumes:
    ```bash

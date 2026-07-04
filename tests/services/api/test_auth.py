@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -8,7 +10,9 @@ from services.api.app import create_app
 
 @pytest.fixture()
 def client():
-    app = create_app()
+    # Auth tests exercise authz, not stream plumbing — inject a mock Redis so
+    # the kill endpoint doesn't 503 on the missing connection.
+    app = create_app(redis_client=AsyncMock())
     return TestClient(app)
 
 
@@ -44,7 +48,8 @@ class TestAuthenticatedAccess:
         )
         data = response.json()
         assert data["role"] == "admin"
-        assert "api_key" in data
+        # The raw API key must never be echoed back in the response.
+        assert "api_key" not in data
 
     def test_viewer_key_authenticates(self, client):
         response = client.get(
