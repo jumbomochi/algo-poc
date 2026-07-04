@@ -6,12 +6,13 @@ from shared.schemas.messages import AlertMessage
 
 logger = get_logger("notifications.dispatcher")
 
-# Priority -> list of channel attribute names to send to
+# Priority -> list of channel attribute names to send to.
+# Telegram is the primary operator channel and receives every priority.
 PRIORITY_ROUTING: dict[str, list[str]] = {
-    "critical": ["slack", "email", "sms"],
-    "high": ["slack", "email"],
-    "medium": ["slack", "email"],
-    "low": ["slack"],
+    "critical": ["telegram", "slack", "email", "sms"],
+    "high": ["telegram", "slack", "email"],
+    "medium": ["telegram", "slack", "email"],
+    "low": ["telegram", "slack"],
 }
 
 
@@ -19,22 +20,25 @@ class NotificationDispatcher:
     """Routes alert messages to appropriate notification channels based on priority.
 
     Routing rules:
-        - ``critical``: Slack + Email + SMS
-        - ``high``: Slack + Email
-        - ``medium``: Slack + Email
-        - ``low``: Slack only
+        - ``critical``: Telegram + Slack + Email + SMS
+        - ``high``/``medium``: Telegram + Slack + Email
+        - ``low``: Telegram + Slack
+
+    Channels passed as ``None`` (disabled) are skipped silently.
     """
 
     def __init__(
         self,
-        slack: NotificationChannelProtocol,
-        email: NotificationChannelProtocol,
-        sms: NotificationChannelProtocol,
+        slack: NotificationChannelProtocol | None = None,
+        email: NotificationChannelProtocol | None = None,
+        sms: NotificationChannelProtocol | None = None,
+        telegram: NotificationChannelProtocol | None = None,
     ) -> None:
-        self._channels: dict[str, NotificationChannelProtocol] = {
+        self._channels: dict[str, NotificationChannelProtocol | None] = {
             "slack": slack,
             "email": email,
             "sms": sms,
+            "telegram": telegram,
         }
 
     async def dispatch(self, alert: AlertMessage) -> None:

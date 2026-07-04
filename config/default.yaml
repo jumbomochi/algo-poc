@@ -62,6 +62,7 @@ notifications:
   slack_enabled: false
   email_enabled: false
   sms_enabled: false
+  telegram_enabled: true  # credentials via TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars
 
 database:
   url: "postgresql://algo:algo@localhost:5432/algo_poc"

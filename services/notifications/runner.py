@@ -122,14 +122,33 @@ if __name__ == "__main__":
     async def main() -> None:
         import redis.asyncio as aioredis
 
-        from services.notifications.channels import EmailChannel, SlackChannel, SMSChannel
+        from services.notifications.channels import (
+            EmailChannel,
+            SlackChannel,
+            SMSChannel,
+            TelegramChannel,
+        )
         from services.notifications.dispatcher import NotificationDispatcher
         from shared.redis_client import RedisStreamClient
 
         redis_conn = aioredis.from_url(config.redis.url)
         redis_client = RedisStreamClient(redis_conn)
+
+        # Only construct channels that are enabled in config; disabled ones are
+        # None and the dispatcher skips them.
+        telegram = None
+        if config.notifications.telegram_enabled:
+            telegram = TelegramChannel()
+            if not telegram.is_configured:
+                logger.warning(
+                    "telegram_enabled but TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID "
+                    "not set; Telegram alerts will fail"
+                )
         dispatcher = NotificationDispatcher(
-            slack=SlackChannel(), email=EmailChannel(), sms=SMSChannel()
+            slack=SlackChannel() if config.notifications.slack_enabled else None,
+            email=EmailChannel() if config.notifications.email_enabled else None,
+            sms=SMSChannel() if config.notifications.sms_enabled else None,
+            telegram=telegram,
         )
         runner = NotificationsServiceRunner(
             config=config, redis_client=redis_client, dispatcher=dispatcher

@@ -86,6 +86,9 @@ class NotificationsConfig(BaseModel):
     slack_enabled: bool = False
     email_enabled: bool = False
     sms_enabled: bool = False
+    # Telegram credentials come from env (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID),
+    # never from config files.
+    telegram_enabled: bool = False
 
 
 class ObservabilityConfig(BaseModel):

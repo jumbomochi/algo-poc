@@ -146,6 +146,9 @@ services:
       - ALGO_MODE=paper
       - ALGO_DATABASE_URL=postgresql://algo:algo@postgres:5432/algo_poc
       - ALGO_REDIS_URL=redis://redis:6379/0
+      # Telegram credentials from the (gitignored) .env file in the project root
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
 
 volumes:
   pgdata:
