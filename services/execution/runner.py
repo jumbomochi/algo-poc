@@ -48,6 +48,10 @@ class ExecutionServiceRunner:
         # Positions tracked locally (in production loaded from DB)
         self._positions: dict[str, int] = {}
 
+        # order_id -> ApprovedOrderMessage, so IB fills can be attributed
+        # back to the originating recommendation.
+        self._pending_orders: dict[str, ApprovedOrderMessage] = {}
+
         # Determine IB port based on mode
         if config.mode == "live":
             self.ib_port = config.ib.live_port
@@ -69,7 +73,11 @@ class ExecutionServiceRunner:
 
         For buy orders: submit a limit entry.
         For sell orders: submit a market exit.
-        Then publish a fill message to ``stream:fills``.
+
+        A ``FillMessage`` is NOT published here — submission is not a fill.
+        Fills are published by :meth:`handle_ib_fill` when IB reports actual
+        executions (including partials); anything else silently corrupts
+        position tracking on rejected, repriced, or partially-filled orders.
 
         Args:
             order: The approved order message to process.
@@ -98,26 +106,57 @@ class ExecutionServiceRunner:
                 recommendation_id=order.recommendation_id,
             )
 
-        # Publish fill message
-        fill = FillMessage(
-            ticker=order.ticker,
-            timestamp=datetime.now(timezone.utc),
-            side=order.action,
-            quantity=order.quantity,
-            fill_price=order.limit_price or 0.0,
-            commission=0.0,
-            recommendation_id=order.recommendation_id,
+        # Remember the order so fills can be attributed back to the
+        # recommendation that caused them.
+        self._pending_orders[order_id] = order
+
+        self._logger.info(
+            "Order submitted, awaiting fill",
             order_id=order_id,
+            ticker=order.ticker,
+            action=order.action,
         )
 
+    async def handle_ib_fill(self, fill_info: dict[str, Any]) -> None:
+        """Publish a ``FillMessage`` for a real IB execution.
+
+        Registered as the executor's fill handler; invoked once per IB fill
+        (partial fills produce one call each) with actual execution price,
+        quantity, and commission.
+
+        Args:
+            fill_info: Payload from :class:`IBExecutor` — order_id, ticker,
+                side, quantity, fill_price, commission, order_done.
+        """
+        order_id = fill_info["order_id"]
+        pending = self._pending_orders.get(order_id)
+
+        fill = FillMessage(
+            ticker=fill_info["ticker"],
+            timestamp=datetime.now(timezone.utc),
+            side=fill_info["side"],
+            quantity=fill_info["quantity"],
+            fill_price=fill_info["fill_price"],
+            commission=fill_info.get("commission", 0.0),
+            recommendation_id=pending.recommendation_id if pending else "unknown",
+            order_id=order_id,
+        )
         await self._redis.publish(FILLS_STREAM, fill.to_stream_dict())
 
         self._logger.info(
             "Fill published",
             order_id=order_id,
-            ticker=order.ticker,
-            action=order.action,
+            ticker=fill_info["ticker"],
+            side=fill_info["side"],
+            quantity=fill_info["quantity"],
+            fill_price=fill_info["fill_price"],
+            order_done=fill_info.get("order_done", False),
         )
+
+        # Once IB reports the order complete, it is no longer pending or open.
+        if fill_info.get("order_done"):
+            self._pending_orders.pop(order_id, None)
+            self._order_manager.open_orders.pop(order_id, None)
 
     async def process_kill(self, kill_msg: KillMessage) -> None:
         """Process a kill event: cancel all open orders and liquidate positions.
@@ -264,12 +303,21 @@ if __name__ == "__main__":
             port=config.ib.paper_port if config.mode != "live" else config.ib.live_port,
             client_id=config.ib.client_id,
         )
+        # Connect BEFORE consuming orders. A failed connect exits nonzero so
+        # the container restart policy retries; running without IB would
+        # consume approved orders while executing nothing.
+        await executor.connect()
+
         order_manager = OrderManager(
             executor=executor, redis_client=redis_client, db_session=None
         )
         runner = ExecutionServiceRunner(
             config=config, redis_client=redis_client, order_manager=order_manager
         )
-        await runner.run()
+        executor.set_fill_handler(runner.handle_ib_fill)
+        try:
+            await runner.run()
+        finally:
+            await executor.disconnect()
 
     asyncio.run(main())

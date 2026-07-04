@@ -111,26 +111,74 @@ class TestApprovedOrderProcessing:
         )
 
     @pytest.mark.asyncio
-    async def test_buy_order_publishes_fill(
+    async def test_buy_order_does_not_publish_fill_at_submission(
         self, runner, mock_redis, mock_order_manager
     ):
-        """After submitting a buy, a fill message should be published."""
+        """Submission is not a fill: nothing goes to stream:fills yet."""
         order = make_approved_order(
             ticker="AAPL", action="buy", limit_price=150.0
         )
 
         await runner.process_approved_order(order)
 
-        mock_redis.publish.assert_called()
-        # Check that stream:fills was used
-        call_args = mock_redis.publish.call_args
-        assert call_args[0][0] == "stream:fills"
+        mock_redis.publish.assert_not_called()
+        # The order is tracked so a later IB fill can be attributed.
+        assert order in runner._pending_orders.values()
 
     @pytest.mark.asyncio
-    async def test_sell_order_publishes_fill(
+    async def test_ib_fill_publishes_fill_with_execution_data(
         self, runner, mock_redis, mock_order_manager
     ):
-        """After submitting a sell, a fill message should be published."""
+        """A real IB fill event publishes actual execution price/quantity."""
+        order = make_approved_order(ticker="AAPL", action="buy", limit_price=150.0)
+        await runner.process_approved_order(order)
+        (order_id,) = runner._pending_orders.keys()
+
+        await runner.handle_ib_fill({
+            "order_id": order_id,
+            "ticker": "AAPL",
+            "side": "buy",
+            "quantity": 100.0,
+            "fill_price": 149.87,
+            "commission": 0.5,
+            "order_done": True,
+        })
+
+        mock_redis.publish.assert_called_once()
+        stream, payload = mock_redis.publish.call_args[0]
+        assert stream == "stream:fills"
+        assert payload["fill_price"] == "149.87"
+        assert payload["recommendation_id"] == order.recommendation_id
+        # Completed order is no longer pending.
+        assert order_id not in runner._pending_orders
+
+    @pytest.mark.asyncio
+    async def test_partial_fill_keeps_order_pending(
+        self, runner, mock_redis, mock_order_manager
+    ):
+        """A partial fill publishes but keeps the order tracked."""
+        order = make_approved_order(ticker="AAPL", action="buy", limit_price=150.0)
+        await runner.process_approved_order(order)
+        (order_id,) = runner._pending_orders.keys()
+
+        await runner.handle_ib_fill({
+            "order_id": order_id,
+            "ticker": "AAPL",
+            "side": "buy",
+            "quantity": 40.0,
+            "fill_price": 149.90,
+            "commission": 0.2,
+            "order_done": False,
+        })
+
+        mock_redis.publish.assert_called_once()
+        assert order_id in runner._pending_orders
+
+    @pytest.mark.asyncio
+    async def test_sell_order_does_not_publish_fill_at_submission(
+        self, runner, mock_redis, mock_order_manager
+    ):
+        """Market exits also wait for the real IB fill."""
         order = make_approved_order(
             ticker="AAPL",
             action="sell",
@@ -140,9 +188,8 @@ class TestApprovedOrderProcessing:
 
         await runner.process_approved_order(order)
 
-        mock_redis.publish.assert_called()
-        call_args = mock_redis.publish.call_args
-        assert call_args[0][0] == "stream:fills"
+        mock_redis.publish.assert_not_called()
+        assert order in runner._pending_orders.values()
 
 
 class TestKillHandling:

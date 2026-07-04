@@ -310,10 +310,18 @@ class OrderManager:
             try:
                 await self._executor.cancel_order(order_id)
                 cancelled.append(order_id)
+                # Only forget orders whose cancel was actually submitted; a
+                # failed cancel is still live at IB and must stay tracked
+                # so the next attempt retries it.
+                del self.open_orders[order_id]
                 self._logger.info("Order cancelled", order_id=order_id)
             except Exception:
                 self._logger.exception(
                     "Failed to cancel order", order_id=order_id
                 )
-        self.open_orders.clear()
+        if self.open_orders:
+            self._logger.error(
+                "Orders remain open after cancel-all",
+                remaining=list(self.open_orders.keys()),
+            )
         return cancelled
