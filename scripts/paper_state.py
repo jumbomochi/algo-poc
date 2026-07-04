@@ -148,12 +148,17 @@ class PaperTradingState:
             ).scalar_one_or_none()
 
             if pos:
-                pnl = (price - pos.avg_entry_price) * quantity
+                # Sell signals emit quantity=0 meaning "close the full position"
+                # (the backtest runner has the same semantics: it always sells
+                # the whole lot). An explicit positive quantity is honoured as a
+                # partial sell, clamped to the held quantity.
+                sell_qty = pos.quantity if quantity <= 0 else min(quantity, pos.quantity)
+                pnl = (price - pos.avg_entry_price) * sell_qty
                 trade = Trade(
                     ticker=ticker,
                     portfolio=portfolio,
                     side="sell",
-                    quantity=quantity,
+                    quantity=sell_qty,
                     price=price,
                     entry_price=pos.avg_entry_price,
                     entry_date=pos.opened_at.date(),
@@ -166,8 +171,12 @@ class PaperTradingState:
                     executed_at=datetime(fill_date.year, fill_date.month, fill_date.day, tzinfo=timezone.utc),
                 )
                 self._session.add(trade)
-                self._session.delete(pos)
-                self._update_cash(portfolio, price * quantity)
+                if sell_qty >= pos.quantity:
+                    self._session.delete(pos)
+                else:
+                    pos.quantity -= sell_qty
+                    pos.current_price = price
+                self._update_cash(portfolio, price * sell_qty)
 
         self._session.flush()
 
