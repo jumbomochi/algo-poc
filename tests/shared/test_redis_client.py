@@ -54,3 +54,69 @@ class TestRedisStreamClient:
         client = RedisStreamClient(mock_redis)
         result = await client.ack("stream:test", "my-group", "1234-0")
         assert result == 1
+
+
+class TestPendingReplay:
+    """Crash-recovery semantics: delivered-but-unacked messages are replayable."""
+
+    @pytest.fixture
+    def fake_client(self):
+        import fakeredis.aioredis
+
+        return RedisStreamClient(fakeredis.aioredis.FakeRedis())
+
+    @pytest.mark.asyncio
+    async def test_drain_pending_returns_unacked_messages(self, fake_client):
+        await fake_client.create_consumer_group("s", "g")
+        for i in range(3):
+            await fake_client.publish("s", {"n": str(i)})
+
+        # Deliver but do not ack — simulates a crash mid-processing.
+        delivered = await fake_client.read_group("s", "g", "c1", block_ms=1)
+        assert len(delivered) == 3
+
+        # "Restart": the same consumer drains its pending list.
+        pending = await fake_client.drain_pending("s", "g", "c1")
+        assert [m.data["n"] for m in pending] == ["0", "1", "2"]
+
+    @pytest.mark.asyncio
+    async def test_drain_pending_empty_after_ack(self, fake_client):
+        await fake_client.create_consumer_group("s", "g")
+        await fake_client.publish("s", {"n": "0"})
+        delivered = await fake_client.read_group("s", "g", "c1", block_ms=1)
+        await fake_client.ack("s", "g", delivered[0].message_id)
+
+        assert await fake_client.drain_pending("s", "g", "c1") == []
+
+    @pytest.mark.asyncio
+    async def test_drain_pending_paginates_without_ack(self, fake_client):
+        """The cursor must advance even though nothing is acked mid-drain."""
+        await fake_client.create_consumer_group("s", "g")
+        for i in range(5):
+            await fake_client.publish("s", {"n": str(i)})
+        await fake_client.read_group("s", "g", "c1", block_ms=1)
+
+        pending = await fake_client.drain_pending("s", "g", "c1", batch_size=2)
+        assert len(pending) == 5
+
+    @pytest.mark.asyncio
+    async def test_drain_pending_recovers_other_consumers_messages(self, fake_client):
+        """XAUTOCLAIM claims across consumers: a restarted worker with a new
+        name still recovers messages a dead worker left pending."""
+        await fake_client.create_consumer_group("s", "g")
+        await fake_client.publish("s", {"n": "0"})
+        await fake_client.read_group("s", "g", "dead_worker", block_ms=1)
+
+        pending = await fake_client.drain_pending("s", "g", "new_worker")
+        assert len(pending) == 1
+        assert pending[0].data["n"] == "0"
+
+    @pytest.mark.asyncio
+    async def test_normal_read_does_not_redeliver_pending(self, fake_client):
+        """Documents WHY replay is needed: '>' never re-delivers pending."""
+        await fake_client.create_consumer_group("s", "g")
+        await fake_client.publish("s", {"n": "0"})
+        await fake_client.read_group("s", "g", "c1", block_ms=1)
+
+        again = await fake_client.read_group("s", "g", "c1", block_ms=1)
+        assert again == []

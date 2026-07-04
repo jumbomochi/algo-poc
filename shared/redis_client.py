@@ -53,6 +53,51 @@ class RedisStreamClient:
         results = await self._redis.xreadgroup(
             group, consumer, {stream: ">"}, count=count, block=block_ms,
         )
+        return self._decode_results(results)
+
+    async def drain_pending(
+        self,
+        stream: str,
+        group: str,
+        consumer: str,
+        batch_size: int = 100,
+    ) -> list[StreamMessage]:
+        """Claim and return ALL pending (delivered-but-unacked) messages.
+
+        Messages read before a crash but never acked stay in the group's
+        pending entries list forever; ``xreadgroup`` with ``">"`` never
+        re-delivers them. Call this during service startup, before the normal
+        ``read_group`` loop, so no message is silently lost across a restart.
+
+        Uses ``XAUTOCLAIM`` (min idle 0), which claims from *any* consumer in
+        the group — this also recovers messages held by a dead worker or a
+        prior consumer name, not just this consumer's own.
+        """
+        drained: list[StreamMessage] = []
+        seen: set[str] = set()
+        cursor = "0-0"
+        while True:
+            next_cursor, entries, _deleted = await self._redis.xautoclaim(
+                stream, group, consumer,
+                min_idle_time=0, start_id=cursor, count=batch_size,
+            )
+            batch = self._decode_results([(stream, entries)])
+            # XAUTOCLAIM's start is inclusive and some servers (and fakeredis)
+            # return the last-claimed id rather than 0-0 as the next cursor —
+            # dedupe on message id so the loop terminates on either behaviour.
+            new = [m for m in batch if m.message_id not in seen]
+            if not new:
+                return drained
+            drained.extend(new)
+            seen.update(m.message_id for m in new)
+            next_cursor = (
+                next_cursor if isinstance(next_cursor, str) else next_cursor.decode()
+            )
+            if next_cursor == "0-0":
+                return drained
+            cursor = next_cursor
+
+    def _decode_results(self, results: Any) -> list[StreamMessage]:
         messages = []
         for stream_name, entries in results:
             s = stream_name if isinstance(stream_name, str) else stream_name.decode()

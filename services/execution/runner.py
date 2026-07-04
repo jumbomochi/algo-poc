@@ -59,11 +59,62 @@ class ExecutionServiceRunner:
             self.ib_port = config.ib.paper_port
 
     async def setup(self) -> None:
-        """Create consumer groups for subscribed streams."""
+        """Create consumer groups and replay pending messages.
+
+        Messages delivered but not acked before a crash sit in the pending
+        entries list and are never re-delivered by the normal ``">"`` read —
+        without this replay, an approved order in flight during a restart is
+        silently lost.
+        """
         await self._redis.create_consumer_group(
             APPROVED_ORDERS_STREAM, CONSUMER_GROUP
         )
         await self._redis.create_consumer_group(KILLS_STREAM, CONSUMER_GROUP)
+
+        pending_orders = await self._redis.drain_pending(
+            APPROVED_ORDERS_STREAM, CONSUMER_GROUP, CONSUMER_NAME
+        )
+        for msg in pending_orders:
+            try:
+                order = ApprovedOrderMessage.from_stream_dict(msg.data)
+                await self.process_approved_order(order)
+                await self._redis.ack(
+                    APPROVED_ORDERS_STREAM, CONSUMER_GROUP, msg.message_id
+                )
+            except Exception as exc:
+                self._logger.exception(
+                    "Error replaying pending order; sending to DLQ",
+                    message_id=msg.message_id,
+                )
+                await self._redis.send_to_dead_letter(
+                    APPROVED_ORDERS_STREAM, msg, str(exc)
+                )
+                await self._redis.ack(
+                    APPROVED_ORDERS_STREAM, CONSUMER_GROUP, msg.message_id
+                )
+
+        pending_kills = await self._redis.drain_pending(
+            KILLS_STREAM, CONSUMER_GROUP, CONSUMER_NAME
+        )
+        for msg in pending_kills:
+            try:
+                kill_msg = KillMessage.from_stream_dict(msg.data)
+                await self.process_kill(kill_msg)
+                await self._redis.ack(KILLS_STREAM, CONSUMER_GROUP, msg.message_id)
+            except Exception as exc:
+                self._logger.exception(
+                    "Error replaying pending kill; sending to DLQ",
+                    message_id=msg.message_id,
+                )
+                await self._redis.send_to_dead_letter(KILLS_STREAM, msg, str(exc))
+                await self._redis.ack(KILLS_STREAM, CONSUMER_GROUP, msg.message_id)
+
+        if pending_orders or pending_kills:
+            self._logger.warning(
+                "Replayed pending messages from a prior crash",
+                orders=len(pending_orders),
+                kills=len(pending_kills),
+            )
         self._logger.info("Execution service consumer groups created")
 
     async def process_approved_order(

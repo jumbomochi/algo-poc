@@ -104,12 +104,46 @@ class RiskServiceRunner:
         }
 
     async def setup(self) -> None:
-        """Create consumer groups for the streams we subscribe to."""
+        """Create consumer groups and replay pending messages.
+
+        Delivered-but-unacked messages from before a crash are never
+        re-delivered by the normal ``">"`` read; replay them so no
+        recommendation, kill, or fill is silently lost across a restart.
+        """
         await self._redis.create_consumer_group(
             RECOMMENDATIONS_STREAM, CONSUMER_GROUP
         )
         await self._redis.create_consumer_group(KILL_STREAM, CONSUMER_GROUP)
         await self._redis.create_consumer_group(FILLS_STREAM, CONSUMER_GROUP)
+
+        replayed = 0
+        for stream, parser, handler in (
+            (RECOMMENDATIONS_STREAM, RecommendationMessage.from_stream_dict,
+             self.process_recommendation),
+            (KILL_STREAM, KillMessage.from_stream_dict, self.process_kill),
+            (FILLS_STREAM, FillMessage.from_stream_dict, self.process_fill),
+        ):
+            pending = await self._redis.drain_pending(
+                stream, CONSUMER_GROUP, CONSUMER_NAME
+            )
+            for msg in pending:
+                try:
+                    await handler(parser(msg.data))
+                    await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
+                except Exception as exc:
+                    self._logger.exception(
+                        "Error replaying pending message; sending to DLQ",
+                        stream=stream,
+                        message_id=msg.message_id,
+                    )
+                    await self._redis.send_to_dead_letter(stream, msg, str(exc))
+                    await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
+            replayed += len(pending)
+
+        if replayed:
+            self._logger.warning(
+                "Replayed pending messages from a prior crash", count=replayed
+            )
         self._logger.info("Risk service consumer groups created")
 
     async def process_fill(self, fill: FillMessage) -> None:

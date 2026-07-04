@@ -38,8 +38,23 @@ class NotificationsServiceRunner:
         self._running = False
 
     async def setup(self) -> None:
-        """Create consumer group for the alerts stream."""
+        """Create consumer group and replay pending alerts.
+
+        Alerts delivered but unacked before a crash would otherwise never be
+        re-delivered — a lost critical alert is exactly the failure this
+        service exists to prevent.
+        """
         await self._redis.create_consumer_group(ALERTS_STREAM, CONSUMER_GROUP)
+        pending = await self._redis.drain_pending(
+            ALERTS_STREAM, CONSUMER_GROUP, CONSUMER_NAME
+        )
+        for msg in pending:
+            # process_message handles its own ack / dead-lettering.
+            await self.process_message(msg)
+        if pending:
+            self._logger.warning(
+                "Replayed pending alerts from a prior crash", count=len(pending)
+            )
         self._logger.info("Notifications service consumer group created")
 
     async def process_message(self, message: StreamMessage) -> None:
