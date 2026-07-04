@@ -13,6 +13,7 @@ from shared.logging import get_logger
 from shared.schemas.messages import (
     AlertMessage,
     ApprovedOrderMessage,
+    FillMessage,
     KillMessage,
     RecommendationMessage,
 )
@@ -21,6 +22,7 @@ RECOMMENDATIONS_STREAM = "stream:recommendations"
 APPROVED_ORDERS_STREAM = "stream:approved_orders"
 ALERTS_STREAM = "stream:alerts"
 KILL_STREAM = "stream:kill"
+FILLS_STREAM = "stream:fills"
 
 CONSUMER_GROUP = "risk_management"
 CONSUMER_NAME = "risk_worker_1"
@@ -45,6 +47,7 @@ class RiskServiceRunner:
         self,
         config: AppConfig,
         redis_client: Any,
+        db_session: Any = None,
     ) -> None:
         self._config = config
         self._redis = redis_client
@@ -64,16 +67,41 @@ class RiskServiceRunner:
         self._passive_monitor = PassiveBreachMonitor(config=risk_cfg)
         self._correlation_monitor = CorrelationMonitor()
 
-        # Portfolio state — in production this would be loaded from DB
-        self._portfolio = PortfolioState(
-            nav=0.0,
-            peak_nav=0.0,
-            positions={},
-            sector_exposure={},
-            total_exposure_pct=0.0,
-            margin_utilization_pct=0.0,
-        )
-        self._current_prices: dict[str, float] = {}
+        # Portfolio state — loaded from the DB when a session is provided so
+        # kill liquidation and stop-loss scans act on real holdings instead
+        # of an empty dict.
+        self._cash = 0.0
+        if db_session is not None:
+            from shared.position_loader import load_portfolio_state
+
+            state = load_portfolio_state(db_session)
+            self._cash = state["cash"]
+            self._portfolio = PortfolioState(
+                nav=state["nav"],
+                peak_nav=state["peak_nav"],
+                positions=state["positions"],
+                sector_exposure=state["sector_exposure"],
+                total_exposure_pct=0.0,
+                margin_utilization_pct=0.0,
+            )
+            self._logger.info(
+                "Portfolio state loaded from DB",
+                nav=state["nav"],
+                peak_nav=state["peak_nav"],
+                open_positions=len(state["positions"]),
+            )
+        else:
+            self._portfolio = PortfolioState(
+                nav=0.0,
+                peak_nav=0.0,
+                positions={},
+                sector_exposure={},
+                total_exposure_pct=0.0,
+                margin_utilization_pct=0.0,
+            )
+        self._current_prices: dict[str, float] = {
+            t: p["current_price"] for t, p in self._portfolio.positions.items()
+        }
 
     async def setup(self) -> None:
         """Create consumer groups for the streams we subscribe to."""
@@ -81,7 +109,62 @@ class RiskServiceRunner:
             RECOMMENDATIONS_STREAM, CONSUMER_GROUP
         )
         await self._redis.create_consumer_group(KILL_STREAM, CONSUMER_GROUP)
+        await self._redis.create_consumer_group(FILLS_STREAM, CONSUMER_GROUP)
         self._logger.info("Risk service consumer groups created")
+
+    async def process_fill(self, fill: FillMessage) -> None:
+        """Update the in-memory portfolio from an execution fill.
+
+        Keeps positions, cash, nav, and peak_nav current between DB reloads
+        so risk checks act on what the account actually holds.
+        """
+        positions = self._portfolio.positions
+        self._current_prices[fill.ticker] = fill.fill_price
+
+        if fill.side == "buy":
+            pos = positions.get(fill.ticker)
+            if pos is None:
+                positions[fill.ticker] = {
+                    "quantity": fill.quantity,
+                    "avg_entry_price": fill.fill_price,
+                    "current_price": fill.fill_price,
+                    "highest_price_since_entry": fill.fill_price,
+                    "sector": "Unknown",
+                }
+            else:
+                total = pos["quantity"] + fill.quantity
+                if total > 0:
+                    pos["avg_entry_price"] = (
+                        pos["avg_entry_price"] * pos["quantity"]
+                        + fill.fill_price * fill.quantity
+                    ) / total
+                pos["quantity"] = total
+                pos["current_price"] = fill.fill_price
+            self._cash -= fill.fill_price * fill.quantity + fill.commission
+        else:
+            pos = positions.get(fill.ticker)
+            if pos is not None:
+                pos["quantity"] -= fill.quantity
+                pos["current_price"] = fill.fill_price
+                if pos["quantity"] <= 0:
+                    del positions[fill.ticker]
+            self._cash += fill.fill_price * fill.quantity - fill.commission
+
+        market_value = sum(
+            p["quantity"] * self._current_prices.get(t, p["current_price"])
+            for t, p in positions.items()
+        )
+        self._portfolio.nav = self._cash + market_value
+        self._portfolio.peak_nav = max(self._portfolio.peak_nav, self._portfolio.nav)
+
+        self._logger.info(
+            "Portfolio updated from fill",
+            ticker=fill.ticker,
+            side=fill.side,
+            quantity=fill.quantity,
+            nav=self._portfolio.nav,
+            open_positions=len(positions),
+        )
 
     async def process_recommendation(
         self, rec: RecommendationMessage
@@ -422,6 +505,20 @@ class RiskServiceRunner:
                         self._logger.exception(
                             "Error processing kill message", message_id=msg.message_id
                         )
+
+                # Read fills to keep the in-memory portfolio current
+                fill_messages = await self._redis.read_group(
+                    FILLS_STREAM, CONSUMER_GROUP, CONSUMER_NAME, count=10, block_ms=500
+                )
+                for msg in fill_messages:
+                    try:
+                        fill = FillMessage.from_stream_dict(msg.data)
+                        await self.process_fill(fill)
+                        await self._redis.ack(FILLS_STREAM, CONSUMER_GROUP, msg.message_id)
+                    except Exception:
+                        self._logger.exception(
+                            "Error processing fill message", message_id=msg.message_id
+                        )
         except (KeyboardInterrupt, Exception):
             self._logger.info("Risk management service interrupted")
 
@@ -435,12 +532,24 @@ if __name__ == "__main__":
 
     async def main() -> None:
         import redis.asyncio as aioredis
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
 
         from shared.redis_client import RedisStreamClient
 
         redis_conn = aioredis.from_url(config.redis.url)
         redis_client = RedisStreamClient(redis_conn)
-        runner = RiskServiceRunner(config=config, redis_client=redis_client)
+
+        # Load real holdings at startup — stop-loss and kill liquidation
+        # must act on actual positions, not an empty dict.
+        engine = create_engine(config.database.url)
+        session = sessionmaker(bind=engine)()
+        try:
+            runner = RiskServiceRunner(
+                config=config, redis_client=redis_client, db_session=session
+            )
+        finally:
+            session.close()
         await runner.run()
 
     asyncio.run(main())

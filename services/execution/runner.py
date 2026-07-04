@@ -153,6 +153,18 @@ class ExecutionServiceRunner:
             order_done=fill_info.get("order_done", False),
         )
 
+        # Keep local position view current so a kill liquidates accurately.
+        ticker = fill_info["ticker"]
+        delta = fill_info["quantity"]
+        if fill_info["side"] == "buy":
+            self._positions[ticker] = self._positions.get(ticker, 0) + delta
+        else:
+            remaining = self._positions.get(ticker, 0) - delta
+            if remaining > 0:
+                self._positions[ticker] = remaining
+            else:
+                self._positions.pop(ticker, None)
+
         # Once IB reports the order complete, it is no longer pending or open.
         if fill_info.get("order_done"):
             self._pending_orders.pop(order_id, None)
@@ -314,6 +326,22 @@ if __name__ == "__main__":
         runner = ExecutionServiceRunner(
             config=config, redis_client=redis_client, order_manager=order_manager
         )
+
+        # Load real holdings so a kill event liquidates actual positions.
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from shared.position_loader import load_open_positions
+
+        engine = create_engine(config.database.url)
+        session = sessionmaker(bind=engine)()
+        try:
+            positions = load_open_positions(session)
+            runner._positions = {
+                ticker: p["quantity"] for ticker, p in positions.items()
+            }
+        finally:
+            session.close()
         executor.set_fill_handler(runner.handle_ib_fill)
         try:
             await runner.run()

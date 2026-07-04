@@ -276,3 +276,62 @@ class TestAuditLogging:
 
         # Logger should have been called (at least info level)
         assert mock_logger.info.call_count >= 1
+
+
+class TestFillProcessing:
+    """process_fill keeps the in-memory portfolio synced with executions."""
+
+    def _fill(self, ticker="AAPL", side="buy", quantity=10.0, price=100.0,
+              commission=0.5):
+        from shared.schemas.messages import FillMessage
+
+        return FillMessage(
+            ticker=ticker,
+            timestamp=datetime.now(timezone.utc),
+            side=side,
+            quantity=quantity,
+            fill_price=price,
+            commission=commission,
+            recommendation_id=str(uuid.uuid4()),
+            order_id="order-1",
+        )
+
+    @pytest.mark.asyncio
+    async def test_buy_fill_opens_position_and_debits_cash(self, runner):
+        runner._cash = 10_000.0
+        await runner.process_fill(self._fill(side="buy", quantity=10, price=100))
+
+        pos = runner._portfolio.positions["AAPL"]
+        assert pos["quantity"] == 10
+        assert pos["avg_entry_price"] == 100
+        assert runner._cash == pytest.approx(10_000 - 1_000 - 0.5)
+        assert runner._portfolio.nav == pytest.approx(runner._cash + 1_000)
+
+    @pytest.mark.asyncio
+    async def test_sell_fill_closes_position_and_credits_cash(self, runner):
+        runner._cash = 9_000.0
+        runner._portfolio.positions["AAPL"] = {
+            "quantity": 10.0, "avg_entry_price": 100.0,
+            "current_price": 100.0, "highest_price_since_entry": 100.0,
+            "sector": "Tech",
+        }
+        await runner.process_fill(self._fill(side="sell", quantity=10, price=110))
+
+        assert "AAPL" not in runner._portfolio.positions
+        assert runner._cash == pytest.approx(9_000 + 1_100 - 0.5)
+
+    @pytest.mark.asyncio
+    async def test_peak_nav_ratchets_up(self, runner):
+        runner._cash = 10_000.0
+        runner._portfolio.peak_nav = 5_000.0
+        await runner.process_fill(self._fill(side="buy", quantity=1, price=100))
+        assert runner._portfolio.peak_nav >= 10_000 - 0.5
+
+    @pytest.mark.asyncio
+    async def test_buy_fill_averages_into_existing_position(self, runner):
+        runner._cash = 20_000.0
+        await runner.process_fill(self._fill(side="buy", quantity=10, price=100))
+        await runner.process_fill(self._fill(side="buy", quantity=10, price=120))
+        pos = runner._portfolio.positions["AAPL"]
+        assert pos["quantity"] == 20
+        assert pos["avg_entry_price"] == pytest.approx(110.0)
