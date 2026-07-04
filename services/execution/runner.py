@@ -368,8 +368,9 @@ if __name__ == "__main__":
         )
         # Connect BEFORE consuming orders. A failed connect exits nonzero so
         # the container restart policy retries; running without IB would
-        # consume approved orders while executing nothing.
-        await executor.connect()
+        # consume approved orders while executing nothing. expect_paper
+        # refuses a LIVE Gateway session answering on the paper port.
+        await executor.connect(expect_paper=(config.mode != "live"))
 
         order_manager = OrderManager(
             executor=executor, redis_client=redis_client, db_session=None

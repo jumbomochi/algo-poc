@@ -34,6 +34,10 @@ class NotConnectedError(RuntimeError):
     """Raised when an order operation is attempted without an IB connection."""
 
 
+class WrongAccountTypeError(RuntimeError):
+    """Raised when the Gateway session's account type contradicts the mode."""
+
+
 class IBExecutor:
     """Wraps ib_insync to submit orders to Interactive Brokers.
 
@@ -67,8 +71,16 @@ class IBExecutor:
         """Register the async callback invoked on every real IB fill."""
         self._fill_handler = handler
 
-    async def connect(self) -> None:
-        """Connect to Interactive Brokers TWS/Gateway."""
+    async def connect(self, expect_paper: bool | None = None) -> None:
+        """Connect to Interactive Brokers TWS/Gateway.
+
+        Args:
+            expect_paper: When True, refuse the connection unless every
+                managed account is a paper account (``DU`` prefix). Guards
+                against the Gateway being logged into a LIVE session on the
+                paper port — which happened on 2026-07-04 (live account
+                U-prefix answering on 7497 after a manual live login).
+        """
         try:
             from ib_insync import IB
 
@@ -76,13 +88,28 @@ class IBExecutor:
             await self._ib.connectAsync(
                 self._host, self._port, clientId=self._client_id
             )
+            accounts = self._ib.managedAccounts()
+
+            if expect_paper:
+                non_paper = [a for a in accounts if not a.startswith("DU")]
+                if non_paper:
+                    self._ib.disconnect()
+                    self._ib = None
+                    raise WrongAccountTypeError(
+                        f"Paper mode but the Gateway session holds LIVE "
+                        f"account(s) {non_paper} on port {self._port}. "
+                        "Re-login the Gateway with the paper credentials."
+                    )
+
             self._logger.info(
                 "Connected to IB",
                 host=self._host,
                 port=self._port,
                 client_id=self._client_id,
-                accounts=self._ib.managedAccounts(),
+                accounts=accounts,
             )
+        except WrongAccountTypeError:
+            raise
         except Exception:
             self._ib = None
             self._logger.exception("Failed to connect to IB")

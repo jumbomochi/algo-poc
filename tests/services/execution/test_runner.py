@@ -268,3 +268,44 @@ class TestPaperMode:
             order_manager=AsyncMock(),
         )
         assert runner.ib_port == mock_config.ib.live_port
+
+
+class TestPaperAccountGuard:
+    """connect(expect_paper=True) must refuse a live-account Gateway session."""
+
+    @pytest.mark.asyncio
+    async def test_live_account_on_paper_port_refused(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from services.execution.ib_executor import (
+            IBExecutor,
+            WrongAccountTypeError,
+        )
+
+        executor = IBExecutor(host="h", port=7497, client_id=1)
+        fake_ib = MagicMock()
+        fake_ib.connectAsync = AsyncMock()
+        fake_ib.managedAccounts.return_value = ["U17723819"]  # LIVE prefix
+
+        with patch("ib_insync.IB", return_value=fake_ib):
+            with pytest.raises(WrongAccountTypeError, match="LIVE"):
+                await executor.connect(expect_paper=True)
+
+        fake_ib.disconnect.assert_called_once()
+        assert executor._ib is None
+
+    @pytest.mark.asyncio
+    async def test_paper_account_accepted(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from services.execution.ib_executor import IBExecutor
+
+        executor = IBExecutor(host="h", port=7497, client_id=1)
+        fake_ib = MagicMock()
+        fake_ib.connectAsync = AsyncMock()
+        fake_ib.managedAccounts.return_value = ["DUN551088"]  # paper prefix
+
+        with patch("ib_insync.IB", return_value=fake_ib):
+            await executor.connect(expect_paper=True)
+
+        assert executor._ib is fake_ib
