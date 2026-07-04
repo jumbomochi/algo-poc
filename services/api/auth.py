@@ -24,16 +24,36 @@ def _load_api_keys() -> dict[str, str]:
     """Load API key -> role mapping.
 
     Uses ``API_KEYS`` env var if set (format: ``key1:role1,key2:role2``),
-    otherwise falls back to development defaults.
+    otherwise falls back to development defaults. The fallback is refused in
+    live mode: an internet-reachable kill switch must never accept "test-key".
     """
     env_keys = os.environ.get("API_KEYS")
     if env_keys:
         mapping: dict[str, str] = {}
         for entry in env_keys.split(","):
-            key, role = entry.strip().split(":")
+            entry = entry.strip()
+            if not entry:
+                continue
+            key, sep, role = entry.partition(":")
+            if not sep or not key.strip() or role.strip() not in ROLES:
+                raise ValueError(
+                    f"Malformed API_KEYS entry {entry!r}: expected 'key:role' "
+                    f"with role in {ROLES}"
+                )
             mapping[key.strip()] = role.strip()
+        if not mapping:
+            raise ValueError("API_KEYS is set but contains no valid entries")
         return mapping
 
+    if os.environ.get("ALGO_MODE") == "live":
+        raise RuntimeError(
+            "API_KEYS must be set in live mode; refusing to start with "
+            "development default keys"
+        )
+    logger.warning(
+        "api_keys_using_dev_defaults",
+        hint="set API_KEYS=key:role[,key:role] for real deployments",
+    )
     return {
         "test-key": "admin",
         "operator-key": "operator",

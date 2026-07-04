@@ -436,19 +436,24 @@ def main():
         earnings_lookup=earnings_lookup,
     )
 
-    # Run signals
+    # Run signals. Roll back on any failure so a mid-run crash cannot leave
+    # some portfolios updated and others not (record_fill flushes as it goes).
     print(f"\nRunning signals across {len(portfolios)} portfolios...")
-    signals = run_daily(state, portfolios, bars_by_ticker)
+    try:
+        signals = run_daily(state, portfolios, bars_by_ticker)
+        session.commit()
+    except Exception:
+        session.rollback()
+        print("\nERROR: daily run failed; database changes rolled back")
+        raise
+    finally:
+        session.close()
 
     if signals:
         print(f"\n{len(signals)} signals generated")
     else:
         print("\nNo signals generated today")
-
-    # Commit state to database
-    session.commit()
     print(f"\nState committed to database")
-    session.close()
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -97,7 +97,9 @@ class ObservabilityConfig(BaseModel):
 
 
 class AppConfig(BaseModel):
-    mode: str = "paper"
+    # Literal so a typo'd ALGO_MODE (e.g. "liv") fails at startup instead of
+    # silently falling through to the paper port in live deployments.
+    mode: Literal["paper", "live", "backtest"] = "paper"
     universe: UniverseConfig = Field(default_factory=UniverseConfig)
     data_ingestion: DataIngestionConfig = Field(default_factory=DataIngestionConfig)
     signals: SignalsConfig = Field(default_factory=SignalsConfig)
