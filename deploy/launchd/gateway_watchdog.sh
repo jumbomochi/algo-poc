@@ -1,11 +1,18 @@
 #!/bin/bash
-# IB Gateway watchdog for algo-poc.
-# Checks the API port; if it's been down for TWO consecutive runs, kickstarts
-# the IBC gateway launchd job (the fix that resolved the stuck-login-modal issue
-# on 2026-06-25). Two-strike logic rides over the legitimate ~1-min nightly
-# auto-restart (23:55) and cold-restart (08:00) blips instead of fighting them.
+# IB Gateway watchdog for algo-poc — hardened version.
 #
-# Wire via launchd with StartInterval (e.g. every 300s). See deploy/launchd/.
+# Checks the API port; if it's been down for TWO consecutive runs, kickstarts
+# the IBC gateway launchd job. Two-strike logic rides over the legitimate
+# ~1-min nightly auto-restart (23:55) and weekly cold-restart (Sun 08:00).
+#
+# HARDENING (2026-07-05): before any kickstart, the newest IBC gateway log is
+# checked for authentication failures. If the Gateway is being REJECTED
+# ("Unrecognized Username or Password" / "Too many failed login attempts"),
+# restarting would loop failed logins into an IB rate-limit or lockout — the
+# 2026-07-01 incident (30 rejected logins). In that state the watchdog
+# refuses to act, sends ONE Telegram alert, and waits for a human.
+#
+# Wire via launchd with StartInterval (300s). See deploy/launchd/.
 
 set -uo pipefail
 
@@ -14,24 +21,53 @@ GW_LABEL="local.ibc-gateway"
 LOG_DIR="$HOME/ibc/logs"
 LOG_FILE="$LOG_DIR/gateway_watchdog_$(date +%Y%m%d).log"
 MARKER="$HOME/ibc/.gateway_down_marker"
+AUTH_MARKER="$HOME/ibc/.gateway_auth_failure_alerted"
+ENV_FILE="/Users/huiliang/GitHub/algo-poc/.env"
 
 mkdir -p "$LOG_DIR"
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
+telegram() {
+    # Best-effort Telegram alert; never fails the watchdog.
+    [ -f "$ENV_FILE" ] || return 0
+    local token chat
+    token=$(grep '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" | head -1 | cut -d= -f2-)
+    chat=$(grep '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | head -1 | cut -d= -f2-)
+    [ -n "$token" ] && [ -n "$chat" ] || return 0
+    curl -s -m 10 "https://api.telegram.org/bot${token}/sendMessage" \
+        -d chat_id="$chat" --data-urlencode text="$1" >/dev/null 2>&1 || true
+}
+
 if nc -z -G 3 127.0.0.1 "$PORT" 2>/dev/null; then
-    # Up — clear any pending strike. Only log on recovery to keep the log quiet.
-    if [ -f "$MARKER" ]; then
+    # Up — clear pending strikes. Only log/alert on a state change.
+    if [ -f "$MARKER" ] || [ -f "$AUTH_MARKER" ]; then
         echo "$(ts): port $PORT recovered" >> "$LOG_FILE"
-        rm -f "$MARKER"
+        [ -f "$AUTH_MARKER" ] && telegram "✅ IB Gateway recovered: port $PORT is up again after the login problem."
+        rm -f "$MARKER" "$AUTH_MARKER"
     fi
     exit 0
 fi
 
-# Port is down.
+# Port is down. FIRST: is the Gateway stuck on a login rejection? Restarting
+# into that state hammers IB with failed logins — refuse and alert instead.
+LATEST_GW_LOG=$(ls -t "$LOG_DIR"/ibc-*.txt 2>/dev/null | head -1)
+if [ -n "$LATEST_GW_LOG" ] && tail -80 "$LATEST_GW_LOG" 2>/dev/null \
+        | grep -qE "Unrecognized Username or Password|Too many failed login attempts"; then
+    if [ ! -f "$AUTH_MARKER" ]; then
+        echo "$(ts): AUTH FAILURE in $LATEST_GW_LOG — refusing to kickstart; alerted operator" >> "$LOG_FILE"
+        telegram "🚨 IB Gateway login is being REJECTED (port $PORT down). Watchdog will NOT restart it — repeated failed logins risk an IB lockout. Manual re-login needed (check the paper-trading password)."
+        touch "$AUTH_MARKER"
+    fi
+    rm -f "$MARKER"
+    exit 0
+fi
+
+# No auth failure in evidence — treat as a dead/stuck process. Two strikes.
 if [ -f "$MARKER" ]; then
     echo "$(ts): port $PORT down 2 consecutive checks — kickstarting $GW_LABEL" >> "$LOG_FILE"
     launchctl kickstart -k "gui/$(id -u)/$GW_LABEL" >> "$LOG_FILE" 2>&1
     rm -f "$MARKER"            # reset; next run confirms recovery (or strikes again)
+    telegram "⚠️ IB Gateway watchdog: port $PORT was down ~10 min with no auth error in the log — kickstarted the Gateway. Will confirm recovery next check."
 else
     echo "$(ts): port $PORT down (1st check) — grace before action" >> "$LOG_FILE"
     touch "$MARKER"

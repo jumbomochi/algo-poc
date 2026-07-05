@@ -61,19 +61,31 @@ launchctl bootout gui/$(id -u)/local.algo-divergence-monitor
 rm ~/Library/LaunchAgents/local.algo-divergence-monitor.plist
 ```
 
-## IB Gateway watchdog
+## IB Gateway watchdog (hardened 2026-07-05)
 
 Runs `gateway_watchdog.sh` every **5 minutes** (`StartInterval` 300s). Checks
 the API port (7497 paper); after **two consecutive** failures (~10 min down) it
-`launchctl kickstart -k`s the `local.ibc-gateway` job — the fix that cleared the
-stuck "Unrecognized Username or Password" login modal on 2026-06-25. The
-two-strike logic rides over the legitimate ~1-min nightly auto-restart (23:55)
-and cold-restart (08:00) blips instead of fighting them.
+`launchctl kickstart -k`s the `local.ibc-gateway` job. The two-strike logic
+rides over the legitimate ~1-min nightly auto-restart (23:55) and weekly
+cold-restart blips instead of fighting them.
+
+**Auth-failure refusal:** before any kickstart the newest IBC gateway log is
+checked for `Unrecognized Username or Password` / `Too many failed login
+attempts`. If present, the watchdog **refuses to restart** (restarting loops
+failed logins into an IB rate-limit — the 2026-07-01 incident: 30 rejected
+attempts), sends **one Telegram alert**, and waits for a human re-login. It
+alerts again on recovery.
+
+**Telegram alerts** (best-effort) are sent on: auth-failure refusal, kickstart
+action, and recovery. Credentials are read from the repo's gitignored `.env`
+(`TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`).
 
 - **Logs:** `~/ibc/logs/gateway_watchdog_YYYYMMDD.log` (only logs on state
   change / action, to stay quiet), launchd stdout/stderr to
   `~/ibc/logs/gateway-watchdog-launchd.log`.
-- **State marker:** `~/ibc/.gateway_down_marker` (present = one strike pending).
+- **State markers:** `~/ibc/.gateway_down_marker` (one strike pending),
+  `~/ibc/.gateway_auth_failure_alerted` (alert already sent; cleared on
+  recovery).
 - **For live:** change `PORT=7497` to `7496` in the script.
 
 > Note: when the Gateway is kickstarted, in-flight IB API sessions drop.
