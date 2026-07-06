@@ -135,7 +135,9 @@ if __name__ == "__main__":
         ib_client = IBClient(
             host=config.ib.host,
             port=config.ib.paper_port if config.mode != "live" else config.ib.live_port,
-            client_id=config.ib.client_id,
+            # Distinct from execution's client_id: IB kicks the older session
+            # when two clients connect with the same id.
+            client_id=config.ib.data_client_id,
         )
         runner = DataIngestionRunner(
             config=config, ib_client=ib_client, redis_client=redis_client, db_session=None

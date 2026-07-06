@@ -71,7 +71,12 @@ class IBConfig(BaseModel):
     host: str = "127.0.0.1"
     live_port: int = 7496
     paper_port: int = 7497
+    # Every concurrent API client needs a DISTINCT id — IB disconnects the
+    # older session when a duplicate id connects. execution uses client_id;
+    # data_ingestion uses data_client_id. (Backtest/paper scripts use 10+,
+    # ad-hoc probes 42+.)
     client_id: int = 1
+    data_client_id: int = 2
 
 
 class DatabaseConfig(BaseModel):

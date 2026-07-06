@@ -56,7 +56,8 @@ ib:
   host: "127.0.0.1"
   live_port: 7496
   paper_port: 7497
-  client_id: 1
+  client_id: 1        # execution service — every concurrent client needs a distinct id
+  data_client_id: 2   # data_ingestion service
 
 notifications:
   slack_enabled: false
