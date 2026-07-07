@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Disabled</key>
+	<false/>
+	<key>Label</key>
+	<string>local.algo-backtest-refresh</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/huiliang/ibc/run_backtest_refresh.sh</string>
+	</array>
+	<key>StandardErrorPath</key>
+	<string>/Users/huiliang/ibc/logs/backtest-refresh-launchd.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/huiliang/ibc/logs/backtest-refresh-launchd.log</string>
+	<!-- Tuesday 05:00 SGT: after Tue 04:15 paper run + 04:45 divergence, with
+	     the US Monday session closed and IBKR's data farms warm (they are
+	     routinely dead Sun-Mon pre-market). -->
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Weekday</key>
+		<integer>2</integer>
+		<key>Hour</key>
+		<integer>5</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+</dict>
+</plist>

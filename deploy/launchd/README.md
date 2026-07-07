@@ -10,6 +10,8 @@ host. The **live** copies are deployed outside the repo:
 | `local.algo-divergence-monitor.plist` | `~/Library/LaunchAgents/local.algo-divergence-monitor.plist` |
 | `gateway_watchdog.sh` | `~/ibc/gateway_watchdog.sh` (chmod +x) |
 | `local.algo-gateway-watchdog.plist` | `~/Library/LaunchAgents/local.algo-gateway-watchdog.plist` |
+| `run_backtest_refresh.sh` | `~/ibc/run_backtest_refresh.sh` (chmod +x) — Tue 05:00 SGT weekly baseline refresh |
+| `local.algo-backtest-refresh.plist` | `~/Library/LaunchAgents/local.algo-backtest-refresh.plist` |
 
 Both `run_paper.sh` and `run_divergence.sh` export
 `ALGO_DATABASE_URL=postgresql://algo:algo@localhost:55432/algo_poc` — the
@@ -103,3 +105,23 @@ launchctl bootout   gui/$(id -u)/local.algo-gateway-watchdog 2>/dev/null
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.algo-gateway-watchdog.plist
 launchctl list | grep local.algo-gateway-watchdog
 ```
+
+## Weekly backtest refresh
+
+Runs `run_backtest_refresh.sh` every **Tuesday 05:00 SGT** — full 10yr
+backtest so the [divergence monitor](../../docs/operations/divergence-monitor.md)
+baseline stays current (it auto-picks the newest `output/backtest_multi_*.json`;
+without refreshes the live equity dates never overlap the baseline and every
+portfolio reads `NO_DATA`).
+
+**Why Tuesday, not Monday:** IBKR's historical-data farm is routinely dead
+from Saturday night until the US Monday open (observed 2026-07-05/06 — 26
+consecutive failed probes across the weekend). By Tuesday 05:00 SGT the US
+Monday session has closed and the farms are warm. The job also runs safely
+alongside the 04:15/04:45 jobs (backtest uses IB clientId 10).
+
+- **Telegram**: ✅ with the headline metrics on success, ❌ on failure or when
+  the Gateway is unreachable (baseline going stale is a silent risk otherwise).
+- **Logs:** `~/ibc/logs/backtest_refresh_YYYYMMDD.log` (pruned after 90 days).
+- **Pruning:** baseline JSONs older than 90 days are deleted (~64 MB each;
+  only the newest is ever used).

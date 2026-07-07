@@ -125,7 +125,7 @@ written that day's `equity_snapshots` row. The deployed job is:
 |---|---|---|
 | 04:15 | `scripts/run_paper.py` | Daily signal run, persists state to DB |
 | 04:45 | `scripts/divergence_monitor.py --prometheus-textfile ...` | Reads the snapshots just written |
-| 05:00 | Backtest refresh on Mondays only (weekly) | Updates the baseline that divergence is measured against |
+| 05:00 Tue | Backtest refresh (weekly, `local.algo-backtest-refresh`) | Updates the baseline that divergence is measured against. Tuesday, not Monday: IBKR's hist-data farm is routinely down from Saturday night through Monday pre-market. |
 
 **Alert wiring:** the script exits non-zero on BREACH. Wrap the cron line in:
 
