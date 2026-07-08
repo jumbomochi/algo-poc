@@ -53,9 +53,20 @@ fi
 LATEST_GW_LOG=$(ls -t "$LOG_DIR"/ibc-*.txt 2>/dev/null | head -1)
 if [ -n "$LATEST_GW_LOG" ] && tail -80 "$LATEST_GW_LOG" 2>/dev/null \
         | grep -qE "Unrecognized Username or Password|Too many failed login attempts"; then
+    # Alert immediately, then RE-ALERT every 12h while unresolved — a single
+    # missed message cost two paper-record days (2026-07-07..09).
+    REALERT_SECS=$((12 * 3600))
+    NEED_ALERT=0
     if [ ! -f "$AUTH_MARKER" ]; then
+        NEED_ALERT=1
+    else
+        LAST_ALERT=$(stat -f %m "$AUTH_MARKER" 2>/dev/null || echo 0)
+        NOW_EPOCH=$(date +%s)
+        [ $((NOW_EPOCH - LAST_ALERT)) -ge "$REALERT_SECS" ] && NEED_ALERT=1
+    fi
+    if [ "$NEED_ALERT" -eq 1 ]; then
         echo "$(ts): AUTH FAILURE in $LATEST_GW_LOG — refusing to kickstart; alerted operator" >> "$LOG_FILE"
-        telegram "🚨 IB Gateway login is being REJECTED (port $PORT down). Watchdog will NOT restart it — repeated failed logins risk an IB lockout. Manual re-login needed (check the paper-trading password)."
+        telegram "🚨 IB Gateway login is being REJECTED (port $PORT down). Watchdog will NOT restart it — repeated failed logins risk an IB lockout. Manual re-login needed. (This repeats every 12h until fixed.)"
         touch "$AUTH_MARKER"
     fi
     rm -f "$MARKER"
