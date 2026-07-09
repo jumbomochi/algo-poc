@@ -1,7 +1,10 @@
 mode: paper  # live | backtest | paper
 
 universe:
-  watchlist_source: sp500
+  # sleeves = union universe of the active sleeves (ingest exactly what the
+  # strategies trade); sp500 = SP500_TOP100; custom = only custom_tickers.
+  # custom_tickers are additive for non-custom sources.
+  watchlist_source: sleeves
   custom_tickers: []
 
 data_ingestion:

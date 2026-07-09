@@ -50,68 +50,19 @@ from services.signal_generation.technical import (
     find_support_levels,
 )
 
-# Top 50 S&P 500 by market cap (as of early 2025)
-SP500_TOP50 = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "BRK B", "LLY",
-    "AVGO", "JPM", "TSLA", "UNH", "XOM", "V", "MA", "PG", "COST",
-    "JNJ", "HD", "ABBV", "WMT", "NFLX", "CRM", "BAC", "CVX",
-    "MRK", "KO", "AMD", "PEP", "TMO", "LIN", "ACN", "CSCO", "ADBE",
-    "MCD", "ABT", "WFC", "DHR", "TXN", "PM", "GE", "QCOM", "ISRG",
-    "INTU", "CMCSA", "AMAT", "VZ", "NOW", "IBM", "AMGN",
-]
-
-# Inverse ETFs for bear market plays
-BEAR_TICKERS = {"SH", "PSQ"}  # SH = inverse S&P 500, PSQ = inverse NASDAQ-100
-
-# Inverse/defensive ETFs for tail-risk hedge
-DEFENSIVE_TICKERS = ["SH", "PSQ", "SDS", "TLT", "GLD"]
-
-# SPDR sector ETFs
-SECTOR_ETFS = [
-    "XLK", "XLE", "XLF", "XLV", "XLY", "XLP",
-    "XLI", "XLB", "XLU", "XLRE", "XLC",
-]
-
-# Thematic ETFs
-THEMATIC_ETFS = [
-    "ARKK", "TAN", "HACK", "BOTZ", "LIT", "CIBR", "SKYY", "DRIV",
-    "FINX", "GAMR", "HERO", "IDRV", "CLOU", "WCLD", "SNSR", "PRNT",
-    "IZRL", "GNOM", "ARKG", "ARKQ", "ARKW", "ARKF", "ICLN", "QCLN", "PBW",
-]
-
-# S&P 500 extended (top 100 for short-term MR)
-SP500_TOP100 = SP500_TOP50 + [
-    "CAT", "MS", "NEE", "LOW", "UPS", "SPGI", "RTX", "HON", "ELV",
-    "BLK", "SYK", "BKNG", "MDLZ", "ADP", "VRTX", "SCHW", "GILD",
-    "AMT", "REGN", "LRCX", "PANW", "BSX", "CB", "MMC", "KLAC",
-    "TMUS", "SHW", "SO", "EQIX", "MO", "PGR", "ZTS", "CME",
-    "CI", "DUK", "ICE", "SNPS", "CL", "AON", "MCO", "WM",
-    "CDNS", "TGT", "BDX", "NOC", "APH", "ITW", "FI", "HUM",
-]
-
-# Per-strategy ticker universes
-UNIVERSE_REGISTRY: dict[str, list[str]] = {
-    "mean_reversion": SP500_TOP50,
-    "momentum": SP500_TOP50 + [t for t in sorted(BEAR_TICKERS) if t not in SP500_TOP50],
-    "sector_rotation": SECTOR_ETFS,
-    "quality_value": SP500_TOP100,
-    "earnings_drift": SP500_TOP100,
-    "short_term_mr": SP500_TOP100,
-    "thematic_momentum": THEMATIC_ETFS,
-    "tail_risk_hedge": DEFENSIVE_TICKERS,
-}
-
-
-def get_union_universe(strategy_names: list[str]) -> list[str]:
-    """Return deduplicated union of tickers across the given strategies."""
-    seen: set[str] = set()
-    result: list[str] = []
-    for name in strategy_names:
-        for ticker in UNIVERSE_REGISTRY[name]:
-            if ticker not in seen:
-                seen.add(ticker)
-                result.append(ticker)
-    return result
+# Ticker universes moved to shared/universe.py (single source of truth,
+# also used by the data_ingestion service). Re-exported here so existing
+# imports (run_paper.py, tests) keep working.
+from shared.universe import (  # noqa: F401
+    BEAR_TICKERS,
+    DEFENSIVE_TICKERS,
+    SECTOR_ETFS,
+    SP500_TOP50,
+    SP500_TOP100,
+    THEMATIC_ETFS,
+    UNIVERSE_REGISTRY,
+    get_union_universe,
+)
 
 
 def fetch_bars_from_ib(

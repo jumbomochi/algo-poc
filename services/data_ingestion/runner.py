@@ -143,8 +143,17 @@ if __name__ == "__main__":
             config=config, ib_client=ib_client, redis_client=redis_client, db_session=None
         )
 
-        logger.info("Data ingestion service started", mode=config.mode)
-        tickers = config.universe.custom_tickers or []
+        from shared.universe import resolve_watchlist
+
+        tickers = resolve_watchlist(
+            config.universe.watchlist_source, config.universe.custom_tickers
+        )
+        logger.info(
+            "Data ingestion service started",
+            mode=config.mode,
+            watchlist_source=config.universe.watchlist_source,
+            ticker_count=len(tickers),
+        )
         while True:
             if runner.is_market_active() or config.mode == "backtest":
                 await runner.run_cycle(tickers)
