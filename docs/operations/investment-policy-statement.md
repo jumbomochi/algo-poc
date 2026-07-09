@@ -31,13 +31,14 @@ impair core goals.
 
 Its honest value is **three-fold**, in priority order:
 
-1. **Drawdown protection** — backtested max DD 10.85% vs ~30% for CW8 over the same
+1. **Drawdown protection** — backtested max DD ~11.6% vs ~30% for CW8 over the same
    horizon.
 2. **Skill-building & optionality** — operating a live systematic book is a durable
    capability; the infrastructure has option value beyond this strategy.
-3. **Return** — secondary. The headline edge is ~+7 pp CAGR vs CW8, but only
-   **~+2.78 pp is durable skill alpha**; the remaining ~+4 pp is a US-vs-international
-   concentration premium that is regime-dependent and may fade or invert. The IPS
+3. **Return** — secondary. The headline edge is ~+6 pp CAGR vs CW8 (corrected
+   2026-07-10 for the exposure-gate fix), of which only **~+1.8 pp is durable skill
+   alpha**; the remainder is a US-vs-international concentration premium that is
+   regime-dependent and may fade or invert. The IPS
    treats return as a *bonus on top of* drawdown protection, not the thesis.
 
 The operator commits to not rationalizing the strategy upward into "core" status
@@ -275,15 +276,18 @@ to hold, and counts as a weight change under § 9 (monthly-review-only, document
 
 ### Appendix B — key backtest baseline (for divergence reference)
 
-9.97-year backtest (2016-05-31 → 2026-05-22), $100K basis:
+~10.1-year backtest (2016-05-31 → 2026-07-06), $100K basis. **Corrected
+2026-07-10**: earlier figures (+420–427%) were produced with the per-sleeve
+total-exposure limit silently disabled (internal leverage); Sharpe is
+unchanged by the correction — the difference was leverage, not skill.
 
 | Metric | Value |
 |---|---:|
-| Total return | +420.4% |
-| CAGR | 17.98% |
+| Total return | +385.9% |
+| CAGR | ~17.0% |
 | Sharpe | 1.97 |
-| Max drawdown | 10.85% |
-| Win rate | 53.82% |
-| Trades | 4,262 |
+| Max drawdown | 11.60% |
+| Win rate | 53.5% |
+| Trades | 3,748 |
 
 Full detail: [portfolio-2026-05.md](../strategies/portfolio-2026-05.md).

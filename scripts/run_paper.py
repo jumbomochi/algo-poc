@@ -41,6 +41,7 @@ from scripts.run_backtest import (
 )
 from scripts.fetch_fundamentals import load_fundamentals_cache, build_fundamentals_lookup, SECTOR_MAP
 from scripts.fetch_earnings import load_earnings_cache, build_earnings_lookup
+from backtest._portfolio_state import SimplePortfolioState
 from backtest.aggregate_risk import AggregateRiskMonitor
 from services.risk_management.engine import RiskEngine
 
@@ -271,19 +272,62 @@ def run_daily(
                 signal["portfolio"] = name
                 signal["date"] = str(today)
                 signal["ticker"] = ticker
-                signals_generated.append(signal)
 
                 action = signal["action"]
                 price = signal["limit_price"]
                 qty = signal.get("quantity", 0)
 
                 if action == "buy":
+                    from shared.universe import ETF_SECTORS
+
+                    sector = SECTOR_MAP.get(ticker) or ETF_SECTORS.get(ticker)
+
+                    # Gate through the sleeve's RiskEngine exactly like the
+                    # backtest runner does — without it the sim books every
+                    # buy unconstrained (quality_value went to -$43K cash /
+                    # 3.8x leverage on day one).
+                    positions = state.get_positions(name)
+                    sleeve_cash = state.get_cash(name)
+                    nav = sleeve_cash + sum(
+                        p["quantity"] * current_prices.get(t, p["avg_entry_price"])
+                        for t, p in positions.items()
+                    )
+                    portfolio_state = SimplePortfolioState(
+                        nav=nav,
+                        peak_nav=nav,
+                        positions={
+                            t: {"quantity": p["quantity"]} for t, p in positions.items()
+                        },
+                        # {} matches the backtest gate (sector limits are
+                        # enforced account-level by the risk service instead)
+                        sector_exposure={},
+                        # market value / nav — same computation as the
+                        # backtest's _make_simple_portfolio
+                        total_exposure_pct=(
+                            ((nav - sleeve_cash) / nav) * 100.0 if nav > 0 else 0.0
+                        ),
+                        margin_utilization_pct=0.0,
+                    )
+                    decision = pc.risk_engine.check_entry(
+                        ticker=ticker,
+                        quantity=qty,
+                        price=price,
+                        sector=sector or "Unknown",
+                        portfolio=portfolio_state,
+                        existing_lots=1 if ticker in positions else 0,
+                    )
+                    if not decision.approved:
+                        print(f"  SKIP {ticker:>6s}  {qty:>8.4f} @ ${price:>8.2f}  [{name}] ({decision.reason})")
+                        continue
+                    if decision.adjusted_quantity and decision.adjusted_quantity != qty:
+                        qty = decision.adjusted_quantity
+                        signal["quantity"] = qty
+
+                    signals_generated.append(signal)
                     entry_signals = {
                         k: v for k, v in signal.items()
                         if k not in ("action", "limit_price", "quantity", "portfolio", "date", "ticker")
                     }
-                    from shared.universe import ETF_SECTORS
-
                     state.record_fill(
                         portfolio=name,
                         ticker=ticker,
@@ -292,10 +336,13 @@ def run_daily(
                         price=price,
                         fill_date=today,
                         entry_signals=entry_signals,
-                        sector=SECTOR_MAP.get(ticker) or ETF_SECTORS.get(ticker),
+                        sector=sector,
                     )
                     print(f"  BUY  {ticker:>6s}  {qty:>8.4f} @ ${price:>8.2f}  [{name}]")
                 elif action == "sell":
+                    # Exits are never gated (matching the backtest runner:
+                    # "Sell signals for existing positions are always processed").
+                    signals_generated.append(signal)
                     reason = signal.get("exit_reason", "signal")
                     state.record_fill(
                         portfolio=name,

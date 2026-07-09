@@ -240,11 +240,18 @@ def _make_simple_portfolio(
             price = bar["close"] if bar else lot.entry_price
             nav += price * lot.quantity
 
+    # Exposure = market value / nav. Was hard-coded 0.0, which silently
+    # disabled the RiskEngine's total-exposure limit in every backtest —
+    # sleeves could lever internally (cash below zero) bounded only by
+    # per-position caps and max-lots.
+    market_value = nav - cash
+    exposure_pct = (market_value / nav) * 100.0 if nav > 0 else 0.0
+
     return SimplePortfolioState(
         nav=nav,
         peak_nav=nav,
         positions=all_positions,
         sector_exposure={},
-        total_exposure_pct=0.0,
+        total_exposure_pct=exposure_pct,
         margin_utilization_pct=0.0,
     )

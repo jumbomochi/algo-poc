@@ -1,9 +1,18 @@
 # Active Portfolio Configuration — 2026-05
 
-**Status:** Current as of 2026-05-26; **figures refreshed 2026-06-14** (sanity-check rerun on fresh IB data)
+**Status:** Current as of 2026-05-26; **figures corrected 2026-07-10** (exposure-gate fix, see note below)
 **Capital basis:** $100,000 reference
-**Backtest horizon:** 2016-05-31 → 2026-06-13 (~10.0 years)
-**Backtest JSON:** `output/backtest_multi_20260614_090335.json` (prior: `backtest_multi_20260526_235302.json`)
+**Backtest horizon:** 2016-05-31 → 2026-07-06 (~10.1 years)
+**Backtest JSON:** `output/backtest_multi_20260710_005841.json`
+
+> **2026-07-10 correction — exposure limits were silently disabled.** All
+> prior backtests passed `total_exposure_pct=0.0` to the risk gate, so the
+> per-sleeve total-exposure limits never fired and sleeves could lever
+> internally (cash below zero; quality_value reached ~3.8x). With exposure
+> enforced honestly, the aggregate return drops from +427% to **+386%**
+> while **Sharpe is unchanged (1.97)** — the difference was pure leverage,
+> not strategy quality, and was not implementable at real brokerage margin.
+> Figures below are the corrected, implementable baseline.
 
 This document describes the **active sleeves** used by both
 `scripts/run_backtest.py` and `scripts/run_paper.py`. For the historical
@@ -35,32 +44,29 @@ see `docs/strategy.md`. For why two sleeves were dropped, see
 
 ### Aggregate
 
-Figures below are the **2026-06-14 refresh** (prior 2026-05-26 values in parentheses
-where they differ — all within noise).
-
 | Metric | Value |
 |---|---:|
-| Total return | **+427.1%** (was +420.4%) |
-| **CAGR** | **~17.9%** |
+| Total return | **+385.9%** |
+| **CAGR** | **~17.0%** |
 | Sharpe ratio | 1.97 |
-| Max drawdown | 10.89% (was 10.85%) |
-| Win rate | 53.86% |
-| Total trades | 4,330 (was 4,262) |
+| Max drawdown | 11.60% |
+| Win rate | 53.5% |
+| Total trades | 3,748 |
 | Starting capital | $100,000 |
-| Final value | $527,116.57 |
+| Final value | $485,871.14 |
 
 ### Per-sleeve
 
-Refreshed 2026-06-14 (return / Sharpe / max DD / trades):
+Corrected 2026-07-10 (exposure gate enforced; return / Sharpe / max DD / trades):
 
 | Sleeve | Return | Sharpe | Max DD | Trades |
 |---|---:|---:|---:|---:|
-| thematic_momentum | +856.96% | 1.94 | 12.54% | 1,357 |
-| sector_rotation | +793.32% | 1.80 | 14.43% | 582 |
-| momentum | +506.92% | 1.53 | 14.88% | 644 |
-| earnings_drift | +254.74% | 1.44 | 8.16% | 1,249 |
-| quality_value | +123.64% | 0.87 | 21.30% | 112 |
-| tail_risk_hedge | −5.65% | −0.12 | 14.50% | 386 |
+| thematic_momentum | +826.83% | 2.03 | 13.90% | 1,275 |
+| sector_rotation | +714.48% | 1.89 | 16.09% | 525 |
+| momentum | +495.02% | 1.53 | 15.90% | 641 |
+| earnings_drift | +179.13% | 1.55 | 6.30% | 844 |
+| quality_value | +75.71% | 0.80 | 13.25% | 69 |
+| tail_risk_hedge | −7.34% | −0.16 | 14.68% | 394 |
 
 ---
 
@@ -68,15 +74,16 @@ Refreshed 2026-06-14 (return / Sharpe / max DD / trades):
 
 | | Total Return | CAGR | Max DD |
 |---|---:|---:|---:|
-| **6-sleeve system** | +420.4% | **17.98%** | 10.85% |
+| **6-sleeve system** (corrected 2026-07-10) | +385.9% | **~17.0%** | 11.60% |
 | S&P 500 cap-weight (sector-ETF proxy) ≈ Amundi 500U | +310.2% | 15.20% | 34.1% |
 | MSCI World (estimated) ≈ Amundi CW8 | ~+185% | ~11% | ~30% |
 | SP500 Top-50 equal-weight | +980.6% | 26.95% | 40.0% |
 | XLK (tech-only) | +716.2% | 23.43% | 34.0% |
 | 60/40 sectors + TLT | +173.0% | 10.59% | 29.0% |
 
-**Honest decomposition** of the +7 pp edge vs CW8:
-- ~+2.78 pp = durable skill alpha (vs cap-weight S&P 500)
+**Honest decomposition** of the (now ~+6 pp) edge vs CW8:
+- ~+1.8 pp = durable skill alpha (vs cap-weight S&P 500), after the
+  exposure-gate correction shaved ~1 pp of leverage return
 - ~+4 pp = US-vs-international concentration premium (regime-dependent — could
   fade or invert)
 
