@@ -84,6 +84,7 @@ class TestRecommendationProcessing:
     ):
         """Approved buy recommendation -> published to stream:approved_orders."""
         runner._portfolio = mock_portfolio
+        runner._current_prices["AAPL"] = 150.0  # buys without any price are rejected
         rec = make_recommendation(ticker="AAPL", action="buy")
 
         with patch.object(
@@ -335,3 +336,47 @@ class TestFillProcessing:
         pos = runner._portfolio.positions["AAPL"]
         assert pos["quantity"] == 20
         assert pos["avg_entry_price"] == pytest.approx(110.0)
+
+
+class TestSleeveBridgeRecommendations:
+    """Sleeve recommendations (run_paper --publish) carry price + sizing."""
+
+    def _sleeve_rec(self, action="buy", limit_price=184.76, quantity=8.3243,
+                    ticker="PM", portfolio="quality_value"):
+        return RecommendationMessage(
+            ticker=ticker,
+            timestamp=datetime.now(timezone.utc),
+            action=action,
+            confidence=1.0,
+            top_features={},
+            recommendation_id=f"sleeve-2026-07-10-{portfolio}-{ticker}-{action}",
+            limit_price=limit_price,
+            quantity=quantity,
+            portfolio=portfolio,
+        )
+
+    @pytest.mark.asyncio
+    async def test_sleeve_buy_uses_sleeve_price_and_quantity(self, runner, mock_redis):
+        runner._portfolio = make_portfolio(nav=100_000)
+        await runner.process_recommendation(self._sleeve_rec())
+
+        published = [c for c in mock_redis.publish.call_args_list
+                     if c.args[0] == "stream:approved_orders"]
+        assert len(published) == 1
+        order = published[0].args[1]
+        assert float(order["quantity"]) == pytest.approx(8.3243)
+        assert float(order["limit_price"]) == pytest.approx(184.76)
+        # traceability: sleeve name rides along in risk_adjustments
+        import json
+        assert json.loads(order["risk_adjustments"])["portfolio"] == "quality_value"
+
+    @pytest.mark.asyncio
+    async def test_buy_without_any_price_is_rejected(self, runner, mock_redis):
+        """No sleeve price and no market price -> reject, never divide by zero."""
+        runner._portfolio = make_portfolio(nav=100_000)
+        rec = self._sleeve_rec(limit_price=None, quantity=None)
+        await runner.process_recommendation(rec)
+
+        streams = [c.args[0] for c in mock_redis.publish.call_args_list]
+        assert "stream:approved_orders" not in streams
+        assert "stream:alerts" in streams  # rejection alert

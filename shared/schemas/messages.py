@@ -12,6 +12,11 @@ class StreamSerializable(BaseModel):
         data = self.model_dump(mode="json")
         result: dict[str, str] = {}
         for k, v in data.items():
+            if v is None:
+                # Omit None fields: str(None) wires the string "None", which
+                # fails validation on read (e.g. the limit_price of a market
+                # sell) — omission lets the pydantic default apply instead.
+                continue
             if isinstance(v, str):
                 result[k] = v
             elif isinstance(v, (dict, list)):
@@ -81,13 +86,20 @@ class RecommendationMessage(StreamSerializable):
     confidence: float
     top_features: dict[str, float]
     recommendation_id: str
+    # Sleeve-strategy bridge fields (run_paper --publish). None when the
+    # recommendation comes from the ML path; when present, the risk service
+    # uses the sleeve's own sizing/pricing instead of re-deriving them.
+    limit_price: float | None = None
+    quantity: float | None = None
+    portfolio: str | None = None
 
 
 class ApprovedOrderMessage(StreamSerializable):
     ticker: str
     timestamp: datetime
     action: Literal["buy", "sell"]
-    quantity: int
+    # float: the system trades fractional shares (IBKR Share Slices)
+    quantity: float
     order_type: Literal["limit", "market"]
     limit_price: float | None = None
     recommendation_id: str
@@ -99,7 +111,8 @@ class FillMessage(StreamSerializable):
     ticker: str
     timestamp: datetime
     side: Literal["buy", "sell"]
-    quantity: int
+    # float: the system trades fractional shares (IBKR Share Slices)
+    quantity: float
     fill_price: float
     commission: float
     recommendation_id: str

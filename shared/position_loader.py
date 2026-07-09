@@ -26,7 +26,12 @@ def load_open_positions(session: Session) -> dict[str, dict[str, Any]]:
     quantity-weighted, and the highest-since-entry is the max.
     """
     rows = (
-        session.execute(select(Position).where(Position.status == "open"))
+        session.execute(
+            select(Position).where(
+                Position.status == "open",
+                ~Position.portfolio.startswith("_", autoescape=True),
+            )
+        )
         .scalars()
         .all()
     )
@@ -67,8 +72,12 @@ def load_portfolio_state(session: Session) -> dict[str, Any]:
     """
     positions = load_open_positions(session)
 
+    # Exclude synthetic rollup rows (e.g. "_aggregate") — including them
+    # double-counts: peak_nav read 2x NAV and tripped the circuit breaker.
     total_cash = session.execute(
-        select(func.coalesce(func.sum(PortfolioConfig.cash), 0.0))
+        select(func.coalesce(func.sum(PortfolioConfig.cash), 0.0)).where(
+            ~PortfolioConfig.portfolio.startswith("_", autoescape=True)
+        )
     ).scalar_one()
 
     market_value = sum(
@@ -76,9 +85,11 @@ def load_portfolio_state(session: Session) -> dict[str, Any]:
     )
     nav = float(total_cash) + market_value
 
-    # Highest aggregate equity across snapshot dates.
+    # Highest aggregate equity across snapshot dates (excluding synthetic
+    # rollup rows like "_aggregate", which would double the total).
     peak_row = session.execute(
         select(func.sum(EquitySnapshot.equity).label("total"))
+        .where(~EquitySnapshot.portfolio.startswith("_", autoescape=True))
         .group_by(EquitySnapshot.date)
         .order_by(func.sum(EquitySnapshot.equity).desc())
         .limit(1)

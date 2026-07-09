@@ -47,3 +47,72 @@ def test_kill_message():
         triggered_by="operator", reason="Manual kill switch",
     )
     assert msg.triggered_by == "operator"
+
+
+class TestNoneFieldRoundtrip:
+    """None fields must survive the stream roundtrip via omission.
+
+    Regression: str(None) wired the literal string "None", making every
+    market sell order (limit_price=None) unparseable by the execution
+    service — stop-loss and kill-liquidation orders silently never ran.
+    """
+
+    def test_market_sell_order_roundtrips(self):
+        from datetime import datetime, timezone
+
+        from shared.schemas.messages import ApprovedOrderMessage
+
+        order = ApprovedOrderMessage(
+            ticker="AAPL",
+            timestamp=datetime.now(timezone.utc),
+            action="sell",
+            quantity=5,
+            order_type="market",
+            limit_price=None,
+            recommendation_id="r1",
+            risk_adjustments={},
+        )
+        wire = order.to_stream_dict()
+        assert "limit_price" not in wire  # omitted, not "None"
+        restored = ApprovedOrderMessage.from_stream_dict(wire)
+        assert restored.limit_price is None
+        assert restored.quantity == 5
+
+    def test_recommendation_bridge_fields_roundtrip(self):
+        from datetime import datetime, timezone
+
+        from shared.schemas.messages import RecommendationMessage
+
+        rec = RecommendationMessage(
+            ticker="GLD",
+            timestamp=datetime.now(timezone.utc),
+            action="buy",
+            confidence=1.0,
+            top_features={},
+            recommendation_id="sleeve-2026-07-10-tail_risk_hedge-GLD-buy",
+            limit_price=382.13,
+            quantity=4.1969,
+            portfolio="tail_risk_hedge",
+        )
+        restored = RecommendationMessage.from_stream_dict(rec.to_stream_dict())
+        assert restored.limit_price == 382.13
+        assert restored.quantity == 4.1969
+        assert restored.portfolio == "tail_risk_hedge"
+
+    def test_ml_path_recommendation_defaults_none(self):
+        from datetime import datetime, timezone
+
+        from shared.schemas.messages import RecommendationMessage
+
+        rec = RecommendationMessage(
+            ticker="AAPL",
+            timestamp=datetime.now(timezone.utc),
+            action="buy",
+            confidence=0.7,
+            top_features={"growth": 0.4},
+            recommendation_id="ml-1",
+        )
+        restored = RecommendationMessage.from_stream_dict(rec.to_stream_dict())
+        assert restored.limit_price is None
+        assert restored.quantity is None
+        assert restored.portfolio is None

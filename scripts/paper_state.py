@@ -97,6 +97,7 @@ class PaperTradingState:
         entry_signals: dict | None = None,
         bar_features: dict | None = None,
         exit_reason: str | None = None,
+        sector: str | None = None,
     ) -> None:
         """Record a fill (buy or sell) for a portfolio."""
         now = datetime.now(timezone.utc)
@@ -130,6 +131,7 @@ class PaperTradingState:
                     current_price=price,
                     peak_price=price,
                     highest_price_since_entry=price,
+                    sector=sector,
                     entry_signals=entry_signals,
                     opened_at=datetime(fill_date.year, fill_date.month, fill_date.day, tzinfo=timezone.utc),
                     status="open",

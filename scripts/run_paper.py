@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -270,6 +270,7 @@ def run_daily(
             if signal is not None:
                 signal["portfolio"] = name
                 signal["date"] = str(today)
+                signal["ticker"] = ticker
                 signals_generated.append(signal)
 
                 action = signal["action"]
@@ -279,8 +280,10 @@ def run_daily(
                 if action == "buy":
                     entry_signals = {
                         k: v for k, v in signal.items()
-                        if k not in ("action", "limit_price", "quantity", "portfolio", "date")
+                        if k not in ("action", "limit_price", "quantity", "portfolio", "date", "ticker")
                     }
+                    from shared.universe import ETF_SECTORS
+
                     state.record_fill(
                         portfolio=name,
                         ticker=ticker,
@@ -289,6 +292,7 @@ def run_daily(
                         price=price,
                         fill_date=today,
                         entry_signals=entry_signals,
+                        sector=SECTOR_MAP.get(ticker) or ETF_SECTORS.get(ticker),
                     )
                     print(f"  BUY  {ticker:>6s}  {qty:>8.4f} @ ${price:>8.2f}  [{name}]")
                 elif action == "sell":
@@ -323,6 +327,48 @@ def run_daily(
     return signals_generated
 
 
+def publish_recommendations(signals: list[dict], redis_url: str, run_date: date) -> int:
+    """Publish sleeve signals to stream:recommendations (the pipeline bridge).
+
+    Each signal becomes a RecommendationMessage carrying the sleeve's own
+    limit price and sizing; the risk service gates it and the execution
+    service places a real IB paper order. Deterministic recommendation ids
+    (date+portfolio+ticker+action) make re-runs idempotent downstream.
+
+    Returns the number of recommendations published.
+    """
+    import redis as redis_sync
+
+    from shared.schemas.messages import RecommendationMessage
+
+    conn = redis_sync.Redis.from_url(redis_url)
+    published = 0
+    try:
+        for signal in signals:
+            action = signal.get("action")
+            if action not in ("buy", "sell"):
+                continue
+            message = RecommendationMessage(
+                ticker=signal["ticker"],
+                timestamp=datetime.now(timezone.utc),
+                action=action,
+                confidence=1.0,  # rule-based sleeves carry no model confidence
+                top_features={},
+                recommendation_id=(
+                    f"sleeve-{run_date}-{signal['portfolio']}-"
+                    f"{signal['ticker']}-{action}"
+                ),
+                limit_price=signal.get("limit_price"),
+                quantity=signal.get("quantity") or None,
+                portfolio=signal.get("portfolio"),
+            )
+            conn.xadd("stream:recommendations", message.to_stream_dict())
+            published += 1
+    finally:
+        conn.close()
+    return published
+
+
 def make_db_session(db_url: str) -> Session:
     """Create a SQLAlchemy session from a database URL."""
     engine = create_engine(db_url)
@@ -331,11 +377,14 @@ def make_db_session(db_url: str) -> Session:
 
 
 def main():
-    # Load default DB URL from config (may fail if config file missing, that's OK)
+    # Load defaults from config (may fail if config file missing, that's OK)
     try:
-        default_db_url = load_config("config/default.yaml").database.url
+        _config = load_config("config/default.yaml")
+        default_db_url = _config.database.url
+        default_redis_url = _config.redis.url
     except Exception:
         default_db_url = "postgresql://algo:algo@localhost:5432/algo_poc"
+        default_redis_url = "redis://localhost:6379/0"
 
     parser = argparse.ArgumentParser(description="Daily paper trading runner")
     parser.add_argument("--capital", type=float, default=100_000,
@@ -352,6 +401,11 @@ def main():
                         help="Wipe all paper trading state tables")
     parser.add_argument("--ib-host", default="127.0.0.1")
     parser.add_argument("--ib-port", type=int, default=7497)
+    parser.add_argument("--publish", action="store_true",
+                        help="Also publish signals to stream:recommendations so the "
+                             "risk/execution services place real IB paper orders")
+    parser.add_argument("--redis-url", default=default_redis_url,
+                        help="Redis URL for --publish")
     args = parser.parse_args()
 
     session = make_db_session(args.db_url)
@@ -454,6 +508,17 @@ def main():
     else:
         print("\nNo signals generated today")
     print(f"\nState committed to database")
+
+    # Bridge to the service pipeline: publish the same signals as
+    # recommendations so risk gates them and execution places real IB paper
+    # orders. Deliberately after the DB commit — the simulated book (the
+    # divergence benchmark) is never blocked by the pipeline being down.
+    if args.publish and signals:
+        try:
+            count = publish_recommendations(signals, args.redis_url, date.today())
+            print(f"{count} recommendations published to stream:recommendations")
+        except Exception as e:
+            print(f"WARNING: publish to pipeline failed ({e}); simulated state is committed")
 
 
 if __name__ == "__main__":

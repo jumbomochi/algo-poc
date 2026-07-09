@@ -8,10 +8,11 @@ VENV="$ALGO_DIR/.venv/bin/python"
 LOG_DIR="$HOME/ibc/logs"
 LOG_FILE="$LOG_DIR/paper_trading_$(date +%Y%m%d).log"
 
-# The paper DB is the dockerized postgres, published on a machine-local port
-# (see docker-compose.override.yml). config/default.yaml's localhost:5432
-# default points at nothing on this machine.
+# The paper DB and redis are the dockerized instances, published on
+# machine-local ports (see docker-compose.override.yml). config/default.yaml's
+# localhost defaults point at nothing on this machine.
 export ALGO_DATABASE_URL="postgresql://algo:algo@localhost:55432/algo_poc"
+export ALGO_REDIS_URL="redis://localhost:56379/0"
 
 echo "$(date): Starting daily paper trading run" >> "$LOG_FILE"
 
@@ -27,9 +28,11 @@ if ! nc -z 127.0.0.1 55432 2>/dev/null; then
     exit 1
 fi
 
-# Run paper trading
+# Run paper trading. --publish bridges the signals into the service
+# pipeline (risk -> execution -> real IB paper orders) for gates 4-6
+# evidence; the simulated book commits regardless.
 cd "$ALGO_DIR"
-"$VENV" scripts/run_paper.py >> "$LOG_FILE" 2>&1
+"$VENV" scripts/run_paper.py --publish >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
 
 echo "$(date): Paper trading run completed (exit code: $EXIT_CODE)" >> "$LOG_FILE"

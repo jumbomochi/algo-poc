@@ -265,10 +265,30 @@ class RiskServiceRunner:
         quantity: int = 0
 
         if rec.action == "buy":
-            price = self._current_prices.get(rec.ticker, 0.0)
+            # Sleeve recommendations carry their own limit price; ML-path
+            # ones rely on the last seen market price.
+            price = rec.limit_price or self._current_prices.get(rec.ticker, 0.0)
+            if price <= 0:
+                self._logger.warning(
+                    "Rejecting buy with no usable price",
+                    ticker=rec.ticker,
+                    recommendation_id=rec.recommendation_id,
+                )
+                await self._publish_alert(
+                    event_type="entry_rejection",
+                    priority="medium",
+                    message=f"Rejected buy {rec.ticker}: no usable price",
+                    context={"ticker": rec.ticker, "recommendation_id": rec.recommendation_id},
+                )
+                return
+            self._current_prices[rec.ticker] = price
             sector = self._get_sector(rec.ticker)
-            # Default quantity estimation based on config position limit
-            default_qty = self._estimate_buy_quantity(rec.ticker, price)
+            # Sleeve-sized quantity when provided, else estimate from the
+            # config position limit.
+            if rec.quantity and rec.quantity > 0:
+                default_qty = rec.quantity
+            else:
+                default_qty = self._estimate_buy_quantity(rec.ticker, price)
 
             entry_decision = self._engine.check_entry(
                 ticker=rec.ticker,
@@ -306,6 +326,9 @@ class RiskServiceRunner:
             quantity = pos.get("quantity", 0) if isinstance(pos, dict) else 0
             if quantity <= 0:
                 quantity = 1  # minimum sell quantity
+
+        if rec.portfolio:
+            risk_adjustments["portfolio"] = rec.portfolio
 
         # 4. Publish approved order
         order = ApprovedOrderMessage(

@@ -98,3 +98,32 @@ class TestLoadPortfolioState:
         state = load_portfolio_state(session)  # nav = 7800 + 2200 = 10000
         assert state["sector_exposure"]["Tech"] == pytest.approx(11.0)
         assert state["sector_exposure"]["Energy"] == pytest.approx(11.0)
+
+
+class TestAggregateRowExclusion:
+    """Synthetic '_aggregate' rollup rows must not double-count NAV/peak.
+
+    Regression: peak_nav summed the _aggregate snapshot alongside the sleeve
+    rows, reading 2x NAV — the risk service saw a phantom 50% drawdown and
+    circuit-breakered every buy.
+    """
+
+    def test_peak_nav_excludes_aggregate_row(self, session):
+        session.add(PortfolioConfig(portfolio="momentum", capital=10_000.0,
+                                     cash=10_000.0, created_at=NOW, updated_at=NOW))
+        d = date(2026, 7, 7)
+        session.add(EquitySnapshot(portfolio="momentum", date=d, equity=10_000.0,
+                                   cash=10_000.0, market_value=0.0, created_at=NOW))
+        session.add(EquitySnapshot(portfolio="_aggregate", date=d, equity=10_000.0,
+                                   cash=10_000.0, market_value=0.0, created_at=NOW))
+        session.flush()
+        state = load_portfolio_state(session)
+        assert state["peak_nav"] == pytest.approx(10_000.0)  # not 20_000
+
+    def test_cash_excludes_aggregate_row(self, session):
+        session.add(PortfolioConfig(portfolio="momentum", capital=10_000.0,
+                                     cash=10_000.0, created_at=NOW, updated_at=NOW))
+        session.add(PortfolioConfig(portfolio="_aggregate", capital=10_000.0,
+                                     cash=10_000.0, created_at=NOW, updated_at=NOW))
+        session.flush()
+        assert load_portfolio_state(session)["cash"] == pytest.approx(10_000.0)

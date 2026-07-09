@@ -111,3 +111,19 @@ def resolve_watchlist(watchlist_source: str, custom_tickers: list[str]) -> list[
         )
     seen = set(base)
     return base + [t for t in custom_tickers if t not in seen]
+
+
+# Sector labels for the ETF universe (the equity map lives in
+# scripts/fetch_fundamentals.SECTOR_MAP). Sector ETFs are labelled as the
+# sector they hold; broad thematic/defensive instruments get honest coarse
+# buckets so sector-concentration limits act on real information instead of
+# a wall of "Unknown".
+ETF_SECTORS: dict[str, str] = {
+    "XLK": "Technology", "XLE": "Energy", "XLF": "Financials",
+    "XLV": "Healthcare", "XLY": "Consumer Discretionary",
+    "XLP": "Consumer Staples", "XLI": "Industrials", "XLB": "Materials",
+    "XLU": "Utilities", "XLRE": "Real Estate", "XLC": "Communication Services",
+    **{t: "Thematic ETF" for t in THEMATIC_ETFS},
+    "TLT": "Bonds", "GLD": "Commodities",
+    "SH": "Inverse ETF", "PSQ": "Inverse ETF", "SDS": "Inverse ETF",
+}
