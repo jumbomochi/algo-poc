@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Disabled</key>
+	<false/>
+	<key>Label</key>
+	<string>local.algo-pipeline-report</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/huiliang/ibc/run_pipeline_report.sh</string>
+	</array>
+	<key>StandardErrorPath</key>
+	<string>/Users/huiliang/ibc/logs/pipeline-report-launchd.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/huiliang/ibc/logs/pipeline-report-launchd.log</string>
+	<!-- 04:52 SGT Tue-Sat: after the 04:15 paper run and 04:45 divergence
+	     monitor, mirroring the trading-day schedule of both. -->
+	<key>StartCalendarInterval</key>
+	<array>
+		<dict>
+			<key>Weekday</key><integer>2</integer>
+			<key>Hour</key><integer>4</integer>
+			<key>Minute</key><integer>52</integer>
+		</dict>
+		<dict>
+			<key>Weekday</key><integer>3</integer>
+			<key>Hour</key><integer>4</integer>
+			<key>Minute</key><integer>52</integer>
+		</dict>
+		<dict>
+			<key>Weekday</key><integer>4</integer>
+			<key>Hour</key><integer>4</integer>
+			<key>Minute</key><integer>52</integer>
+		</dict>
+		<dict>
+			<key>Weekday</key><integer>5</integer>
+			<key>Hour</key><integer>4</integer>
+			<key>Minute</key><integer>52</integer>
+		</dict>
+		<dict>
+			<key>Weekday</key><integer>6</integer>
+			<key>Hour</key><integer>4</integer>
+			<key>Minute</key><integer>52</integer>
+		</dict>
+	</array>
+</dict>
+</plist>

@@ -14,6 +14,8 @@ host. The **live** copies are deployed outside the repo:
 | `local.algo-backtest-refresh.plist` | `~/Library/LaunchAgents/local.algo-backtest-refresh.plist` |
 | `run_db_backup.sh` | `~/ibc/run_db_backup.sh` (chmod +x) — 05:15 SGT daily paper-DB pg_dump (RPO ≤ 1 day) |
 | `local.algo-db-backup.plist` | `~/Library/LaunchAgents/local.algo-db-backup.plist` |
+| `run_pipeline_report.sh` | `~/ibc/run_pipeline_report.sh` (chmod +x) — 04:52 SGT Tue–Sat pipeline report + Telegram heartbeat |
+| `local.algo-pipeline-report.plist` | `~/Library/LaunchAgents/local.algo-pipeline-report.plist` |
 
 Both `run_paper.sh` and `run_divergence.sh` export
 `ALGO_DATABASE_URL=postgresql://algo:algo@localhost:55432/algo_poc` — the
@@ -142,3 +144,24 @@ Added after the 2026-07-10 incident where an agent wiped the paper book via
   archive). Success is logged only.
 - **Logs:** `~/ibc/logs/db_backup_YYYYMMDD.log` (pruned after 30 days).
 - **Restore runbook:** [backups.md](../../docs/operations/backups.md).
+
+## Daily pipeline report
+
+Runs `run_pipeline_report.sh` at **04:52 SGT, Tue–Sat** — after the 04:15
+paper run and 04:45 divergence monitor. One log per day with the whole
+pipeline's state: paper-run tail, risk-gate BUY/SELL/SKIP counts, divergence
+result, execution-service activity (last 2h), resting IB orders (clientId 54),
+and the last 7 days of equity snapshots.
+
+Sends a one-line **Telegram summary every run** — deliberately a positive
+heartbeat, not failure-only: the 2026-07-07 incident showed a single missed
+alert can silently cost paper-record days, so *no morning message = something
+is wrong*. Replaces the ad-hoc scratchpad watcher that did not survive
+reboots.
+
+- **Logs:** `~/ibc/logs/pipeline_report_YYYYMMDD.log` (pruned after 30 days),
+  launchd stdout/stderr to `~/ibc/logs/pipeline-report-launchd.log`.
+- **launchd scripts and PATH:** any job script that calls the `docker` CLI
+  must export `PATH` including `/usr/local/bin` — launchd's default PATH
+  does not have it (`run_db_backup.sh` and `run_pipeline_report.sh` both do
+  this).

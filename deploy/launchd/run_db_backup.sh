@@ -15,6 +15,9 @@
 
 set -uo pipefail
 
+# launchd's default PATH lacks /usr/local/bin, where the docker CLI lives.
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
 CONTAINER="algo-poc-postgres-1"
 DB_USER="algo"
 DB_NAME="algo_poc"
