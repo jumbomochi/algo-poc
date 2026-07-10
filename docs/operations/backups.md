@@ -12,7 +12,8 @@ trading state via `run_paper.py --reset` with no backup to restore from.
 | Job | `local.algo-db-backup` (launchd), 05:15 SGT daily |
 | Script | `~/ibc/run_db_backup.sh` (repo copy: `deploy/launchd/run_db_backup.sh`) |
 | Dumps | `~/ibc/backups/algo_poc_<YYYYmmdd_HHMMSS>.dump` (pg_dump custom format, compressed) |
-| Retention | 30 days, pruned by the job itself |
+| Offsite | rsync to iCloud Drive `algo-poc-backups/` after each verified dump |
+| Retention | 30 days on both sides, pruned by the job itself |
 | Logs | `~/ibc/logs/db_backup_<YYYYmmdd>.log`, launchd stdout to `db-backup-launchd.log` |
 | Alerts | Telegram on ANY failure (container down, dump error, unreadable archive). Success is logged only. |
 
@@ -50,12 +51,24 @@ docker compose start risk-management execution
 To restore a single table (e.g. only `equity_snapshots`), add
 `--table=equity_snapshots --data-only` and truncate the table first.
 
+## Offsite copy (iCloud Drive)
+
+After each verified dump, the job rsyncs all local dumps to
+`~/Library/Mobile Documents/com~apple~CloudDocs/algo-poc-backups/`, covering
+machine loss as well as accidental deletion. Design choices:
+
+- **No `rsync --delete`**: wiping `~/ibc/backups/` must not propagate to the
+  offsite copy. Each side is pruned independently by age (30 days).
+- **Failure alerts but doesn't fail the job**: the local dump (the primary
+  RPO layer) already succeeded; a ⚠️ Telegram alert flags the broken offsite
+  guarantee.
+- **iCloud upload is asynchronous**: the file lands in the local iCloud
+  folder immediately but reaches Apple's servers only when the machine is
+  online. Check sync state with `brctl status com.apple.CloudDocs | head`
+  if in doubt.
+
 ## Limitations / future work
 
-- Backups live on the same disk as the database. This protects against the
-  observed failure mode (accidental deletion), not machine loss. If offsite
-  coverage is wanted, rsync `~/ibc/backups/` to iCloud Drive or object
-  storage as a follow-up.
 - RPO is 1 day: intra-day writes since 05:15 are not covered (no WAL
   archiving). Acceptable while the paper book is rebuilt nightly from the
   04:15 run.
