@@ -13,8 +13,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import date, datetime, timezone
+from pathlib import Path
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -416,6 +418,33 @@ def publish_recommendations(signals: list[dict], redis_url: str, run_date: date)
     return published
 
 
+# The four tables that hold all paper trading state, in delete-safe order.
+STATE_TABLES = (EquitySnapshot, Trade, Position, PortfolioConfigModel)
+
+
+def dump_paper_state(session: Session, out_path: Path) -> Path:
+    """Serialize all paper state tables to JSON before any destructive change."""
+    payload = {}
+    for model in STATE_TABLES:
+        columns = [c.name for c in model.__table__.columns]
+        payload[model.__table__.name] = [
+            {col: getattr(row, col) for col in columns}
+            for row in session.query(model).all()
+        ]
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2, default=str))
+    return out_path
+
+
+def reset_paper_state(session: Session) -> None:
+    """Delete all rows from the paper state tables. Callers MUST have already
+    confirmed interactively and written a backup (see the --reset CLI path)."""
+    for model in STATE_TABLES:
+        session.execute(model.__table__.delete())
+    session.commit()
+
+
 def make_db_session(db_url: str) -> Session:
     """Create a SQLAlchemy session from a database URL."""
     engine = create_engine(db_url)
@@ -457,17 +486,26 @@ def main():
 
     session = make_db_session(args.db_url)
 
-    # --reset: wipe all paper state tables
+    # --reset: wipe all paper state tables. Interactive-only by design: on
+    # 2026-07-10 an agent piped `echo yes |` past the old prompt and wiped the
+    # live paper book. A human at a real terminal is the only accepted input.
     if args.reset:
+        if not sys.stdin.isatty():
+            print("Refusing --reset: stdin is not a TTY. This wipes all paper "
+                  "trading state and must be run by a human in an interactive "
+                  "terminal — piping confirmation is not accepted. "
+                  "(See CLAUDE.md/AGENTS.md 'Destructive Actions'.)")
+            session.close()
+            sys.exit(2)
         confirm = input("This will DELETE all paper trading data. Type 'yes' to confirm: ")
         if confirm.strip().lower() != "yes":
             print("Aborted.")
+            session.close()
             return
-        session.execute(EquitySnapshot.__table__.delete())
-        session.execute(Trade.__table__.delete())
-        session.execute(Position.__table__.delete())
-        session.execute(PortfolioConfigModel.__table__.delete())
-        session.commit()
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        backup = dump_paper_state(session, Path("output") / f"paper_state_pre_reset_{stamp}.json")
+        print(f"Pre-reset backup written to {backup}")
+        reset_paper_state(session)
         print("All paper trading state wiped.")
         session.close()
         return

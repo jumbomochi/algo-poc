@@ -12,6 +12,8 @@ host. The **live** copies are deployed outside the repo:
 | `local.algo-gateway-watchdog.plist` | `~/Library/LaunchAgents/local.algo-gateway-watchdog.plist` |
 | `run_backtest_refresh.sh` | `~/ibc/run_backtest_refresh.sh` (chmod +x) — Tue 05:00 SGT weekly baseline refresh |
 | `local.algo-backtest-refresh.plist` | `~/Library/LaunchAgents/local.algo-backtest-refresh.plist` |
+| `run_db_backup.sh` | `~/ibc/run_db_backup.sh` (chmod +x) — 05:15 SGT daily paper-DB pg_dump (RPO ≤ 1 day) |
+| `local.algo-db-backup.plist` | `~/Library/LaunchAgents/local.algo-db-backup.plist` |
 
 Both `run_paper.sh` and `run_divergence.sh` export
 `ALGO_DATABASE_URL=postgresql://algo:algo@localhost:55432/algo_poc` — the
@@ -125,3 +127,18 @@ alongside the 04:15/04:45 jobs (backtest uses IB clientId 10).
 - **Logs:** `~/ibc/logs/backtest_refresh_YYYYMMDD.log` (pruned after 90 days).
 - **Pruning:** baseline JSONs older than 90 days are deleted (~64 MB each;
   only the newest is ever used).
+
+## Daily paper-DB backup
+
+Runs `run_db_backup.sh` at **05:15 SGT every day** — a `pg_dump` (custom
+format) of the dockerized `algo_poc` DB, taken after the 04:15 paper run and
+04:45 divergence monitor so each dump contains that day's rows. RPO ≤ 1 day.
+Added after the 2026-07-10 incident where an agent wiped the paper book via
+`run_paper.py --reset` with nothing to restore from.
+
+- **Dumps:** `~/ibc/backups/algo_poc_<YYYYmmdd_HHMMSS>.dump`, pruned after 30
+  days. Every dump is verified with `pg_restore --list` before success.
+- **Telegram**: ❌ on any failure (container down, dump error, unreadable
+  archive). Success is logged only.
+- **Logs:** `~/ibc/logs/db_backup_YYYYMMDD.log` (pruned after 30 days).
+- **Restore runbook:** [backups.md](../../docs/operations/backups.md).

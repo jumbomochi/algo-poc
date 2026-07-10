@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Disabled</key>
+	<false/>
+	<key>Label</key>
+	<string>local.algo-db-backup</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/huiliang/ibc/run_db_backup.sh</string>
+	</array>
+	<key>StandardErrorPath</key>
+	<string>/Users/huiliang/ibc/logs/db-backup-launchd.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/huiliang/ibc/logs/db-backup-launchd.log</string>
+	<!-- 05:15 SGT daily: after the 04:15 paper run and 04:45 divergence monitor
+	     have written the day's rows, so each dump captures that day's state.
+	     Runs every day (not just Tue-Sat): a dump of an unchanged DB is cheap,
+	     and a fixed daily cadence keeps the RPO <= 1 day guarantee simple. -->
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>5</integer>
+		<key>Minute</key>
+		<integer>15</integer>
+	</dict>
+</dict>
+</plist>

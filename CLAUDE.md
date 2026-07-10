@@ -115,3 +115,27 @@ Environment variables take precedence over `config/default.yaml`:
 - Services are structured as `services/<name>/runner.py` with a main runner class
 - Stream message schemas live in `shared/schemas/messages.py`
 - Each service Dockerfile builds from Python 3.12-slim and sets `ENTRYPOINT ["python", "-m", "services.<name>.runner"]`
+
+## Destructive Actions — Human Confirmation Required
+
+This repo runs a real trading system with state that cannot be recreated
+(paper trading history, the live IB account). Agents must NEVER execute any of
+the following on their own — no matter how sound the engineering rationale.
+Instead, explain what should be run and why, and ask the user to run it
+themselves in their own terminal:
+
+- `scripts/run_paper.py --reset` (wipes all paper trading state)
+- Any `DELETE`, `TRUNCATE`, `DROP`, or destructive `UPDATE` against the paper
+  or live databases (`algo_poc` on any host/port)
+- `docker compose down -v`, `docker volume rm`, or anything else that removes
+  the postgres/redis volumes
+- Deleting or overwriting files under `output/`, `~/ibc/logs/`, or
+  `~/ibc/backups/`
+- `launchctl bootout` / disabling the launchd jobs
+- Placing, modifying, or cancelling orders on a LIVE (`U*`-prefixed) IB account
+
+Bypassing an interactive confirmation prompt (e.g. `echo yes | ...`, `yes |`,
+`--force`, or here-docs) counts as executing the destructive action and is
+prohibited. Interactive prompts exist precisely so a human makes the call.
+This rule was added after an agent piped `yes` into `run_paper.py --reset` on
+2026-07-10 and wiped the paper book without authorization.
