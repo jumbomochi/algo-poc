@@ -143,19 +143,33 @@ class ExecutionServiceRunner:
 
         order_id: str
 
-        if order.action == "buy":
-            order_id = await self._order_manager.submit_entry(
+        from services.execution.ib_executor import OrderSkippedError
+
+        try:
+            if order.action == "buy":
+                order_id = await self._order_manager.submit_entry(
+                    ticker=order.ticker,
+                    quantity=order.quantity,
+                    limit_price=order.limit_price,
+                    recommendation_id=order.recommendation_id,
+                )
+            else:
+                order_id = await self._order_manager.submit_exit(
+                    ticker=order.ticker,
+                    quantity=order.quantity,
+                    recommendation_id=order.recommendation_id,
+                )
+        except OrderSkippedError as exc:
+            # Not a failure: the order cannot be sized on this account
+            # (e.g. sub-1-share on a no-fractional account). Ack and move on.
+            self._logger.warning(
+                "Order skipped",
                 ticker=order.ticker,
+                action=order.action,
                 quantity=order.quantity,
-                limit_price=order.limit_price,
-                recommendation_id=order.recommendation_id,
+                reason=str(exc),
             )
-        else:
-            order_id = await self._order_manager.submit_exit(
-                ticker=order.ticker,
-                quantity=order.quantity,
-                recommendation_id=order.recommendation_id,
-            )
+            return
 
         # Remember the order so fills can be attributed back to the
         # recommendation that caused them.
@@ -365,6 +379,7 @@ if __name__ == "__main__":
             host=config.ib.host,
             port=config.ib.paper_port if config.mode != "live" else config.ib.live_port,
             client_id=config.ib.client_id,
+            allow_fractional=config.execution.fractional_orders,
         )
         # Connect BEFORE consuming orders. A failed connect exits nonzero so
         # the container restart policy retries; running without IB would

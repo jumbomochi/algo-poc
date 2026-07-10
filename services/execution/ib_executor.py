@@ -38,6 +38,12 @@ class WrongAccountTypeError(RuntimeError):
     """Raised when the Gateway session's account type contradicts the mode."""
 
 
+class OrderSkippedError(RuntimeError):
+    """Raised when an order cannot be placed as sized (e.g. a fractional
+    quantity rounds to zero whole shares on an account without fractional
+    API support)."""
+
+
 class IBExecutor:
     """Wraps ib_insync to submit orders to Interactive Brokers.
 
@@ -54,14 +60,43 @@ class IBExecutor:
     time.
     """
 
-    def __init__(self, host: str, port: int, client_id: int) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        client_id: int,
+        allow_fractional: bool = False,
+    ) -> None:
         self._host = host
         self._port = port
         self._client_id = client_id
+        self._allow_fractional = allow_fractional
         self._ib = None  # Will hold ib_insync.IB instance
         self._trades: dict[str, Any] = {}  # order_id -> ib_insync.Trade
         self._fill_handler: FillHandler | None = None
         self._logger = get_logger("ib_executor")
+
+    def _effective_quantity(self, ticker: str, quantity: float) -> float:
+        """Round to whole shares when the account can't trade fractions.
+
+        Raises :class:`OrderSkippedError` when the rounded quantity is zero —
+        the caller must treat the order as skipped, not failed.
+        """
+        if self._allow_fractional or float(quantity).is_integer():
+            return quantity
+        rounded = float(int(quantity))
+        if rounded <= 0:
+            raise OrderSkippedError(
+                f"{ticker}: fractional quantity {quantity} rounds to zero "
+                "whole shares (account has no fractional API support)"
+            )
+        self._logger.warning(
+            "Quantity rounded to whole shares (no fractional API support)",
+            ticker=ticker,
+            requested=quantity,
+            placed=rounded,
+        )
+        return rounded
 
     @property
     def is_connected(self) -> bool:
@@ -156,10 +191,13 @@ class IBExecutor:
     ) -> str:
         """Submit a limit buy order via IB."""
         self._require_connection()
+        quantity = self._effective_quantity(ticker, quantity)
         from ib_insync import LimitOrder, Stock
 
         contract = Stock(ticker, "SMART", "USD")
-        order = LimitOrder("BUY", quantity, limit_price)
+        # Explicit TIF: without it the order inherits the TWS desktop preset,
+        # which can mutate/cancel API orders (Error 10349 observed).
+        order = LimitOrder("BUY", quantity, limit_price, tif="DAY")
         trade = self._ib.placeOrder(contract, order)
         order_id = str(trade.order.orderId)
         self._register_trade(order_id, trade, ticker=ticker, side="buy")
@@ -176,10 +214,11 @@ class IBExecutor:
     async def submit_market_order(self, ticker: str, quantity: float) -> str:
         """Submit a market sell order via IB."""
         self._require_connection()
+        quantity = self._effective_quantity(ticker, quantity)
         from ib_insync import MarketOrder, Stock
 
         contract = Stock(ticker, "SMART", "USD")
-        order = MarketOrder("SELL", quantity)
+        order = MarketOrder("SELL", quantity, tif="DAY")
         trade = self._ib.placeOrder(contract, order)
         order_id = str(trade.order.orderId)
         self._register_trade(order_id, trade, ticker=ticker, side="sell")

@@ -33,6 +33,11 @@ class ExecutionConfig(BaseModel):
     reprice_interval_minutes: int = 60
     max_reprice_attempts: int = 3
     order_submission_lag_seconds: int = 5
+    # IBKR paper accounts reject fractional API orders (Error 10243; cashQty
+    # rejected too, 10244). False = round down to whole shares and skip
+    # orders that round to zero. Flip true once trading an account whose
+    # fractional permission is verified to work via the API.
+    fractional_orders: bool = False
 
 
 class SignalStalenessConfig(BaseModel):

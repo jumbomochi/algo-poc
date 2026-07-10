@@ -54,6 +54,7 @@ execution:
   reprice_interval_minutes: 60
   max_reprice_attempts: 3
   order_submission_lag_seconds: 5  # simulated lag for backtest
+  fractional_orders: false  # IBKR paper API rejects fractional (10243/10244); whole-share rounding applies
 
 ib:
   host: "127.0.0.1"

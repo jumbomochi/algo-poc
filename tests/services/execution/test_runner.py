@@ -309,3 +309,45 @@ class TestPaperAccountGuard:
             await executor.connect(expect_paper=True)
 
         assert executor._ib is fake_ib
+
+
+class TestWholeShareFallback:
+    """Accounts without fractional API support round down; sub-1-share skips."""
+
+    def _executor(self, allow_fractional=False):
+        from services.execution.ib_executor import IBExecutor
+
+        return IBExecutor(host="h", port=7497, client_id=1,
+                          allow_fractional=allow_fractional)
+
+    def test_fractional_rounds_down(self):
+        ex = self._executor()
+        assert ex._effective_quantity("PM", 8.3243) == 8.0
+
+    def test_whole_quantity_untouched(self):
+        ex = self._executor()
+        assert ex._effective_quantity("PM", 8.0) == 8.0
+
+    def test_sub_one_share_raises_skip(self):
+        from services.execution.ib_executor import OrderSkippedError
+
+        ex = self._executor()
+        with pytest.raises(OrderSkippedError, match="rounds to zero"):
+            ex._effective_quantity("ISRG", 0.4)
+
+    def test_fractional_allowed_passthrough(self):
+        ex = self._executor(allow_fractional=True)
+        assert ex._effective_quantity("PM", 8.3243) == 8.3243
+
+    @pytest.mark.asyncio
+    async def test_runner_treats_skip_as_nonfailure(self, runner, mock_redis, mock_order_manager):
+        """A skipped order acks cleanly: no pending entry, no exception."""
+        from services.execution.ib_executor import OrderSkippedError
+
+        mock_order_manager.submit_entry.side_effect = OrderSkippedError("too small")
+        order = make_approved_order(ticker="ISRG", action="buy", limit_price=432.83)
+
+        await runner.process_approved_order(order)  # must not raise
+
+        assert order not in runner._pending_orders.values()
+        mock_redis.publish.assert_not_called()
