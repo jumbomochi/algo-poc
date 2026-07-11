@@ -351,3 +351,86 @@ class TestWholeShareFallback:
 
         assert order not in runner._pending_orders.values()
         mock_redis.publish.assert_not_called()
+
+
+class TestAutoReconnect:
+    """A dropped Gateway session must reconnect on demand, not fail orders.
+
+    Regression: overnight 2026-07-10/11 the Gateway dropped the socket
+    ("Peer closed connection") and the sole Saturday order (CSCO) failed
+    with NotConnectedError because the executor never reconnected.
+    """
+
+    async def _connected_paper_executor(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from services.execution.ib_executor import IBExecutor
+
+        executor = IBExecutor(host="h", port=7497, client_id=1)
+        fake_ib = MagicMock()
+        fake_ib.connectAsync = AsyncMock()
+        fake_ib.managedAccounts.return_value = ["DUN551088"]
+        fake_ib.isConnected.return_value = True
+        with patch("ib_insync.IB", return_value=fake_ib):
+            await executor.connect(expect_paper=True)
+        return executor, fake_ib
+
+    @pytest.mark.asyncio
+    async def test_submit_reconnects_after_drop(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        executor, fake_ib = await self._connected_paper_executor()
+        fake_ib.isConnected.return_value = False  # Gateway dropped us
+
+        fresh_ib = MagicMock()
+        fresh_ib.connectAsync = AsyncMock()
+        fresh_ib.managedAccounts.return_value = ["DUN551088"]
+        fresh_ib.isConnected.return_value = True
+        trade = MagicMock()
+        trade.order.orderId = 7
+        fresh_ib.placeOrder.return_value = trade
+
+        with patch("ib_insync.IB", return_value=fresh_ib):
+            order_id = await executor.submit_limit_order("CSCO", 17.0, 121.31)
+
+        assert order_id == "7"
+        fresh_ib.connectAsync.assert_awaited_once()
+        fresh_ib.placeOrder.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_failure_raises_not_connected(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from services.execution.ib_executor import NotConnectedError
+
+        executor, fake_ib = await self._connected_paper_executor()
+        fake_ib.isConnected.return_value = False
+
+        dead_ib = MagicMock()
+        dead_ib.connectAsync = AsyncMock(side_effect=ConnectionRefusedError("down"))
+
+        with patch("ib_insync.IB", return_value=dead_ib):
+            with pytest.raises(NotConnectedError, match="reconnect failed"):
+                await executor.submit_limit_order("CSCO", 17.0, 121.31)
+
+    @pytest.mark.asyncio
+    async def test_reconnect_reapplies_paper_guard(self):
+        """A reconnect must re-check the account type — the 2026-07-04
+        live-account-on-paper-port scenario applies to reconnects too."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from services.execution.ib_executor import WrongAccountTypeError
+
+        executor, fake_ib = await self._connected_paper_executor()
+        fake_ib.isConnected.return_value = False
+
+        live_ib = MagicMock()
+        live_ib.connectAsync = AsyncMock()
+        live_ib.managedAccounts.return_value = ["U17723819"]  # LIVE
+        live_ib.isConnected.return_value = True
+
+        with patch("ib_insync.IB", return_value=live_ib):
+            with pytest.raises(WrongAccountTypeError, match="LIVE"):
+                await executor.submit_limit_order("CSCO", 17.0, 121.31)
+
+        live_ib.placeOrder.assert_not_called()

@@ -74,6 +74,7 @@ class IBExecutor:
         self._ib = None  # Will hold ib_insync.IB instance
         self._trades: dict[str, Any] = {}  # order_id -> ib_insync.Trade
         self._fill_handler: FillHandler | None = None
+        self._expect_paper: bool | None = None
         self._logger = get_logger("ib_executor")
 
     def _effective_quantity(self, ticker: str, quantity: float) -> float:
@@ -116,6 +117,7 @@ class IBExecutor:
                 paper port — which happened on 2026-07-04 (live account
                 U-prefix answering on 7497 after a manual live login).
         """
+        self._expect_paper = expect_paper
         try:
             from ib_insync import IB
 
@@ -156,12 +158,33 @@ class IBExecutor:
             self._ib.disconnect()
             self._logger.info("Disconnected from IB")
 
-    def _require_connection(self) -> None:
-        if not self.is_connected:
+    async def _ensure_connected(self) -> None:
+        """Reconnect on demand when the Gateway dropped the session.
+
+        The Gateway drops API sockets routinely (data-farm resets, the
+        nightly auto-restart); orders must not fail on a stale socket while
+        the Gateway itself is healthy. The reconnect re-applies the same
+        ``expect_paper`` guard as the original connect —
+        :class:`WrongAccountTypeError` propagates untouched. Any other
+        reconnect failure raises :class:`NotConnectedError`: still failing
+        loud, never faking an order id.
+        """
+        if self.is_connected:
+            return
+        self._logger.warning(
+            "IB connection lost — reconnecting",
+            host=self._host,
+            port=self._port,
+        )
+        try:
+            await self.connect(expect_paper=self._expect_paper)
+        except WrongAccountTypeError:
+            raise
+        except Exception as exc:
             raise NotConnectedError(
-                f"IB not connected ({self._host}:{self._port}); refusing to "
-                "fake an order id"
-            )
+                f"IB not connected ({self._host}:{self._port}) and "
+                f"reconnect failed: {exc}"
+            ) from exc
 
     def _register_trade(self, order_id: str, trade: Any, ticker: str, side: str) -> None:
         """Track the trade and wire its fill event to the registered handler."""
@@ -190,7 +213,7 @@ class IBExecutor:
         self, ticker: str, quantity: float, limit_price: float
     ) -> str:
         """Submit a limit buy order via IB."""
-        self._require_connection()
+        await self._ensure_connected()
         quantity = self._effective_quantity(ticker, quantity)
         from ib_insync import LimitOrder, Stock
 
@@ -213,7 +236,7 @@ class IBExecutor:
 
     async def submit_market_order(self, ticker: str, quantity: float) -> str:
         """Submit a market sell order via IB."""
-        self._require_connection()
+        await self._ensure_connected()
         quantity = self._effective_quantity(ticker, quantity)
         from ib_insync import MarketOrder, Stock
 
@@ -233,7 +256,7 @@ class IBExecutor:
 
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel an open order via IB."""
-        self._require_connection()
+        await self._ensure_connected()
         trade = self._trades.get(order_id)
         if trade is None:
             self._logger.warning(
