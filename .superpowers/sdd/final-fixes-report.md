@@ -193,3 +193,75 @@ identity no longer includes the candidate cutoff itself. Explicit identities
 change only when dated membership changes; implicit raw identities represent
 the supplied panel ticker columns, while candidate snapshot identity still
 changes by date through `data_cutoff` and the as-of input checksum.
+
+## Causally eligible provenance columns follow-up
+
+A final provenance review found that row clipping alone still admitted global
+panel columns whose first observation and membership were in the future.
+Implementation commit:
+`fd23f054f497222362584c6a82b138b78cbf5554`.
+
+The correction uses one deterministic cutoff-eligibility rule for universe
+identity and all input artifact fields:
+
+- Explicit membership panels include only tickers active (`== 1`) in the
+  latest membership row at or before the cutoff. Universe identity hashes the
+  sorted active set and the effective date on which that active set began.
+- Implicit raw panels include only sorted ticker columns with at least one
+  non-null observation in any panel field at or before the cutoff.
+- Every field is row-clipped and column-restricted to that same eligible set
+  before input checksum serialization.
+- An empty eligible universe is valid and serializes as a deterministic empty
+  column set; repeated hashes are tested for both explicit and implicit panels.
+
+RED evidence:
+
+```text
+python -m pytest tests/research/test_engine.py \
+  tests/research/test_shadow.py -q
+4 failed, 29 passed in 1.38s
+```
+
+The four failures proved that a ticker whose first bar/membership was after
+January 2 changed January 2 provenance and recorder keys in both explicit and
+implicit panels.
+
+GREEN and release evidence:
+
+```text
+python -m pytest tests/research/test_engine.py \
+  tests/research/test_shadow.py tests/research/test_panel.py \
+  tests/research/test_contracts.py tests/backtest/test_multi_portfolio.py -q
+76 passed in 2.36s
+
+python -m pytest tests/research/ tests/backtest/test_multi_portfolio.py -q
+129 passed in 2.78s
+
+python -m pytest tests/backtest/ tests/scripts/test_run_paper_gate.py \
+  tests/scripts/test_run_paper_reset.py \
+  tests/scripts/test_run_paper_research_shadow.py \
+  tests/scripts/test_paper_state.py tests/shared/test_models.py \
+  tests/shared/test_config.py tests/services/ml_model/ -q
+282 passed in 10.79s
+
+python -m pytest
+737 passed in 13.38s
+
+ruff check research/factors/contracts.py tests/research/test_engine.py \
+  tests/research/test_shadow.py
+All checks passed
+
+git diff --check
+exit 0, no output
+
+/opt/homebrew/bin/uv build --offline --wheel \
+  --out-dir /tmp/algo-poc-wheel-final-pit-columns
+Successfully built \
+  /tmp/algo-poc-wheel-final-pit-columns/algo_poc-0.1.0-py3-none-any.whl
+```
+
+Regression controls prove a future-only ticker leaves the prior cutoff's input
+checksum, universe identity, snapshot identity, and candidate key unchanged,
+while a genuine same-date bar/active-membership backfill changes the prior
+identity. All prior membership addition/removal, z-score masking, idempotency,
+panel isolation, and six-sleeve shadow guarantees remain green.
