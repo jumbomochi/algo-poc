@@ -97,6 +97,32 @@ def test_shadow_recorders_share_snapshots_but_not_records():
     assert recorders["momentum"].records is not recorders["quality_value"].records
 
 
+def test_disabled_shadow_does_not_construct_factor_dependencies(monkeypatch):
+    def unexpected_panel_construction(*args, **kwargs):
+        raise AssertionError("disabled shadow must not build a factor panel")
+
+    class UnexpectedFactorEngine:
+        def __init__(self, registry):
+            raise AssertionError("disabled shadow must not build a factor engine")
+
+    monkeypatch.setattr(
+        "research.factors.panel.build_factor_panel",
+        unexpected_panel_construction,
+    )
+    monkeypatch.setattr(
+        "research.factors.engine.FactorEngine",
+        UnexpectedFactorEngine,
+    )
+
+    recorders = _create_backtest_shadow_recorders(
+        enabled=False,
+        bars_by_ticker={},
+        portfolio_names=("momentum", "quality_value"),
+    )
+
+    assert recorders == {}
+
+
 def test_shadow_setup_failure_returns_no_recorders(monkeypatch):
     class FailingFactorEngine:
         def __init__(self, registry):
