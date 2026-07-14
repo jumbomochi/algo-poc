@@ -120,3 +120,76 @@ contents. No network or escalation was requested.
   it does not depend on a mutable working-tree Git label.
 - The migration was rendered only in Alembic offline SQL mode. It was not run
   against any database.
+
+## Point-in-time universe follow-up
+
+Whole-branch re-review identified that the initial catalog could not truthfully
+apply cross-sectional normalization because the opt-in paper and cached
+backtest paths do not supply authoritative dated S&P 500 or Russell 1000
+membership. Follow-up implementation commit:
+`6da652471b6ec9ea1cf76a7b22aa8e9677ecb292`.
+
+The correction:
+
+- Changes all four pre-release catalog normalization policies to `none`, keeping
+  their `1.0.0` versions because no released/persisted contract exists yet.
+- Retains the reusable z-score operation but requires an aligned
+  `universe:member` frame for every factor that declares
+  `cross_sectional_zscore`.
+- Masks every date to membership equal to one before normalization and leaves
+  removed/not-yet-added tickers missing. Tests mutate extreme nonmember values
+  and prove active scores do not change.
+- Adds immutable `provenance_for(date)` and `snapshot_identity_for(date)` APIs.
+  Engine provenance uses that date's cutoff, as-of-clipped input checksum, and
+  latest explicit membership snapshot at or before the date. Raw implicit
+  universes are identified by the explicitly supplied panel columns.
+- Makes both in-memory and SQL recorders persist/export and key by the candidate
+  date's provenance identity.
+- Adds a six-sleeve integration assertion proving the default shared snapshot
+  records raw catalog values without changing failure isolation.
+
+Follow-up RED evidence:
+
+```text
+python -m pytest tests/research/test_catalog.py \
+  tests/research/test_engine.py tests/research/test_shadow.py -q
+7 failed, 43 passed in 0.94s
+```
+
+The failures covered the still-cross-sectional catalog metadata, missing
+membership acceptance, nonmember contamination, absent dated provenance APIs,
+and absence of dated-provenance construction in recorders.
+
+Follow-up GREEN and release evidence:
+
+```text
+python -m pytest tests/research/ tests/backtest/test_multi_portfolio.py -q
+123 passed in 2.28s
+
+python -m pytest tests/backtest/ tests/scripts/test_run_paper_gate.py \
+  tests/scripts/test_run_paper_reset.py \
+  tests/scripts/test_run_paper_research_shadow.py \
+  tests/scripts/test_paper_state.py tests/shared/test_models.py \
+  tests/shared/test_config.py tests/services/ml_model/ -q
+282 passed in 10.65s
+
+python -m pytest
+731 passed in 12.65s
+
+alembic upgrade 9b3d1c7e4a20 --sql
+exit 0; offline PostgreSQL SQL generation only
+
+/opt/homebrew/bin/uv build --offline --wheel \
+  --out-dir /tmp/algo-poc-wheel-final-fixes-followup
+Successfully built \
+  /tmp/algo-poc-wheel-final-fixes-followup/algo_poc-0.1.0-py3-none-any.whl
+
+git diff --check
+exit 0, no output
+```
+
+This follow-up supersedes the earlier implicit-universe concern above: universe
+identity no longer includes the candidate cutoff itself. Explicit identities
+change only when dated membership changes; implicit raw identities represent
+the supplied panel ticker columns, while candidate snapshot identity still
+changes by date through `data_cutoff` and the as-of input checksum.
