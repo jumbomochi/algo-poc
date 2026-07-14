@@ -3,13 +3,48 @@ from __future__ import annotations
 from datetime import date
 
 import pandas as pd
+import pytest
 from sqlalchemy import create_engine, select
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from research.factors.engine import FactorSnapshotIndex
 from research.shadow import InMemoryShadowRecorder, SQLShadowRecorder, candidate_key
 from shared.models.base import Base
 from shared.models.research import ResearchCandidate
+
+
+class RollbackTrackingSession(Session):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.rollback_calls = 0
+
+    def rollback(self):
+        self.rollback_calls += 1
+        super().rollback()
+
+
+class QueryFailingSession(RollbackTrackingSession):
+    def scalar(self, *args, **kwargs):
+        raise RuntimeError("query unavailable")
+
+
+class CommitFailingSession(RollbackTrackingSession):
+    def commit(self):
+        self.flush()
+        raise RuntimeError("commit unavailable")
+
+
+class Uncopyable:
+    def __deepcopy__(self, memo):
+        raise RuntimeError("snapshot unavailable")
+
+
+def database_sessions(session_class):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    failing_session = sessionmaker(bind=engine, class_=session_class)()
+    verification_session = sessionmaker(bind=engine)()
+    return failing_session, verification_session
 
 
 def test_in_memory_recorder_attaches_factor_snapshot_and_risk_outcome():
@@ -106,3 +141,92 @@ def test_sql_recorder_is_idempotent():
     recorder.observe(**kwargs)
     recorder.observe(**kwargs)
     assert len(session.scalars(select(ResearchCandidate)).all()) == 1
+
+
+def test_sql_recorder_owns_one_consistent_signal_snapshot_during_persistence():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    signal = {
+        "action": "buy",
+        "signals": {"momentum": {"score": 0.8}},
+    }
+
+    class MutatingSnapshots:
+        def values_for(self, as_of, ticker):
+            signal["signals"]["momentum"]["score"] = -1.0
+            return {}
+
+    recorder = SQLShadowRecorder(session, MutatingSnapshots())
+
+    recorder.observe(
+        portfolio="momentum",
+        ticker="AAPL",
+        as_of=date(2026, 1, 2),
+        signal=signal,
+        risk_approved=True,
+        risk_reason="approved",
+    )
+
+    stored = session.scalar(select(ResearchCandidate))
+    assert stored.raw_signal["signals"]["momentum"]["score"] == 0.8
+    assert stored.candidate_key == candidate_key(
+        stored.portfolio,
+        stored.ticker,
+        stored.as_of,
+        stored.raw_signal,
+    )
+
+
+def test_sql_recorder_rolls_back_and_reraises_signal_snapshot_failure():
+    session, verification_session = database_sessions(RollbackTrackingSession)
+    recorder = SQLShadowRecorder(session, FactorSnapshotIndex({}))
+
+    with pytest.raises(RuntimeError, match="snapshot unavailable"):
+        recorder.observe(
+            portfolio="momentum",
+            ticker="AAPL",
+            as_of=date(2026, 1, 2),
+            signal={"action": "buy", "nested": Uncopyable()},
+            risk_approved=True,
+            risk_reason="approved",
+        )
+
+    assert session.rollback_calls == 1
+    assert verification_session.scalar(select(ResearchCandidate)) is None
+
+
+def test_sql_recorder_rolls_back_and_reraises_query_failure():
+    session, verification_session = database_sessions(QueryFailingSession)
+    recorder = SQLShadowRecorder(session, FactorSnapshotIndex({}))
+
+    with pytest.raises(RuntimeError, match="query unavailable"):
+        recorder.observe(
+            portfolio="momentum",
+            ticker="AAPL",
+            as_of=date(2026, 1, 2),
+            signal={"action": "buy"},
+            risk_approved=True,
+            risk_reason="approved",
+        )
+
+    assert session.rollback_calls == 1
+    assert verification_session.scalar(select(ResearchCandidate)) is None
+
+
+def test_sql_recorder_rolls_back_commit_failure_without_partial_record():
+    session, verification_session = database_sessions(CommitFailingSession)
+    recorder = SQLShadowRecorder(session, FactorSnapshotIndex({}))
+
+    with pytest.raises(RuntimeError, match="commit unavailable"):
+        recorder.observe(
+            portfolio="momentum",
+            ticker="AAPL",
+            as_of=date(2026, 1, 2),
+            signal={"action": "buy"},
+            risk_approved=True,
+            risk_reason="approved",
+        )
+
+    assert session.rollback_calls == 1
+    assert verification_session.scalar(select(ResearchCandidate)) is None

@@ -108,7 +108,8 @@ class SQLShadowRecorder:
         risk_reason: str,
     ) -> None:
         try:
-            key = candidate_key(portfolio, ticker, as_of, signal)
+            signal_snapshot = deepcopy(signal)
+            key = candidate_key(portfolio, ticker, as_of, signal_snapshot)
             existing_id = self._session.scalar(
                 select(ResearchCandidate.id).where(
                     ResearchCandidate.candidate_key == key
@@ -122,8 +123,8 @@ class SQLShadowRecorder:
                     portfolio=portfolio,
                     ticker=ticker,
                     as_of=as_of,
-                    action=str(signal["action"]),
-                    raw_signal=dict(signal),
+                    action=str(signal_snapshot["action"]),
+                    raw_signal=signal_snapshot,
                     factor_values=self._snapshots.values_for(as_of, ticker),
                     risk_approved=risk_approved,
                     risk_reason=risk_reason,
