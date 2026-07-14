@@ -5,7 +5,7 @@ from datetime import date
 import pandas as pd
 
 from research.factors.engine import FactorSnapshotIndex
-from research.shadow import InMemoryShadowRecorder
+from research.shadow import InMemoryShadowRecorder, candidate_key
 
 
 def test_in_memory_recorder_attaches_factor_snapshot_and_risk_outcome():
@@ -55,3 +55,31 @@ def test_candidate_key_is_stable_for_equivalent_signal_mappings():
     )
 
     assert first.records[0].candidate_key == second.records[0].candidate_key
+
+
+def test_recorder_snapshot_is_unchanged_after_caller_mutates_original_signal():
+    recorder = InMemoryShadowRecorder(FactorSnapshotIndex({}))
+    signal = {
+        "action": "buy",
+        "quantity": 1.0,
+        "signals": {"momentum": {"score": 0.8}},
+    }
+
+    recorder.observe(
+        portfolio="momentum",
+        ticker="AAPL",
+        as_of=date(2026, 1, 2),
+        signal=signal,
+        risk_approved=True,
+        risk_reason="approved",
+    )
+    signal["signals"]["momentum"]["score"] = -1.0
+
+    record = recorder.records[0]
+    assert record.raw_signal["signals"]["momentum"]["score"] == 0.8
+    assert record.candidate_key == candidate_key(
+        record.portfolio,
+        record.ticker,
+        record.as_of,
+        record.raw_signal,
+    )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -149,11 +150,12 @@ class BacktestRunner:
 
                     if candidate_observer is not None:
                         try:
+                            signal_snapshot = deepcopy(signal)
                             candidate_observer.observe(
                                 portfolio=portfolio_name,
                                 ticker=ticker,
                                 as_of=current_date,
-                                signal=dict(signal),
+                                signal=signal_snapshot,
                                 risk_approved=bool(decision.approved),
                                 risk_reason=str(decision.reason),
                             )

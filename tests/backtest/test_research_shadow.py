@@ -27,6 +27,16 @@ class ExportFailingObserver:
         raise RuntimeError("export unavailable")
 
 
+class MutatingObserver:
+    def observe(self, **kwargs):
+        kwargs["signal"]["signals"]["momentum"]["score"] = -1.0
+
+
+class Uncopyable:
+    def __deepcopy__(self, memo):
+        raise RuntimeError("snapshot unavailable")
+
+
 def run_with(observer):
     bars = {
         "AAPL": [
@@ -51,6 +61,56 @@ def run_with(observer):
         "quantity": 1.0,
         "sector": "Technology",
     }
+    runner = BacktestRunner(
+        SimulatedExecutor(slippage_bps=0, commission_per_share=0), 10_000
+    )
+    return runner.run(
+        bars,
+        signal_fn,
+        risk,
+        candidate_observer=observer,
+        portfolio_name="momentum",
+    )
+
+
+def run_approved_with(observer):
+    bars = {
+        "AAPL": [
+            {
+                "date": date(2026, 1, 2),
+                "open": 100,
+                "high": 101,
+                "low": 99,
+                "close": 100,
+                "volume": 1000,
+            },
+            {
+                "date": date(2026, 1, 3),
+                "open": 102,
+                "high": 103,
+                "low": 101,
+                "close": 102,
+                "volume": 1000,
+            },
+        ]
+    }
+    risk = MagicMock()
+    risk.check_entry.return_value = MagicMock(
+        approved=True, adjusted_quantity=1.0, reason="approved"
+    )
+
+    def signal_fn(ticker, history):
+        if len(history) == 1:
+            return {
+                "action": "buy",
+                "ticker": ticker,
+                "limit_price": 100.0,
+                "quantity": 1.0,
+                "sector": "Technology",
+                "signals": {"momentum": {"score": 0.8}},
+            }
+        return {"action": "sell", "ticker": ticker, "exit_reason": "test"}
+
     runner = BacktestRunner(
         SimulatedExecutor(slippage_bps=0, commission_per_share=0), 10_000
     )
@@ -91,3 +151,62 @@ def test_observer_export_failure_does_not_change_backtest_result():
     assert with_failure.trades == baseline.trades
     assert with_failure.portfolio_values == baseline.portfolio_values
     assert with_failure.shadow_candidates == []
+
+
+def test_mutating_observer_cannot_change_established_backtest_result_fields():
+    baseline = run_approved_with(None)
+
+    with_observer = run_approved_with(MutatingObserver())
+
+    assert with_observer.trades == baseline.trades
+    assert with_observer.portfolio_values == baseline.portfolio_values
+    assert with_observer.dates == baseline.dates
+    assert with_observer.metrics == baseline.metrics
+    assert with_observer.trades[0]["entry_signals"] == {
+        "momentum": {"score": 0.8}
+    }
+
+
+def test_signal_snapshot_failure_does_not_change_backtest_result():
+    observer = RecordingObserver()
+    bars = {
+        "AAPL": [
+            {
+                "date": date(2026, 1, 2),
+                "open": 100,
+                "high": 101,
+                "low": 99,
+                "close": 100,
+                "volume": 1000,
+            }
+        ]
+    }
+    risk = MagicMock()
+    risk.check_entry.return_value = MagicMock(
+        approved=False, adjusted_quantity=0, reason="cap"
+    )
+
+    def signal_fn(ticker, history):
+        return {
+            "action": "buy",
+            "ticker": ticker,
+            "limit_price": 100.0,
+            "quantity": 1.0,
+            "sector": "Technology",
+            "signals": {"uncopyable": Uncopyable()},
+        }
+
+    runner = BacktestRunner(
+        SimulatedExecutor(slippage_bps=0, commission_per_share=0), 10_000
+    )
+    result = runner.run(
+        bars,
+        signal_fn,
+        risk,
+        candidate_observer=observer,
+        portfolio_name="momentum",
+    )
+
+    assert result.trades == []
+    assert result.portfolio_values == [10_000, 10_000]
+    assert observer.calls == []

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import date
 from typing import Any, Protocol
@@ -67,14 +68,17 @@ class InMemoryShadowRecorder:
         risk_approved: bool,
         risk_reason: str,
     ) -> None:
+        signal_snapshot = deepcopy(signal)
         self.records.append(
             ShadowCandidateRecord(
-                candidate_key=candidate_key(portfolio, ticker, as_of, signal),
+                candidate_key=candidate_key(
+                    portfolio, ticker, as_of, signal_snapshot
+                ),
                 portfolio=portfolio,
                 ticker=ticker,
                 as_of=as_of,
-                action=str(signal["action"]),
-                raw_signal=dict(signal),
+                action=str(signal_snapshot["action"]),
+                raw_signal=signal_snapshot,
                 factor_values=self._snapshots.values_for(as_of, ticker),
                 risk_approved=risk_approved,
                 risk_reason=risk_reason,
