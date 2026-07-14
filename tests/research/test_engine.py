@@ -7,7 +7,7 @@ import pytest
 
 from research.factors.catalog import DEFAULT_FACTOR_IDS, build_default_registry
 from research.factors.contracts import FactorPanel
-from research.factors.engine import FactorEngine
+from research.factors.engine import FactorEngine, FactorSnapshotIndex
 from research.factors.panel import build_factor_panel
 
 
@@ -85,3 +85,27 @@ def test_engine_rejects_misaligned_factor_output() -> None:
         ValueError, match="factor 'price_momentum_126d' returned a misaligned frame"
     ):
         FactorEngine(registry).compute(panel, ["price_momentum_126d"])
+
+
+def test_snapshot_defensively_copies_input_frames() -> None:
+    timestamp = pd.Timestamp("2025-01-01")
+    frame = pd.DataFrame({"A": [1.5]}, index=[timestamp])
+    frames = {"factor@1.0.0": frame}
+    index = FactorSnapshotIndex(frames=frames)
+
+    frame.at[timestamp, "A"] = 99.0
+    frames.clear()
+
+    assert index.values_for(date(2025, 1, 1), "A") == {"factor@1.0.0": 1.5}
+
+
+def test_snapshot_exposes_only_lookup_not_mutable_frames() -> None:
+    index = FactorSnapshotIndex(
+        frames={
+            "factor@1.0.0": pd.DataFrame(
+                {"A": [1.5]}, index=[pd.Timestamp("2025-01-01")]
+            )
+        }
+    )
+
+    assert not hasattr(index, "frames")

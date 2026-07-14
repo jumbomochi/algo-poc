@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from datetime import date
-from typing import Iterable
+from types import MappingProxyType
 
 import numpy as np
 import pandas as pd
@@ -11,14 +12,20 @@ from research.factors.contracts import FactorPanel
 from research.factors.registry import FactorRegistry
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False, slots=True)
 class FactorSnapshotIndex:
-    frames: dict[str, pd.DataFrame]
+    _frames: Mapping[str, pd.DataFrame] = field(repr=False)
+
+    def __init__(self, frames: Mapping[str, pd.DataFrame]) -> None:
+        copied_frames = {
+            key: frame.copy(deep=True) for key, frame in frames.items()
+        }
+        object.__setattr__(self, "_frames", MappingProxyType(copied_frames))
 
     def values_for(self, as_of: date, ticker: str) -> dict[str, float]:
         timestamp = pd.Timestamp(as_of)
         values: dict[str, float] = {}
-        for key, frame in self.frames.items():
+        for key, frame in self._frames.items():
             if timestamp not in frame.index or ticker not in frame.columns:
                 continue
             value = frame.at[timestamp, ticker]
