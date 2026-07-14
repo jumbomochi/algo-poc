@@ -6,10 +6,45 @@ import pytest
 
 from research.factors.operations import (
     cross_sectional_rank,
+    cross_sectional_zscore,
     rolling_dollar_volume,
     rolling_volatility,
     trailing_return,
 )
+
+
+def test_cross_sectional_zscore_is_row_wise_and_preserves_missing_values():
+    frame = pd.DataFrame(
+        {"A": [1.0, 4.0], "B": [2.0, np.nan], "C": [3.0, 4.0]},
+        index=pd.to_datetime(["2026-01-02", "2026-01-05"]),
+    )
+
+    result = cross_sectional_zscore(frame)
+
+    assert result.loc["2026-01-02"].to_dict() == {
+        "A": pytest.approx(-np.sqrt(1.5)),
+        "B": pytest.approx(0.0),
+        "C": pytest.approx(np.sqrt(1.5)),
+    }
+    assert pd.isna(result.loc["2026-01-05", "B"])
+
+
+def test_cross_sectional_zscore_requires_two_observations_and_zeroes_zero_dispersion():
+    frame = pd.DataFrame(
+        {"A": [1.0, 4.0], "B": [np.nan, 4.0], "C": [np.nan, np.nan]},
+        index=pd.to_datetime(["2026-01-02", "2026-01-05"]),
+    )
+
+    result = cross_sectional_zscore(frame)
+
+    assert result.loc["2026-01-02"].isna().all()
+    assert result.loc["2026-01-05", ["A", "B"]].to_dict() == {"A": 0.0, "B": 0.0}
+    assert pd.isna(result.loc["2026-01-05", "C"])
+
+
+def test_cross_sectional_zscore_rejects_invalid_minimum_coverage():
+    with pytest.raises(ValueError, match="min_count must be at least 2"):
+        cross_sectional_zscore(pd.DataFrame({"A": [1.0]}), min_count=1)
 
 
 def test_cross_sectional_rank_is_per_date_and_bounded():

@@ -132,6 +132,7 @@ def test_research_candidate_has_shadow_audit_fields():
         "action",
         "raw_signal",
         "factor_values",
+        "provenance",
         "risk_approved",
         "risk_reason",
         "created_at",

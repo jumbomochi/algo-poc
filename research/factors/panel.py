@@ -52,15 +52,23 @@ def build_factor_panel(
             and isinstance(row[key], (int, float))
         }
     )
+    for ticker, rows in (fundamentals_by_ticker or {}).items():
+        revisions_by_availability: dict[pd.Timestamp, set[str]] = {}
+        for row in rows:
+            available_at = _fundamental_available_at(row)
+            revisions_by_availability.setdefault(available_at, set()).add(
+                str(row["source_revision"])
+            )
+        if any(len(revisions) > 1 for revisions in revisions_by_availability.values()):
+            raise ValueError(
+                f"ambiguous source_revision values for '{ticker}' at equal availability timestamp"
+            )
     for metric in metric_names:
         frame = pd.DataFrame(index=index, columns=tickers, dtype=float)
         for ticker, rows in (fundamentals_by_ticker or {}).items():
             for row in sorted(
                 rows,
-                key=lambda item: (
-                    _fundamental_available_at(item),
-                    str(item["source_revision"]),
-                ),
+                key=_fundamental_available_at,
             ):
                 available_day = _fundamental_available_at(row).date()
                 if available_day <= cutoff and metric in row:

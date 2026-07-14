@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass
 from datetime import date
-from typing import Mapping, Protocol, runtime_checkable
+from types import MappingProxyType
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 import pandas as pd
 
@@ -27,46 +30,142 @@ class FactorSpec:
     license: str
 
     def __post_init__(self) -> None:
-        if not self.factor_id or "@" in self.factor_id:
+        if (
+            not isinstance(self.factor_id, str)
+            or not self.factor_id.strip()
+            or "@" in self.factor_id
+        ):
             raise ValueError("factor_id must be non-empty and cannot contain '@'")
-        if re.fullmatch(
-            r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)",
-            self.version,
-        ) is None:
+        if (
+            re.fullmatch(
+                r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)",
+                self.version,
+            )
+            is None
+        ):
             raise ValueError("version must use semantic MAJOR.MINOR.PATCH format")
         if self.lookback_days < 1:
             raise ValueError("lookback_days must be at least 1")
+        if self.prediction_horizon_days < 1:
+            raise ValueError("prediction_horizon_days must be at least 1")
         if self.direction not in (-1, 1):
             raise ValueError("direction must be -1 or 1")
-        if not self.required_fields:
-            raise ValueError("required_fields must be non-empty")
+        for field_name in (
+            "family",
+            "description",
+            "economic_rationale",
+            "missing_data_policy",
+            "normalization_policy",
+            "source",
+            "license",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be non-empty")
+        for field_name in (
+            "required_fields",
+            "supported_sleeves",
+            "supported_universes",
+        ):
+            values = getattr(self, field_name)
+            if (
+                not isinstance(values, tuple)
+                or not values
+                or any(
+                    not isinstance(value, str) or not value.strip() for value in values
+                )
+            ):
+                raise ValueError(f"{field_name} must contain non-empty text values")
 
     @property
     def key(self) -> str:
         return f"{self.factor_id}@{self.version}"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False, slots=True)
 class FactorPanel:
-    fields: Mapping[str, pd.DataFrame]
+    _fields: Mapping[str, pd.DataFrame]
     as_of: date
 
-    def __post_init__(self) -> None:
-        frames = list(self.fields.values())
+    def __init__(self, fields: Mapping[str, pd.DataFrame], as_of: date) -> None:
+        owned = {name: frame.copy(deep=True) for name, frame in fields.items()}
+        frames = list(owned.values())
         if not frames:
             raise ValueError("fields must be non-empty")
         first = frames[0]
         for frame in frames[1:]:
-            if not frame.index.equals(first.index) or not frame.columns.equals(first.columns):
-                raise ValueError("all factor fields must have the same index and columns")
-        if len(first.index) and first.index.max().date() > self.as_of:
+            if not frame.index.equals(first.index) or not frame.columns.equals(
+                first.columns
+            ):
+                raise ValueError(
+                    "all factor fields must have the same index and columns"
+                )
+        if len(first.index) and first.index.max().date() > as_of:
             raise ValueError("panel contains observations after as_of")
+        object.__setattr__(self, "_fields", MappingProxyType(owned))
+        object.__setattr__(self, "as_of", as_of)
 
     def field(self, name: str) -> pd.DataFrame:
         try:
-            return self.fields[name]
+            return self._fields[name].copy(deep=True)
         except KeyError as exc:
             raise KeyError(f"factor panel is missing required field '{name}'") from exc
+
+    def input_artifact_checksum(self) -> str:
+        payload = {
+            "as_of": self.as_of.isoformat(),
+            "fields": {
+                name: _frame_payload(frame)
+                for name, frame in sorted(self._fields.items())
+            },
+        }
+        return _sha256(payload)
+
+    def universe_snapshot_id(self) -> str:
+        if "universe:member" in self._fields and len(
+            self._fields["universe:member"].index
+        ):
+            frame = self._fields["universe:member"]
+            payload: Any = {
+                "as_of": self.as_of.isoformat(),
+                "membership": _frame_payload(frame.iloc[[-1]]),
+            }
+        else:
+            first = next(iter(self._fields.values()))
+            payload = {
+                "as_of": self.as_of.isoformat(),
+                "implicit_tickers": [str(column) for column in first.columns],
+            }
+        return _sha256(payload)
+
+
+def _sha256(payload: Any) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _frame_payload(frame: pd.DataFrame) -> dict[str, Any]:
+    return {
+        "index": [_canonical_value(value) for value in frame.index],
+        "columns": [_canonical_value(value) for value in frame.columns],
+        "dtypes": [str(dtype) for dtype in frame.dtypes],
+        "values": [
+            [_canonical_value(value) for value in row]
+            for row in frame.to_numpy(dtype=object).tolist()
+        ],
+    }
+
+
+def _canonical_value(value: Any) -> Any:
+    if pd.isna(value):
+        return None
+    if hasattr(value, "item"):
+        value = value.item()
+    if isinstance(value, (date, pd.Timestamp)):
+        return pd.Timestamp(value).isoformat()
+    if isinstance(value, float) and not pd.notna(value):
+        return None
+    return value
 
 
 @runtime_checkable

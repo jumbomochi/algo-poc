@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 
 import pandas as pd
+import pytest
 
 from research.factors.panel import build_factor_panel
 
@@ -133,7 +134,7 @@ def test_later_ingested_fundamental_revision_does_not_rewrite_history():
     assert values.loc["2026-01-09"] == 0.05
 
 
-def test_source_revision_breaks_ties_deterministically():
+def test_equal_availability_with_distinct_source_revisions_is_rejected():
     bars = {
         "A": [
             {
@@ -164,12 +165,8 @@ def test_source_revision_breaks_ties_deterministically():
         ]
     }
 
-    values = build_factor_panel(
-        bars,
-        fundamentals_by_ticker=fundamentals,
-    ).field("fund:earnings_yield")["A"]
-
-    assert values.loc["2026-01-06"] == 0.05
+    with pytest.raises(ValueError, match="ambiguous.*source_revision.*availability"):
+        build_factor_panel(bars, fundamentals_by_ticker=fundamentals)
 
 
 def test_universe_snapshots_project_forward_without_backfill_and_track_removals():

@@ -95,6 +95,12 @@ class TestDumpAndReset:
                 action="buy",
                 raw_signal={"action": "buy"},
                 factor_values={"price_momentum_126d@1.0.0": 0.25},
+                provenance={
+                    "data_cutoff": "2026-07-07",
+                    "universe_snapshot_id": "sha256:" + "1" * 64,
+                    "code_revision": "sha256:" + "2" * 64,
+                    "input_artifact_checksum": "sha256:" + "3" * 64,
+                },
                 risk_approved=False,
                 risk_reason="position cap",
             )

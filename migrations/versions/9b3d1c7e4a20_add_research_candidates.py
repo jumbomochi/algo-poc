@@ -27,6 +27,7 @@ def upgrade() -> None:
         sa.Column("action", sa.String(length=8), nullable=False),
         sa.Column("raw_signal", sa.JSON(), nullable=False),
         sa.Column("factor_values", sa.JSON(), nullable=False),
+        sa.Column("provenance", sa.JSON(), nullable=False),
         sa.Column("risk_approved", sa.Boolean(), nullable=False),
         sa.Column("risk_reason", sa.Text(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
