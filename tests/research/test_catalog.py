@@ -51,12 +51,16 @@ def standard_bars() -> dict[str, list[dict[str, object]]]:
 
 def test_default_catalog_contains_four_reviewed_price_factors() -> None:
     ids = {spec.factor_id for spec in build_default_registry().list_specs()}
-    assert ids == set(DEFAULT_FACTOR_IDS) == {
-        "price_momentum_126d",
-        "high_52w",
-        "low_volatility_63d",
-        "liquidity_20d",
-    }
+    assert (
+        ids
+        == set(DEFAULT_FACTOR_IDS)
+        == {
+            "price_momentum_126d",
+            "high_52w",
+            "low_volatility_63d",
+            "liquidity_20d",
+        }
+    )
 
 
 @pytest.mark.parametrize(
@@ -202,12 +206,8 @@ def test_default_catalog_populates_canonical_factor_metadata() -> None:
 
     assert all(spec.economic_rationale for spec in specs)
     assert all(spec.prediction_horizon_days > 0 for spec in specs)
-    assert all(
-        spec.supported_universes == ("sp500", "russell1000") for spec in specs
-    )
+    assert all(spec.supported_universes == ("sp500", "russell1000") for spec in specs)
     assert all(
         spec.missing_data_policy == "require_complete_lookback" for spec in specs
     )
-    assert all(
-        spec.normalization_policy == "cross_sectional_zscore" for spec in specs
-    )
+    assert all(spec.normalization_policy == "none" for spec in specs)

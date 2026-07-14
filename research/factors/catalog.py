@@ -47,7 +47,7 @@ class PriceMomentum126d:
         lookback_days=126,
         direction=1,
         missing_data_policy="require_complete_lookback",
-        normalization_policy="cross_sectional_zscore",
+        normalization_policy="none",
         source="Jegadeesh and Titman",
         license="formula",
     )
@@ -73,7 +73,7 @@ class High52Week:
         lookback_days=252,
         direction=1,
         missing_data_policy="require_complete_lookback",
-        normalization_policy="cross_sectional_zscore",
+        normalization_policy="none",
         source="George and Hwang",
         license="formula",
     )
@@ -100,7 +100,7 @@ class LowVolatility63d:
         lookback_days=63,
         direction=1,
         missing_data_policy="require_complete_lookback",
-        normalization_policy="cross_sectional_zscore",
+        normalization_policy="none",
         source="Ang et al.",
         license="formula",
     )
@@ -126,15 +126,13 @@ class Liquidity20d:
         lookback_days=20,
         direction=1,
         missing_data_policy="require_complete_lookback",
-        normalization_policy="cross_sectional_zscore",
+        normalization_policy="none",
         source="execution-capacity control",
         license="formula",
     )
 
     def compute(self, panel: FactorPanel) -> pd.DataFrame:
-        value = rolling_dollar_volume(
-            panel.field("close"), panel.field("volume"), 20
-        )
+        value = rolling_dollar_volume(panel.field("close"), panel.field("volume"), 20)
         return np.log(value.where(value > 0))
 
 

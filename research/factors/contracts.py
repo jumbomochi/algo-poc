@@ -111,29 +111,54 @@ class FactorPanel:
         except KeyError as exc:
             raise KeyError(f"factor panel is missing required field '{name}'") from exc
 
-    def input_artifact_checksum(self) -> str:
+    def observation_dates(self) -> tuple[date, ...]:
+        first = next(iter(self._fields.values()))
+        return tuple(pd.Timestamp(timestamp).date() for timestamp in first.index)
+
+    def input_artifact_checksum(self, as_of: date | None = None) -> str:
+        cutoff = as_of or self.as_of
+        timestamp = pd.Timestamp(cutoff)
         payload = {
-            "as_of": self.as_of.isoformat(),
+            "as_of": cutoff.isoformat(),
             "fields": {
-                name: _frame_payload(frame)
+                name: _frame_payload(frame.loc[frame.index <= timestamp])
                 for name, frame in sorted(self._fields.items())
             },
         }
         return _sha256(payload)
 
-    def universe_snapshot_id(self) -> str:
+    def universe_snapshot_id(self, as_of: date | None = None) -> str:
+        cutoff = as_of or self.as_of
         if "universe:member" in self._fields and len(
             self._fields["universe:member"].index
         ):
             frame = self._fields["universe:member"]
+            eligible = frame.loc[frame.index <= pd.Timestamp(cutoff)]
+            if eligible.empty:
+                membership = {str(column): None for column in frame.columns}
+                effective_at = None
+            else:
+                current = eligible.iloc[-1]
+                membership = {
+                    str(column): _canonical_value(value)
+                    for column, value in current.items()
+                }
+                effective_at = None
+                if current.notna().any():
+                    effective_timestamp = eligible.index[-1]
+                    for timestamp in reversed(eligible.index[:-1]):
+                        if eligible.loc[timestamp].equals(current):
+                            effective_timestamp = timestamp
+                        else:
+                            break
+                    effective_at = pd.Timestamp(effective_timestamp).isoformat()
             payload: Any = {
-                "as_of": self.as_of.isoformat(),
-                "membership": _frame_payload(frame.iloc[[-1]]),
+                "snapshot_effective_at": effective_at,
+                "membership": membership,
             }
         else:
             first = next(iter(self._fields.values()))
             payload = {
-                "as_of": self.as_of.isoformat(),
                 "implicit_tickers": [str(column) for column in first.columns],
             }
         return _sha256(payload)

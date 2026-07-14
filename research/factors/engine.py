@@ -46,20 +46,33 @@ class CalculationProvenance:
 @dataclass(frozen=True, init=False, slots=True)
 class FactorSnapshotIndex:
     _frames: Mapping[str, pd.DataFrame] = field(repr=False)
+    _provenance_by_date: Mapping[date, CalculationProvenance] = field(repr=False)
     provenance: CalculationProvenance
 
     def __init__(
         self,
         frames: Mapping[str, pd.DataFrame],
         provenance: CalculationProvenance,
+        provenance_by_date: Mapping[date, CalculationProvenance] | None = None,
     ) -> None:
         copied_frames = {key: frame.copy(deep=True) for key, frame in frames.items()}
         object.__setattr__(self, "_frames", MappingProxyType(copied_frames))
+        dated = dict(provenance_by_date or {provenance.data_cutoff: provenance})
+        object.__setattr__(self, "_provenance_by_date", MappingProxyType(dated))
         object.__setattr__(self, "provenance", provenance)
 
     @property
     def snapshot_identity(self) -> str:
         return self.provenance.identity
+
+    def provenance_for(self, as_of: date) -> CalculationProvenance:
+        try:
+            return self._provenance_by_date[as_of]
+        except KeyError as exc:
+            raise KeyError(f"no factor provenance for {as_of.isoformat()}") from exc
+
+    def snapshot_identity_for(self, as_of: date) -> str:
+        return self.provenance_for(as_of).identity
 
     def values_for(self, as_of: date, ticker: str) -> dict[str, float]:
         timestamp = pd.Timestamp(as_of)
@@ -95,23 +108,59 @@ class FactorEngine:
                 reference.columns
             ):
                 raise ValueError(f"factor '{factor_id}' returned a misaligned frame")
+            membership = None
+            if factor.spec.normalization_policy == "cross_sectional_zscore":
+                try:
+                    membership = panel.field("universe:member")
+                except KeyError as exc:
+                    raise ValueError(
+                        f"factor '{factor_id}' cross_sectional_zscore requires dated "
+                        "'universe:member' field"
+                    ) from exc
             frames[factor.spec.key] = _normalize(
-                output.astype(float), factor.spec.normalization_policy
+                output.astype(float), factor.spec.normalization_policy, membership
             )
-        provenance = CalculationProvenance(
-            data_cutoff=panel.as_of,
-            universe_snapshot_id=panel.universe_snapshot_id(),
-            code_revision=_code_revision(factors),
-            input_artifact_checksum=panel.input_artifact_checksum(),
+        code_revision = _code_revision(factors)
+        provenance_by_date = {
+            observation_date: _provenance_for(panel, observation_date, code_revision)
+            for observation_date in panel.observation_dates()
+        }
+        provenance = provenance_by_date.get(panel.as_of) or _provenance_for(
+            panel, panel.as_of, code_revision
         )
-        return FactorSnapshotIndex(frames=frames, provenance=provenance)
+        return FactorSnapshotIndex(
+            frames=frames,
+            provenance=provenance,
+            provenance_by_date=provenance_by_date,
+        )
 
 
-def _normalize(frame: pd.DataFrame, policy: str) -> pd.DataFrame:
+def _provenance_for(
+    panel: FactorPanel,
+    as_of: date,
+    code_revision: str,
+) -> CalculationProvenance:
+    return CalculationProvenance(
+        data_cutoff=as_of,
+        universe_snapshot_id=panel.universe_snapshot_id(as_of=as_of),
+        code_revision=code_revision,
+        input_artifact_checksum=panel.input_artifact_checksum(as_of=as_of),
+    )
+
+
+def _normalize(
+    frame: pd.DataFrame,
+    policy: str,
+    membership: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     if policy == "none":
         return frame.copy(deep=True)
     if policy == "cross_sectional_zscore":
-        return cross_sectional_zscore(frame)
+        if membership is None:
+            raise ValueError(
+                "cross_sectional_zscore requires dated 'universe:member' field"
+            )
+        return cross_sectional_zscore(frame.where(membership.eq(1.0)))
     raise ValueError(f"unknown normalization policy '{policy}'")
 
 

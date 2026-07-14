@@ -15,7 +15,6 @@ from research.factors.engine import (
 )
 from research.factors.registry import FactorRegistry
 from research.factors.panel import build_factor_panel
-from research.factors.operations import cross_sectional_zscore
 
 
 def _test_provenance() -> CalculationProvenance:
@@ -85,10 +84,8 @@ def test_default_engine_output_matches_every_catalog_normalization_policy():
 
     for factor_id in DEFAULT_FACTOR_IDS:
         factor = registry.get(factor_id)
-        assert factor.spec.normalization_policy == "cross_sectional_zscore"
-        expected = cross_sectional_zscore(factor.compute(panel)).loc[
-            pd.Timestamp(panel.as_of)
-        ]
+        assert factor.spec.normalization_policy == "none"
+        expected = factor.compute(panel).loc[pd.Timestamp(panel.as_of)]
         actual = {
             ticker: snapshots.values_for(panel.as_of, ticker)[factor.spec.key]
             for ticker in expected.dropna().index
@@ -127,7 +124,11 @@ def test_engine_applies_declared_cross_sectional_zscore_to_raw_factor_output():
             "close": pd.DataFrame(
                 {"A": [1.0], "B": [2.0], "C": [3.0]},
                 index=pd.to_datetime(["2026-01-02"]),
-            )
+            ),
+            "universe:member": pd.DataFrame(
+                {"A": [1.0], "B": [1.0], "C": [1.0]},
+                index=pd.to_datetime(["2026-01-02"]),
+            ),
         },
         as_of=date(2026, 1, 2),
     )
@@ -137,6 +138,87 @@ def test_engine_applies_declared_cross_sectional_zscore_to_raw_factor_output():
     assert factor.compute(panel).loc["2026-01-02", "A"] == 1.0
     assert snapshots.values_for(panel.as_of, "A")["raw@1.0.0"] == pytest.approx(
         -np.sqrt(1.5)
+    )
+
+
+def test_cross_sectional_normalization_requires_dated_universe_membership():
+    class CrossSectionalFactor:
+        spec = FactorSpec(
+            **{
+                **build_default_registry().get("price_momentum_126d").spec.__dict__,
+                "factor_id": "cross_sectional",
+                "normalization_policy": "cross_sectional_zscore",
+            }
+        )
+
+        def compute(self, panel):
+            return panel.field("close")
+
+    registry = FactorRegistry()
+    registry.register(CrossSectionalFactor())
+    panel = FactorPanel(
+        fields={
+            "close": pd.DataFrame(
+                {"A": [1.0], "B": [2.0]},
+                index=pd.to_datetime(["2026-01-02"]),
+            )
+        },
+        as_of=date(2026, 1, 2),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="cross_sectional.*requires dated 'universe:member'",
+    ):
+        FactorEngine(registry).compute(panel, ["cross_sectional"])
+
+
+def test_cross_sectional_normalization_masks_additions_removals_and_nonmembers():
+    class CrossSectionalFactor:
+        spec = FactorSpec(
+            **{
+                **build_default_registry().get("price_momentum_126d").spec.__dict__,
+                "factor_id": "cross_sectional",
+                "normalization_policy": "cross_sectional_zscore",
+            }
+        )
+
+        def compute(self, panel):
+            return panel.field("close")
+
+    registry = FactorRegistry()
+    registry.register(CrossSectionalFactor())
+    index = pd.to_datetime(["2026-01-02", "2026-01-05"])
+    membership = pd.DataFrame(
+        {"A": [1.0, 0.0], "B": [1.0, 1.0], "C": [0.0, 1.0]}, index=index
+    )
+
+    def compute(a_values, c_values):
+        panel = FactorPanel(
+            fields={
+                "close": pd.DataFrame(
+                    {"A": a_values, "B": [3.0, 3.0], "C": c_values}, index=index
+                ),
+                "universe:member": membership,
+            },
+            as_of=date(2026, 1, 5),
+        )
+        return FactorEngine(registry).compute(panel, ["cross_sectional"])
+
+    baseline = compute([1.0, 1_000.0], [1_000.0, 5.0])
+    mutated = compute([1.0, -999_999.0], [999_999.0, 5.0])
+
+    assert baseline.values_for(date(2026, 1, 2), "A")["cross_sectional@1.0.0"] == -1.0
+    assert baseline.values_for(date(2026, 1, 2), "B")["cross_sectional@1.0.0"] == 1.0
+    assert baseline.values_for(date(2026, 1, 2), "C") == {}
+    assert baseline.values_for(date(2026, 1, 5), "A") == {}
+    assert baseline.values_for(date(2026, 1, 5), "B")["cross_sectional@1.0.0"] == -1.0
+    assert baseline.values_for(date(2026, 1, 5), "C")["cross_sectional@1.0.0"] == 1.0
+    assert baseline.values_for(date(2026, 1, 2), "B") == mutated.values_for(
+        date(2026, 1, 2), "B"
+    )
+    assert baseline.values_for(date(2026, 1, 5), "B") == mutated.values_for(
+        date(2026, 1, 5), "B"
     )
 
 
@@ -238,6 +320,69 @@ def test_engine_provenance_and_snapshot_identity_are_deterministic_and_sensitive
     serialized = first.provenance.to_mapping()
     with pytest.raises(TypeError):
         serialized["data_cutoff"] = "changed"
+
+
+def test_snapshot_provenance_is_point_in_time_for_each_candidate_date():
+    days = [date(2026, 1, 2), date(2026, 1, 5), date(2026, 1, 6)]
+    bars = {
+        ticker: [
+            {
+                "date": day,
+                "open": value,
+                "high": value,
+                "low": value,
+                "close": value,
+                "volume": 1,
+            }
+            for day, value in zip(days, values, strict=True)
+        ]
+        for ticker, values in {"A": [1, 2, 3], "B": [2, 3, 4], "C": [3, 4, 5]}.items()
+    }
+    membership = {days[0]: {"A", "B"}, days[2]: {"B", "C"}}
+    panel = build_factor_panel(bars, universe_membership_by_date=membership)
+    snapshots = FactorEngine(build_default_registry()).compute(panel, ["liquidity_20d"])
+
+    first = snapshots.provenance_for(days[0])
+    middle = snapshots.provenance_for(days[1])
+    last = snapshots.provenance_for(days[2])
+    assert first.data_cutoff == days[0]
+    assert middle.data_cutoff == days[1]
+    assert last.data_cutoff == days[2]
+    assert first.universe_snapshot_id == middle.universe_snapshot_id
+    assert middle.universe_snapshot_id != last.universe_snapshot_id
+    assert snapshots.snapshot_identity_for(days[0]) == first.identity
+    assert first.input_artifact_checksum != middle.input_artifact_checksum
+    with pytest.raises(KeyError, match="no factor provenance for 2026-01-03"):
+        snapshots.provenance_for(date(2026, 1, 3))
+
+
+def test_candidate_date_provenance_ignores_future_panel_mutations():
+    days = [date(2026, 1, 2), date(2026, 1, 5)]
+    bars = {
+        "A": [
+            {
+                "date": day,
+                "open": value,
+                "high": value,
+                "low": value,
+                "close": value,
+                "volume": 1,
+            }
+            for day, value in zip(days, [1, 2], strict=True)
+        ]
+    }
+    original = FactorEngine(build_default_registry()).compute(
+        build_factor_panel(bars), ["liquidity_20d"]
+    )
+    bars["A"][-1]["close"] = 999_999
+    mutated = FactorEngine(build_default_registry()).compute(
+        build_factor_panel(bars), ["liquidity_20d"]
+    )
+
+    assert original.provenance_for(days[0]) == mutated.provenance_for(days[0])
+    assert original.snapshot_identity_for(days[0]) == mutated.snapshot_identity_for(
+        days[0]
+    )
 
 
 def test_unknown_date_or_ticker_returns_empty_snapshot() -> None:

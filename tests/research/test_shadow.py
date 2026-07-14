@@ -62,6 +62,21 @@ def make_snapshots(frames=None, *, input_seed="input"):
     )
 
 
+def make_dated_snapshots():
+    first = make_snapshots(input_seed="first").provenance
+    second = CalculationProvenance(
+        data_cutoff=date(2026, 1, 5),
+        universe_snapshot_id=first.universe_snapshot_id,
+        code_revision=first.code_revision,
+        input_artifact_checksum="sha256:" + "4" * 64,
+    )
+    return FactorSnapshotIndex(
+        {},
+        provenance=second,
+        provenance_by_date={first.data_cutoff: first, second.data_cutoff: second},
+    )
+
+
 def test_in_memory_recorder_attaches_factor_snapshot_and_risk_outcome():
     snapshots = make_snapshots(
         {
@@ -109,6 +124,26 @@ def test_candidate_key_includes_snapshot_identity_but_identical_reruns_are_stabl
     exported = first.records[0].to_dict()
     exported["provenance"]["code_revision"] = "mutated"
     assert first.records[0].provenance["code_revision"] != "mutated"
+
+
+def test_recorder_uses_candidate_date_provenance_and_identity():
+    recorder = InMemoryShadowRecorder(make_dated_snapshots())
+    kwargs = dict(
+        portfolio="momentum",
+        ticker="AAPL",
+        signal={"action": "buy"},
+        risk_approved=True,
+        risk_reason="approved",
+    )
+
+    recorder.observe(as_of=date(2026, 1, 2), **kwargs)
+    recorder.observe(as_of=date(2026, 1, 5), **kwargs)
+
+    first, second = recorder.records
+    assert first.provenance["data_cutoff"] == "2026-01-02"
+    assert second.provenance["data_cutoff"] == "2026-01-05"
+    assert first.snapshot_identity != second.snapshot_identity
+    assert first.candidate_key != second.candidate_key
 
 
 def test_candidate_key_is_stable_for_equivalent_signal_mappings():
@@ -208,6 +243,31 @@ def test_sql_recorder_persists_provenance_and_distinct_snapshots():
     }
 
 
+def test_sql_recorder_persists_candidate_date_provenance():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    recorder = SQLShadowRecorder(session, make_dated_snapshots())
+    kwargs = dict(
+        portfolio="momentum",
+        ticker="AAPL",
+        signal={"action": "buy"},
+        risk_approved=True,
+        risk_reason="approved",
+    )
+
+    recorder.observe(as_of=date(2026, 1, 2), **kwargs)
+    recorder.observe(as_of=date(2026, 1, 5), **kwargs)
+
+    stored = session.scalars(
+        select(ResearchCandidate).order_by(ResearchCandidate.as_of)
+    ).all()
+    assert [row.provenance["data_cutoff"] for row in stored] == [
+        "2026-01-02",
+        "2026-01-05",
+    ]
+
+
 def test_sql_recorder_owns_one_consistent_signal_snapshot_during_persistence():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -220,6 +280,12 @@ def test_sql_recorder_owns_one_consistent_signal_snapshot_during_persistence():
     class MutatingSnapshots:
         provenance = make_snapshots().provenance
         snapshot_identity = make_snapshots().snapshot_identity
+
+        def provenance_for(self, as_of):
+            return self.provenance
+
+        def snapshot_identity_for(self, as_of):
+            return self.snapshot_identity
 
         def values_for(self, as_of, ticker):
             signal["signals"]["momentum"]["score"] = -1.0

@@ -89,6 +89,8 @@ class InMemoryShadowRecorder:
         risk_reason: str,
     ) -> None:
         signal_snapshot = deepcopy(signal)
+        provenance = self._snapshots.provenance_for(as_of)
+        snapshot_identity = self._snapshots.snapshot_identity_for(as_of)
         self.records.append(
             ShadowCandidateRecord(
                 candidate_key=candidate_key(
@@ -96,7 +98,7 @@ class InMemoryShadowRecorder:
                     ticker,
                     as_of,
                     signal_snapshot,
-                    self._snapshots.snapshot_identity,
+                    snapshot_identity,
                 ),
                 portfolio=portfolio,
                 ticker=ticker,
@@ -104,10 +106,8 @@ class InMemoryShadowRecorder:
                 action=str(signal_snapshot["action"]),
                 raw_signal=signal_snapshot,
                 factor_values=self._snapshots.values_for(as_of, ticker),
-                provenance=MappingProxyType(
-                    dict(self._snapshots.provenance.to_mapping())
-                ),
-                snapshot_identity=self._snapshots.snapshot_identity,
+                provenance=MappingProxyType(dict(provenance.to_mapping())),
+                snapshot_identity=snapshot_identity,
                 risk_approved=risk_approved,
                 risk_reason=risk_reason,
             )
@@ -131,12 +131,14 @@ class SQLShadowRecorder:
     ) -> None:
         try:
             signal_snapshot = deepcopy(signal)
+            provenance = self._snapshots.provenance_for(as_of)
+            snapshot_identity = self._snapshots.snapshot_identity_for(as_of)
             key = candidate_key(
                 portfolio,
                 ticker,
                 as_of,
                 signal_snapshot,
-                self._snapshots.snapshot_identity,
+                snapshot_identity,
             )
             existing_id = self._session.scalar(
                 select(ResearchCandidate.id).where(
@@ -154,7 +156,7 @@ class SQLShadowRecorder:
                     action=str(signal_snapshot["action"]),
                     raw_signal=signal_snapshot,
                     factor_values=self._snapshots.values_for(as_of, ticker),
-                    provenance=dict(self._snapshots.provenance.to_mapping()),
+                    provenance=dict(provenance.to_mapping()),
                     risk_approved=risk_approved,
                     risk_reason=risk_reason,
                 )
