@@ -265,3 +265,71 @@ checksum, universe identity, snapshot identity, and candidate key unchanged,
 while a genuine same-date bar/active-membership backfill changes the prior
 identity. All prior membership addition/removal, z-score masking, idempotency,
 panel isolation, and six-sleeve shadow guarantees remain green.
+
+## Broadcast metadata eligibility follow-up
+
+The final edge-case review found that implicit eligibility treated broadcast
+metadata as ticker-existence evidence and serialized fields that were wholly
+empty at the candidate cutoff. Implementation commit:
+`f50b198d9a7d321615a017828c0008660e415ffe`.
+
+The correction:
+
+- Uses `close` as the primary implicit ticker-existence field when available.
+- Falls back to available OHLCV fields if `close` is absent.
+- For generic non-OHLCV panels, uses only non-broadcast fields; `regime:*` and
+  `universe:*` metadata cannot establish that a ticker existed.
+- After causal row and column restriction, omits an entire field when it has no
+  non-null value at or before the cutoff. A truly empty artifact remains the
+  deterministic payload `{as_of, fields: {}}`.
+
+RED evidence:
+
+```text
+python -m pytest tests/research/test_engine.py \
+  tests/research/test_shadow.py tests/research/test_contracts.py -q
+4 failed, 51 passed in 1.85s
+```
+
+Failures showed that a broadcast historical regime admitted future-only ticker
+`B`, changed prior provenance and recorder keys, and that a future-only
+fundamental field changed the prior input checksum.
+
+GREEN and release evidence:
+
+```text
+python -m pytest tests/research/test_engine.py \
+  tests/research/test_shadow.py tests/research/test_contracts.py \
+  tests/research/test_panel.py tests/backtest/test_multi_portfolio.py -q
+80 passed in 2.48s
+
+python -m pytest tests/research/ tests/backtest/test_multi_portfolio.py -q
+133 passed in 2.89s
+
+python -m pytest tests/backtest/ tests/scripts/test_run_paper_gate.py \
+  tests/scripts/test_run_paper_reset.py \
+  tests/scripts/test_run_paper_research_shadow.py \
+  tests/scripts/test_paper_state.py tests/shared/test_models.py \
+  tests/shared/test_config.py tests/services/ml_model/ -q
+282 passed in 10.79s
+
+python -m pytest
+741 passed in 13.34s
+
+ruff check research/factors/contracts.py tests/research/test_contracts.py \
+  tests/research/test_engine.py tests/research/test_shadow.py
+All checks passed
+
+git diff --check
+exit 0, no output
+
+/opt/homebrew/bin/uv build --offline --wheel \
+  --out-dir /tmp/algo-poc-wheel-final-broadcast-pit
+Successfully built \
+  /tmp/algo-poc-wheel-final-broadcast-pit/algo_poc-0.1.0-py3-none-any.whl
+```
+
+Regressions prove that historical broadcast regime labels and cutoff-empty
+future fundamental fields cannot churn the prior universe ID, input checksum,
+snapshot identity, or candidate key. A genuine pre-cutoff market backfill still
+changes identity, and all prior PIT and isolation guarantees remain green.
