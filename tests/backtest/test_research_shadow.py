@@ -18,6 +18,15 @@ class RecordingObserver:
         self.calls.append(kwargs)
 
 
+class ExportFailingObserver:
+    def observe(self, **kwargs):
+        pass
+
+    @property
+    def records(self):
+        raise RuntimeError("export unavailable")
+
+
 def run_with(observer):
     bars = {
         "AAPL": [
@@ -72,3 +81,13 @@ def test_observer_failure_does_not_change_backtest_result():
 
     assert with_failure.trades == baseline.trades
     assert with_failure.portfolio_values == baseline.portfolio_values
+
+
+def test_observer_export_failure_does_not_change_backtest_result():
+    baseline = run_with(None)
+
+    with_failure = run_with(ExportFailingObserver())
+
+    assert with_failure.trades == baseline.trades
+    assert with_failure.portfolio_values == baseline.portfolio_values
+    assert with_failure.shadow_candidates == []

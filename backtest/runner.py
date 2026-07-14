@@ -207,8 +207,14 @@ class BacktestRunner:
             portfolio_values=portfolio_values,
             trades=trades,
         )
-        shadow_records = getattr(candidate_observer, "records", [])
-        shadow_candidates = [record.to_dict() for record in shadow_records]
+        try:
+            shadow_records = getattr(candidate_observer, "records", [])
+            shadow_candidates = [record.to_dict() for record in shadow_records]
+        except Exception:
+            logger.exception(
+                "Research shadow export failed; trading result is unchanged"
+            )
+            shadow_candidates = []
 
         return BacktestResult(
             trades=trades,
