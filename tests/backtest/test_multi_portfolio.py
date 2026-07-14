@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from datetime import date
+from unittest.mock import MagicMock
 
-from backtest.runner import BacktestResult
+from backtest.runner import BacktestResult, BacktestRunner
+from backtest.simulator import SimulatedExecutor
 from scripts.run_backtest import (
     PortfolioConfig,
+    _create_backtest_shadow_recorders,
     compute_aggregate_metrics,
 )
 from services.risk_management.engine import RiskEngine
@@ -12,6 +15,107 @@ from services.risk_management.engine import RiskEngine
 
 def _make_risk_engine() -> RiskEngine:
     return RiskEngine(position_entry_limit_pct=12.0)
+
+
+class _PortfolioObserver:
+    def __init__(self):
+        self.records = []
+
+    def observe(self, **kwargs):
+        record = MagicMock()
+        record.to_dict.return_value = dict(kwargs)
+        self.records.append(record)
+
+
+def test_each_portfolio_keeps_its_own_shadow_candidates():
+    bars = {
+        "AAPL": [
+            {
+                "date": date(2026, 1, 2),
+                "open": 100,
+                "high": 101,
+                "low": 99,
+                "close": 100,
+                "volume": 1000,
+            }
+        ]
+    }
+    def signal_fn(ticker, history):
+        return {
+            "action": "buy",
+            "limit_price": 100.0,
+            "quantity": 1.0,
+            "sector": "Technology",
+        }
+    risk = MagicMock()
+    risk.check_entry.return_value = MagicMock(
+        approved=False, adjusted_quantity=0, reason="cap"
+    )
+    results = {}
+    for portfolio in ("momentum", "quality_value"):
+        observer = _PortfolioObserver()
+        results[portfolio] = BacktestRunner(
+            SimulatedExecutor(slippage_bps=0, commission_per_share=0), 10_000
+        ).run(
+            bars,
+            signal_fn,
+            risk,
+            candidate_observer=observer,
+            portfolio_name=portfolio,
+        )
+
+    assert {
+        row["portfolio"] for row in results["momentum"].shadow_candidates
+    } == {"momentum"}
+    assert {
+        row["portfolio"] for row in results["quality_value"].shadow_candidates
+    } == {"quality_value"}
+
+
+def test_shadow_recorders_share_snapshots_but_not_records():
+    bars = {
+        "AAPL": [
+            {
+                "date": date(2026, 1, 2),
+                "open": 100,
+                "high": 101,
+                "low": 99,
+                "close": 100,
+                "volume": 1000,
+            }
+        ]
+    }
+
+    recorders = _create_backtest_shadow_recorders(
+        enabled=True,
+        bars_by_ticker=bars,
+        portfolio_names=("momentum", "quality_value"),
+    )
+
+    assert recorders["momentum"] is not recorders["quality_value"]
+    assert recorders["momentum"]._snapshots is recorders["quality_value"]._snapshots
+    assert recorders["momentum"].records is not recorders["quality_value"].records
+
+
+def test_shadow_setup_failure_returns_no_recorders(monkeypatch):
+    class FailingFactorEngine:
+        def __init__(self, registry):
+            pass
+
+        def compute(self, panel, factor_ids):
+            raise RuntimeError("factor computation unavailable")
+
+    monkeypatch.setattr(
+        "research.factors.engine.FactorEngine", FailingFactorEngine
+    )
+
+    recorders = _create_backtest_shadow_recorders(
+        enabled=True,
+        bars_by_ticker={},
+        portfolio_names=("momentum", "quality_value"),
+    )
+
+    assert recorders == {}
 
 
 def _make_result(
