@@ -11,6 +11,10 @@ from typing import Any, Mapping, Protocol, runtime_checkable
 import pandas as pd
 
 
+_MARKET_OBSERVATION_FIELDS = ("close", "open", "high", "low", "volume")
+_BROADCAST_FIELD_PREFIXES = ("regime:", "universe:")
+
+
 @dataclass(frozen=True)
 class FactorSpec:
     factor_id: str
@@ -119,14 +123,14 @@ class FactorPanel:
         cutoff = as_of or self.as_of
         timestamp = pd.Timestamp(cutoff)
         eligible_columns = list(self._eligible_columns(cutoff))
+        field_payloads = {}
+        for name, frame in sorted(self._fields.items()):
+            eligible = frame.loc[frame.index <= timestamp, eligible_columns]
+            if eligible.notna().to_numpy().any():
+                field_payloads[name] = _frame_payload(eligible)
         payload = {
             "as_of": cutoff.isoformat(),
-            "fields": {
-                name: _frame_payload(
-                    frame.loc[frame.index <= timestamp, eligible_columns]
-                )
-                for name, frame in sorted(self._fields.items())
-            },
+            "fields": field_payloads,
         }
         return _sha256(payload)
 
@@ -187,11 +191,24 @@ class FactorPanel:
             latest = eligible_rows.iloc[-1]
             columns = [column for column, value in latest.items() if value == 1.0]
         else:
+            if "close" in self._fields:
+                evidence_fields = (self._fields["close"],)
+            else:
+                market_fields = tuple(
+                    self._fields[name]
+                    for name in _MARKET_OBSERVATION_FIELDS
+                    if name in self._fields
+                )
+                evidence_fields = market_fields or tuple(
+                    frame
+                    for name, frame in sorted(self._fields.items())
+                    if not name.startswith(_BROADCAST_FIELD_PREFIXES)
+                )
             columns = []
             for column in next(iter(self._fields.values())).columns:
                 if any(
                     frame.loc[frame.index <= timestamp, column].notna().any()
-                    for frame in self._fields.values()
+                    for frame in evidence_fields
                 ):
                     columns.append(column)
         return tuple(sorted(columns, key=str))

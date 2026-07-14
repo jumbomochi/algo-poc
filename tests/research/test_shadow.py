@@ -194,6 +194,46 @@ def test_future_only_ticker_does_not_change_prior_candidate_key(explicit_members
     assert appended.candidate_key == baseline.candidate_key
 
 
+def test_broadcast_regime_for_future_ticker_does_not_change_prior_candidate_key():
+    cutoff = date(2026, 1, 2)
+    future = date(2026, 1, 5)
+    base_bars = {
+        "A": [
+            {"date": cutoff, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
+            {"date": future, "open": 2, "high": 2, "low": 2, "close": 2, "volume": 2},
+        ]
+    }
+    appended_bars = {
+        **base_bars,
+        "B": [
+            {"date": future, "open": 3, "high": 3, "low": 3, "close": 3, "volume": 3}
+        ],
+    }
+
+    def record(bars):
+        panel = build_factor_panel(bars, regime_labels_by_date={cutoff: "bull"})
+        snapshots = FactorEngine(build_default_registry()).compute(
+            panel, ["liquidity_20d"]
+        )
+        recorder = InMemoryShadowRecorder(snapshots)
+        recorder.observe(
+            portfolio="momentum",
+            ticker="A",
+            as_of=cutoff,
+            signal={"action": "buy"},
+            risk_approved=True,
+            risk_reason="approved",
+        )
+        return recorder.records[0]
+
+    baseline = record(base_bars)
+    appended = record(appended_bars)
+
+    assert appended.provenance == baseline.provenance
+    assert appended.snapshot_identity == baseline.snapshot_identity
+    assert appended.candidate_key == baseline.candidate_key
+
+
 def test_candidate_key_is_stable_for_equivalent_signal_mappings():
     snapshots = make_snapshots()
     first = InMemoryShadowRecorder(snapshots)

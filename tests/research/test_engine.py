@@ -470,6 +470,67 @@ def test_empty_eligible_universe_has_deterministic_provenance(explicit_membershi
     assert panel.input_artifact_checksum(as_of=cutoff).startswith("sha256:")
 
 
+def test_broadcast_regime_does_not_make_future_only_ticker_implicitly_eligible():
+    cutoff = date(2026, 1, 2)
+    future = date(2026, 1, 5)
+    base_bars = {
+        "A": [
+            {"date": cutoff, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
+            {"date": future, "open": 2, "high": 2, "low": 2, "close": 2, "volume": 2},
+        ]
+    }
+    appended_bars = {
+        **base_bars,
+        "B": [
+            {"date": future, "open": 3, "high": 3, "low": 3, "close": 3, "volume": 3}
+        ],
+    }
+
+    def snapshot(bars):
+        panel = build_factor_panel(bars, regime_labels_by_date={cutoff: "bull"})
+        return FactorEngine(build_default_registry()).compute(panel, ["liquidity_20d"])
+
+    baseline = snapshot(base_bars)
+    appended = snapshot(appended_bars)
+
+    assert appended.provenance_for(cutoff) == baseline.provenance_for(cutoff)
+    assert appended.snapshot_identity_for(cutoff) == baseline.snapshot_identity_for(
+        cutoff
+    )
+
+
+def test_future_only_field_does_not_change_prior_input_artifact_identity():
+    cutoff = date(2026, 1, 2)
+    future = date(2026, 1, 5)
+    bars = {
+        "A": [
+            {"date": cutoff, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
+            {"date": future, "open": 2, "high": 2, "low": 2, "close": 2, "volume": 2},
+        ]
+    }
+    fundamentals = {
+        "A": [
+            {
+                "effective_at": "2026-01-05T12:00:00+00:00",
+                "ingested_at": "2026-01-05T13:00:00+00:00",
+                "source_revision": "future",
+                "earnings_yield": 0.04,
+            }
+        ]
+    }
+    engine = FactorEngine(build_default_registry())
+    baseline = engine.compute(build_factor_panel(bars), ["liquidity_20d"])
+    appended = engine.compute(
+        build_factor_panel(bars, fundamentals_by_ticker=fundamentals),
+        ["liquidity_20d"],
+    )
+
+    assert appended.provenance_for(cutoff) == baseline.provenance_for(cutoff)
+    assert appended.snapshot_identity_for(cutoff) == baseline.snapshot_identity_for(
+        cutoff
+    )
+
+
 def test_unknown_date_or_ticker_returns_empty_snapshot() -> None:
     panel = build_factor_panel({"A": []}, as_of=date.min)
     index = FactorEngine(build_default_registry()).compute(panel, [])

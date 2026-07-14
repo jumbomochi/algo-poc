@@ -118,3 +118,28 @@ def test_factor_panel_deep_owns_inputs_and_returns_isolated_fields():
 
     assert panel.field("close").iloc[0, 0] == 100.0
     assert not hasattr(panel, "fields")
+
+
+def test_generic_panel_implicit_eligibility_ignores_broadcast_metadata():
+    timestamp = pd.Timestamp("2026-01-02")
+    baseline = FactorPanel(
+        fields={
+            "custom:observation": pd.DataFrame({"A": [1.0]}, index=[timestamp]),
+            "regime:label": pd.DataFrame({"A": ["bull"]}, index=[timestamp]),
+        },
+        as_of=date(2026, 1, 2),
+    )
+    appended = FactorPanel(
+        fields={
+            "custom:observation": pd.DataFrame(
+                {"A": [1.0], "B": [float("nan")]}, index=[timestamp]
+            ),
+            "regime:label": pd.DataFrame(
+                {"A": ["bull"], "B": ["bull"]}, index=[timestamp]
+            ),
+        },
+        as_of=date(2026, 1, 2),
+    )
+
+    assert appended.universe_snapshot_id() == baseline.universe_snapshot_id()
+    assert appended.input_artifact_checksum() == baseline.input_artifact_checksum()
