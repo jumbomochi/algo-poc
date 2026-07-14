@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date
 from typing import Mapping, Protocol, runtime_checkable
@@ -13,18 +14,26 @@ class FactorSpec:
     version: str
     family: str
     description: str
+    economic_rationale: str
+    prediction_horizon_days: int
     required_fields: tuple[str, ...]
     supported_sleeves: tuple[str, ...]
+    supported_universes: tuple[str, ...]
     lookback_days: int
     direction: int
+    missing_data_policy: str
+    normalization_policy: str
     source: str
     license: str
 
     def __post_init__(self) -> None:
         if not self.factor_id or "@" in self.factor_id:
             raise ValueError("factor_id must be non-empty and cannot contain '@'")
-        if not self.version:
-            raise ValueError("version must be non-empty")
+        if re.fullmatch(
+            r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)",
+            self.version,
+        ) is None:
+            raise ValueError("version must use semantic MAJOR.MINOR.PATCH format")
         if self.lookback_days < 1:
             raise ValueError("lookback_days must be at least 1")
         if self.direction not in (-1, 1):
