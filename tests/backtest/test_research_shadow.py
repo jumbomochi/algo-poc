@@ -54,13 +54,14 @@ def run_with(observer):
     risk.check_entry.return_value = MagicMock(
         approved=False, adjusted_quantity=0, reason="cap"
     )
-    signal_fn = lambda ticker, history: {
-        "action": "buy",
-        "ticker": ticker,
-        "limit_price": 100.0,
-        "quantity": 1.0,
-        "sector": "Technology",
-    }
+    def signal_fn(ticker, history):
+        return {
+            "action": "buy",
+            "ticker": ticker,
+            "limit_price": 100.0,
+            "quantity": 1.0,
+            "sector": "Technology",
+        }
     runner = BacktestRunner(
         SimulatedExecutor(slippage_bps=0, commission_per_share=0), 10_000
     )
@@ -123,6 +124,16 @@ def run_approved_with(observer):
     )
 
 
+def established_result(result):
+    """Return every established backtest output, excluding shadow evidence."""
+    return {
+        "trades": result.trades,
+        "portfolio_values": result.portfolio_values,
+        "dates": result.dates,
+        "metrics": result.metrics,
+    }
+
+
 def test_backtest_observes_rejected_raw_buy_candidate():
     observer = RecordingObserver()
 
@@ -139,8 +150,7 @@ def test_observer_failure_does_not_change_backtest_result():
 
     with_failure = run_with(RecordingObserver(raises=True))
 
-    assert with_failure.trades == baseline.trades
-    assert with_failure.portfolio_values == baseline.portfolio_values
+    assert established_result(with_failure) == established_result(baseline)
 
 
 def test_observer_export_failure_does_not_change_backtest_result():
@@ -148,8 +158,7 @@ def test_observer_export_failure_does_not_change_backtest_result():
 
     with_failure = run_with(ExportFailingObserver())
 
-    assert with_failure.trades == baseline.trades
-    assert with_failure.portfolio_values == baseline.portfolio_values
+    assert established_result(with_failure) == established_result(baseline)
     assert with_failure.shadow_candidates == []
 
 

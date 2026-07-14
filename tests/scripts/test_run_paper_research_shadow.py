@@ -69,6 +69,18 @@ def make_state_and_portfolio(*, entry_limit_pct: float = 100.0):
     return session, state, portfolios, bars
 
 
+def established_paper_state(state: PaperTradingState) -> dict:
+    """Return every persisted established-paper output exposed by the state API."""
+    portfolio = "momentum"
+    return {
+        "capital": state.get_capital(portfolio),
+        "cash": state.get_cash(portfolio),
+        "positions": state.get_positions(portfolio),
+        "trades": state.get_trades(portfolio),
+        "equity_history": state.get_equity_history(portfolio),
+    }
+
+
 def test_paper_run_observes_raw_buy_candidate_with_final_bar_date():
     session, state, portfolios, bars = make_state_and_portfolio()
     observer = Observer()
@@ -107,7 +119,7 @@ def test_paper_run_observes_candidate_rejected_by_risk():
 def test_observer_failure_leaves_established_fill_and_signal_unchanged():
     baseline_session, baseline_state, portfolios, bars = make_state_and_portfolio()
     expected = run_paper.run_daily(baseline_state, portfolios, bars)
-    expected_positions = deepcopy(baseline_state.get_positions("momentum"))
+    expected_state = deepcopy(established_paper_state(baseline_state))
 
     session, state, portfolios, bars = make_state_and_portfolio()
     actual = run_paper.run_daily(
@@ -115,7 +127,7 @@ def test_observer_failure_leaves_established_fill_and_signal_unchanged():
     )
 
     assert actual == expected
-    assert state.get_positions("momentum") == expected_positions
+    assert established_paper_state(state) == expected_state
     baseline_session.close()
     session.close()
 
