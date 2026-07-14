@@ -13,6 +13,16 @@ from scripts.run_backtest import (
 from services.risk_management.engine import RiskEngine
 
 
+CANONICAL_SLEEVES = (
+    "momentum",
+    "sector_rotation",
+    "thematic_momentum",
+    "quality_value",
+    "earnings_drift",
+    "tail_risk_hedge",
+)
+
+
 def _make_risk_engine() -> RiskEngine:
     return RiskEngine(position_entry_limit_pct=12.0)
 
@@ -95,6 +105,35 @@ def test_shadow_recorders_share_snapshots_but_not_records():
     assert recorders["momentum"] is not recorders["quality_value"]
     assert recorders["momentum"]._snapshots is recorders["quality_value"]._snapshots
     assert recorders["momentum"].records is not recorders["quality_value"].records
+
+
+def test_all_six_canonical_sleeves_get_separate_recorders_over_one_snapshot():
+    bars = {
+        "AAPL": [
+            {
+                "date": date(2026, 1, 2),
+                "open": 100,
+                "high": 101,
+                "low": 99,
+                "close": 100,
+                "volume": 1000,
+            }
+        ]
+    }
+
+    recorders = _create_backtest_shadow_recorders(
+        enabled=True,
+        bars_by_ticker=bars,
+        portfolio_names=CANONICAL_SLEEVES,
+    )
+
+    assert tuple(recorders) == CANONICAL_SLEEVES
+    assert len({id(recorder) for recorder in recorders.values()}) == 6
+    assert len({id(recorder.records) for recorder in recorders.values()}) == 6
+    snapshots = {id(recorder._snapshots) for recorder in recorders.values()}
+    assert len(snapshots) == 1
+    shared_snapshot = next(iter(recorders.values()))._snapshots
+    assert type(shared_snapshot).__dataclass_params__.frozen is True
 
 
 def test_disabled_shadow_does_not_construct_factor_dependencies(monkeypatch):

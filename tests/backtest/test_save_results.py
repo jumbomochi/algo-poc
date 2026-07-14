@@ -13,6 +13,16 @@ from scripts.run_backtest import (
 )
 
 
+CANONICAL_SLEEVES = (
+    "momentum",
+    "sector_rotation",
+    "thematic_momentum",
+    "quality_value",
+    "earnings_drift",
+    "tail_risk_hedge",
+)
+
+
 def test_save_results_creates_json(tmp_path):
     """save_results writes a valid JSON file with expected keys."""
     config = {
@@ -117,3 +127,43 @@ def test_multi_portfolio_results_include_shadow_candidates(tmp_path):
     assert payload["portfolios"]["momentum"]["shadow_candidates"][0][
         "ticker"
     ] == "AAPL"
+
+
+def test_multi_portfolio_results_preserve_shadow_field_for_all_six_sleeves(
+    tmp_path,
+):
+    results = {
+        sleeve: BacktestResult(
+            trades=[],
+            portfolio_values=[10_000.0],
+            dates=[date(2026, 1, 2)],
+            metrics={},
+            shadow_candidates=[{"portfolio": sleeve, "ticker": "AAPL"}],
+        )
+        for sleeve in CANONICAL_SLEEVES
+    }
+    configs = {
+        sleeve: PortfolioConfig(sleeve, 10_000.0, lambda *_: None, MagicMock())
+        for sleeve in CANONICAL_SLEEVES
+    }
+
+    path = save_multi_portfolio_results(
+        config={},
+        results=results,
+        portfolio_configs=configs,
+        aggregate={
+            "portfolio_values": [60_000.0],
+            "trades": [],
+            "dates": [],
+            "metrics": {},
+        },
+        bars={},
+        output_dir=str(tmp_path),
+    )
+
+    portfolios = json.loads(Path(path).read_text())["portfolios"]
+    assert tuple(portfolios) == CANONICAL_SLEEVES
+    for sleeve in CANONICAL_SLEEVES:
+        assert portfolios[sleeve]["shadow_candidates"] == [
+            {"portfolio": sleeve, "ticker": "AAPL"}
+        ]

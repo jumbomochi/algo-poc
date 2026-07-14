@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
 from datetime import date
 from unittest.mock import MagicMock
 
-from backtest.runner import BacktestRunner
+from backtest.runner import BacktestResult, BacktestRunner
 from backtest.simulator import SimulatedExecutor
 
 
@@ -126,12 +127,21 @@ def run_approved_with(observer):
 
 def established_result(result):
     """Return every established backtest output, excluding shadow evidence."""
-    return {
-        "trades": result.trades,
-        "portfolio_values": result.portfolio_values,
-        "dates": result.dates,
-        "metrics": result.metrics,
-    }
+    established = asdict(result)
+    established.pop("shadow_candidates")
+    return established
+
+
+@dataclass
+class ExtendedBacktestResult(BacktestResult):
+    future_established_field: str = ""
+
+
+def test_established_result_parity_includes_future_dataclass_fields():
+    baseline = ExtendedBacktestResult(future_established_field="baseline")
+    changed = ExtendedBacktestResult(future_established_field="changed")
+
+    assert established_result(baseline) != established_result(changed)
 
 
 def test_backtest_observes_rejected_raw_buy_candidate():
@@ -167,10 +177,7 @@ def test_mutating_observer_cannot_change_established_backtest_result_fields():
 
     with_observer = run_approved_with(MutatingObserver())
 
-    assert with_observer.trades == baseline.trades
-    assert with_observer.portfolio_values == baseline.portfolio_values
-    assert with_observer.dates == baseline.dates
-    assert with_observer.metrics == baseline.metrics
+    assert established_result(with_observer) == established_result(baseline)
     assert with_observer.trades[0]["entry_signals"] == {
         "momentum": {"score": 0.8}
     }
