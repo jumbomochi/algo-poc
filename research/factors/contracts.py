@@ -118,10 +118,13 @@ class FactorPanel:
     def input_artifact_checksum(self, as_of: date | None = None) -> str:
         cutoff = as_of or self.as_of
         timestamp = pd.Timestamp(cutoff)
+        eligible_columns = list(self._eligible_columns(cutoff))
         payload = {
             "as_of": cutoff.isoformat(),
             "fields": {
-                name: _frame_payload(frame.loc[frame.index <= timestamp])
+                name: _frame_payload(
+                    frame.loc[frame.index <= timestamp, eligible_columns]
+                )
                 for name, frame in sorted(self._fields.items())
             },
         }
@@ -135,33 +138,63 @@ class FactorPanel:
             frame = self._fields["universe:member"]
             eligible = frame.loc[frame.index <= pd.Timestamp(cutoff)]
             if eligible.empty:
-                membership = {str(column): None for column in frame.columns}
+                active_members: tuple[str, ...] = ()
                 effective_at = None
             else:
                 current = eligible.iloc[-1]
-                membership = {
-                    str(column): _canonical_value(value)
-                    for column, value in current.items()
-                }
+                active_members = tuple(
+                    str(column) for column in self._eligible_columns(cutoff)
+                )
                 effective_at = None
                 if current.notna().any():
                     effective_timestamp = eligible.index[-1]
                     for timestamp in reversed(eligible.index[:-1]):
-                        if eligible.loc[timestamp].equals(current):
+                        previous = eligible.loc[timestamp]
+                        previous_members = tuple(
+                            sorted(
+                                str(column)
+                                for column, value in previous.items()
+                                if value == 1.0
+                            )
+                        )
+                        if (
+                            previous.notna().any()
+                            and previous_members == active_members
+                        ):
                             effective_timestamp = timestamp
                         else:
                             break
                     effective_at = pd.Timestamp(effective_timestamp).isoformat()
             payload: Any = {
                 "snapshot_effective_at": effective_at,
-                "membership": membership,
+                "active_members": active_members,
             }
         else:
-            first = next(iter(self._fields.values()))
             payload = {
-                "implicit_tickers": [str(column) for column in first.columns],
+                "implicit_tickers": [
+                    str(column) for column in self._eligible_columns(cutoff)
+                ],
             }
         return _sha256(payload)
+
+    def _eligible_columns(self, as_of: date) -> tuple[Any, ...]:
+        timestamp = pd.Timestamp(as_of)
+        membership = self._fields.get("universe:member")
+        if membership is not None:
+            eligible_rows = membership.loc[membership.index <= timestamp]
+            if eligible_rows.empty:
+                return ()
+            latest = eligible_rows.iloc[-1]
+            columns = [column for column, value in latest.items() if value == 1.0]
+        else:
+            columns = []
+            for column in next(iter(self._fields.values())).columns:
+                if any(
+                    frame.loc[frame.index <= timestamp, column].notna().any()
+                    for frame in self._fields.values()
+                ):
+                    columns.append(column)
+        return tuple(sorted(columns, key=str))
 
 
 def _sha256(payload: Any) -> str:

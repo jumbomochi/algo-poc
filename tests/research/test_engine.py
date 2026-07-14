@@ -385,6 +385,91 @@ def test_candidate_date_provenance_ignores_future_panel_mutations():
     )
 
 
+@pytest.mark.parametrize("explicit_membership", [False, True])
+def test_future_only_ticker_does_not_change_prior_provenance(explicit_membership):
+    first = date(2026, 1, 2)
+    future = date(2026, 1, 5)
+
+    def bars(include_b_on):
+        result = {
+            "A": [
+                {
+                    "date": first,
+                    "open": 1,
+                    "high": 1,
+                    "low": 1,
+                    "close": 1,
+                    "volume": 1,
+                },
+                {
+                    "date": future,
+                    "open": 2,
+                    "high": 2,
+                    "low": 2,
+                    "close": 2,
+                    "volume": 2,
+                },
+            ]
+        }
+        if include_b_on is not None:
+            result["B"] = [
+                {
+                    "date": include_b_on,
+                    "open": 3,
+                    "high": 3,
+                    "low": 3,
+                    "close": 3,
+                    "volume": 3,
+                }
+            ]
+        return result
+
+    def provenance(include_b_on):
+        memberships = None
+        if explicit_membership:
+            memberships = {first: {"A"}}
+            if include_b_on == future:
+                memberships[future] = {"A", "B"}
+            elif include_b_on == first:
+                memberships[first] = {"A", "B"}
+        panel = build_factor_panel(
+            bars(include_b_on), universe_membership_by_date=memberships
+        )
+        snapshots = FactorEngine(build_default_registry()).compute(
+            panel, ["liquidity_20d"]
+        )
+        return snapshots.provenance_for(first), snapshots.snapshot_identity_for(first)
+
+    baseline, baseline_identity = provenance(None)
+    future_only, future_only_identity = provenance(future)
+    backfilled, backfilled_identity = provenance(first)
+
+    assert future_only == baseline
+    assert future_only_identity == baseline_identity
+    assert backfilled.input_artifact_checksum != baseline.input_artifact_checksum
+    assert backfilled.universe_snapshot_id != baseline.universe_snapshot_id
+    assert backfilled_identity != baseline_identity
+
+
+@pytest.mark.parametrize("explicit_membership", [False, True])
+def test_empty_eligible_universe_has_deterministic_provenance(explicit_membership):
+    cutoff = date(2026, 1, 2)
+    future = date(2026, 1, 5)
+    bars = {
+        "B": [{"date": future, "open": 3, "high": 3, "low": 3, "close": 3, "volume": 3}]
+    }
+    membership = {cutoff: set(), future: {"B"}} if explicit_membership else None
+    panel = build_factor_panel(
+        bars, as_of=future, universe_membership_by_date=membership
+    )
+
+    first = panel.universe_snapshot_id(as_of=cutoff)
+    second = panel.universe_snapshot_id(as_of=cutoff)
+
+    assert first == second
+    assert panel.input_artifact_checksum(as_of=cutoff).startswith("sha256:")
+
+
 def test_unknown_date_or_ticker_returns_empty_snapshot() -> None:
     panel = build_factor_panel({"A": []}, as_of=date.min)
     index = FactorEngine(build_default_registry()).compute(panel, [])

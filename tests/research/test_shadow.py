@@ -8,6 +8,9 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from research.factors.engine import CalculationProvenance, FactorSnapshotIndex
+from research.factors.catalog import build_default_registry
+from research.factors.engine import FactorEngine
+from research.factors.panel import build_factor_panel
 from research.shadow import InMemoryShadowRecorder, SQLShadowRecorder, candidate_key
 from shared.models.base import Base
 from shared.models.research import ResearchCandidate
@@ -144,6 +147,51 @@ def test_recorder_uses_candidate_date_provenance_and_identity():
     assert second.provenance["data_cutoff"] == "2026-01-05"
     assert first.snapshot_identity != second.snapshot_identity
     assert first.candidate_key != second.candidate_key
+
+
+@pytest.mark.parametrize("explicit_membership", [False, True])
+def test_future_only_ticker_does_not_change_prior_candidate_key(explicit_membership):
+    cutoff = date(2026, 1, 2)
+    future = date(2026, 1, 5)
+    base_bars = {
+        "A": [
+            {"date": cutoff, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
+            {"date": future, "open": 2, "high": 2, "low": 2, "close": 2, "volume": 2},
+        ]
+    }
+    appended_bars = {
+        **base_bars,
+        "B": [
+            {"date": future, "open": 3, "high": 3, "low": 3, "close": 3, "volume": 3}
+        ],
+    }
+    base_membership = {cutoff: {"A"}} if explicit_membership else None
+    appended_membership = (
+        {cutoff: {"A"}, future: {"A", "B"}} if explicit_membership else None
+    )
+
+    def recorder(bars, membership):
+        panel = build_factor_panel(bars, universe_membership_by_date=membership)
+        snapshots = FactorEngine(build_default_registry()).compute(
+            panel, ["liquidity_20d"]
+        )
+        result = InMemoryShadowRecorder(snapshots)
+        result.observe(
+            portfolio="momentum",
+            ticker="A",
+            as_of=cutoff,
+            signal={"action": "buy"},
+            risk_approved=True,
+            risk_reason="approved",
+        )
+        return result.records[0]
+
+    baseline = recorder(base_bars, base_membership)
+    appended = recorder(appended_bars, appended_membership)
+
+    assert appended.provenance == baseline.provenance
+    assert appended.snapshot_identity == baseline.snapshot_identity
+    assert appended.candidate_key == baseline.candidate_key
 
 
 def test_candidate_key_is_stable_for_equivalent_signal_mappings():
