@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from backtest.metrics import BacktestMetrics
 from backtest.simulator import SimulatedExecutor
+from research.shadow import CandidateObserver
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -15,6 +20,7 @@ class BacktestResult:
     portfolio_values: list[float] = field(default_factory=list)
     dates: list = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
+    shadow_candidates: list[dict] = field(default_factory=list)
 
 
 class BacktestRunner:
@@ -42,6 +48,9 @@ class BacktestRunner:
         signals_fn: Callable[[str, list[dict]], dict | None],
         risk_engine: Any,
         trade_start_date: Any = None,
+        *,
+        candidate_observer: CandidateObserver | None = None,
+        portfolio_name: str = "",
     ) -> BacktestResult:
         """Run a backtest over the provided bar data.
 
@@ -56,6 +65,8 @@ class BacktestRunner:
             trade_start_date: If set, only allow new buy entries on or after this
                 date. Earlier bars are still fed to signals_fn for indicator
                 warm-up. Sell signals for existing positions are always processed.
+            candidate_observer: Optional observational hook for raw buy candidates.
+            portfolio_name: Portfolio identity supplied to candidate_observer.
 
         Returns:
             BacktestResult with trades, portfolio_values, and metrics.
@@ -136,6 +147,21 @@ class BacktestRunner:
                         existing_lots=len(existing_lots),
                     )
 
+                    if candidate_observer is not None:
+                        try:
+                            candidate_observer.observe(
+                                portfolio=portfolio_name,
+                                ticker=ticker,
+                                as_of=current_date,
+                                signal=dict(signal),
+                                risk_approved=bool(decision.approved),
+                                risk_reason=str(decision.reason),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Research shadow observer failed; trading result is unchanged"
+                            )
+
                     if not decision.approved:
                         continue
 
@@ -181,12 +207,15 @@ class BacktestRunner:
             portfolio_values=portfolio_values,
             trades=trades,
         )
+        shadow_records = getattr(candidate_observer, "records", [])
+        shadow_candidates = [record.to_dict() for record in shadow_records]
 
         return BacktestResult(
             trades=trades,
             portfolio_values=portfolio_values,
             dates=dates,
             metrics=metrics,
+            shadow_candidates=shadow_candidates,
         )
 
 
