@@ -15,6 +15,8 @@ def trailing_return(close: pd.DataFrame, periods: int) -> pd.DataFrame:
 
 
 def rolling_volatility(close: pd.DataFrame, periods: int) -> pd.DataFrame:
+    if periods < 1:
+        raise ValueError("periods must be at least 1")
     returns = close.pct_change(fill_method=None)
     return returns.rolling(periods, min_periods=periods).std() * np.sqrt(252.0)
 
@@ -24,4 +26,6 @@ def rolling_dollar_volume(
     volume: pd.DataFrame,
     periods: int,
 ) -> pd.DataFrame:
+    if periods < 1:
+        raise ValueError("periods must be at least 1")
     return (close * volume).rolling(periods, min_periods=periods).mean()
