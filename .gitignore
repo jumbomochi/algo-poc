@@ -11,4 +11,5 @@ config/secrets.yaml
 docker-compose.override.yml
 output/
 .DS_Store
+.worktrees/
 data/cache/*.json
