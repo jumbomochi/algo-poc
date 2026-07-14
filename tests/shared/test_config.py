@@ -122,3 +122,18 @@ def test_paper_entries_enabled_and_guarded_by_reconciliation():
         account_id="DUN551088",
     )
     assert major.entries_allowed is False
+
+
+def test_research_shadow_is_disabled_by_default(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("mode: paper\n")
+
+    config = load_config(str(path))
+
+    assert config.research.shadow_enabled is False
+    assert config.research.factor_ids == [
+        "price_momentum_126d",
+        "high_52w",
+        "low_volatility_63d",
+        "liquidity_20d",
+    ]

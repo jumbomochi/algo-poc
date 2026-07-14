@@ -96,3 +96,11 @@ redis:
 observability:
   prometheus_port: 9090
   tracing_enabled: false
+
+research:
+  shadow_enabled: false  # observational only; never changes signals or orders
+  factor_ids:
+    - price_momentum_126d
+    - high_52w
+    - low_volatility_63d
+    - liquidity_20d
