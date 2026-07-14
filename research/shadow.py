@@ -7,7 +7,11 @@ from dataclasses import asdict, dataclass
 from datetime import date
 from typing import Any, Protocol
 
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
 from research.factors.engine import FactorSnapshotIndex
+from shared.models.research import ResearchCandidate
 
 
 @dataclass(frozen=True)
@@ -84,3 +88,48 @@ class InMemoryShadowRecorder:
                 risk_reason=risk_reason,
             )
         )
+
+
+class SQLShadowRecorder:
+    def __init__(
+        self, session: Session, snapshots: FactorSnapshotIndex
+    ) -> None:
+        self._session = session
+        self._snapshots = snapshots
+
+    def observe(
+        self,
+        *,
+        portfolio: str,
+        ticker: str,
+        as_of: date,
+        signal: dict[str, Any],
+        risk_approved: bool,
+        risk_reason: str,
+    ) -> None:
+        try:
+            key = candidate_key(portfolio, ticker, as_of, signal)
+            existing_id = self._session.scalar(
+                select(ResearchCandidate.id).where(
+                    ResearchCandidate.candidate_key == key
+                )
+            )
+            if existing_id is not None:
+                return
+            self._session.add(
+                ResearchCandidate(
+                    candidate_key=key,
+                    portfolio=portfolio,
+                    ticker=ticker,
+                    as_of=as_of,
+                    action=str(signal["action"]),
+                    raw_signal=dict(signal),
+                    factor_values=self._snapshots.values_for(as_of, ticker),
+                    risk_approved=risk_approved,
+                    risk_reason=risk_reason,
+                )
+            )
+            self._session.commit()
+        except Exception:
+            self._session.rollback()
+            raise

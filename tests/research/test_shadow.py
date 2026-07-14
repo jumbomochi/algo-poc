@@ -3,9 +3,13 @@ from __future__ import annotations
 from datetime import date
 
 import pandas as pd
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
 
 from research.factors.engine import FactorSnapshotIndex
-from research.shadow import InMemoryShadowRecorder, candidate_key
+from research.shadow import InMemoryShadowRecorder, SQLShadowRecorder, candidate_key
+from shared.models.base import Base
+from shared.models.research import ResearchCandidate
 
 
 def test_in_memory_recorder_attaches_factor_snapshot_and_risk_outcome():
@@ -83,3 +87,22 @@ def test_recorder_snapshot_is_unchanged_after_caller_mutates_original_signal():
         record.as_of,
         record.raw_signal,
     )
+
+
+def test_sql_recorder_is_idempotent():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    snapshots = FactorSnapshotIndex({})
+    recorder = SQLShadowRecorder(session, snapshots)
+    kwargs = dict(
+        portfolio="momentum",
+        ticker="AAPL",
+        as_of=date(2026, 1, 2),
+        signal={"action": "buy"},
+        risk_approved=True,
+        risk_reason="approved",
+    )
+    recorder.observe(**kwargs)
+    recorder.observe(**kwargs)
+    assert len(session.scalars(select(ResearchCandidate)).all()) == 1

@@ -10,6 +10,7 @@ from shared.models.signals import SignalRecord
 from shared.models.fundamentals import FundamentalRecord
 from shared.models.events import EventRecord
 from shared.models.ml_models import ModelVersion
+from shared.models.research import ResearchCandidate
 
 
 def test_ohlcv_model_has_required_columns():
@@ -119,3 +120,20 @@ def test_portfolio_config_has_required_fields():
 def test_portfolio_config_portfolio_is_unique():
     col = PortfolioConfig.__table__.columns["portfolio"]
     assert col.unique is True
+
+
+def test_research_candidate_has_shadow_audit_fields():
+    cols = {column.name for column in ResearchCandidate.__table__.columns}
+    assert cols >= {
+        "candidate_key",
+        "portfolio",
+        "ticker",
+        "as_of",
+        "action",
+        "raw_signal",
+        "factor_values",
+        "risk_approved",
+        "risk_reason",
+        "created_at",
+    }
+    assert ResearchCandidate.__table__.columns["candidate_key"].unique is True
