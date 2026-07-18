@@ -1,0 +1,76 @@
+# Task 6 Report: Project IB fills into sleeve positions
+
+## Outcome
+
+- Added a `portfolio_accounting` service whose `FillProjector.apply()` owns the
+  durable fill transaction and returns `False` for an immutable broker replay.
+- Inserted fills by `(account_id, execution_id)`, locked the durable intent,
+  sleeve cash, and position, then updated commissions, cash, quantity, weighted
+  average entry price, trades, and order lifecycle atomically.
+- Kept unknown, mismatched, and invalid-but-identifiable executions durably
+  audited while leaving cash, positions, and lifecycle unchanged before raising
+  a projection error. Non-finite payloads that SQLite/PostgreSQL cannot safely
+  persist are rejected before insertion.
+- Reconciled delayed executions after completed-order history has already marked
+  an intent `FILLED`, without attempting an illegal `FILLED -> FILLED`
+  transition or double-counting `filled_quantity`.
+- Prevented overfills, non-monotonic cumulative quantities, oversized sells,
+  missing positions, negative buy cash, and conflicting execution-identity
+  reuse.
+- Added a runner using consumer group `portfolio_accounting`: startup pending
+  messages are drained first, projection commits before acknowledgment,
+  duplicates acknowledge successfully, deterministic malformed/rejected fills
+  go to the fill DLQ, and transient unexpected failures remain pending.
+- Refactored paper fill accounting behind a private transactional helper and
+  removed both simulated `record_fill` calls from `scripts/run_paper.py`, so
+  signals can no longer mutate the durable book before IB execution.
+- Added the service package and Dockerfile.
+
+## TDD evidence
+
+Initial focused RED:
+
+```text
+pytest tests/services/portfolio_accounting/ -v
+2 collection errors
+ModuleNotFoundError: No module named 'services.portfolio_accounting'
+```
+
+Additional RED/GREEN cycles covered:
+
+- non-finite economics reaching database/accounting state;
+- rejected audit rows poisoning a later valid cumulative fill;
+- unexpected database/runtime failures being DLQ'd and acknowledged;
+- conflicting execution timestamps being accepted as immutable replays.
+
+Focused GREEN:
+
+```text
+pytest tests/services/portfolio_accounting/ tests/scripts/test_paper_state.py \
+  tests/backtest/test_paper_state.py tests/scripts/test_run_paper_gate.py -q
+50 passed in 0.64s
+```
+
+## Verification
+
+```text
+pytest
+697 passed in 11.37s
+
+git diff --check
+clean
+
+python -m compileall -q services/portfolio_accounting \
+  scripts/paper_state.py scripts/run_paper.py
+clean
+```
+
+No PostgreSQL, Redis, or IB connection was made. No paper reset, database
+destruction, volume removal, or live/paper broker order action was performed.
+
+## Review
+
+Self-review tightened immutable replay comparison to include execution time,
+kept transient infrastructure failures pending instead of acknowledging them,
+and reconstructed delayed completed-history fill progress without counting
+rejected immutable audit rows.

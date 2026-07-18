@@ -83,8 +83,8 @@ class TestEntryGate:
 
         assert state.get_cash("test_sleeve") >= -1e-6  # never negative
 
-    def test_sells_are_never_gated(self, state):
-        """Exits always process, matching the backtest runner."""
+    def test_sell_signal_waits_for_actual_execution_fill(self, state):
+        """Signals do not mutate the durable position before IB fills them."""
         state.record_fill(portfolio="test_sleeve", ticker="AAPL", action="buy",
                           quantity=5.0, price=100.0, fill_date=date(2026, 7, 1))
 
@@ -94,19 +94,18 @@ class TestEntryGate:
         signals = run_daily(state, build_portfolio(sell_fn), {"AAPL": make_bars(110.0)})
 
         assert any(s["action"] == "sell" for s in signals)
-        assert state.get_positions("test_sleeve") == {}
-        assert state.get_cash("test_sleeve") == pytest.approx(10_000.0 + 50.0)
+        assert state.get_positions("test_sleeve")["AAPL"]["quantity"] == 5
+        assert state.get_cash("test_sleeve") == pytest.approx(9_500.0)
 
-    def test_rejected_signal_not_published(self, state):
-        """Signals the sleeve gate rejects must not reach signals_generated
-        (and therefore never get published to the pipeline)."""
+    def test_buy_signal_does_not_create_a_parallel_fill(self, state):
+        """Daily signal evaluation leaves durable cash and positions alone."""
 
         def greedy_fn(ticker, bars):
             return {"action": "buy", "limit_price": 100.0, "quantity": 200.0}
 
-        # First run fills up to the position limit; second run's re-entry is
-        # blocked by max_lots_per_ticker=1 and must not appear in signals.
         portfolios = build_portfolio(greedy_fn)
-        run_daily(state, portfolios, {"AAPL": make_bars()})
         signals = run_daily(state, portfolios, {"AAPL": make_bars()})
-        assert signals == []
+
+        assert len(signals) == 1
+        assert state.get_positions("test_sleeve") == {}
+        assert state.get_cash("test_sleeve") == pytest.approx(10_000.0)

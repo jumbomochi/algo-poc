@@ -326,35 +326,12 @@ def run_daily(
                         signal["quantity"] = qty
 
                     signals_generated.append(signal)
-                    entry_signals = {
-                        k: v for k, v in signal.items()
-                        if k not in ("action", "limit_price", "quantity", "portfolio", "date", "ticker")
-                    }
-                    state.record_fill(
-                        portfolio=name,
-                        ticker=ticker,
-                        action="buy",
-                        quantity=qty,
-                        price=price,
-                        fill_date=today,
-                        entry_signals=entry_signals,
-                        sector=sector,
-                    )
                     print(f"  BUY  {ticker:>6s}  {qty:>8.4f} @ ${price:>8.2f}  [{name}]")
                 elif action == "sell":
                     # Exits are never gated (matching the backtest runner:
                     # "Sell signals for existing positions are always processed").
                     signals_generated.append(signal)
                     reason = signal.get("exit_reason", "signal")
-                    state.record_fill(
-                        portfolio=name,
-                        ticker=ticker,
-                        action="sell",
-                        quantity=qty,
-                        price=price,
-                        fill_date=today,
-                        exit_reason=reason,
-                    )
                     print(f"  SELL {ticker:>6s}             @ ${price:>8.2f}  [{name}] ({reason})")
 
         # After all signals for this portfolio, update peaks and record snapshot
@@ -575,8 +552,8 @@ def main():
         earnings_lookup=earnings_lookup,
     )
 
-    # Run signals. Roll back on any failure so a mid-run crash cannot leave
-    # some portfolios updated and others not (record_fill flushes as it goes).
+    # Signal evaluation never projects fills.  Actual IB executions are the
+    # only input allowed to mutate durable cash and positions.
     print(f"\nRunning signals across {len(portfolios)} portfolios...")
     try:
         signals = run_daily(state, portfolios, bars_by_ticker)

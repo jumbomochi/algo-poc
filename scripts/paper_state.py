@@ -86,32 +86,59 @@ class PaperTradingState:
         )
         self._session.flush()
 
-    def record_fill(
+    def _apply_fill_accounting(
         self,
         portfolio: str,
         ticker: str,
         action: str,
         quantity: float,
         price: float,
-        fill_date: date,
+        fill_datetime: datetime,
+        commission: float = 0.0,
+        recommendation_id: str | None = None,
+        con_id: int | None = None,
+        exchange: str | None = None,
+        currency: str | None = None,
+        strict_quantity: bool = False,
         entry_signals: dict | None = None,
         bar_features: dict | None = None,
         exit_reason: str | None = None,
         sector: str | None = None,
     ) -> None:
-        """Record a fill (buy or sell) for a portfolio."""
+        """Apply already-validated fill economics without committing.
+
+        The fill projector is the production caller.  Locking here keeps cash
+        and position changes in the projectors' encompassing transaction.
+        """
         now = datetime.now(timezone.utc)
+        config = self._session.scalar(
+            select(PortfolioConfig)
+            .where(PortfolioConfig.portfolio == portfolio)
+            .with_for_update()
+        )
+        if config is None:
+            raise ValueError(f"unknown portfolio {portfolio}")
+
+        existing = self._session.scalar(
+            select(Position)
+            .where(
+                Position.portfolio == portfolio,
+                Position.ticker == ticker,
+                Position.status == "open",
+            )
+            .with_for_update()
+        )
 
         if action == "buy":
-            existing = self._session.execute(
-                select(Position).where(
-                    Position.portfolio == portfolio,
-                    Position.ticker == ticker,
-                    Position.status == "open",
-                )
-            ).scalar_one_or_none()
+            cash_delta = -(price * quantity + commission)
+            if strict_quantity and config.cash + cash_delta < -1e-9:
+                raise ValueError("fill would make sleeve cash negative")
 
             if existing:
+                identity = (existing.con_id, existing.exchange, existing.currency)
+                incoming = (con_id, exchange, currency)
+                if strict_quantity and identity != incoming:
+                    raise ValueError("position broker contract identity conflicts")
                 old_qty = existing.quantity
                 old_price = existing.avg_entry_price
                 new_qty = old_qty + quantity
@@ -133,21 +160,26 @@ class PaperTradingState:
                     highest_price_since_entry=price,
                     sector=sector,
                     entry_signals=entry_signals,
-                    opened_at=datetime(fill_date.year, fill_date.month, fill_date.day, tzinfo=timezone.utc),
+                    opened_at=fill_datetime,
                     status="open",
+                    con_id=con_id,
+                    exchange=exchange,
+                    currency=currency,
                 )
                 self._session.add(pos)
 
-            self._update_cash(portfolio, -(price * quantity))
+            config.cash += cash_delta
+            config.updated_at = now
 
         elif action == "sell":
-            pos = self._session.execute(
-                select(Position).where(
-                    Position.portfolio == portfolio,
-                    Position.ticker == ticker,
-                    Position.status == "open",
-                )
-            ).scalar_one_or_none()
+            pos = existing
+            if strict_quantity and (pos is None or quantity > pos.quantity + 1e-9):
+                raise ValueError("sell fill exceeds open position quantity")
+            if strict_quantity and pos is not None:
+                identity = (pos.con_id, pos.exchange, pos.currency)
+                incoming = (con_id, exchange, currency)
+                if identity != incoming:
+                    raise ValueError("position broker contract identity conflicts")
 
             if pos:
                 # Sell signals emit quantity=0 meaning "close the full position"
@@ -164,13 +196,14 @@ class PaperTradingState:
                     price=price,
                     entry_price=pos.avg_entry_price,
                     entry_date=pos.opened_at.date(),
+                    recommendation_id=recommendation_id,
                     exit_reason=exit_reason,
                     pnl=pnl,
                     entry_signals=pos.entry_signals,
                     bar_features=bar_features,
-                    commission=0.0,
+                    commission=commission,
                     slippage=0.0,
-                    executed_at=datetime(fill_date.year, fill_date.month, fill_date.day, tzinfo=timezone.utc),
+                    executed_at=fill_datetime,
                 )
                 self._session.add(trade)
                 if sell_qty >= pos.quantity:
@@ -178,9 +211,46 @@ class PaperTradingState:
                 else:
                     pos.quantity -= sell_qty
                     pos.current_price = price
-                self._update_cash(portfolio, price * sell_qty)
+                config.cash += price * sell_qty - commission
+                config.updated_at = now
+
+        else:
+            raise ValueError(f"unsupported fill action {action}")
 
         self._session.flush()
+
+    def record_fill(
+        self,
+        portfolio: str,
+        ticker: str,
+        action: str,
+        quantity: float,
+        price: float,
+        fill_date: date,
+        entry_signals: dict | None = None,
+        bar_features: dict | None = None,
+        exit_reason: str | None = None,
+        sector: str | None = None,
+    ) -> None:
+        """Compatibility helper for historical backtest/training fixtures.
+
+        Live paper execution must flow through ``FillProjector``; this wrapper
+        deliberately has no broker identity or idempotency semantics.
+        """
+        self._apply_fill_accounting(
+            portfolio=portfolio,
+            ticker=ticker,
+            action=action,
+            quantity=quantity,
+            price=price,
+            fill_datetime=datetime(
+                fill_date.year, fill_date.month, fill_date.day, tzinfo=timezone.utc
+            ),
+            entry_signals=entry_signals,
+            bar_features=bar_features,
+            exit_reason=exit_reason,
+            sector=sector,
+        )
 
     def update_peak_prices(
         self, portfolio: str, current_prices: dict[str, float]
