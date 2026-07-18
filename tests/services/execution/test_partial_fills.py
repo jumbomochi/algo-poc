@@ -243,6 +243,8 @@ class TestIBExecutionIdentity:
         completed.order.orderId = 9
         completed.orderStatus.status = "Expired"
         completed.orderStatus.filled = 0
+        completed.orderStatus.whyHeld = ""
+        completed.log = []
         fake_ib.reqCompletedOrdersAsync = AsyncMock(return_value=[completed])
         executor._ib = fake_ib
         handler = AsyncMock()
@@ -258,3 +260,53 @@ class TestIBExecutionIdentity:
             "filled_quantity": 0.0,
             "completed_order_confirmed": True,
         })
+
+    @pytest.mark.asyncio
+    async def test_completed_inactive_restore_uses_trade_log_reason(self):
+        from services.execution.ib_executor import IBExecutor
+
+        executor = IBExecutor("h", 7497, 1)
+        fake_ib = MagicMock()
+        fake_ib.isConnected.return_value = True
+        fake_ib.openTrades.return_value = []
+        completed = MagicMock()
+        completed.order.orderRef = "rec-1"
+        completed.order.orderId = 9
+        completed.orderStatus.status = "Inactive"
+        completed.orderStatus.filled = 0
+        completed.orderStatus.whyHeld = ""
+        completed.log = [SimpleNamespace(message="Error 201: rejected")]
+        fake_ib.reqCompletedOrdersAsync = AsyncMock(return_value=[completed])
+        executor._ib = fake_ib
+        handler = AsyncMock()
+        executor.set_order_status_handler(handler)
+
+        await executor.restore_order_by_ref("rec-1", "9")
+
+        assert handler.await_args.args[0]["reason"] == "Error 201: rejected"
+
+    @pytest.mark.asyncio
+    async def test_completed_inactive_restore_uses_fallback_reason(self):
+        from services.execution.ib_executor import IBExecutor
+
+        executor = IBExecutor("h", 7497, 1)
+        fake_ib = MagicMock()
+        fake_ib.isConnected.return_value = True
+        fake_ib.openTrades.return_value = []
+        completed = MagicMock()
+        completed.order.orderRef = "rec-1"
+        completed.order.orderId = 9
+        completed.orderStatus.status = "Inactive"
+        completed.orderStatus.filled = 0
+        completed.orderStatus.whyHeld = ""
+        completed.log = []
+        fake_ib.reqCompletedOrdersAsync = AsyncMock(return_value=[completed])
+        executor._ib = fake_ib
+        handler = AsyncMock()
+        executor.set_order_status_handler(handler)
+
+        await executor.restore_order_by_ref("rec-1", "9")
+
+        assert handler.await_args.args[0]["reason"] == (
+            "IB completed order is Inactive"
+        )

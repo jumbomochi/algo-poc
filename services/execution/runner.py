@@ -416,6 +416,12 @@ class ExecutionServiceRunner:
 
         broker_status = str(status_info.get("status", ""))
         reason = status_info.get("reason") or None
+        if (
+            broker_status == "Inactive"
+            and status_info.get("completed_order_confirmed") is True
+            and reason is None
+        ):
+            reason = "IB completed order is Inactive"
         target: OrderStatus | None = None
         if broker_status in {"Cancelled", "ApiCancelled"}:
             target = OrderStatus.CANCELLED

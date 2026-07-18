@@ -290,6 +290,23 @@ class TestDurableExecutionIdentity:
         assert ledger.get("rec-1").status == OrderStatus.CANCELLED.value
 
     @pytest.mark.asyncio
+    async def test_completed_inactive_without_reason_never_stays_active(
+        self, durable_runner
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9", filled_quantity=0)
+        runner.restore_pending_orders()
+
+        await runner.handle_ib_order_status({
+            "order_id": "9", "status": "Inactive", "reason": "",
+            "filled_quantity": 0, "completed_order_confirmed": True,
+        })
+
+        intent = ledger.get("rec-1")
+        assert intent.status == OrderStatus.SUBMISSION_FAILED.value
+        assert intent.reason == "IB completed order is Inactive"
+
+    @pytest.mark.asyncio
     async def test_expiry_requires_completed_order_confirmation(
         self, durable_runner
     ):

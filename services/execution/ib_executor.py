@@ -354,11 +354,14 @@ class IBExecutor:
             ):
                 continue
             status = str(trade.orderStatus.status)
+            reason = self._status_reason(trade)
+            if status == "Inactive" and not reason:
+                reason = "IB completed order is Inactive"
             if self._order_status_handler is not None:
                 await self._order_status_handler({
                     "order_id": str(expected_order_id),
                     "status": status,
-                    "reason": "",
+                    "reason": reason,
                     "filled_quantity": float(
                         getattr(trade.orderStatus, "filled", 0.0) or 0.0
                     ),
