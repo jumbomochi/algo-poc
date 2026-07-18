@@ -63,6 +63,7 @@ class RiskEngine:
         sector: str,
         portfolio: PortfolioState,
         existing_lots: int = 0,
+        reserved_notional: float = 0.0,
     ) -> RiskDecision:
         """Check whether a proposed entry trade is allowed.
 
@@ -76,14 +77,33 @@ class RiskEngine:
             RiskDecision with approved=True and adjusted_quantity, or
             approved=False with reason.
         """
-        # Check total exposure first
-        if portfolio.total_exposure_pct >= self.total_exposure_limit_pct:
-            return RiskDecision(
-                approved=False,
-                reason=(
+        proposed_value = quantity * price
+        reservation_value = max(0.0, reserved_notional)
+
+        # Check projected total exposure first
+        current_total_value = portfolio.nav * portfolio.total_exposure_pct / 100.0
+        total_limit_value = portfolio.nav * self.total_exposure_limit_pct / 100.0
+        total_headroom = max(
+            0.0,
+            total_limit_value - current_total_value - reservation_value,
+        )
+        total_headroom_quantity = (
+            round(total_headroom / price, 4) if price > 0 else total_headroom
+        )
+        if total_headroom <= 0 or total_headroom_quantity < 0.0001:
+            if portfolio.total_exposure_pct >= self.total_exposure_limit_pct:
+                reason = (
                     f"Total exposure {portfolio.total_exposure_pct:.1f}% "
                     f"exceeds limit {self.total_exposure_limit_pct:.1f}%"
-                ),
+                )
+            else:
+                reason = (
+                    "Projected total exposure leaves no usable entry headroom "
+                    f"under {self.total_exposure_limit_pct:.1f}% limit"
+                )
+            return RiskDecision(
+                approved=False,
+                reason=reason,
                 adjusted_quantity=0,
             )
 
@@ -98,37 +118,73 @@ class RiskEngine:
                 adjusted_quantity=0,
             )
 
-        # Check sector concentration
+        # Check projected sector concentration
         current_sector_pct = portfolio.sector_exposure.get(sector, 0.0)
-        if current_sector_pct >= self.sector_concentration_pct:
+        current_sector_value = portfolio.nav * current_sector_pct / 100.0
+        sector_limit_value = portfolio.nav * self.sector_concentration_pct / 100.0
+        sector_headroom = max(
+            0.0,
+            sector_limit_value - current_sector_value - reservation_value,
+        )
+        sector_headroom_quantity = (
+            round(sector_headroom / price, 4) if price > 0 else sector_headroom
+        )
+        if sector_headroom <= 0 or sector_headroom_quantity < 0.0001:
+            if current_sector_pct >= self.sector_concentration_pct:
+                reason = (
+                    f"Sector '{sector}' exposure {current_sector_pct:.1f}% "
+                    f"exceeds concentration limit {self.sector_concentration_pct:.1f}%"
+                )
+            else:
+                reason = (
+                    f"Projected sector '{sector}' exposure leaves no usable entry "
+                    f"headroom under {self.sector_concentration_pct:.1f}% limit"
+                )
+            return RiskDecision(
+                approved=False,
+                reason=reason,
+                adjusted_quantity=0,
+            )
+
+        # Scale to the tightest projected exposure or entry headroom.
+        max_position_value = portfolio.nav * (self.position_entry_limit_pct / 100.0)
+        allowed_value = min(
+            proposed_value,
+            total_headroom,
+            sector_headroom,
+            max_position_value,
+        )
+        adjusted_quantity = round(allowed_value / price, 4) if price > 0 else 0.0
+        if adjusted_quantity < 0.0001:
             return RiskDecision(
                 approved=False,
                 reason=(
-                    f"Sector '{sector}' exposure {current_sector_pct:.1f}% "
-                    f"exceeds concentration limit {self.sector_concentration_pct:.1f}%"
+                    f"Position value exceeds {self.position_entry_limit_pct:.1f}% "
+                    f"of NAV and cannot scale down"
                 ),
                 adjusted_quantity=0,
             )
 
-        # Check position entry limit and scale down if needed
-        max_position_value = portfolio.nav * (self.position_entry_limit_pct / 100.0)
-        proposed_value = quantity * price
-        if proposed_value > max_position_value:
-            adjusted_quantity = round(max_position_value / price, 4)
-            if adjusted_quantity < 0.0001:
-                return RiskDecision(
-                    approved=False,
-                    reason=(
-                        f"Position value exceeds {self.position_entry_limit_pct:.1f}% "
-                        f"of NAV and cannot scale down"
-                    ),
-                    adjusted_quantity=0,
+        if adjusted_quantity < quantity:
+            if allowed_value == total_headroom:
+                limit_reason = (
+                    f"projected total exposure within "
+                    f"{self.total_exposure_limit_pct:.1f}% limit"
+                )
+            elif allowed_value == sector_headroom:
+                limit_reason = (
+                    f"projected sector '{sector}' exposure within "
+                    f"{self.sector_concentration_pct:.1f}% limit"
+                )
+            else:
+                limit_reason = (
+                    f"within {self.position_entry_limit_pct:.1f}% position limit"
                 )
             return RiskDecision(
                 approved=True,
                 reason=(
                     f"Scaled down from {quantity} to {adjusted_quantity} shares "
-                    f"to stay within {self.position_entry_limit_pct:.1f}% position limit"
+                    f"to keep {limit_reason}"
                 ),
                 adjusted_quantity=adjusted_quantity,
             )
