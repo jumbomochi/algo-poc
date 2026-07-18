@@ -112,6 +112,7 @@ class OrderLedger:
             updated_at=now,
         )
         try:
+            self._ensure_sqlite_transaction()
             with self.session.begin_nested():
                 self.session.add(intent)
                 self.session.flush()
@@ -126,6 +127,15 @@ class OrderLedger:
                 raise
             self._ensure_same_economics(existing, values)
             return existing
+
+    def _ensure_sqlite_transaction(self) -> None:
+        connection = self.session.connection()
+        if connection.dialect.name != "sqlite":
+            return
+
+        driver_connection = connection.connection.driver_connection
+        if not driver_connection.in_transaction:
+            connection.exec_driver_sql("BEGIN")
 
     def get(self, recommendation_id: str) -> OrderIntent:
         return self._locked(recommendation_id, required=True)

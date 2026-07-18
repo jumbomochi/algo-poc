@@ -4,10 +4,10 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
-from shared.models import Base, OrderStatus
+from shared.models import Base, OrderIntent, OrderStatus
 from shared.order_ledger import (
     ConflictingOrderIntent,
     InvalidOrderTransition,
@@ -97,6 +97,17 @@ def test_create_intent_recovers_matching_concurrent_insert(session, monkeypatch)
 
     assert replay.id == first.id
     assert session.in_transaction()
+
+
+def test_create_intent_is_rolled_back_by_caller(session):
+    ledger = OrderLedger(session)
+    ledger.create_intent(make_proposal("rec-1"))
+
+    session.rollback()
+
+    assert session.scalar(select(OrderIntent).where(
+        OrderIntent.recommendation_id == "rec-1"
+    )) is None
 
 
 def test_submission_pending_load_and_publication_lifecycle(session):
