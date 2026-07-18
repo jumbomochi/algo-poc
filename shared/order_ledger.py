@@ -33,6 +33,7 @@ ALLOWED_TRANSITIONS = {
         OrderStatus.SUBMITTED,
     },
     OrderStatus.SUBMITTED: {
+        OrderStatus.SUBMISSION_FAILED,
         OrderStatus.PARTIALLY_FILLED,
         OrderStatus.FILLED,
         OrderStatus.CANCELLED,
@@ -139,6 +140,17 @@ class OrderLedger:
 
     def get(self, recommendation_id: str) -> OrderIntent:
         return self._locked(recommendation_id, required=True)
+
+    def get_by_ib_order_id(
+        self, ib_order_id: str | int, *, account_id: str | None = None
+    ) -> OrderIntent | None:
+        """Load attribution by broker order ID in any lifecycle state."""
+        stmt = select(OrderIntent).where(
+            OrderIntent.ib_order_id == str(ib_order_id)
+        )
+        if account_id is not None:
+            stmt = stmt.where(OrderIntent.account_id == account_id)
+        return self.session.scalar(stmt.with_for_update())
 
     def transition(
         self,

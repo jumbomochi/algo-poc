@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 
 from services.execution.runner import ExecutionServiceRunner
 from shared.config import AppConfig, ExecutionConfig, IBConfig
+from shared.models import Base, OrderStatus
+from shared.order_ledger import OrderLedger
 from shared.schemas.messages import ApprovedOrderMessage, KillMessage
 
 
@@ -68,6 +73,266 @@ def runner(mock_config, mock_redis, mock_order_manager):
         order_manager=mock_order_manager,
     )
     return r
+
+
+@pytest.fixture()
+def ledger_session():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        yield session
+
+
+def seed_approved_intent(
+    ledger: OrderLedger,
+    recommendation_id: str = "rec-1",
+    *,
+    ib_order_id: str | None = None,
+    filled_quantity: float = 0,
+):
+    proposal = SimpleNamespace(
+        recommendation_id=recommendation_id,
+        account_id="DUN551088",
+        mode="paper",
+        portfolio="momentum",
+        con_id=265598,
+        symbol="AAPL",
+        exchange="SMART",
+        currency="USD",
+        action="BUY",
+        quantity=50,
+        limit_price=150.0,
+        order_type="LMT",
+    )
+    intent = ledger.create_intent(proposal)
+    ledger.transition(recommendation_id, OrderStatus.APPROVED)
+    if ib_order_id is not None:
+        ledger.record_submission(recommendation_id, ib_order_id)
+    intent.filled_quantity = filled_quantity
+    ledger.session.commit()
+    return intent
+
+
+@pytest.fixture()
+def durable_runner(
+    mock_config, mock_redis, mock_order_manager, ledger_session
+):
+    ledger = OrderLedger(ledger_session)
+    runner = ExecutionServiceRunner(
+        config=mock_config,
+        redis_client=mock_redis,
+        order_manager=mock_order_manager,
+        order_ledger=ledger,
+    )
+    return runner, ledger
+
+
+class TestDurableExecutionIdentity:
+    @pytest.mark.asyncio
+    async def test_submission_persists_order_id_before_return(
+        self, durable_runner, ledger_session
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger)
+        commits = 0
+        original_commit = ledger_session.commit
+
+        def counting_commit():
+            nonlocal commits
+            commits += 1
+            original_commit()
+
+        ledger_session.commit = counting_commit
+
+        await runner.process_approved_order(
+            make_approved_order(recommendation_id="rec-1")
+        )
+
+        intent = ledger.get("rec-1")
+        assert intent.status == OrderStatus.SUBMITTED.value
+        assert intent.ib_order_id == "order-001"
+        assert commits == 1
+
+    @pytest.mark.asyncio
+    async def test_submission_does_not_await_broker_with_db_transaction_open(
+        self, durable_runner, ledger_session
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger)
+
+        async def submit_entry(**kwargs):
+            assert not ledger_session.in_transaction()
+            return "order-001"
+
+        runner._order_manager.submit_entry.side_effect = submit_entry
+
+        await runner.process_approved_order(
+            make_approved_order(recommendation_id="rec-1")
+        )
+
+    def test_restore_pending_orders_reloads_persisted_attribution(
+        self, durable_runner
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+
+        runner.restore_pending_orders()
+
+        assert runner._pending_orders["9"].portfolio == "momentum"
+        assert runner._pending_orders["9"].recommendation_id == "rec-1"
+
+    @pytest.mark.asyncio
+    async def test_skip_persists_submission_failed(self, durable_runner):
+        from services.execution.ib_executor import OrderSkippedError
+
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger)
+        runner._order_manager.submit_entry.side_effect = OrderSkippedError("too small")
+
+        await runner.process_approved_order(
+            make_approved_order(recommendation_id="rec-1")
+        )
+
+        intent = ledger.get("rec-1")
+        assert intent.status == OrderStatus.SUBMISSION_FAILED.value
+        assert intent.reason == "too small"
+
+    @pytest.mark.asyncio
+    async def test_submission_exception_persists_failure_then_raises(
+        self, durable_runner
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger)
+        runner._order_manager.submit_entry.side_effect = RuntimeError("IB down")
+
+        with pytest.raises(RuntimeError, match="IB down"):
+            await runner.process_approved_order(
+                make_approved_order(recommendation_id="rec-1")
+            )
+
+        assert ledger.get("rec-1").status == OrderStatus.SUBMISSION_FAILED.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("broker_status", ["Cancelled", "ApiCancelled"])
+    async def test_broker_cancellation_releases_reservation(
+        self, durable_runner, broker_status
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        runner.restore_pending_orders()
+
+        await runner.handle_ib_order_status({
+            "order_id": "9",
+            "status": broker_status,
+            "reason": "cancelled at IB",
+        })
+
+        assert ledger.get("rec-1").status == OrderStatus.CANCELLED.value
+        assert ledger.active_reservations("momentum") == 0
+
+    @pytest.mark.asyncio
+    async def test_inactive_before_fill_is_submission_failed(
+        self, durable_runner
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        runner.restore_pending_orders()
+
+        await runner.handle_ib_order_status({
+            "order_id": "9", "status": "Inactive", "reason": "rejected"
+        })
+
+        assert ledger.get("rec-1").status == OrderStatus.SUBMISSION_FAILED.value
+
+    @pytest.mark.asyncio
+    async def test_inactive_after_partial_fill_is_cancelled(
+        self, durable_runner
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9", filled_quantity=5)
+        ledger.get("rec-1").status = OrderStatus.PARTIALLY_FILLED.value
+        ledger.session.commit()
+        runner.restore_pending_orders()
+
+        await runner.handle_ib_order_status({
+            "order_id": "9", "status": "Inactive", "reason": "rejected remainder"
+        })
+
+        assert ledger.get("rec-1").status == OrderStatus.CANCELLED.value
+
+    @pytest.mark.asyncio
+    async def test_expiry_requires_completed_order_confirmation(
+        self, durable_runner
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        runner.restore_pending_orders()
+
+        await runner.handle_ib_order_status({
+            "order_id": "9", "status": "Expired",
+            "completed_order_confirmed": False,
+        })
+        assert ledger.get("rec-1").status == OrderStatus.SUBMITTED.value
+
+        await runner.handle_ib_order_status({
+            "order_id": "9", "status": "Expired",
+            "completed_order_confirmed": True,
+        })
+        assert ledger.get("rec-1").status == OrderStatus.EXPIRED.value
+
+    @pytest.mark.asyncio
+    async def test_fill_uses_persisted_attribution_and_execution_identity(
+        self, durable_runner
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        runner.restore_pending_orders()
+
+        await runner.handle_ib_fill({
+            "execution_id": "exec-1",
+            "account_id": "DUN551088",
+            "order_id": "9",
+            "con_id": 265598,
+            "ticker": "AAPL",
+            "exchange": "SMART",
+            "currency": "USD",
+            "side": "buy",
+            "quantity": 5.0,
+            "cumulative_quantity": 5.0,
+            "fill_price": 149.5,
+            "commission": 0.25,
+            "order_done": False,
+        })
+
+        _, payload = runner._redis.publish.call_args.args
+        assert payload["recommendation_id"] == "rec-1"
+        assert payload["portfolio"] == "momentum"
+        assert payload["execution_id"] == "exec-1"
+        assert payload["account_id"] == "DUN551088"
+        assert payload["cumulative_quantity"] == "5.0"
+
+    @pytest.mark.asyncio
+    async def test_late_fill_uses_terminal_intent_attribution(
+        self, durable_runner
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        runner.restore_pending_orders()
+        await runner.handle_ib_order_status({
+            "order_id": "9", "status": "Cancelled", "reason": "cancelled"
+        })
+
+        await runner.handle_ib_fill({
+            "execution_id": "late-1", "account_id": "DUN551088",
+            "order_id": "9", "con_id": 265598, "ticker": "AAPL",
+            "exchange": "SMART", "currency": "USD", "side": "buy",
+            "quantity": 1.0, "cumulative_quantity": 1.0,
+            "fill_price": 149.5, "commission": 0.1, "order_done": True,
+        })
+
+        _, payload = runner._redis.publish.call_args.args
+        assert payload["recommendation_id"] == "rec-1"
+        assert payload["portfolio"] == "momentum"
 
 
 class TestApprovedOrderProcessing:

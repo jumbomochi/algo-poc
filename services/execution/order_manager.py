@@ -92,9 +92,16 @@ class OrderManager:
             )
             return self._submitted[recommendation_id]
 
-        order_id = await self._executor.submit_limit_order(
-            ticker, quantity, limit_price
-        )
+        recovered = await self._executor.find_order_by_ref(recommendation_id)
+        if isinstance(recovered, (str, int)):
+            order_id = str(recovered)
+        else:
+            order_id = await self._executor.submit_limit_order(
+                ticker,
+                quantity,
+                limit_price,
+                recommendation_id=recommendation_id,
+            )
 
         now = datetime.now(timezone.utc)
 
@@ -151,7 +158,13 @@ class OrderManager:
             )
             return self._submitted[recommendation_id]
 
-        order_id = await self._executor.submit_market_order(ticker, quantity)
+        recovered = await self._executor.find_order_by_ref(recommendation_id)
+        if isinstance(recovered, (str, int)):
+            order_id = str(recovered)
+        else:
+            order_id = await self._executor.submit_market_order(
+                ticker, quantity, recommendation_id=recommendation_id
+            )
 
         # Track for idempotency
         self._submitted[recommendation_id] = order_id
@@ -165,6 +178,39 @@ class OrderManager:
         )
 
         return order_id
+
+    def restore_submission(
+        self,
+        recommendation_id: str,
+        order_id: str,
+        *,
+        ticker: str,
+        quantity: float,
+        limit_price: float | None,
+    ) -> None:
+        """Restore durable idempotency/open-order state after a restart."""
+        self._submitted[recommendation_id] = order_id
+        self.open_orders.setdefault(order_id, {
+            "ticker": ticker,
+            "quantity": quantity,
+            "limit_price": limit_price,
+            "placed_at": datetime.now(timezone.utc),
+            "last_repriced_at": datetime.now(timezone.utc),
+            "reprice_count": 0,
+            "recommendation_id": recommendation_id,
+        })
+
+    async def restore_broker_tracking(self) -> None:
+        """Reattach executor callbacks for submissions loaded from the DB."""
+        for recommendation_id, order_id in self._submitted.items():
+            restored = await self._executor.restore_order_by_ref(
+                recommendation_id, order_id
+            )
+            if restored is None:
+                raise RuntimeError(
+                    f"persisted order {order_id} ({recommendation_id}) "
+                    "is missing at IB"
+                )
 
     def check_unfilled_orders(
         self,

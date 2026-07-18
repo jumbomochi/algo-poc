@@ -49,6 +49,47 @@ def test_kill_message():
     assert msg.triggered_by == "operator"
 
 
+def test_fill_message_round_trips_execution_identity():
+    now = datetime.now(timezone.utc)
+    fill = FillMessage(
+        ticker="AAPL",
+        timestamp=now,
+        side="buy",
+        quantity=2,
+        cumulative_quantity=2,
+        fill_price=100,
+        commission=0.2,
+        recommendation_id="rec-1",
+        order_id="9",
+        execution_id="e-1",
+        account_id="DUN551088",
+        portfolio="momentum",
+        con_id=265598,
+        exchange="SMART",
+        currency="USD",
+    )
+
+    assert FillMessage.from_stream_dict(fill.to_stream_dict()) == fill
+
+
+def test_fill_message_accepts_legacy_payload_without_execution_identity():
+    legacy = {
+        "ticker": "AAPL",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "side": "buy",
+        "quantity": "2",
+        "fill_price": "100",
+        "commission": "0.2",
+        "recommendation_id": "rec-1",
+        "order_id": "9",
+    }
+
+    fill = FillMessage.from_stream_dict(legacy)
+
+    assert fill.execution_id is None
+    assert fill.cumulative_quantity is None
+
+
 class TestNoneFieldRoundtrip:
     """None fields must survive the stream roundtrip via omission.
 
