@@ -64,6 +64,23 @@ class TestPositionEntryLimit:
         assert decision.approved is True
         assert decision.adjusted_quantity == 50
 
+    def test_position_quantity_never_rounds_above_headroom(self):
+        headroom = 1.00006
+        engine = RiskEngine(
+            position_entry_limit_pct=headroom / 10_000 * 100.0,
+            sector_concentration_pct=20.0,
+            total_exposure_limit_pct=100.0,
+        )
+        portfolio = make_portfolio(nav=10_000)
+
+        decision = engine.check_entry(
+            "AAPL", quantity=2, price=1.0, sector="Technology", portfolio=portfolio
+        )
+
+        assert decision.approved is True
+        assert decision.adjusted_quantity == 1.0
+        assert decision.adjusted_quantity * 1.0 <= headroom
+
 
 class TestSectorConcentration:
     def test_sector_concentration_rejects(self):
@@ -151,6 +168,29 @@ class TestSectorConcentration:
 
         assert decision.approved is False
         assert "sector" in decision.reason.lower()
+
+    def test_sector_quantity_never_rounds_above_headroom(self):
+        headroom = 1.00006
+        engine = RiskEngine(
+            position_entry_limit_pct=50.0,
+            sector_concentration_pct=20.0,
+            total_exposure_limit_pct=100.0,
+        )
+        current_sector_value = 2_000.0 - headroom
+        portfolio = make_portfolio(
+            nav=10_000,
+            sector_exposure={
+                "Technology": current_sector_value / 10_000 * 100.0,
+            },
+        )
+
+        decision = engine.check_entry(
+            "MSFT", quantity=2, price=1.0, sector="Technology", portfolio=portfolio
+        )
+
+        assert decision.approved is True
+        assert decision.adjusted_quantity == 1.0
+        assert decision.adjusted_quantity * 1.0 <= headroom
 
 
 class TestTotalExposure:
@@ -253,6 +293,27 @@ class TestTotalExposure:
 
         assert decision.approved is False
         assert "total exposure" in decision.reason.lower()
+
+    def test_total_quantity_never_rounds_above_headroom(self):
+        headroom = 1.00006
+        engine = RiskEngine(
+            position_entry_limit_pct=50.0,
+            sector_concentration_pct=50.0,
+            total_exposure_limit_pct=100.0,
+        )
+        current_total_value = 10_000.0 - headroom
+        portfolio = make_portfolio(
+            nav=10_000,
+            total_exposure_pct=current_total_value / 10_000 * 100.0,
+        )
+
+        decision = engine.check_entry(
+            "AAPL", quantity=2, price=1.0, sector="Technology", portfolio=portfolio
+        )
+
+        assert decision.approved is True
+        assert decision.adjusted_quantity == 1.0
+        assert decision.adjusted_quantity * 1.0 <= headroom
 
 
 class TestRiskDecisionDataclass:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
+from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
 
@@ -80,6 +80,22 @@ class RiskEngine:
         proposed_value = quantity * price
         reservation_value = max(0.0, reserved_notional)
 
+        quantity_precision = Decimal("0.0001")
+
+        def floor_supported_quantity(raw_quantity: float) -> float:
+            return float(
+                Decimal(str(raw_quantity)).quantize(
+                    quantity_precision,
+                    rounding=ROUND_DOWN,
+                )
+            )
+
+        def floor_value_quantity(allowed_value: float) -> float:
+            if price <= 0:
+                return 0.0
+            raw_quantity = Decimal(str(allowed_value)) / Decimal(str(price))
+            return float(raw_quantity.quantize(quantity_precision, rounding=ROUND_DOWN))
+
         # Check projected total exposure first
         current_total_value = portfolio.nav * portfolio.total_exposure_pct / 100.0
         total_limit_value = portfolio.nav * self.total_exposure_limit_pct / 100.0
@@ -87,10 +103,10 @@ class RiskEngine:
             0.0,
             total_limit_value - current_total_value - reservation_value,
         )
-        total_headroom_quantity = (
-            round(total_headroom / price, 4) if price > 0 else total_headroom
-        )
-        if total_headroom <= 0 or total_headroom_quantity < 0.0001:
+        total_headroom_quantity = floor_value_quantity(total_headroom)
+        if total_headroom <= 0 or (
+            price > 0 and total_headroom_quantity < 0.0001
+        ):
             if portfolio.total_exposure_pct >= self.total_exposure_limit_pct:
                 reason = (
                     f"Total exposure {portfolio.total_exposure_pct:.1f}% "
@@ -126,10 +142,10 @@ class RiskEngine:
             0.0,
             sector_limit_value - current_sector_value - reservation_value,
         )
-        sector_headroom_quantity = (
-            round(sector_headroom / price, 4) if price > 0 else sector_headroom
-        )
-        if sector_headroom <= 0 or sector_headroom_quantity < 0.0001:
+        sector_headroom_quantity = floor_value_quantity(sector_headroom)
+        if sector_headroom <= 0 or (
+            price > 0 and sector_headroom_quantity < 0.0001
+        ):
             if current_sector_pct >= self.sector_concentration_pct:
                 reason = (
                     f"Sector '{sector}' exposure {current_sector_pct:.1f}% "
@@ -154,7 +170,12 @@ class RiskEngine:
             sector_headroom,
             max_position_value,
         )
-        adjusted_quantity = round(allowed_value / price, 4) if price > 0 else 0.0
+        adjusted_quantity = min(
+            floor_supported_quantity(quantity),
+            total_headroom_quantity,
+            sector_headroom_quantity,
+            floor_value_quantity(max_position_value),
+        )
         if adjusted_quantity < 0.0001:
             return RiskDecision(
                 approved=False,
