@@ -91,6 +91,24 @@ class TestPartialFills:
 
 
 class TestIBExecutionIdentity:
+    @pytest.mark.asyncio
+    async def test_status_payload_includes_broker_filled_quantity(self):
+        from services.execution.ib_executor import IBExecutor
+
+        executor = IBExecutor("h", 7497, 1)
+        handler = AsyncMock()
+        executor.set_order_status_handler(handler)
+
+        await executor._emit_order_status(
+            "9", "Inactive", "rejected remainder", filled_quantity=3
+        )
+
+        handler.assert_awaited_once_with({
+            "order_id": "9", "status": "Inactive",
+            "reason": "rejected remainder", "filled_quantity": 3.0,
+            "completed_order_confirmed": False,
+        })
+
     def test_inactive_reason_uses_latest_ib_trade_log_message(self):
         from services.execution.ib_executor import IBExecutor
 
@@ -224,6 +242,7 @@ class TestIBExecutionIdentity:
         completed.order.orderRef = "rec-1"
         completed.order.orderId = 9
         completed.orderStatus.status = "Expired"
+        completed.orderStatus.filled = 0
         fake_ib.reqCompletedOrdersAsync = AsyncMock(return_value=[completed])
         executor._ib = fake_ib
         handler = AsyncMock()
@@ -236,5 +255,6 @@ class TestIBExecutionIdentity:
             "order_id": "9",
             "status": "Expired",
             "reason": "",
+            "filled_quantity": 0.0,
             "completed_order_confirmed": True,
         })

@@ -58,6 +58,7 @@ class OrderManager:
 
         # Idempotency: maps recommendation_id -> order_id
         self._submitted: dict[str, str] = {}
+        self._recovered: set[str] = set()
 
         # Open orders: maps order_id -> order info dict
         self.open_orders: dict[str, dict[str, Any]] = {}
@@ -95,6 +96,7 @@ class OrderManager:
         recovered = await self._executor.find_order_by_ref(recommendation_id)
         if isinstance(recovered, (str, int)):
             order_id = str(recovered)
+            self._recovered.add(recommendation_id)
         else:
             order_id = await self._executor.submit_limit_order(
                 ticker,
@@ -161,6 +163,7 @@ class OrderManager:
         recovered = await self._executor.find_order_by_ref(recommendation_id)
         if isinstance(recovered, (str, int)):
             order_id = str(recovered)
+            self._recovered.add(recommendation_id)
         else:
             order_id = await self._executor.submit_market_order(
                 ticker, quantity, recommendation_id=recommendation_id
@@ -211,6 +214,23 @@ class OrderManager:
                     f"persisted order {order_id} ({recommendation_id}) "
                     "is missing at IB"
                 )
+
+    async def reconcile_submission(
+        self, recommendation_id: str, order_id: str
+    ) -> bool:
+        """Reconcile a recovered crash-window order after DB submission commit."""
+        if recommendation_id not in self._recovered:
+            return True
+        restored = await self._executor.restore_order_by_ref(
+            recommendation_id, order_id
+        )
+        if restored is None:
+            raise RuntimeError(
+                f"recovered order {order_id} ({recommendation_id}) "
+                "is missing at IB"
+            )
+        self._recovered.discard(recommendation_id)
+        return restored
 
     def check_unfilled_orders(
         self,

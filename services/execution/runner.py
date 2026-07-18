@@ -8,7 +8,7 @@ from typing import Any
 from shared.config import AppConfig
 from shared.logging import get_logger
 from shared.models import OrderStatus
-from shared.order_ledger import OrderLedger
+from shared.order_ledger import OrderLedger, TERMINAL_STATUSES
 from shared.schemas.messages import (
     AlertMessage,
     ApprovedOrderMessage,
@@ -219,6 +219,9 @@ class ExecutionServiceRunner:
 
         if self._order_ledger is not None:
             intent = self._order_ledger.get(order.recommendation_id)
+            if OrderStatus(intent.status) in TERMINAL_STATUSES:
+                self._order_ledger.session.rollback()
+                return
             if (
                 intent.status
                 in {
@@ -280,8 +283,10 @@ class ExecutionServiceRunner:
                     reason=str(exc),
                 )
                 self._commit_ledger()
+                return
             raise
 
+        broker_active = True
         if self._order_ledger is not None:
             try:
                 intent = self._order_ledger.record_submission(
@@ -292,6 +297,15 @@ class ExecutionServiceRunner:
             except Exception:
                 self._order_ledger.session.rollback()
                 raise
+            reconcile = getattr(
+                type(self._order_manager), "reconcile_submission", None
+            )
+            if reconcile is not None:
+                broker_active = await reconcile(
+                    self._order_manager,
+                    order.recommendation_id,
+                    order_id,
+                )
         else:
             intent = order
             portfolio = order.portfolio
@@ -300,7 +314,7 @@ class ExecutionServiceRunner:
         # recommendation that caused them.
         if self._order_ledger is None:
             self._pending_orders[order_id] = order
-        else:
+        elif broker_active:
             self._pending_orders[order_id] = PendingOrderAttribution(
                 recommendation_id=order.recommendation_id,
                 portfolio=portfolio,
@@ -408,9 +422,17 @@ class ExecutionServiceRunner:
         elif broker_status == "Inactive" and reason:
             target = (
                 OrderStatus.CANCELLED
-                if intent.filled_quantity > 0
+                if (
+                    intent.filled_quantity > 0
+                    or float(status_info.get("filled_quantity", 0.0) or 0.0) > 0
+                )
                 else OrderStatus.SUBMISSION_FAILED
             )
+        elif (
+            broker_status == "Filled"
+            and status_info.get("completed_order_confirmed") is True
+        ):
+            target = OrderStatus.FILLED
         elif (
             broker_status == "Expired"
             and intent.filled_quantity == 0

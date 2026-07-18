@@ -198,19 +198,33 @@ class TestDurableExecutionIdentity:
         assert intent.reason == "too small"
 
     @pytest.mark.asyncio
-    async def test_submission_exception_persists_failure_then_raises(
+    async def test_submission_exception_persists_failure_and_returns_ack_safe(
         self, durable_runner
     ):
         runner, ledger = durable_runner
         seed_approved_intent(ledger)
         runner._order_manager.submit_entry.side_effect = RuntimeError("IB down")
 
-        with pytest.raises(RuntimeError, match="IB down"):
-            await runner.process_approved_order(
-                make_approved_order(recommendation_id="rec-1")
-            )
+        await runner.process_approved_order(
+            make_approved_order(recommendation_id="rec-1")
+        )
 
         assert ledger.get("rec-1").status == OrderStatus.SUBMISSION_FAILED.value
+
+    @pytest.mark.asyncio
+    async def test_terminal_replay_never_calls_broker(self, durable_runner):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger)
+        ledger.transition(
+            "rec-1", OrderStatus.SUBMISSION_FAILED, reason="IB down"
+        )
+        ledger.session.commit()
+
+        await runner.process_approved_order(
+            make_approved_order(recommendation_id="rec-1")
+        )
+
+        runner._order_manager.submit_entry.assert_not_awaited()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("broker_status", ["Cancelled", "ApiCancelled"])
@@ -261,6 +275,21 @@ class TestDurableExecutionIdentity:
         assert ledger.get("rec-1").status == OrderStatus.CANCELLED.value
 
     @pytest.mark.asyncio
+    async def test_inactive_race_uses_broker_filled_quantity(
+        self, durable_runner
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9", filled_quantity=0)
+        runner.restore_pending_orders()
+
+        await runner.handle_ib_order_status({
+            "order_id": "9", "status": "Inactive", "reason": "remainder",
+            "filled_quantity": 5,
+        })
+
+        assert ledger.get("rec-1").status == OrderStatus.CANCELLED.value
+
+    @pytest.mark.asyncio
     async def test_expiry_requires_completed_order_confirmation(
         self, durable_runner
     ):
@@ -279,6 +308,21 @@ class TestDurableExecutionIdentity:
             "completed_order_confirmed": True,
         })
         assert ledger.get("rec-1").status == OrderStatus.EXPIRED.value
+
+    @pytest.mark.asyncio
+    async def test_live_filled_status_waits_for_fill_projector(
+        self, durable_runner
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        runner.restore_pending_orders()
+
+        await runner.handle_ib_order_status({
+            "order_id": "9", "status": "Filled",
+            "filled_quantity": 50, "completed_order_confirmed": False,
+        })
+
+        assert ledger.get("rec-1").status == OrderStatus.SUBMITTED.value
 
     @pytest.mark.asyncio
     async def test_fill_uses_persisted_attribution_and_execution_identity(
@@ -333,6 +377,38 @@ class TestDurableExecutionIdentity:
         _, payload = runner._redis.publish.call_args.args
         assert payload["recommendation_id"] == "rec-1"
         assert payload["portfolio"] == "momentum"
+
+    @pytest.mark.asyncio
+    async def test_completed_fill_recovery_releases_reservation_without_duplicate(
+        self, mock_config, mock_redis, ledger_session
+    ):
+        from services.execution.order_manager import OrderManager
+
+        ledger = OrderLedger(ledger_session)
+        seed_approved_intent(ledger)
+        executor = AsyncMock()
+        executor.find_order_by_ref.return_value = "77"
+        manager = OrderManager(executor, mock_redis, ledger_session)
+        runner = ExecutionServiceRunner(
+            mock_config, mock_redis, manager, order_ledger=ledger
+        )
+
+        async def reconcile_completed(recommendation_id, order_id):
+            await runner.handle_ib_order_status({
+                "order_id": order_id, "status": "Filled",
+                "filled_quantity": 50, "completed_order_confirmed": True,
+            })
+            return False
+
+        executor.restore_order_by_ref.side_effect = reconcile_completed
+
+        await runner.process_approved_order(
+            make_approved_order(recommendation_id="rec-1")
+        )
+
+        executor.submit_limit_order.assert_not_awaited()
+        assert ledger.get("rec-1").status == OrderStatus.FILLED.value
+        assert ledger.active_reservations("momentum") == 0
 
 
 class TestApprovedOrderProcessing:

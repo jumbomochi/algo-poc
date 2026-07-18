@@ -260,13 +260,23 @@ class IBExecutor:
             status = str(trade.orderStatus.status)
             reason = self._status_reason(trade)
             asyncio.ensure_future(
-                self._emit_order_status(order_id, status, reason)
+                self._emit_order_status(
+                    order_id,
+                    status,
+                    reason,
+                    filled_quantity=float(trade.orderStatus.filled or 0.0),
+                )
             )
 
         trade.statusEvent += _on_status
 
     async def _emit_order_status(
-        self, order_id: str, status: str, reason: str
+        self,
+        order_id: str,
+        status: str,
+        reason: str,
+        *,
+        filled_quantity: float = 0.0,
     ) -> None:
         if self._order_status_handler is None:
             return
@@ -277,6 +287,7 @@ class IBExecutor:
             "order_id": order_id,
             "status": status,
             "reason": reason,
+            "filled_quantity": float(filled_quantity),
             "completed_order_confirmed": confirmed,
         })
 
@@ -348,7 +359,10 @@ class IBExecutor:
                     "order_id": str(expected_order_id),
                     "status": status,
                     "reason": "",
-                    "completed_order_confirmed": status == "Expired",
+                    "filled_quantity": float(
+                        getattr(trade.orderStatus, "filled", 0.0) or 0.0
+                    ),
+                    "completed_order_confirmed": True,
                 })
             return False
         return None
