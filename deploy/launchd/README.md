@@ -140,6 +140,8 @@ Added after the 2026-07-10 incident where an agent wiped the paper book via
 
 - **Dumps:** `~/ibc/backups/algo_poc_<YYYYmmdd_HHMMSS>.dump`, pruned after 30
   days. Every dump is verified with `pg_restore --list` before success.
+- **Storage:** local-only; the job does not access iCloud Drive or other
+  offsite storage.
 - **Telegram**: ❌ on any failure (container down, dump error, unreadable
   archive). Success is logged only.
 - **Logs:** `~/ibc/logs/db_backup_YYYYMMDD.log` (pruned after 30 days).
