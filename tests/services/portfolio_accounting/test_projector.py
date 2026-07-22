@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import create_engine, func, select
@@ -143,6 +143,20 @@ def test_replayed_buy_fill_changes_cash_once(projector, session):
     assert get_position(session).quantity == 10
     assert get_cash(session) == pytest.approx(8_999)
     assert fill_count(session) == 1
+    assert session.scalar(select(ExecutionFill)).projection_applied is True
+
+
+def test_replayed_fill_accepts_equivalent_timestamp_offset(projector, session):
+    seed_intent(session)
+    fill = make_fill()
+
+    assert projector.apply(fill) is True
+    assert projector.apply(make_fill(
+        timestamp=NOW.astimezone(timezone(timedelta(hours=8)))
+    )) is False
+
+    assert get_position(session).quantity == 10
+    assert get_cash(session) == pytest.approx(8_999)
 
 
 @pytest.mark.parametrize(
@@ -197,6 +211,33 @@ def test_delayed_fills_project_after_completed_history_marked_filled(projector, 
     assert intent.status == OrderStatus.FILLED.value
     assert intent.filled_quantity == pytest.approx(10)
     assert get_position(session).quantity == pytest.approx(10)
+
+
+def test_rejected_fill_is_not_reconstructed_as_applied_for_delayed_history(
+    projector, session
+):
+    seed_intent(
+        session,
+        status=OrderStatus.FILLED,
+        filled_quantity=10,
+    )
+    config = session.scalar(select(PortfolioConfig))
+    config.cash = 0
+    session.commit()
+
+    with pytest.raises(InvalidFillError, match="cash"):
+        projector.apply(make_fill("e-1", quantity=4, cumulative=4, commission=0))
+
+    config = session.scalar(select(PortfolioConfig))
+    config.cash = 10_000
+    session.commit()
+    with pytest.raises(InvalidFillError, match="cumulative"):
+        projector.apply(make_fill("e-2", quantity=6, cumulative=10, commission=0))
+
+    assert get_position(session) is None
+    assert get_cash(session) == pytest.approx(10_000)
+    fills = session.scalars(select(ExecutionFill).order_by(ExecutionFill.id)).all()
+    assert [fill.projection_applied for fill in fills] == [False, False]
 
 
 def test_unknown_fill_is_audited_without_position_or_cash_mutation(projector, session):

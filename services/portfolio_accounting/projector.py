@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from math import isclose, isfinite
 from typing import Any
 
@@ -103,23 +103,26 @@ class FillProjector:
                 .with_for_update()
             )
             try:
-                cumulative = self._validate(fill, intent, execution)
-                self._paper_state._apply_fill_accounting(
-                    portfolio=intent.portfolio,
-                    ticker=intent.symbol,
-                    action=fill.side,
-                    quantity=fill.quantity,
-                    price=fill.fill_price,
-                    fill_datetime=fill.timestamp,
-                    commission=fill.commission,
-                    recommendation_id=intent.recommendation_id,
-                    con_id=intent.con_id,
-                    exchange=intent.exchange,
-                    currency=intent.currency,
-                    strict_quantity=True,
-                    exit_reason=intent.reason,
-                )
-                self._advance_intent(intent, cumulative)
+                with self.session.begin_nested():
+                    cumulative = self._validate(fill, intent, execution)
+                    self._paper_state._apply_fill_accounting(
+                        portfolio=intent.portfolio,
+                        ticker=intent.symbol,
+                        action=fill.side,
+                        quantity=fill.quantity,
+                        price=fill.fill_price,
+                        fill_datetime=fill.timestamp,
+                        commission=fill.commission,
+                        recommendation_id=intent.recommendation_id,
+                        con_id=intent.con_id,
+                        exchange=intent.exchange,
+                        currency=intent.currency,
+                        strict_quantity=True,
+                        exit_reason=intent.reason,
+                    )
+                    self._advance_intent(intent, cumulative)
+                    execution.projection_applied = True
+                    self.session.flush()
             except (FillProjectionError, ValueError) as exc:
                 # Do not raise inside the transaction: the immutable execution
                 # row is the durable audit record and must survive the failure.
@@ -293,6 +296,7 @@ class FillProjector:
                 ExecutionFill.recommendation_id == intent.recommendation_id,
                 ExecutionFill.account_id == intent.account_id,
                 ExecutionFill.id != current_execution_id,
+                ExecutionFill.projection_applied.is_(True),
             )
             .order_by(ExecutionFill.id)
         )
@@ -349,5 +353,11 @@ def _same_value(left: Any, right: Any) -> bool:
             return left is right
         return isclose(float(left), float(right), rel_tol=1e-9, abs_tol=1e-9)
     if isinstance(left, datetime) and isinstance(right, datetime):
-        return left.replace(tzinfo=None) == right.replace(tzinfo=None)
+        return _as_utc(left) == _as_utc(right)
     return left == right
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)

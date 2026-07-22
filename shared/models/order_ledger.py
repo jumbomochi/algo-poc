@@ -5,6 +5,7 @@ from enum import StrEnum
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     Float,
@@ -121,6 +122,9 @@ class ExecutionFill(Base):
     cumulative_quantity: Mapped[float | None] = mapped_column(Float, nullable=True)
     executed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
+    )
+    projection_applied: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
     )
 
 
