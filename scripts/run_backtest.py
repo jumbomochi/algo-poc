@@ -41,6 +41,28 @@ class PortfolioConfig:
     capital: float
     signals_fn: Callable[[str, list[dict]], dict | None]
     risk_engine: RiskEngine
+
+
+def _context_exit_quantity(
+    portfolio_context: PortfolioContext | None,
+    ticker: str,
+    held_quantity: float,
+) -> float | None:
+    """Return filled quantity not already covered by an active order.
+
+    An active BUY is opposing flow and therefore suppresses a new SELL. Active
+    SELL quantity only covers that portion of the durable filled position.
+    """
+    if portfolio_context is None:
+        return 0.0
+    if portfolio_context.pending_quantity(ticker, "buy") > 0:
+        return None
+    uncovered = max(
+        float(held_quantity)
+        - portfolio_context.pending_quantity(ticker, "sell"),
+        0.0,
+    )
+    return uncovered if uncovered > 0 else None
 from scripts.fetch_fundamentals import load_fundamentals_cache, build_fundamentals_lookup, SECTOR_MAP
 from scripts.fetch_earnings import load_earnings_cache, build_earnings_lookup
 from services.signal_generation.technical import (
@@ -441,7 +463,10 @@ def make_momentum_signals_fn(
             # Force-exit inverse ETFs when regime turns non-bear
             is_bear_ticker = bear_tickers and ticker in bear_tickers
             if is_bear_ticker and regime != "bear":
-                if portfolio_context and portfolio_context.has_pending(ticker, "sell"):
+                exit_quantity = _context_exit_quantity(
+                    portfolio_context, ticker, held.quantity if held else 0
+                )
+                if exit_quantity is None:
                     return None
                 if portfolio_context is None:
                     tracked.pop(ticker, None)
@@ -449,7 +474,7 @@ def make_momentum_signals_fn(
                     "action": "sell",
                     "ticker": ticker,
                     "limit_price": current_price,
-                    "quantity": held.quantity if held else 0,
+                    "quantity": exit_quantity,
                     "sector": "Unknown",
                     "exit_reason": "regime_change",
                 }
@@ -473,7 +498,10 @@ def make_momentum_signals_fn(
                     break
 
             if should_sell:
-                if portfolio_context and portfolio_context.has_pending(ticker, "sell"):
+                exit_quantity = _context_exit_quantity(
+                    portfolio_context, ticker, held.quantity if held else 0
+                )
+                if exit_quantity is None:
                     return None
                 if portfolio_context is None:
                     tracked.pop(ticker, None)
@@ -481,17 +509,18 @@ def make_momentum_signals_fn(
                     "action": "sell",
                     "ticker": ticker,
                     "limit_price": current_price,
-                    "quantity": held.quantity if held else 0,
+                    "quantity": exit_quantity,
                     "sector": "Unknown",
                     "exit_reason": exit_reason,
                 }
 
         # === Entry logic: buy if in top N and not already tracked ===
         top_tickers = rankings_by_date.get(current_date, [])
-        pending_buy = bool(
-            portfolio_context and portfolio_context.has_pending(ticker, "buy")
+        pending_buy_quantity = (
+            portfolio_context.pending_quantity(ticker, "buy")
+            if portfolio_context else 0.0
         )
-        if not lots and not pending_buy and ticker in top_tickers:
+        if not lots and pending_buy_quantity <= 0 and ticker in top_tickers:
             quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
             if portfolio_context is None:
                 tracked[ticker] = [{
@@ -637,7 +666,10 @@ def make_sector_rotation_signals_fn(
                 peak = lot["peak_price"]
                 entry = lot["entry_price"]
                 if peak > entry and (peak - current_price) / peak >= trailing_stop_pct:
-                    if portfolio_context and portfolio_context.has_pending(ticker, "sell"):
+                    exit_quantity = _context_exit_quantity(
+                        portfolio_context, ticker, held.quantity if held else 0
+                    )
+                    if exit_quantity is None:
                         return None
                     if portfolio_context is None:
                         tracked.pop(ticker, None)
@@ -645,17 +677,18 @@ def make_sector_rotation_signals_fn(
                         "action": "sell",
                         "ticker": ticker,
                         "limit_price": current_price,
-                        "quantity": held.quantity if held else 0,
+                        "quantity": exit_quantity,
                         "sector": "Unknown",
                         "exit_reason": "trailing_stop",
                     }
 
         # Entry: buy if in top N and not already tracked
         top_tickers = rankings_by_date.get(current_date, [])
-        pending_buy = bool(
-            portfolio_context and portfolio_context.has_pending(ticker, "buy")
+        pending_buy_quantity = (
+            portfolio_context.pending_quantity(ticker, "buy")
+            if portfolio_context else 0.0
         )
-        if not lots and not pending_buy and ticker in top_tickers:
+        if not lots and pending_buy_quantity <= 0 and ticker in top_tickers:
             quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
             if portfolio_context is None:
                 tracked[ticker] = [{
@@ -889,7 +922,10 @@ def make_thematic_momentum_signals_fn(
                         break
 
             if should_sell:
-                if portfolio_context and portfolio_context.has_pending(ticker, "sell"):
+                exit_quantity = _context_exit_quantity(
+                    portfolio_context, ticker, held.quantity if held else 0
+                )
+                if exit_quantity is None:
                     return None
                 if portfolio_context is None:
                     tracked.pop(ticker, None)
@@ -897,17 +933,23 @@ def make_thematic_momentum_signals_fn(
                     "action": "sell",
                     "ticker": ticker,
                     "limit_price": current_price,
-                    "quantity": held.quantity if held else 0,
+                    "quantity": exit_quantity,
                     "sector": "Unknown",
                     "exit_reason": exit_reason,
                 }
 
         # Entry: in top N AND above 50-day MA
         top_tickers = rankings_by_date.get(current_date, [])
-        pending_buy = bool(
-            portfolio_context and portfolio_context.has_pending(ticker, "buy")
+        pending_buy_quantity = (
+            portfolio_context.pending_quantity(ticker, "buy")
+            if portfolio_context else 0.0
         )
-        if not lots and not pending_buy and ticker in top_tickers and above_ma:
+        if (
+            not lots
+            and pending_buy_quantity <= 0
+            and ticker in top_tickers
+            and above_ma
+        ):
             quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
             if portfolio_context is None:
                 tracked[ticker] = [{
@@ -978,9 +1020,11 @@ def make_quality_value_signals_fn(
             "peak_price": max(held.peak_price, current_price),
         }] if held else tracked.get(ticker, []))
 
-        fundamentals = fundamentals_lookup(ticker, current_date)
-        if fundamentals is None:
-            return None
+        fundamentals = None
+        if portfolio_context is None:
+            fundamentals = fundamentals_lookup(ticker, current_date)
+            if fundamentals is None:
+                return None
 
         # Determine regime-adjusted trailing stop
         effective_trailing = trailing_stop_pct
@@ -999,7 +1043,10 @@ def make_quality_value_signals_fn(
                 peak = lot["peak_price"]
                 entry = lot["entry_price"]
                 if peak > entry and (peak - current_price) / peak >= effective_trailing:
-                    if portfolio_context and portfolio_context.has_pending(ticker, "sell"):
+                    exit_quantity = _context_exit_quantity(
+                        portfolio_context, ticker, held.quantity if held else 0
+                    )
+                    if exit_quantity is None:
                         return None
                     if portfolio_context is None:
                         tracked.pop(ticker, None)
@@ -1007,10 +1054,15 @@ def make_quality_value_signals_fn(
                         "action": "sell",
                         "ticker": ticker,
                         "limit_price": current_price,
-                        "quantity": held.quantity if held else 0,
+                        "quantity": exit_quantity,
                         "sector": sector_map.get(ticker, "Unknown"),
                         "exit_reason": "trailing_stop",
                     }
+
+        if fundamentals is None:
+            fundamentals = fundamentals_lookup(ticker, current_date)
+        if fundamentals is None:
+            return None
 
         # Compute quality score and update cache
         score = _compute_quality_score(fundamentals)
@@ -1022,10 +1074,11 @@ def make_quality_value_signals_fn(
         ranked = sorted(scores_cache.items(), key=lambda x: x[1], reverse=True)
         top_tickers = [t for t, _ in ranked[:top_n]]
 
-        pending_buy = bool(
-            portfolio_context and portfolio_context.has_pending(ticker, "buy")
+        pending_buy_quantity = (
+            portfolio_context.pending_quantity(ticker, "buy")
+            if portfolio_context else 0.0
         )
-        if not lots and not pending_buy and ticker in top_tickers:
+        if not lots and pending_buy_quantity <= 0 and ticker in top_tickers:
             quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
             if portfolio_context is None:
                 tracked[ticker] = [{
@@ -1101,7 +1154,10 @@ def make_earnings_drift_signals_fn(
 
             # Time exit
             if bars_held >= max_hold_days:
-                if portfolio_context and portfolio_context.has_pending(ticker, "sell"):
+                exit_quantity = _context_exit_quantity(
+                    portfolio_context, ticker, held.quantity if held else 0
+                )
+                if exit_quantity is None:
                     return None
                 if portfolio_context is None:
                     tracked.pop(ticker, None)
@@ -1109,7 +1165,7 @@ def make_earnings_drift_signals_fn(
                     "action": "sell",
                     "ticker": ticker,
                     "limit_price": current_price,
-                    "quantity": held.quantity if held else 0,
+                    "quantity": exit_quantity,
                     "sector": "Unknown",
                     "exit_reason": "time_exit",
                 }
@@ -1118,7 +1174,10 @@ def make_earnings_drift_signals_fn(
             peak = lot["peak_price"]
             entry = lot["entry_price"]
             if peak > entry and (peak - current_price) / peak >= effective_trailing:
-                if portfolio_context and portfolio_context.has_pending(ticker, "sell"):
+                exit_quantity = _context_exit_quantity(
+                    portfolio_context, ticker, held.quantity if held else 0
+                )
+                if exit_quantity is None:
                     return None
                 if portfolio_context is None:
                     tracked.pop(ticker, None)
@@ -1126,7 +1185,7 @@ def make_earnings_drift_signals_fn(
                     "action": "sell",
                     "ticker": ticker,
                     "limit_price": current_price,
-                    "quantity": held.quantity if held else 0,
+                    "quantity": exit_quantity,
                     "sector": "Unknown",
                     "exit_reason": "trailing_stop",
                 }
@@ -1134,7 +1193,10 @@ def make_earnings_drift_signals_fn(
             return None
 
         # Entry logic: check for recent earnings event
-        if portfolio_context and portfolio_context.has_pending(ticker, "buy"):
+        if (
+            portfolio_context
+            and portfolio_context.pending_quantity(ticker, "buy") > 0
+        ):
             return None
 
         event = earnings_lookup(ticker, current_date)
@@ -1213,13 +1275,16 @@ def make_tail_risk_hedge_signals_fn(
             and held is not None
             and (ticker not in allocation or hydrated_regime_changed)
         ):
-            if portfolio_context.has_pending(ticker, "sell"):
+            exit_quantity = _context_exit_quantity(
+                portfolio_context, ticker, held.quantity
+            )
+            if exit_quantity is None:
                 return None
             return {
                 "action": "sell",
                 "ticker": ticker,
                 "limit_price": current_price,
-                "quantity": held.quantity,
+                "quantity": exit_quantity,
                 "sector": "Unknown",
                 "exit_reason": "regime_change",
             }
@@ -1237,10 +1302,11 @@ def make_tail_risk_hedge_signals_fn(
             }
 
         # Entry: buy if ticker is in current regime allocation and not already held
-        pending_buy = bool(
-            portfolio_context and portfolio_context.has_pending(ticker, "buy")
+        pending_buy_quantity = (
+            portfolio_context.pending_quantity(ticker, "buy")
+            if portfolio_context else 0.0
         )
-        if lot is None and not pending_buy and ticker in allocation:
+        if lot is None and pending_buy_quantity <= 0 and ticker in allocation:
             weight = allocation[ticker]
             quantity = round(max(0.0001, initial_capital * position_size_pct * weight / current_price), 4)
             if portfolio_context is None:

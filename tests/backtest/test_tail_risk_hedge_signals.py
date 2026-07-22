@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-from backtest.portfolio_context import HeldPosition, PortfolioContext
+from backtest.portfolio_context import HeldPosition, PendingOrder, PortfolioContext
 from scripts.run_backtest import make_tail_risk_hedge_signals_fn
 
 
@@ -122,12 +122,14 @@ def test_tail_risk_hedge_hydrated_obsolete_position_sells_full_quantity():
     regime = {bar["date"]: "bull" for bar in bars}
     context = PortfolioContext(
         positions={"SH": HeldPosition(11, 100, 100, date(2024, 1, 1))},
-        pending_orders={}, sleeve_budget=100_000, reserved_notional=0,
+        pending_orders={
+            "sell": PendingOrder("SH", "sell", 5, 100, "sell")
+        }, sleeve_budget=100_000, reserved_notional=0,
     )
     fn = make_tail_risk_hedge_signals_fn(regime, portfolio_context=context)
     signal = fn("SH", bars)
     assert signal["action"] == "sell"
-    assert signal["quantity"] == 11
+    assert signal["quantity"] == 6
 
 
 def test_tail_risk_hedge_hydrates_regime_at_entry_for_shared_asset():

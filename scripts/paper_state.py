@@ -375,7 +375,12 @@ class PaperTradingState:
             )
             if remaining <= 0:
                 continue
-            pending[intent.symbol] = PendingOrder(
+            key = (
+                intent.symbol
+                if intent.symbol not in pending
+                else intent.recommendation_id
+            )
+            pending[key] = PendingOrder(
                 ticker=intent.symbol,
                 action=str(intent.action).lower(),
                 quantity=remaining,

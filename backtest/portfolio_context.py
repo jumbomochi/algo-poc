@@ -37,5 +37,12 @@ class PortfolioContext:
         )
 
     def has_pending(self, ticker: str, action: str) -> bool:
-        pending = self.pending_orders.get(ticker)
-        return pending is not None and pending.action.lower() == action.lower()
+        return self.pending_quantity(ticker, action) > 0
+
+    def pending_quantity(self, ticker: str, action: str) -> float:
+        """Return uncovered active quantity for one symbol and side."""
+        return sum(
+            order.quantity
+            for order in self.pending_orders.values()
+            if order.ticker == ticker and order.action.lower() == action.lower()
+        )

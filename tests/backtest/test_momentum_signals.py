@@ -146,3 +146,38 @@ def test_momentum_pending_buy_suppresses_duplicate_recommendation():
         portfolio_context=_context(pending=pending),
     )
     assert fn("TEST", bars) is None
+
+
+def test_momentum_pending_sell_only_exits_uncovered_filled_quantity():
+    bars = _make_bars("TEST", 200, 100.0, 0.0)
+    bars[-1]["close"] = 107.0
+    context = PortfolioContext(
+        positions={"TEST": HeldPosition(10, 100, 120, date(2024, 1, 1))},
+        pending_orders={
+            "sell-1": PendingOrder("TEST", "sell", 4, 107, "sell-1")
+        },
+        sleeve_budget=100_000,
+        reserved_notional=0,
+    )
+    signal = make_momentum_signals_fn(
+        {"TEST": bars}, top_n=1, lookback_days=126,
+        trailing_stop_pct=0.10, portfolio_context=context,
+    )("TEST", bars)
+    assert signal["quantity"] == 6
+
+
+def test_momentum_partial_buy_fill_suppresses_opposing_exit():
+    bars = _make_bars("TEST", 200, 100.0, 0.0)
+    bars[-1]["close"] = 80.0
+    context = PortfolioContext(
+        positions={"TEST": HeldPosition(4, 100, 100, date(2024, 1, 1))},
+        pending_orders={
+            "buy-1": PendingOrder("TEST", "buy", 6, 90, "buy-1")
+        },
+        sleeve_budget=100_000,
+        reserved_notional=540,
+    )
+    assert make_momentum_signals_fn(
+        {"TEST": bars}, top_n=1, lookback_days=126,
+        portfolio_context=context,
+    )("TEST", bars) is None

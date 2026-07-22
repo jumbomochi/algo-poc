@@ -123,6 +123,14 @@ def test_submission_pending_load_and_publication_lifecycle(session):
     assert ledger.load_pending_orders() == [intent]
 
 
+def test_approved_intent_is_loaded_as_pending_before_submission(session):
+    ledger = OrderLedger(session)
+    intent = ledger.create_intent(make_proposal("rec-approved"))
+    ledger.transition("rec-approved", OrderStatus.APPROVED)
+
+    assert ledger.load_pending_orders() == [intent]
+
+
 def test_repository_flushes_without_committing(session, monkeypatch):
     ledger = OrderLedger(session)
     monkeypatch.setattr(session, "commit", lambda: pytest.fail("unexpected commit"))

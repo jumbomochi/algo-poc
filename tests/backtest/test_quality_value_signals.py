@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-from backtest.portfolio_context import HeldPosition, PortfolioContext
+from backtest.portfolio_context import HeldPosition, PendingOrder, PortfolioContext
 from scripts.run_backtest import make_quality_value_signals_fn
 
 
@@ -124,10 +124,26 @@ def test_quality_value_hydrated_exit_uses_full_quantity():
     bars["AAPL"][-1]["close"] = 85.0
     context = PortfolioContext(
         positions={"AAPL": HeldPosition(4, 100, 110, date(2024, 1, 1))},
-        pending_orders={}, sleeve_budget=20_000, reserved_notional=0,
+        pending_orders={
+            "sell": PendingOrder("AAPL", "sell", 1, 85, "sell")
+        }, sleeve_budget=20_000, reserved_notional=0,
     )
     fn = make_quality_value_signals_fn(
         _make_fundamentals_lookup(), {"AAPL": "Technology"},
+        trailing_stop_pct=0.12, portfolio_context=context,
+    )
+    assert fn("AAPL", bars["AAPL"])["quantity"] == 3
+
+
+def test_quality_value_hydrated_exit_does_not_require_fundamentals():
+    bars = _make_bars(["AAPL"])
+    bars["AAPL"][-1]["close"] = 85.0
+    context = PortfolioContext(
+        positions={"AAPL": HeldPosition(4, 100, 110, date(2024, 1, 1))},
+        pending_orders={}, sleeve_budget=20_000, reserved_notional=0,
+    )
+    fn = make_quality_value_signals_fn(
+        lambda ticker, as_of: None, {"AAPL": "Technology"},
         trailing_stop_pct=0.12, portfolio_context=context,
     )
     assert fn("AAPL", bars["AAPL"])["quantity"] == 4
