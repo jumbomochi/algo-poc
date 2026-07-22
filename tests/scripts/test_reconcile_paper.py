@@ -252,6 +252,33 @@ def test_apply_refuses_target_ambiguous_with_unowned_legacy_row(
 
 
 @pytest.mark.parametrize(
+    ("legacy_portfolio", "legacy_ticker"),
+    [
+        ("other_sleeve", "AAPL"),
+        ("other_sleeve", "AAPL.A"),
+    ],
+)
+def test_apply_refuses_unowned_contract_across_sleeves_and_ticker_aliases(
+    legacy_portfolio, legacy_ticker, monkeypatch, tmp_path, session
+):
+    owned = _owned_position("DUN551088")
+    legacy = _owned_position(None)
+    legacy.portfolio = legacy_portfolio
+    legacy.ticker = legacy_ticker
+    session.add_all([owned, legacy])
+    session.commit()
+    plan_path = write_repair_plan(_plan(), output_dir=tmp_path)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "APPLY PAPER REPAIR")
+
+    with pytest.raises(RepairRefusedError, match="unowned"):
+        apply_repair_plan(session, plan_path=plan_path)
+
+    assert owned.quantity == 10
+    assert legacy.quantity == 10
+
+
+@pytest.mark.parametrize(
     "mutate",
     [
         lambda payload: payload["actions"][0].update(quantity=True),

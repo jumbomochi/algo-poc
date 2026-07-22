@@ -235,7 +235,6 @@ def _apply_action(
         )
     candidates = list(session.scalars(
         select(Position).where(
-            Position.portfolio == action.portfolio,
             Position.con_id == action.con_id,
             Position.status == "open",
         ).with_for_update()
@@ -247,6 +246,8 @@ def _apply_action(
     positions = [
         position for position in candidates
         if position.account_id == plan_account_id
+        and position.portfolio == action.portfolio
+        and position.con_id == action.con_id
     ]
     if len(positions) != 1:
         raise RepairRefusedError(

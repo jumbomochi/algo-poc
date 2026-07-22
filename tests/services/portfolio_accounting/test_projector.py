@@ -167,6 +167,44 @@ def test_fill_does_not_mutate_unowned_legacy_position(projector, session):
     assert positions[0].quantity == 1
 
 
+@pytest.mark.parametrize(
+    ("legacy_portfolio", "legacy_ticker"),
+    [
+        ("other_sleeve", "AAPL"),
+        ("momentum", "AAPL.A"),
+    ],
+)
+def test_fill_rejects_unowned_contract_across_sleeves_and_ticker_aliases(
+    projector, session, legacy_portfolio, legacy_ticker
+):
+    seed_intent(session)
+    session.add(Position(
+        account_id=None,
+        ticker=legacy_ticker,
+        portfolio=legacy_portfolio,
+        con_id=265598,
+        exchange="SMART",
+        currency="USD",
+        quantity=1,
+        avg_entry_price=90,
+        current_price=90,
+        peak_price=90,
+        highest_price_since_entry=90,
+        opened_at=NOW,
+        status="open",
+    ))
+    session.commit()
+
+    with pytest.raises(InvalidFillError, match="account ownership"):
+        projector.apply(make_fill())
+
+    positions = list(session.scalars(select(Position)))
+    assert len(positions) == 1
+    assert positions[0].portfolio == legacy_portfolio
+    assert positions[0].ticker == legacy_ticker
+    assert positions[0].quantity == 1
+
+
 def test_replayed_fill_accepts_equivalent_timestamp_offset(projector, session):
     seed_intent(session)
     fill = make_fill()

@@ -121,28 +121,42 @@ class PaperTradingState:
         if config is None:
             raise ValueError(f"unknown portfolio {portfolio}")
 
-        candidates = list(self._session.scalars(
-            select(Position)
-            .where(
-                Position.portfolio == portfolio,
-                Position.ticker == ticker,
-                Position.status == "open",
-            )
-            .with_for_update()
-        ))
         if strict_quantity:
             if not account_id:
                 raise ValueError("fill lacks position account ownership")
+            if con_id is None:
+                raise ValueError("fill lacks position broker contract identity")
+            candidates = list(self._session.scalars(
+                select(Position)
+                .where(
+                    Position.con_id == con_id,
+                    Position.status == "open",
+                )
+                .with_for_update()
+            ))
             if any(position.account_id is None for position in candidates):
                 raise ValueError("position account ownership is unresolved")
             owned = [
                 position for position in candidates
                 if position.account_id == account_id
+                and position.portfolio == portfolio
+                and position.con_id == con_id
             ]
             if len(owned) > 1:
                 raise ValueError("position account ownership is ambiguous")
             existing = owned[0] if owned else None
+            if existing is not None and existing.ticker != ticker:
+                raise ValueError("position broker ticker identity conflicts")
         else:
+            candidates = list(self._session.scalars(
+                select(Position)
+                .where(
+                    Position.portfolio == portfolio,
+                    Position.ticker == ticker,
+                    Position.status == "open",
+                )
+                .with_for_update()
+            ))
             existing = candidates[0] if candidates else None
 
         if action == "buy":
