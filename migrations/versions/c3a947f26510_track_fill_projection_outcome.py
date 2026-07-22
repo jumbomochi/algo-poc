@@ -1,5 +1,9 @@
 """track fill projection outcome
 
+Upgrade precondition: ``execution_fills`` must be empty.  Rows created before
+this revision do not record whether portfolio accounting committed, so the
+migration cannot safely infer an applied/rejected outcome for them.
+
 Revision ID: c3a947f26510
 Revises: 8b6f2c1d4a90
 Create Date: 2026-07-22
@@ -18,6 +22,16 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    has_legacy_fills = op.get_bind().scalar(
+        sa.text("SELECT EXISTS (SELECT 1 FROM execution_fills LIMIT 1)")
+    )
+    if has_legacy_fills:
+        raise RuntimeError(
+            "execution_fills must be empty before adding projection_applied; "
+            "pre-existing fill outcomes cannot be inferred safely and require "
+            "manual reconciliation"
+        )
+
     op.add_column(
         "execution_fills",
         sa.Column(
