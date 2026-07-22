@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+from backtest.portfolio_context import HeldPosition, PendingOrder, PortfolioContext
 from scripts.run_backtest import make_earnings_drift_signals_fn
 
 
@@ -99,3 +100,20 @@ def test_earnings_drift_exits_after_hold_period():
             break
 
     assert sell_found, "Expected time_exit sell signal"
+
+
+def test_earnings_drift_hydrated_time_exit_uses_entry_date_and_full_quantity():
+    bars = _make_bars("AAPL")
+    context = PortfolioContext(
+        positions={"AAPL": HeldPosition(6, 150, 150, date(2024, 1, 1))},
+        pending_orders={
+            "sell": PendingOrder("AAPL", "sell", 2, 150, "sell")
+        }, sleeve_budget=20_000, reserved_notional=0,
+    )
+    fn = make_earnings_drift_signals_fn(
+        _make_earnings_lookup(), max_hold_days=20, portfolio_context=context,
+    )
+    signal = fn("AAPL", bars[:32])
+    assert signal["action"] == "sell"
+    assert signal["quantity"] == 4
+    assert signal["exit_reason"] == "time_exit"

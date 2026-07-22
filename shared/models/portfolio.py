@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from sqlalchemy import Date, DateTime, Float, Index, Integer, JSON, String
+from sqlalchemy import (
+    BigInteger,
+    Date,
+    DateTime,
+    Float,
+    Index,
+    JSON,
+    String,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from shared.models.base import Base
@@ -13,11 +21,16 @@ class Position(Base):
     __table_args__ = (
         Index("ix_positions_ticker_status", "ticker", "status"),
         Index("ix_positions_portfolio", "portfolio"),
+        Index("ix_positions_account_contract", "account_id", "con_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
     ticker: Mapped[str] = mapped_column(String(10), nullable=False)
     portfolio: Mapped[str] = mapped_column(String(50), nullable=False)
+    con_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    exchange: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
     quantity: Mapped[float] = mapped_column(Float, nullable=False)
     avg_entry_price: Mapped[float] = mapped_column(Float, nullable=False)
     current_price: Mapped[float] = mapped_column(Float, nullable=False)

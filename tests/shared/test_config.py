@@ -1,6 +1,6 @@
 import os
 import pytest
-from shared.config import load_config, AppConfig
+from shared.config import AppConfig, CapitalConfig, CapitalModeConfig, load_config
 
 
 def test_load_config_returns_app_config(tmp_path):
@@ -54,3 +54,31 @@ def test_load_config_nested_env_override(tmp_path, monkeypatch):
 def test_load_config_missing_file():
     with pytest.raises(FileNotFoundError):
         load_config("/nonexistent/path.yaml")
+
+
+def test_app_config_has_safe_mode_specific_capital_defaults():
+    config = AppConfig()
+
+    assert config.capital == CapitalConfig(
+        paper=CapitalModeConfig(
+            deployment_fraction=1.0,
+            max_deployable_usd=None,
+            entries_enabled=False,
+        ),
+        live=CapitalModeConfig(
+            deployment_fraction=0.0,
+            max_deployable_usd=0.0,
+            entries_enabled=False,
+        ),
+    )
+
+
+def test_default_yaml_declares_mode_specific_capital_values():
+    config = load_config("config/default.yaml")
+
+    assert config.capital.paper.deployment_fraction == 1.0
+    assert config.capital.paper.max_deployable_usd is None
+    assert config.capital.paper.entries_enabled is False
+    assert config.capital.live.deployment_fraction == 0.0
+    assert config.capital.live.max_deployable_usd == 0.0
+    assert config.capital.live.entries_enabled is False

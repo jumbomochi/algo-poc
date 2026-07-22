@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 
+from backtest.portfolio_context import HeldPosition, PendingOrder, PortfolioContext
 from scripts.run_backtest import make_sector_rotation_signals_fn
 
 
@@ -78,3 +79,19 @@ def test_sector_rotation_requires_min_bars():
 
     result = signals_fn("XLK", bars["XLK"])
     assert result is None
+
+
+def test_sector_rotation_hydrated_exit_uses_full_quantity():
+    bars = _make_bars(["XLK"], days=100, daily_return=0.0)
+    bars["XLK"][-1]["close"] = 90.0
+    context = PortfolioContext(
+        positions={"XLK": HeldPosition(7, 100, 110, date(2024, 1, 1))},
+        pending_orders={
+            "sell": PendingOrder("XLK", "sell", 2, 90, "sell")
+        }, sleeve_budget=20_000, reserved_notional=0,
+    )
+    fn = make_sector_rotation_signals_fn(
+        bars, lookback_days=63, trailing_stop_pct=0.08,
+        portfolio_context=context,
+    )
+    assert fn("XLK", bars["XLK"])["quantity"] == 5

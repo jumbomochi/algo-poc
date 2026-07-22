@@ -8,6 +8,10 @@ Connects to IB Gateway on paper port (7497), downloads daily OHLCV bars,
 runs technical signal analysis, gates entries through the risk engine,
 and prints performance metrics.
 """
+
+# Direct script execution needs the worktree bootstrap below before local imports.
+# ruff: noqa: E402
+
 from __future__ import annotations
 
 import argparse
@@ -18,7 +22,21 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable
+
+# When invoked as ``python scripts/run_backtest.py``, prefer this worktree over
+# any editable-package path installed from the primary checkout.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from backtest.portfolio_context import PortfolioContext
+from backtest.ranked_selection import (
+    ReplacementPolicy,
+    rank_complete_universe,
+    target_deltas,
+)
 
 import numpy as np
 import pandas as pd
@@ -39,6 +57,28 @@ class PortfolioConfig:
     capital: float
     signals_fn: Callable[[str, list[dict]], dict | None]
     risk_engine: RiskEngine
+
+
+def _context_exit_quantity(
+    portfolio_context: PortfolioContext | None,
+    ticker: str,
+    held_quantity: float,
+) -> float | None:
+    """Return filled quantity not already covered by an active order.
+
+    An active BUY is opposing flow and therefore suppresses a new SELL. Active
+    SELL quantity only covers that portion of the durable filled position.
+    """
+    if portfolio_context is None:
+        return 0.0
+    if portfolio_context.pending_quantity(ticker, "buy") > 0:
+        return None
+    uncovered = max(
+        float(held_quantity)
+        - portfolio_context.pending_quantity(ticker, "sell"),
+        0.0,
+    )
+    return uncovered if uncovered > 0 else None
 from scripts.fetch_fundamentals import load_fundamentals_cache, build_fundamentals_lookup, SECTOR_MAP
 from scripts.fetch_earnings import load_earnings_cache, build_earnings_lookup
 from services.signal_generation.technical import (
@@ -369,6 +409,7 @@ def make_momentum_signals_fn(
     max_lots: int = 2,
     regime_by_date: dict | None = None,
     bear_tickers: set[str] | None = None,
+    portfolio_context: PortfolioContext | None = None,
 ):
     """Create a momentum signal function based on 6-month relative strength.
 
@@ -417,7 +458,11 @@ def make_momentum_signals_fn(
         current_price = current_bar["close"]
         current_date = current_bar["date"]
         bar_count = len(bars)
-        lots = tracked.get(ticker, [])
+        held = portfolio_context.positions.get(ticker) if portfolio_context else None
+        lots = ([{
+            "entry_price": held.avg_entry_price,
+            "peak_price": max(held.peak_price, current_price),
+        }] if held else tracked.get(ticker, []))
 
         # Determine regime-adjusted parameters
         if regime_by_date:
@@ -434,18 +479,25 @@ def make_momentum_signals_fn(
             # Force-exit inverse ETFs when regime turns non-bear
             is_bear_ticker = bear_tickers and ticker in bear_tickers
             if is_bear_ticker and regime != "bear":
-                tracked.pop(ticker, None)
+                exit_quantity = _context_exit_quantity(
+                    portfolio_context, ticker, held.quantity if held else 0
+                )
+                if exit_quantity is None:
+                    return None
+                if portfolio_context is None:
+                    tracked.pop(ticker, None)
                 return {
                     "action": "sell",
                     "ticker": ticker,
                     "limit_price": current_price,
-                    "quantity": 0,
+                    "quantity": exit_quantity,
                     "sector": "Unknown",
                     "exit_reason": "regime_change",
                 }
 
-            for lot in lots:
-                lot["peak_price"] = max(lot["peak_price"], current_price)
+            if portfolio_context is None:
+                for lot in lots:
+                    lot["peak_price"] = max(lot["peak_price"], current_price)
 
             should_sell = False
             exit_reason = "trailing_stop"
@@ -462,25 +514,36 @@ def make_momentum_signals_fn(
                     break
 
             if should_sell:
-                tracked.pop(ticker, None)
+                exit_quantity = _context_exit_quantity(
+                    portfolio_context, ticker, held.quantity if held else 0
+                )
+                if exit_quantity is None:
+                    return None
+                if portfolio_context is None:
+                    tracked.pop(ticker, None)
                 return {
                     "action": "sell",
                     "ticker": ticker,
                     "limit_price": current_price,
-                    "quantity": 0,
+                    "quantity": exit_quantity,
                     "sector": "Unknown",
                     "exit_reason": exit_reason,
                 }
 
         # === Entry logic: buy if in top N and not already tracked ===
         top_tickers = rankings_by_date.get(current_date, [])
-        if not lots and ticker in top_tickers:
+        pending_buy_quantity = (
+            portfolio_context.pending_quantity(ticker, "buy")
+            if portfolio_context else 0.0
+        )
+        if not lots and pending_buy_quantity <= 0 and ticker in top_tickers:
             quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
-            tracked[ticker] = [{
-                "entry_price": current_price,
-                "entry_idx": bar_count,
-                "peak_price": current_price,
-            }]
+            if portfolio_context is None:
+                tracked[ticker] = [{
+                    "entry_price": current_price,
+                    "entry_idx": bar_count,
+                    "peak_price": current_price,
+                }]
             return {
                 "action": "buy",
                 "ticker": ticker,
@@ -547,6 +610,7 @@ def make_sector_rotation_signals_fn(
     initial_capital: float = 100_000,
     trailing_stop_pct: float = 0.08,
     regime_by_date: dict | None = None,
+    portfolio_context: PortfolioContext | None = None,
 ):
     """Create a sector rotation signal function.
 
@@ -602,36 +666,52 @@ def make_sector_rotation_signals_fn(
         current_price = bars[-1]["close"]
         current_date = bars[-1]["date"]
         bar_count = len(bars)
-        lots = tracked.get(ticker, [])
+        held = portfolio_context.positions.get(ticker) if portfolio_context else None
+        lots = ([{
+            "entry_price": held.avg_entry_price,
+            "peak_price": max(held.peak_price, current_price),
+        }] if held else tracked.get(ticker, []))
 
         # Exit: trailing stop
         if lots:
-            for lot in lots:
-                lot["peak_price"] = max(lot["peak_price"], current_price)
+            if portfolio_context is None:
+                for lot in lots:
+                    lot["peak_price"] = max(lot["peak_price"], current_price)
 
             for lot in lots:
                 peak = lot["peak_price"]
                 entry = lot["entry_price"]
                 if peak > entry and (peak - current_price) / peak >= trailing_stop_pct:
-                    tracked.pop(ticker, None)
+                    exit_quantity = _context_exit_quantity(
+                        portfolio_context, ticker, held.quantity if held else 0
+                    )
+                    if exit_quantity is None:
+                        return None
+                    if portfolio_context is None:
+                        tracked.pop(ticker, None)
                     return {
                         "action": "sell",
                         "ticker": ticker,
                         "limit_price": current_price,
-                        "quantity": 0,
+                        "quantity": exit_quantity,
                         "sector": "Unknown",
                         "exit_reason": "trailing_stop",
                     }
 
         # Entry: buy if in top N and not already tracked
         top_tickers = rankings_by_date.get(current_date, [])
-        if not lots and ticker in top_tickers:
+        pending_buy_quantity = (
+            portfolio_context.pending_quantity(ticker, "buy")
+            if portfolio_context else 0.0
+        )
+        if not lots and pending_buy_quantity <= 0 and ticker in top_tickers:
             quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
-            tracked[ticker] = [{
-                "entry_price": current_price,
-                "entry_idx": bar_count,
-                "peak_price": current_price,
-            }]
+            if portfolio_context is None:
+                tracked[ticker] = [{
+                    "entry_price": current_price,
+                    "entry_idx": bar_count,
+                    "peak_price": current_price,
+                }]
             return {
                 "action": "buy",
                 "ticker": ticker,
@@ -756,6 +836,7 @@ def make_short_term_mr_signals_fn(
 
 def make_thematic_momentum_signals_fn(
     bars_by_ticker: dict[str, list[dict]],
+    eligible_tickers: list[str] | None = None,
     top_n: int = 8,
     lookback_days: int = 63,
     ma_period: int = 50,
@@ -764,6 +845,9 @@ def make_thematic_momentum_signals_fn(
     trailing_stop_pct: float = 0.10,
     max_loss_pct: float = 0.08,
     regime_by_date: dict | None = None,
+    portfolio_context: PortfolioContext | None = None,
+    replacement_policy: ReplacementPolicy = ReplacementPolicy.TECHNICAL_ONLY,
+    replacement_score_margin: float = 0.25,
 ):
     """Create a thematic momentum signal function.
 
@@ -772,7 +856,10 @@ def make_thematic_momentum_signals_fn(
     """
     # Pre-compute date -> {ticker: close_price}
     price_by_date: dict[Any, dict[str, float]] = {}
+    eligible = set(eligible_tickers or bars_by_ticker)
     for ticker, bars in bars_by_ticker.items():
+        if ticker not in eligible:
+            continue
         for bar in bars:
             d = bar["date"]
             if d not in price_by_date:
@@ -782,6 +869,7 @@ def make_thematic_momentum_signals_fn(
     sorted_dates = sorted(price_by_date.keys())
 
     # Pre-compute date -> top N tickers by return
+    scores_by_date: dict[Any, dict[str, float]] = {}
     rankings_by_date: dict[Any, list[str]] = {}
     for i, d in enumerate(sorted_dates):
         if i < lookback_days:
@@ -790,18 +878,20 @@ def make_thematic_momentum_signals_fn(
         past_prices = price_by_date.get(past_date, {})
         current_prices = price_by_date[d]
 
-        returns = []
+        returns: dict[str, float] = {}
         for ticker in current_prices:
             if ticker in past_prices and past_prices[ticker] > 0:
                 ret = (current_prices[ticker] - past_prices[ticker]) / past_prices[ticker]
-                returns.append((ticker, ret))
+                returns[ticker] = ret
 
-        returns.sort(key=lambda x: x[1], reverse=True)
-        rankings_by_date[d] = [t for t, _ in returns[:top_n]]
+        scores_by_date[d] = returns
+        rankings_by_date[d] = rank_complete_universe(returns, top_n)
 
     tracked: dict[str, list[dict]] = {}
 
     def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
+        if ticker not in eligible:
+            return None
         min_bars = max(lookback_days + 1, ma_period + 1)
         if len(bars) < min_bars:
             return None
@@ -809,7 +899,11 @@ def make_thematic_momentum_signals_fn(
         current_price = bars[-1]["close"]
         current_date = bars[-1]["date"]
         bar_count = len(bars)
-        lots = tracked.get(ticker, [])
+        held = portfolio_context.positions.get(ticker) if portfolio_context else None
+        lots = ([{
+            "entry_price": held.avg_entry_price,
+            "peak_price": max(held.peak_price, current_price),
+        }] if held else tracked.get(ticker, []))
 
         # Determine regime-adjusted trailing stop and max loss
         effective_trailing = trailing_stop_pct
@@ -827,8 +921,9 @@ def make_thematic_momentum_signals_fn(
 
         # Exit logic
         if lots:
-            for lot in lots:
-                lot["peak_price"] = max(lot["peak_price"], current_price)
+            if portfolio_context is None:
+                for lot in lots:
+                    lot["peak_price"] = max(lot["peak_price"], current_price)
 
             should_sell = False
             exit_reason = "unknown"
@@ -852,25 +947,77 @@ def make_thematic_momentum_signals_fn(
                         break
 
             if should_sell:
-                tracked.pop(ticker, None)
+                exit_quantity = _context_exit_quantity(
+                    portfolio_context, ticker, held.quantity if held else 0
+                )
+                if exit_quantity is None:
+                    return None
+                if portfolio_context is None:
+                    tracked.pop(ticker, None)
                 return {
                     "action": "sell",
                     "ticker": ticker,
                     "limit_price": current_price,
-                    "quantity": 0,
+                    "quantity": exit_quantity,
                     "sector": "Unknown",
                     "exit_reason": exit_reason,
                 }
 
         # Entry: in top N AND above 50-day MA
         top_tickers = rankings_by_date.get(current_date, [])
-        if not lots and ticker in top_tickers and above_ma:
+        scores = scores_by_date.get(current_date, {})
+        held_tickers = (
+            set(portfolio_context.positions)
+            if portfolio_context is not None
+            else set(tracked)
+        )
+        if lots and held_tickers | set(top_tickers) <= set(scores):
+            replacements = target_deltas(
+                held=held_tickers,
+                selected=set(top_tickers),
+                scores=scores,
+                policy=replacement_policy,
+                score_margin=replacement_score_margin,
+            )
+            replacement = next(
+                (item for item in replacements if item.outgoing == ticker), None
+            )
+            if replacement is not None:
+                exit_quantity = _context_exit_quantity(
+                    portfolio_context, ticker, held.quantity if held else 0
+                )
+                if exit_quantity is None:
+                    return None
+                if portfolio_context is None:
+                    tracked.pop(ticker, None)
+                return {
+                    "action": "sell",
+                    "ticker": ticker,
+                    "limit_price": current_price,
+                    "quantity": exit_quantity,
+                    "sector": "Unknown",
+                    "exit_reason": "rank_replacement",
+                    "replacement_ticker": replacement.incoming,
+                    "score_improvement": replacement.score_improvement,
+                }
+
+        pending_buy_quantity = (
+            portfolio_context.pending_quantity(ticker, "buy")
+            if portfolio_context else 0.0
+        )
+        if (
+            not lots
+            and pending_buy_quantity <= 0
+            and ticker in top_tickers
+            and above_ma
+        ):
             quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
-            tracked[ticker] = [{
-                "entry_price": current_price,
-                "entry_idx": bar_count,
-                "peak_price": current_price,
-            }]
+            if portfolio_context is None:
+                tracked[ticker] = [{
+                    "entry_price": current_price,
+                    "entry_idx": bar_count,
+                    "peak_price": current_price,
+                }]
             return {
                 "action": "buy",
                 "ticker": ticker,
@@ -893,11 +1040,17 @@ def make_thematic_momentum_signals_fn(
 def make_quality_value_signals_fn(
     fundamentals_lookup: Callable[[str, date], dict | None],
     sector_map: dict[str, str],
+    *,
+    bars_by_ticker: dict[str, list[dict]],
+    eligible_tickers: list[str] | None = None,
     top_n: int = 15,
     position_size_pct: float = 0.10,
     initial_capital: float = 100_000,
     trailing_stop_pct: float = 0.12,
     regime_by_date: dict | None = None,
+    portfolio_context: PortfolioContext | None = None,
+    replacement_policy: ReplacementPolicy = ReplacementPolicy.TECHNICAL_ONLY,
+    replacement_score_margin: float = 0.25,
 ):
     """Create a quality value signal function.
 
@@ -906,7 +1059,6 @@ def make_quality_value_signals_fn(
     Exit: trailing stop.
     """
     tracked: dict[str, list[dict]] = {}
-    scores_cache: dict[str, float] = {}
 
     def _compute_quality_score(fundamentals: dict) -> float:
         """Compute composite quality-value score. Higher = better."""
@@ -920,6 +1072,29 @@ def make_quality_value_signals_fn(
 
         return (roe_score + de_score + margin_score) / 3.0
 
+    eligible = set(eligible_tickers or bars_by_ticker)
+    tickers_by_date: dict[date, set[str]] = {}
+    for candidate, candidate_bars in bars_by_ticker.items():
+        if candidate not in eligible:
+            continue
+        for bar in candidate_bars:
+            tickers_by_date.setdefault(bar["date"], set()).add(candidate)
+
+    scores_by_date: dict[date, dict[str, float]] = {}
+    rankings_by_date: dict[date, list[str]] = {}
+    for as_of, available_tickers in tickers_by_date.items():
+        complete_scores: dict[str, float] = {}
+        for candidate in available_tickers:
+            candidate_fundamentals = fundamentals_lookup(candidate, as_of)
+            if candidate_fundamentals is not None:
+                complete_scores[candidate] = _compute_quality_score(
+                    candidate_fundamentals
+                )
+        scores_by_date[as_of] = complete_scores
+        rankings_by_date[as_of] = rank_complete_universe(
+            complete_scores, top_n
+        )
+
     def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
         if len(bars) < 5:
             return None
@@ -927,11 +1102,17 @@ def make_quality_value_signals_fn(
         current_price = bars[-1]["close"]
         current_date = bars[-1]["date"]
         bar_count = len(bars)
-        lots = tracked.get(ticker, [])
+        held = portfolio_context.positions.get(ticker) if portfolio_context else None
+        lots = ([{
+            "entry_price": held.avg_entry_price,
+            "peak_price": max(held.peak_price, current_price),
+        }] if held else tracked.get(ticker, []))
 
-        fundamentals = fundamentals_lookup(ticker, current_date)
-        if fundamentals is None:
-            return None
+        fundamentals = None
+        if portfolio_context is None:
+            fundamentals = fundamentals_lookup(ticker, current_date)
+            if fundamentals is None:
+                return None
 
         # Determine regime-adjusted trailing stop
         effective_trailing = trailing_stop_pct
@@ -942,40 +1123,88 @@ def make_quality_value_signals_fn(
 
         # Exit logic: trailing stop
         if lots:
-            for lot in lots:
-                lot["peak_price"] = max(lot["peak_price"], current_price)
+            if portfolio_context is None:
+                for lot in lots:
+                    lot["peak_price"] = max(lot["peak_price"], current_price)
 
             for lot in lots:
                 peak = lot["peak_price"]
                 entry = lot["entry_price"]
                 if peak > entry and (peak - current_price) / peak >= effective_trailing:
-                    tracked.pop(ticker, None)
+                    exit_quantity = _context_exit_quantity(
+                        portfolio_context, ticker, held.quantity if held else 0
+                    )
+                    if exit_quantity is None:
+                        return None
+                    if portfolio_context is None:
+                        tracked.pop(ticker, None)
                     return {
                         "action": "sell",
                         "ticker": ticker,
                         "limit_price": current_price,
-                        "quantity": 0,
+                        "quantity": exit_quantity,
                         "sector": sector_map.get(ticker, "Unknown"),
                         "exit_reason": "trailing_stop",
                     }
 
-        # Compute quality score and update cache
-        score = _compute_quality_score(fundamentals)
-        scores_cache[ticker] = score
-
-        if len(scores_cache) < 3:
+        if fundamentals is None:
+            fundamentals = fundamentals_lookup(ticker, current_date)
+        if fundamentals is None:
             return None
 
-        ranked = sorted(scores_cache.items(), key=lambda x: x[1], reverse=True)
-        top_tickers = [t for t, _ in ranked[:top_n]]
+        scores = scores_by_date.get(current_date, {})
+        if ticker not in scores:
+            return None
+        score = scores[ticker]
+        top_tickers = rankings_by_date.get(current_date, [])
 
-        if not lots and ticker in top_tickers:
+        held_tickers = (
+            set(portfolio_context.positions)
+            if portfolio_context is not None
+            else set(tracked)
+        )
+        if lots and held_tickers | set(top_tickers) <= set(scores):
+            replacements = target_deltas(
+                held=held_tickers,
+                selected=set(top_tickers),
+                scores=scores,
+                policy=replacement_policy,
+                score_margin=replacement_score_margin,
+            )
+            replacement = next(
+                (item for item in replacements if item.outgoing == ticker), None
+            )
+            if replacement is not None:
+                exit_quantity = _context_exit_quantity(
+                    portfolio_context, ticker, held.quantity if held else 0
+                )
+                if exit_quantity is None:
+                    return None
+                if portfolio_context is None:
+                    tracked.pop(ticker, None)
+                return {
+                    "action": "sell",
+                    "ticker": ticker,
+                    "limit_price": current_price,
+                    "quantity": exit_quantity,
+                    "sector": sector_map.get(ticker, "Unknown"),
+                    "exit_reason": "rank_replacement",
+                    "replacement_ticker": replacement.incoming,
+                    "score_improvement": replacement.score_improvement,
+                }
+
+        pending_buy_quantity = (
+            portfolio_context.pending_quantity(ticker, "buy")
+            if portfolio_context else 0.0
+        )
+        if not lots and pending_buy_quantity <= 0 and ticker in top_tickers:
             quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
-            tracked[ticker] = [{
-                "entry_price": current_price,
-                "entry_idx": bar_count,
-                "peak_price": current_price,
-            }]
+            if portfolio_context is None:
+                tracked[ticker] = [{
+                    "entry_price": current_price,
+                    "entry_idx": bar_count,
+                    "peak_price": current_price,
+                }]
             return {
                 "action": "buy",
                 "ticker": ticker,
@@ -1002,6 +1231,7 @@ def make_earnings_drift_signals_fn(
     initial_capital: float = 100_000,
     trailing_stop_pct: float = 0.06,
     regime_by_date: dict | None = None,
+    portfolio_context: PortfolioContext | None = None,
 ):
     """Create an earnings drift (PEAD) signal function.
 
@@ -1017,7 +1247,12 @@ def make_earnings_drift_signals_fn(
         current_price = bars[-1]["close"]
         current_date = bars[-1]["date"]
         bar_count = len(bars)
-        lot = tracked.get(ticker)
+        held = portfolio_context.positions.get(ticker) if portfolio_context else None
+        lot = ({
+            "entry_price": held.avg_entry_price,
+            "peak_price": max(held.peak_price, current_price),
+            "entry_date": held.entry_date,
+        } if held else tracked.get(ticker))
 
         # Determine regime-adjusted trailing stop
         effective_trailing = trailing_stop_pct
@@ -1028,17 +1263,28 @@ def make_earnings_drift_signals_fn(
 
         # Exit logic
         if lot is not None:
-            lot["peak_price"] = max(lot["peak_price"], current_price)
-            bars_held = bar_count - lot["entry_idx"]
+            if portfolio_context is None:
+                lot["peak_price"] = max(lot["peak_price"], current_price)
+                bars_held = bar_count - lot["entry_idx"]
+            else:
+                bars_held = sum(
+                    1 for bar in bars if bar["date"] > lot["entry_date"]
+                )
 
             # Time exit
             if bars_held >= max_hold_days:
-                tracked.pop(ticker, None)
+                exit_quantity = _context_exit_quantity(
+                    portfolio_context, ticker, held.quantity if held else 0
+                )
+                if exit_quantity is None:
+                    return None
+                if portfolio_context is None:
+                    tracked.pop(ticker, None)
                 return {
                     "action": "sell",
                     "ticker": ticker,
                     "limit_price": current_price,
-                    "quantity": 0,
+                    "quantity": exit_quantity,
                     "sector": "Unknown",
                     "exit_reason": "time_exit",
                 }
@@ -1047,12 +1293,18 @@ def make_earnings_drift_signals_fn(
             peak = lot["peak_price"]
             entry = lot["entry_price"]
             if peak > entry and (peak - current_price) / peak >= effective_trailing:
-                tracked.pop(ticker, None)
+                exit_quantity = _context_exit_quantity(
+                    portfolio_context, ticker, held.quantity if held else 0
+                )
+                if exit_quantity is None:
+                    return None
+                if portfolio_context is None:
+                    tracked.pop(ticker, None)
                 return {
                     "action": "sell",
                     "ticker": ticker,
                     "limit_price": current_price,
-                    "quantity": 0,
+                    "quantity": exit_quantity,
                     "sector": "Unknown",
                     "exit_reason": "trailing_stop",
                 }
@@ -1060,6 +1312,12 @@ def make_earnings_drift_signals_fn(
             return None
 
         # Entry logic: check for recent earnings event
+        if (
+            portfolio_context
+            and portfolio_context.pending_quantity(ticker, "buy") > 0
+        ):
+            return None
+
         event = earnings_lookup(ticker, current_date)
         if event is None:
             return None
@@ -1069,11 +1327,12 @@ def make_earnings_drift_signals_fn(
             return None
 
         quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
-        tracked[ticker] = {
-            "entry_price": current_price,
-            "entry_idx": bar_count,
-            "peak_price": current_price,
-        }
+        if portfolio_context is None:
+            tracked[ticker] = {
+                "entry_price": current_price,
+                "entry_idx": bar_count,
+                "peak_price": current_price,
+            }
         return {
             "action": "buy",
             "ticker": ticker,
@@ -1095,6 +1354,7 @@ def make_tail_risk_hedge_signals_fn(
     regime_by_date: dict,
     position_size_pct: float = 0.25,
     initial_capital: float = 100_000,
+    portfolio_context: PortfolioContext | None = None,
 ):
     """Create a tail-risk hedge signal function.
 
@@ -1120,10 +1380,36 @@ def make_tail_risk_hedge_signals_fn(
         current_date = bars[-1]["date"]
         regime = regime_by_date.get(current_date, "bull")
 
-        lot = tracked.get(ticker)
+        held = portfolio_context.positions.get(ticker) if portfolio_context else None
+        lot = tracked.get(ticker) if portfolio_context is None else held
+
+        allocation = ALLOCATIONS.get(regime, {})
+
+        hydrated_regime_changed = bool(
+            held is not None
+            and regime_by_date.get(held.entry_date, regime) != regime
+        )
+        if (
+            portfolio_context is not None
+            and held is not None
+            and (ticker not in allocation or hydrated_regime_changed)
+        ):
+            exit_quantity = _context_exit_quantity(
+                portfolio_context, ticker, held.quantity
+            )
+            if exit_quantity is None:
+                return None
+            return {
+                "action": "sell",
+                "ticker": ticker,
+                "limit_price": current_price,
+                "quantity": exit_quantity,
+                "sector": "Unknown",
+                "exit_reason": "regime_change",
+            }
 
         # Detect regime change and sell existing positions
-        if lot is not None and lot["regime_at_entry"] != regime:
+        if portfolio_context is None and lot is not None and lot["regime_at_entry"] != regime:
             tracked.pop(ticker, None)
             return {
                 "action": "sell",
@@ -1135,14 +1421,18 @@ def make_tail_risk_hedge_signals_fn(
             }
 
         # Entry: buy if ticker is in current regime allocation and not already held
-        allocation = ALLOCATIONS.get(regime, {})
-        if lot is None and ticker in allocation:
+        pending_buy_quantity = (
+            portfolio_context.pending_quantity(ticker, "buy")
+            if portfolio_context else 0.0
+        )
+        if lot is None and pending_buy_quantity <= 0 and ticker in allocation:
             weight = allocation[ticker]
             quantity = round(max(0.0001, initial_capital * position_size_pct * weight / current_price), 4)
-            tracked[ticker] = {
-                "entry_price": current_price,
-                "regime_at_entry": regime,
-            }
+            if portfolio_context is None:
+                tracked[ticker] = {
+                    "entry_price": current_price,
+                    "regime_at_entry": regime,
+                }
             return {
                 "action": "buy",
                 "ticker": ticker,
@@ -1636,7 +1926,23 @@ def main():
                         help="Path to a prior backtest results JSON. Skips the IB fetch "
                              "and loads the cached bars from that file. Useful when IB "
                              "Gateway is unavailable or for fast iteration.")
+    parser.add_argument(
+        "--replacement-policy",
+        choices=[policy.value for policy in ReplacementPolicy],
+        default=ReplacementPolicy.TECHNICAL_ONLY.value,
+        help="Offline ranked-candidate replacement policy (default: technical_only)",
+    )
+    parser.add_argument(
+        "--replacement-score-margin",
+        type=float,
+        default=0.25,
+        help="Minimum incoming score improvement for score_margin (default: 0.25)",
+    )
     args = parser.parse_args()
+
+    replacement_policy = ReplacementPolicy(args.replacement_policy)
+    if args.replacement_score_margin < 0:
+        parser.error("--replacement-score-margin must be non-negative")
 
     trade_start_date = None
     if args.start_date:
@@ -1747,21 +2053,28 @@ def main():
     )
     thematic_signals_fn = make_thematic_momentum_signals_fn(
         bars_by_ticker=bars_by_ticker,
+        eligible_tickers=UNIVERSE_REGISTRY["thematic_momentum"],
         top_n=8,
         lookback_days=63,
-        position_size_pct=0.15,
+        position_size_pct=0.135,
         initial_capital=args.capital * 0.1410,
         trailing_stop_pct=0.10,
         regime_by_date=regime_by_date,
+        replacement_policy=replacement_policy,
+        replacement_score_margin=args.replacement_score_margin,
     )
     qv_signals_fn = make_quality_value_signals_fn(
         fundamentals_lookup=fundamentals_lookup,
         sector_map=SECTOR_MAP,
+        bars_by_ticker=bars_by_ticker,
+        eligible_tickers=UNIVERSE_REGISTRY["quality_value"],
         top_n=15,
-        position_size_pct=0.10,
+        position_size_pct=0.06,
         initial_capital=args.capital * 0.1538,
         trailing_stop_pct=0.12,
         regime_by_date=regime_by_date,
+        replacement_policy=replacement_policy,
+        replacement_score_margin=args.replacement_score_margin,
     )
     ed_signals_fn = make_earnings_drift_signals_fn(
         earnings_lookup=earnings_lookup,
@@ -1954,6 +2267,8 @@ def main():
         "initial_capital": args.capital,
         "slippage_bps": args.slippage_bps,
         "commission_per_share": args.commission,
+        "replacement_policy": replacement_policy.value,
+        "replacement_score_margin": args.replacement_score_margin,
         "portfolios": {name: pc.capital for name, pc in portfolios.items()},
     }
     if len(portfolios) == 1:

@@ -10,6 +10,8 @@ class SimplePortfolioState:
 
     Mirrors the interface of services.risk_management.engine.PortfolioState
     but kept internal to avoid coupling the backtest package to service internals.
+    Exposure fields remain percentages of NAV; pending order reservations are
+    supplied separately to ``RiskEngine.check_entry``.
     """
 
     nav: float

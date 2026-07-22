@@ -1,5 +1,15 @@
 mode: paper  # live | backtest | paper
 
+capital:
+  paper:
+    deployment_fraction: 1.0
+    max_deployable_usd: null
+    entries_enabled: false
+  live:
+    deployment_fraction: 0.0
+    max_deployable_usd: 0.0
+    entries_enabled: false
+
 universe:
   # sleeves = union universe of the active sleeves (ingest exactly what the
   # strategies trade); sp500 = SP500_TOP100; custom = only custom_tickers.

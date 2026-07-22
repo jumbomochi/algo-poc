@@ -106,6 +106,29 @@ class ObservabilityConfig(BaseModel):
     tracing_enabled: bool = False
 
 
+class CapitalModeConfig(BaseModel):
+    deployment_fraction: float = Field(ge=0.0, le=1.0)
+    max_deployable_usd: float | None = Field(default=None, ge=0.0)
+    entries_enabled: bool = False
+
+
+class CapitalConfig(BaseModel):
+    paper: CapitalModeConfig = Field(
+        default_factory=lambda: CapitalModeConfig(
+            deployment_fraction=1.0,
+            max_deployable_usd=None,
+            entries_enabled=False,
+        )
+    )
+    live: CapitalModeConfig = Field(
+        default_factory=lambda: CapitalModeConfig(
+            deployment_fraction=0.0,
+            max_deployable_usd=0.0,
+            entries_enabled=False,
+        )
+    )
+
+
 class AppConfig(BaseModel):
     # Literal so a typo'd ALGO_MODE (e.g. "liv") fails at startup instead of
     # silently falling through to the paper port in live deployments.
@@ -121,6 +144,7 @@ class AppConfig(BaseModel):
     redis: RedisConfig = Field(default_factory=RedisConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+    capital: CapitalConfig = Field(default_factory=CapitalConfig)
 
 
 ENV_PREFIX = "ALGO_"

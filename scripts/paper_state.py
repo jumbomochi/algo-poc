@@ -12,6 +12,7 @@ from typing import Any
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
+from backtest.portfolio_context import HeldPosition, PendingOrder, PortfolioContext
 from shared.models.portfolio import Position, Trade
 from shared.models.equity_snapshot import EquitySnapshot
 from shared.models.portfolio_config import PortfolioConfig
@@ -86,32 +87,88 @@ class PaperTradingState:
         )
         self._session.flush()
 
-    def record_fill(
+    def _apply_fill_accounting(
         self,
+        account_id: str | None,
         portfolio: str,
         ticker: str,
         action: str,
         quantity: float,
         price: float,
-        fill_date: date,
+        fill_datetime: datetime,
+        commission: float = 0.0,
+        recommendation_id: str | None = None,
+        con_id: int | None = None,
+        exchange: str | None = None,
+        currency: str | None = None,
+        strict_quantity: bool = False,
         entry_signals: dict | None = None,
         bar_features: dict | None = None,
         exit_reason: str | None = None,
         sector: str | None = None,
     ) -> None:
-        """Record a fill (buy or sell) for a portfolio."""
-        now = datetime.now(timezone.utc)
+        """Apply already-validated fill economics without committing.
 
-        if action == "buy":
-            existing = self._session.execute(
-                select(Position).where(
+        The fill projector is the production caller.  Locking here keeps cash
+        and position changes in the projectors' encompassing transaction.
+        """
+        now = datetime.now(timezone.utc)
+        config = self._session.scalar(
+            select(PortfolioConfig)
+            .where(PortfolioConfig.portfolio == portfolio)
+            .with_for_update()
+        )
+        if config is None:
+            raise ValueError(f"unknown portfolio {portfolio}")
+
+        if strict_quantity:
+            if not account_id:
+                raise ValueError("fill lacks position account ownership")
+            if con_id is None:
+                raise ValueError("fill lacks position broker contract identity")
+            candidates = list(self._session.scalars(
+                select(Position)
+                .where(
+                    Position.con_id == con_id,
+                    Position.status == "open",
+                )
+                .with_for_update()
+            ))
+            if any(position.account_id is None for position in candidates):
+                raise ValueError("position account ownership is unresolved")
+            owned = [
+                position for position in candidates
+                if position.account_id == account_id
+                and position.portfolio == portfolio
+                and position.con_id == con_id
+            ]
+            if len(owned) > 1:
+                raise ValueError("position account ownership is ambiguous")
+            existing = owned[0] if owned else None
+            if existing is not None and existing.ticker != ticker:
+                raise ValueError("position broker ticker identity conflicts")
+        else:
+            candidates = list(self._session.scalars(
+                select(Position)
+                .where(
                     Position.portfolio == portfolio,
                     Position.ticker == ticker,
                     Position.status == "open",
                 )
-            ).scalar_one_or_none()
+                .with_for_update()
+            ))
+            existing = candidates[0] if candidates else None
+
+        if action == "buy":
+            cash_delta = -(price * quantity + commission)
+            if strict_quantity and config.cash + cash_delta < -1e-9:
+                raise ValueError("fill would make sleeve cash negative")
 
             if existing:
+                identity = (existing.con_id, existing.exchange, existing.currency)
+                incoming = (con_id, exchange, currency)
+                if strict_quantity and identity != incoming:
+                    raise ValueError("position broker contract identity conflicts")
                 old_qty = existing.quantity
                 old_price = existing.avg_entry_price
                 new_qty = old_qty + quantity
@@ -124,6 +181,7 @@ class PaperTradingState:
                     existing.entry_signals = entry_signals
             else:
                 pos = Position(
+                    account_id=account_id,
                     ticker=ticker,
                     portfolio=portfolio,
                     quantity=quantity,
@@ -133,21 +191,26 @@ class PaperTradingState:
                     highest_price_since_entry=price,
                     sector=sector,
                     entry_signals=entry_signals,
-                    opened_at=datetime(fill_date.year, fill_date.month, fill_date.day, tzinfo=timezone.utc),
+                    opened_at=fill_datetime,
                     status="open",
+                    con_id=con_id,
+                    exchange=exchange,
+                    currency=currency,
                 )
                 self._session.add(pos)
 
-            self._update_cash(portfolio, -(price * quantity))
+            config.cash += cash_delta
+            config.updated_at = now
 
         elif action == "sell":
-            pos = self._session.execute(
-                select(Position).where(
-                    Position.portfolio == portfolio,
-                    Position.ticker == ticker,
-                    Position.status == "open",
-                )
-            ).scalar_one_or_none()
+            pos = existing
+            if strict_quantity and (pos is None or quantity > pos.quantity + 1e-9):
+                raise ValueError("sell fill exceeds open position quantity")
+            if strict_quantity and pos is not None:
+                identity = (pos.con_id, pos.exchange, pos.currency)
+                incoming = (con_id, exchange, currency)
+                if identity != incoming:
+                    raise ValueError("position broker contract identity conflicts")
 
             if pos:
                 # Sell signals emit quantity=0 meaning "close the full position"
@@ -164,13 +227,14 @@ class PaperTradingState:
                     price=price,
                     entry_price=pos.avg_entry_price,
                     entry_date=pos.opened_at.date(),
+                    recommendation_id=recommendation_id,
                     exit_reason=exit_reason,
                     pnl=pnl,
                     entry_signals=pos.entry_signals,
                     bar_features=bar_features,
-                    commission=0.0,
+                    commission=commission,
                     slippage=0.0,
-                    executed_at=datetime(fill_date.year, fill_date.month, fill_date.day, tzinfo=timezone.utc),
+                    executed_at=fill_datetime,
                 )
                 self._session.add(trade)
                 if sell_qty >= pos.quantity:
@@ -178,20 +242,63 @@ class PaperTradingState:
                 else:
                     pos.quantity -= sell_qty
                     pos.current_price = price
-                self._update_cash(portfolio, price * sell_qty)
+                config.cash += price * sell_qty - commission
+                config.updated_at = now
+
+        else:
+            raise ValueError(f"unsupported fill action {action}")
 
         self._session.flush()
 
+    def record_fill(
+        self,
+        portfolio: str,
+        ticker: str,
+        action: str,
+        quantity: float,
+        price: float,
+        fill_date: date,
+        entry_signals: dict | None = None,
+        bar_features: dict | None = None,
+        exit_reason: str | None = None,
+        sector: str | None = None,
+    ) -> None:
+        """Compatibility helper for historical backtest/training fixtures.
+
+        Live paper execution must flow through ``FillProjector``; this wrapper
+        deliberately has no broker identity or idempotency semantics.
+        """
+        self._apply_fill_accounting(
+            account_id=None,
+            portfolio=portfolio,
+            ticker=ticker,
+            action=action,
+            quantity=quantity,
+            price=price,
+            fill_datetime=datetime(
+                fill_date.year, fill_date.month, fill_date.day, tzinfo=timezone.utc
+            ),
+            entry_signals=entry_signals,
+            bar_features=bar_features,
+            exit_reason=exit_reason,
+            sector=sector,
+        )
+
     def update_peak_prices(
-        self, portfolio: str, current_prices: dict[str, float]
+        self,
+        portfolio: str,
+        current_prices: dict[str, float],
+        *,
+        account_id: str | None = None,
     ) -> None:
         """Update peak prices for all held positions in a portfolio."""
-        positions = self._session.execute(
-            select(Position).where(
+        stmt = select(Position).where(
                 Position.portfolio == portfolio,
                 Position.status == "open",
             )
-        ).scalars().all()
+        if account_id is not None:
+            stmt = stmt.where(Position.account_id == account_id)
+        positions = self._session.scalars(stmt).all()
 
         for pos in positions:
             if pos.ticker in current_prices:
@@ -203,16 +310,21 @@ class PaperTradingState:
         self._session.flush()
 
     def compute_equity(
-        self, portfolio: str, current_prices: dict[str, float]
+        self,
+        portfolio: str,
+        current_prices: dict[str, float],
+        *,
+        account_id: str | None = None,
     ) -> float:
         """Compute current equity (cash + market value of positions)."""
         cash = self.get_cash(portfolio)
-        positions = self._session.execute(
-            select(Position).where(
+        stmt = select(Position).where(
                 Position.portfolio == portfolio,
                 Position.status == "open",
             )
-        ).scalars().all()
+        if account_id is not None:
+            stmt = stmt.where(Position.account_id == account_id)
+        positions = self._session.scalars(stmt).all()
 
         market_value = sum(
             pos.quantity * current_prices.get(pos.ticker, pos.avg_entry_price)
@@ -255,26 +367,88 @@ class PaperTradingState:
 
         self._session.flush()
 
-    def get_positions(self, portfolio: str) -> dict[str, dict]:
+    def get_positions(
+        self, portfolio: str, *, account_id: str | None = None
+    ) -> dict[str, dict]:
         """Return open positions for a portfolio as {ticker: {...}}."""
-        rows = self._session.execute(
-            select(Position).where(
+        stmt = select(Position).where(
                 Position.portfolio == portfolio,
                 Position.status == "open",
             )
-        ).scalars().all()
+        if account_id is not None:
+            stmt = stmt.where(Position.account_id == account_id)
+        rows = self._session.scalars(stmt).all()
 
         return {
             pos.ticker: {
                 "quantity": pos.quantity,
                 "avg_entry_price": pos.avg_entry_price,
                 "entry_price": pos.avg_entry_price,
-                "peak_price": pos.peak_price,
+                "peak_price": max(pos.peak_price, pos.highest_price_since_entry),
                 "entry_date": str(pos.opened_at.date()),
                 "entry_signals": pos.entry_signals,
             }
             for pos in rows
         }
+
+    def build_portfolio_context(
+        self,
+        portfolio: str,
+        *,
+        pending_orders: list[Any],
+        sleeve_budget: float,
+        reserved_notional: float,
+        account_id: str | None = None,
+    ) -> PortfolioContext:
+        """Hydrate immutable strategy state from durable fills and intents."""
+        positions = {
+            ticker: HeldPosition(
+                quantity=float(position["quantity"]),
+                avg_entry_price=float(position["avg_entry_price"]),
+                peak_price=float(position["peak_price"]),
+                entry_date=date.fromisoformat(position["entry_date"]),
+            )
+            for ticker, position in self.get_positions(
+                portfolio, account_id=account_id
+            ).items()
+        }
+        pending = {}
+        for intent in pending_orders:
+            if getattr(intent, "portfolio", portfolio) != portfolio:
+                continue
+            if (
+                account_id is not None
+                and getattr(intent, "account_id", account_id) != account_id
+            ):
+                continue
+            remaining = max(
+                0.0,
+                float(intent.requested_quantity) - float(intent.filled_quantity),
+            )
+            if remaining <= 0:
+                continue
+            key = (
+                intent.symbol
+                if intent.symbol not in pending
+                else intent.recommendation_id
+            )
+            pending[key] = PendingOrder(
+                ticker=intent.symbol,
+                action=str(intent.action).lower(),
+                quantity=remaining,
+                limit_price=(
+                    float(intent.limit_price)
+                    if intent.limit_price is not None
+                    else None
+                ),
+                recommendation_id=intent.recommendation_id,
+            )
+        return PortfolioContext(
+            positions=positions,
+            pending_orders=pending,
+            sleeve_budget=float(sleeve_budget),
+            reserved_notional=float(reserved_notional),
+        )
 
     def get_trades(self, portfolio: str) -> list[dict]:
         """Return completed trades for a portfolio."""

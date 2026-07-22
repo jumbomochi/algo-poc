@@ -3,7 +3,12 @@ from __future__ import annotations
 
 import prometheus_client
 
-from shared.observability import create_counter, create_gauge, create_histogram
+from shared.observability import (
+    create_counter,
+    create_gauge,
+    create_histogram,
+    create_trading_metrics,
+)
 
 
 def _reset_registry() -> None:
@@ -21,9 +26,7 @@ class TestCounter:
         _reset_registry()
 
     def test_counter_increments(self) -> None:
-        counter = create_counter(
-            "test_messages_total", "Total test messages processed"
-        )
+        counter = create_counter("test_messages_total", "Total test messages processed")
         assert counter._value.get() == 0.0
 
         counter.inc()
@@ -55,9 +58,7 @@ class TestGauge:
         _reset_registry()
 
     def test_gauge_sets_value(self) -> None:
-        gauge = create_gauge(
-            "test_active_connections", "Test active connections"
-        )
+        gauge = create_gauge("test_active_connections", "Test active connections")
         assert gauge._value.get() == 0.0
 
         gauge.set(42)
@@ -68,3 +69,29 @@ class TestGauge:
 
         gauge.dec(3)
         assert gauge._value.get() == 40.0
+
+
+def test_trading_metrics_cover_capital_reservations_lifecycle_and_reconciliation():
+    _reset_registry()
+    metrics = create_trading_metrics()
+
+    metrics.deployable_capital.set(1_000_000)
+    metrics.sleeve_budget.labels(portfolio="momentum").set(230_800)
+    metrics.reserved_notional.labels(portfolio="momentum").set(1_000)
+    metrics.lifecycle_transitions.labels(status="APPROVED").inc()
+    metrics.lifecycle_state.labels(
+        account_id="DUTEST", mode="paper", status="APPROVED"
+    ).set(3)
+    metrics.reconciliation_entries_allowed.set(1)
+
+    assert metrics.deployable_capital._value.get() == 1_000_000
+    assert metrics.sleeve_budget.labels(portfolio="momentum")._value.get() == 230_800
+    assert metrics.reserved_notional.labels(portfolio="momentum")._value.get() == 1_000
+    assert metrics.lifecycle_transitions.labels(status="APPROVED")._value.get() == 1
+    assert (
+        metrics.lifecycle_state.labels(
+            account_id="DUTEST", mode="paper", status="APPROVED"
+        )._value.get()
+        == 3
+    )
+    assert metrics.reconciliation_entries_allowed._value.get() == 1

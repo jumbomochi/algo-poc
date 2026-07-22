@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from shared.config import AppConfig
 from shared.logging import get_logger
+from shared.models import OrderStatus
+from shared.order_ledger import OrderLedger, TERMINAL_STATUSES
 from shared.schemas.messages import (
     AlertMessage,
     ApprovedOrderMessage,
@@ -20,6 +23,12 @@ ALERTS_STREAM = "stream:alerts"
 
 CONSUMER_GROUP = "execution_service"
 CONSUMER_NAME = "execution_worker_1"
+
+
+@dataclass(frozen=True)
+class PendingOrderAttribution:
+    recommendation_id: str
+    portfolio: str | None
 
 
 class ExecutionServiceRunner:
@@ -38,10 +47,12 @@ class ExecutionServiceRunner:
         config: AppConfig,
         redis_client: Any,
         order_manager: Any,
+        order_ledger: OrderLedger | None = None,
     ) -> None:
         self._config = config
         self._redis = redis_client
         self._order_manager = order_manager
+        self._order_ledger = order_ledger
         self._logger = get_logger("execution_service")
         self._running = False
 
@@ -50,7 +61,9 @@ class ExecutionServiceRunner:
 
         # order_id -> ApprovedOrderMessage, so IB fills can be attributed
         # back to the originating recommendation.
-        self._pending_orders: dict[str, ApprovedOrderMessage] = {}
+        self._pending_orders: dict[
+            str, ApprovedOrderMessage | PendingOrderAttribution
+        ] = {}
 
         # Determine IB port based on mode
         if config.mode == "live":
@@ -66,6 +79,13 @@ class ExecutionServiceRunner:
         without this replay, an approved order in flight during a restart is
         silently lost.
         """
+        self.restore_pending_orders()
+        restore_broker = getattr(
+            type(self._order_manager), "restore_broker_tracking", None
+        )
+        if restore_broker is not None:
+            await restore_broker(self._order_manager)
+
         await self._redis.create_consumer_group(
             APPROVED_ORDERS_STREAM, CONSUMER_GROUP
         )
@@ -117,6 +137,58 @@ class ExecutionServiceRunner:
             )
         self._logger.info("Execution service consumer groups created")
 
+    def restore_pending_orders(self) -> None:
+        """Rebuild execution attribution and idempotency from PostgreSQL."""
+        if self._order_ledger is None:
+            return
+        for intent in self._order_ledger.load_pending_orders():
+            if intent.ib_order_id is None:
+                continue
+            order_id = str(intent.ib_order_id)
+            self._pending_orders[order_id] = PendingOrderAttribution(
+                recommendation_id=intent.recommendation_id,
+                portfolio=intent.portfolio,
+            )
+            restore = getattr(
+                type(self._order_manager), "restore_submission", None
+            )
+            if restore is not None:
+                restore(
+                    self._order_manager,
+                    intent.recommendation_id,
+                    order_id,
+                    ticker=intent.symbol,
+                    quantity=intent.requested_quantity,
+                    limit_price=intent.limit_price,
+                )
+        self._order_ledger.session.rollback()
+
+    def _commit_ledger(self) -> None:
+        if self._order_ledger is not None:
+            self._order_ledger.session.commit()
+
+    def _intent_for_order(
+        self, order_id: str, *, account_id: str | None = None
+    ):
+        if self._order_ledger is None:
+            return None
+        pending = self._pending_orders.get(order_id)
+        if pending is not None:
+            return self._order_ledger.get(pending.recommendation_id)
+        intent = self._order_ledger.get_by_ib_order_id(
+            order_id, account_id=account_id
+        )
+        if intent is not None:
+            return intent
+        for intent in self._order_ledger.load_pending_orders():
+            if str(intent.ib_order_id) == order_id:
+                self._pending_orders[order_id] = PendingOrderAttribution(
+                    recommendation_id=intent.recommendation_id,
+                    portfolio=intent.portfolio,
+                )
+                return intent
+        return None
+
     async def process_approved_order(
         self, order: ApprovedOrderMessage
     ) -> None:
@@ -145,6 +217,32 @@ class ExecutionServiceRunner:
 
         from services.execution.ib_executor import OrderSkippedError
 
+        if self._order_ledger is not None:
+            intent = self._order_ledger.get(order.recommendation_id)
+            if OrderStatus(intent.status) in TERMINAL_STATUSES:
+                self._order_ledger.session.rollback()
+                return
+            if (
+                intent.status
+                in {
+                    OrderStatus.SUBMITTED.value,
+                    OrderStatus.PARTIALLY_FILLED.value,
+                }
+                and intent.ib_order_id is not None
+            ):
+                self._pending_orders[str(intent.ib_order_id)] = (
+                    PendingOrderAttribution(
+                        recommendation_id=intent.recommendation_id,
+                        portfolio=intent.portfolio,
+                    )
+                )
+                self._order_ledger.session.rollback()
+                return
+            # `get()` starts a read transaction. Broker submission is an
+            # await point and IB callbacks use this same service-owned
+            # session, so end the read before yielding control.
+            self._order_ledger.session.rollback()
+
         try:
             if order.action == "buy":
                 order_id = await self._order_manager.submit_entry(
@@ -169,11 +267,58 @@ class ExecutionServiceRunner:
                 quantity=order.quantity,
                 reason=str(exc),
             )
+            if self._order_ledger is not None:
+                self._order_ledger.transition(
+                    order.recommendation_id,
+                    OrderStatus.SUBMISSION_FAILED,
+                    reason=str(exc),
+                )
+                self._commit_ledger()
             return
+        except Exception as exc:
+            if self._order_ledger is not None:
+                self._order_ledger.transition(
+                    order.recommendation_id,
+                    OrderStatus.SUBMISSION_FAILED,
+                    reason=str(exc),
+                )
+                self._commit_ledger()
+                return
+            raise
+
+        broker_active = True
+        if self._order_ledger is not None:
+            try:
+                intent = self._order_ledger.record_submission(
+                    order.recommendation_id, order_id
+                )
+                portfolio = intent.portfolio
+                self._commit_ledger()
+            except Exception:
+                self._order_ledger.session.rollback()
+                raise
+            reconcile = getattr(
+                type(self._order_manager), "reconcile_submission", None
+            )
+            if reconcile is not None:
+                broker_active = await reconcile(
+                    self._order_manager,
+                    order.recommendation_id,
+                    order_id,
+                )
+        else:
+            intent = order
+            portfolio = order.portfolio
 
         # Remember the order so fills can be attributed back to the
         # recommendation that caused them.
-        self._pending_orders[order_id] = order
+        if self._order_ledger is None:
+            self._pending_orders[order_id] = order
+        elif broker_active:
+            self._pending_orders[order_id] = PendingOrderAttribution(
+                recommendation_id=order.recommendation_id,
+                portfolio=portfolio,
+            )
 
         self._logger.info(
             "Order submitted, awaiting fill",
@@ -195,17 +340,35 @@ class ExecutionServiceRunner:
         """
         order_id = fill_info["order_id"]
         pending = self._pending_orders.get(order_id)
+        intent = self._intent_for_order(
+            order_id, account_id=fill_info.get("account_id")
+        )
+        attribution = intent or pending
 
         fill = FillMessage(
             ticker=fill_info["ticker"],
             timestamp=datetime.now(timezone.utc),
             side=fill_info["side"],
             quantity=fill_info["quantity"],
+            cumulative_quantity=fill_info.get("cumulative_quantity"),
             fill_price=fill_info["fill_price"],
             commission=fill_info.get("commission", 0.0),
-            recommendation_id=pending.recommendation_id if pending else "unknown",
+            recommendation_id=(
+                attribution.recommendation_id if attribution else "unknown"
+            ),
             order_id=order_id,
+            execution_id=fill_info.get("execution_id"),
+            account_id=fill_info.get("account_id"),
+            portfolio=getattr(attribution, "portfolio", None),
+            con_id=fill_info.get("con_id"),
+            exchange=fill_info.get("exchange"),
+            currency=fill_info.get("currency"),
         )
+        if self._order_ledger is not None:
+            # Fill publication awaits Redis. End the read-only SQLAlchemy
+            # transaction first so status callbacks never share an active
+            # transaction while this coroutine is suspended.
+            self._order_ledger.session.rollback()
         await self._redis.publish(FILLS_STREAM, fill.to_stream_dict())
 
         self._logger.info(
@@ -234,6 +397,64 @@ class ExecutionServiceRunner:
         if fill_info.get("order_done"):
             self._pending_orders.pop(order_id, None)
             self._order_manager.open_orders.pop(order_id, None)
+
+    async def handle_ib_order_status(
+        self, status_info: dict[str, Any]
+    ) -> None:
+        """Persist terminal broker statuses before returning to IB callbacks."""
+        order_id = str(status_info["order_id"])
+        intent = self._intent_for_order(order_id)
+        if intent is None:
+            self._logger.warning(
+                "IB status received for unattributed order",
+                order_id=order_id,
+                status=status_info.get("status"),
+            )
+            if self._order_ledger is not None:
+                self._order_ledger.session.rollback()
+            return
+
+        broker_status = str(status_info.get("status", ""))
+        reason = status_info.get("reason") or None
+        if (
+            broker_status == "Inactive"
+            and status_info.get("completed_order_confirmed") is True
+            and reason is None
+        ):
+            reason = "IB completed order is Inactive"
+        target: OrderStatus | None = None
+        if broker_status in {"Cancelled", "ApiCancelled"}:
+            target = OrderStatus.CANCELLED
+        elif broker_status == "Inactive" and reason:
+            target = (
+                OrderStatus.CANCELLED
+                if (
+                    intent.filled_quantity > 0
+                    or float(status_info.get("filled_quantity", 0.0) or 0.0) > 0
+                )
+                else OrderStatus.SUBMISSION_FAILED
+            )
+        elif (
+            broker_status == "Filled"
+            and status_info.get("completed_order_confirmed") is True
+        ):
+            target = OrderStatus.FILLED
+        elif (
+            broker_status == "Expired"
+            and intent.filled_quantity == 0
+            and status_info.get("completed_order_confirmed") is True
+        ):
+            target = OrderStatus.EXPIRED
+
+        if target is None:
+            self._order_ledger.session.rollback()
+            return
+        self._order_ledger.transition(
+            intent.recommendation_id, target, reason=reason
+        )
+        self._commit_ledger()
+        self._pending_orders.pop(order_id, None)
+        self._order_manager.open_orders.pop(order_id, None)
 
     async def process_kill(self, kill_msg: KillMessage) -> None:
         """Process a kill event: cancel all open orders and liquidate positions.
@@ -371,6 +592,7 @@ if __name__ == "__main__":
 
         from services.execution.ib_executor import IBExecutor
         from services.execution.order_manager import OrderManager
+        from shared.order_ledger import OrderLedger
         from shared.redis_client import RedisStreamClient
 
         redis_conn = aioredis.from_url(config.redis.url)
@@ -387,13 +609,6 @@ if __name__ == "__main__":
         # refuses a LIVE Gateway session answering on the paper port.
         await executor.connect(expect_paper=(config.mode != "live"))
 
-        order_manager = OrderManager(
-            executor=executor, redis_client=redis_client, db_session=None
-        )
-        runner = ExecutionServiceRunner(
-            config=config, redis_client=redis_client, order_manager=order_manager
-        )
-
         # Load real holdings so a kill event liquidates actual positions.
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
@@ -402,17 +617,25 @@ if __name__ == "__main__":
 
         engine = create_engine(config.database.url)
         session = sessionmaker(bind=engine)()
+        order_manager = OrderManager(
+            executor=executor, redis_client=redis_client, db_session=session
+        )
+        runner = ExecutionServiceRunner(
+            config=config,
+            redis_client=redis_client,
+            order_manager=order_manager,
+            order_ledger=OrderLedger(session),
+        )
         try:
             positions = load_open_positions(session)
             runner._positions = {
                 ticker: p["quantity"] for ticker, p in positions.items()
             }
-        finally:
-            session.close()
-        executor.set_fill_handler(runner.handle_ib_fill)
-        try:
+            executor.set_fill_handler(runner.handle_ib_fill)
+            executor.set_order_status_handler(runner.handle_ib_order_status)
             await runner.run()
         finally:
+            session.close()
             await executor.disconnect()
 
     asyncio.run(main())

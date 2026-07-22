@@ -117,7 +117,13 @@ class FillMessage(StreamSerializable):
     commission: float
     recommendation_id: str
     order_id: str
+    execution_id: str | None = None
+    account_id: str | None = None
+    cumulative_quantity: float | None = None
     portfolio: str | None = None
+    con_id: int | None = None
+    exchange: str | None = None
+    currency: str | None = None
 
 
 class AlertMessage(StreamSerializable):

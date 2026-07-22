@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+from backtest.portfolio_context import HeldPosition, PendingOrder, PortfolioContext
+from backtest.ranked_selection import ReplacementPolicy
 from scripts.run_backtest import make_quality_value_signals_fn
 
 
@@ -47,35 +49,17 @@ def test_quality_value_buys_high_quality():
     signals_fn = make_quality_value_signals_fn(
         fundamentals_lookup=fundamentals_lookup,
         sector_map={"AAPL": "Technology", "MSFT": "Technology", "AMZN": "Technology"},
+        bars_by_ticker=bars,
         top_n=1,
         position_size_pct=0.10,
         initial_capital=20_000,
     )
-
-    # Call all tickers first to populate scores_cache for ranking
-    for ticker in tickers:
-        signals_fn(ticker, bars[ticker])
-
-    # Reset tracked state and call again — AAPL should be top ranked
-    # Actually, since tracked state persists, we need a fresh function
-    signals_fn2 = make_quality_value_signals_fn(
-        fundamentals_lookup=fundamentals_lookup,
-        sector_map={"AAPL": "Technology", "MSFT": "Technology", "AMZN": "Technology"},
-        top_n=1,
-        position_size_pct=0.10,
-        initial_capital=20_000,
-    )
-
-    # Warm up scores by calling each ticker once.
-    # Process AAPL last so that the scores_cache has >= 3 entries when AAPL is evaluated.
-    results = {}
-    for ticker in ["MSFT", "AMZN", "AAPL"]:
-        results[ticker] = signals_fn2(ticker, bars[ticker])
 
     # AAPL has best fundamentals (highest ROE=0.25, lowest D/E=0.5, best margin=0.30)
-    assert results["AAPL"] is not None
-    assert results["AAPL"]["action"] == "buy"
-    assert results["AAPL"]["signals"]["strategy"] == "quality_value"
+    result = signals_fn("AAPL", bars["AAPL"])
+    assert result is not None
+    assert result["action"] == "buy"
+    assert result["signals"]["strategy"] == "quality_value"
 
 
 def test_quality_value_skips_low_quality():
@@ -87,6 +71,7 @@ def test_quality_value_skips_low_quality():
     signals_fn = make_quality_value_signals_fn(
         fundamentals_lookup=fundamentals_lookup,
         sector_map={"AAPL": "Technology", "MSFT": "Technology", "AMZN": "Technology"},
+        bars_by_ticker=bars,
         top_n=1,
         position_size_pct=0.10,
         initial_capital=20_000,
@@ -109,6 +94,7 @@ def test_quality_value_requires_fundamentals():
     signals_fn = make_quality_value_signals_fn(
         fundamentals_lookup=fundamentals_lookup,
         sector_map={},
+        bars_by_ticker=bars,
         top_n=1,
         position_size_pct=0.10,
         initial_capital=20_000,
@@ -116,3 +102,69 @@ def test_quality_value_requires_fundamentals():
 
     result = signals_fn("UNKNOWN", bars["UNKNOWN"])
     assert result is None
+
+
+def test_quality_value_hydrated_exit_uses_full_quantity():
+    bars = _make_bars(["AAPL"])
+    bars["AAPL"][-1]["close"] = 85.0
+    context = PortfolioContext(
+        positions={"AAPL": HeldPosition(4, 100, 110, date(2024, 1, 1))},
+        pending_orders={
+            "sell": PendingOrder("AAPL", "sell", 1, 85, "sell")
+        }, sleeve_budget=20_000, reserved_notional=0,
+    )
+    fn = make_quality_value_signals_fn(
+        _make_fundamentals_lookup(), {"AAPL": "Technology"},
+        bars_by_ticker=bars, trailing_stop_pct=0.12, portfolio_context=context,
+    )
+    assert fn("AAPL", bars["AAPL"])["quantity"] == 3
+
+
+def test_quality_value_hydrated_exit_does_not_require_fundamentals():
+    bars = _make_bars(["AAPL"])
+    bars["AAPL"][-1]["close"] = 85.0
+    context = PortfolioContext(
+        positions={"AAPL": HeldPosition(4, 100, 110, date(2024, 1, 1))},
+        pending_orders={}, sleeve_budget=20_000, reserved_notional=0,
+    )
+    fn = make_quality_value_signals_fn(
+        lambda ticker, as_of: None, {"AAPL": "Technology"},
+        bars_by_ticker=bars, trailing_stop_pct=0.12, portfolio_context=context,
+    )
+    assert fn("AAPL", bars["AAPL"])["quantity"] == 4
+
+
+def test_quality_value_complete_ranking_does_not_depend_on_call_order():
+    bars = _make_bars(["AAPL", "MSFT", "AMZN"])
+    fn = make_quality_value_signals_fn(
+        _make_fundamentals_lookup(),
+        {ticker: "Technology" for ticker in bars},
+        bars_by_ticker=bars,
+        top_n=1,
+        initial_capital=20_000,
+    )
+
+    assert fn("AAPL", bars["AAPL"])["action"] == "buy"
+
+
+def test_quality_value_weakest_policy_exits_rank_dropped_holding():
+    bars = _make_bars(["AAPL", "MSFT", "AMZN"])
+    context = PortfolioContext(
+        positions={"AMZN": HeldPosition(4, 150, 150, date(2024, 1, 1))},
+        pending_orders={},
+        sleeve_budget=20_000,
+        reserved_notional=0,
+    )
+    fn = make_quality_value_signals_fn(
+        _make_fundamentals_lookup(),
+        {ticker: "Technology" for ticker in bars},
+        bars_by_ticker=bars,
+        top_n=1,
+        portfolio_context=context,
+        replacement_policy=ReplacementPolicy.WEAKEST,
+    )
+
+    signal = fn("AMZN", bars["AMZN"])
+    assert signal["action"] == "sell"
+    assert signal["quantity"] == 4
+    assert signal["exit_reason"] == "rank_replacement"
