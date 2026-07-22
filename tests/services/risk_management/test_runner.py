@@ -429,6 +429,170 @@ class TestSleeveBridgeRecommendations:
 
 
 class TestDurableRiskLifecycle:
+    @pytest.fixture
+    def sleeve_sell_case(self, mock_config, mock_redis):
+        sessions: list[Session] = []
+
+        def build(
+            *,
+            momentum_quantity: float,
+            quality_quantity: float,
+            requested_quantity: float,
+            momentum_pending: float = 0,
+        ):
+            engine = create_engine("sqlite:///:memory:")
+            Base.metadata.create_all(engine)
+            session = Session(engine)
+            sessions.append(session)
+            ledger = OrderLedger(session)
+            now = datetime.now(timezone.utc)
+            ledger.create_intent(
+                SimpleNamespace(
+                    recommendation_id="sell-current",
+                    account_id="DUTEST",
+                    mode="paper",
+                    portfolio="momentum",
+                    con_id=265598,
+                    symbol="AAPL",
+                    exchange="SMART",
+                    currency="USD",
+                    action="SELL",
+                    quantity=requested_quantity,
+                    limit_price=None,
+                    order_type="MKT",
+                )
+            )
+            if momentum_pending:
+                ledger.create_intent(
+                    SimpleNamespace(
+                        recommendation_id="sell-momentum-pending",
+                        account_id="DUTEST",
+                        mode="paper",
+                        portfolio="momentum",
+                        con_id=265598,
+                        symbol="AAPL",
+                        exchange="SMART",
+                        currency="USD",
+                        action="SELL",
+                        quantity=momentum_pending,
+                        limit_price=None,
+                        order_type="MKT",
+                    )
+                )
+                ledger.transition("sell-momentum-pending", OrderStatus.APPROVED)
+            session.add(
+                CapitalSnapshot(
+                    account_id="DUTEST",
+                    mode="paper",
+                    net_liquidation=100_000,
+                    deployment_fraction=1,
+                    max_deployable_usd=None,
+                    deployable_capital=100_000,
+                    sleeve_budgets={},
+                    reconciliation_status="ok",
+                    captured_at=now,
+                )
+            )
+            for portfolio, quantity in (
+                ("momentum", momentum_quantity),
+                ("quality_value", quality_quantity),
+            ):
+                if quantity <= 0:
+                    continue
+                session.add(
+                    Position(
+                        account_id="DUTEST",
+                        ticker="AAPL",
+                        portfolio=portfolio,
+                        con_id=265598,
+                        quantity=quantity,
+                        avg_entry_price=100,
+                        current_price=100,
+                        peak_price=100,
+                        highest_price_since_entry=100,
+                        opened_at=now,
+                        status="open",
+                    )
+                )
+            session.commit()
+            runner = RiskServiceRunner(
+                config=mock_config,
+                redis_client=mock_redis,
+                db_session=session,
+                order_ledger=ledger,
+            )
+            rec = RecommendationMessage(
+                ticker="AAPL",
+                timestamp=now,
+                action="sell",
+                confidence=1,
+                top_features={},
+                recommendation_id="sell-current",
+                limit_price=None,
+                quantity=requested_quantity,
+                portfolio="momentum",
+            )
+            return runner, ledger, rec
+
+        yield build
+        for session in sessions:
+            session.close()
+
+    @pytest.mark.asyncio
+    async def test_sell_cannot_use_same_ticker_owned_by_another_sleeve(
+        self, sleeve_sell_case, mock_redis
+    ):
+        runner, ledger, rec = sleeve_sell_case(
+            momentum_quantity=0,
+            quality_quantity=5,
+            requested_quantity=5,
+        )
+
+        await runner.process_recommendation(rec)
+
+        assert ledger.get("sell-current").status == OrderStatus.RISK_REJECTED.value
+        assert not any(
+            call.args[0] == "stream:approved_orders"
+            for call in mock_redis.publish.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_sell_deducts_same_sleeve_pending_quantity(
+        self, sleeve_sell_case, mock_redis
+    ):
+        runner, ledger, rec = sleeve_sell_case(
+            momentum_quantity=5,
+            quality_quantity=5,
+            requested_quantity=4,
+            momentum_pending=2,
+        )
+
+        await runner.process_recommendation(rec)
+
+        assert ledger.get("sell-current").status == OrderStatus.RISK_REJECTED.value
+        assert not any(
+            call.args[0] == "stream:approved_orders"
+            for call in mock_redis.publish.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_exact_sleeve_owned_exit_is_approved(
+        self, sleeve_sell_case, mock_redis
+    ):
+        runner, ledger, rec = sleeve_sell_case(
+            momentum_quantity=5,
+            quality_quantity=5,
+            requested_quantity=5,
+        )
+
+        await runner.process_recommendation(rec)
+
+        assert ledger.get("sell-current").status == OrderStatus.APPROVED.value
+        assert any(
+            call.args[0] == "stream:approved_orders"
+            for call in mock_redis.publish.call_args_list
+        )
+
     @pytest.mark.asyncio
     async def test_corrupted_redis_price_mismatch_fails_closed(
         self, durable_runner, mock_redis

@@ -30,6 +30,7 @@ ALERTS_STREAM = "stream:alerts"
 KILL_STREAM = "stream:kill"
 FILLS_STREAM = "stream:fills"
 CAPITAL_SNAPSHOT_MAX_AGE = timedelta(hours=36)
+SELL_ATTRIBUTION_REJECTION = "sell sleeve attribution headroom insufficient"
 
 
 class RetryableRiskStateError(RuntimeError):
@@ -308,7 +309,10 @@ class RiskServiceRunner:
 
         refresh_error = self._refresh_risk_state(intent, rec.action)
         if refresh_error is not None:
-            if rec.action == "buy":
+            terminal_rejection = (
+                rec.action == "buy" or refresh_error == SELL_ATTRIBUTION_REJECTION
+            )
+            if terminal_rejection:
                 self._persist_risk_rejection(rec.recommendation_id, refresh_error)
             self._logger.error(
                 "Risk state refresh failed closed",
@@ -321,7 +325,7 @@ class RiskServiceRunner:
                 message=f"Rejected {rec.action} {rec.ticker}: {refresh_error}",
                 context={"recommendation_id": rec.recommendation_id},
             )
-            if rec.action == "sell":
+            if rec.action == "sell" and not terminal_rejection:
                 raise RetryableRiskStateError(refresh_error)
             return
 
@@ -590,7 +594,13 @@ class RiskServiceRunner:
                 )
 
         if action == "sell":
-            held_quantity = float(positions.get(intent.symbol, {}).get("quantity", 0.0))
+            sleeve_held_quantity = sum(
+                float(row.quantity)
+                for row in rows
+                if row.ticker == intent.symbol
+                and row.portfolio == intent.portfolio
+                and row.con_id == intent.con_id
+            )
             other_sell_remaining = (
                 OrderIntent.requested_quantity - OrderIntent.filled_quantity
             )
@@ -600,6 +610,8 @@ class RiskServiceRunner:
                         OrderIntent.account_id == intent.account_id,
                         OrderIntent.mode == intent.mode,
                         OrderIntent.symbol == intent.symbol,
+                        OrderIntent.con_id == intent.con_id,
+                        OrderIntent.portfolio == intent.portfolio,
                         OrderIntent.recommendation_id != intent.recommendation_id,
                         func.upper(OrderIntent.action) == "SELL",
                         or_(
@@ -619,10 +631,10 @@ class RiskServiceRunner:
                 )
                 or 0.0
             )
-            uncovered = max(0.0, held_quantity - reserved)
+            uncovered = max(0.0, sleeve_held_quantity - reserved)
             if float(intent.requested_quantity) > uncovered + 1e-6:
                 session.rollback()
-                return "sell validation headroom unavailable"
+                return SELL_ATTRIBUTION_REJECTION
 
         nav = float(snapshot.deployable_capital)
         market_value = sum(
