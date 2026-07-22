@@ -74,3 +74,67 @@ Self-review tightened immutable replay comparison to include execution time,
 kept transient infrastructure failures pending instead of acknowledging them,
 and reconstructed delayed completed-history fill progress without counting
 rejected immutable audit rows.
+
+## Independent-review correction (2026-07-22)
+
+Independent review demonstrated that the reconstruction claim above was not
+yet durable: structurally valid rejected audit rows could still be inferred as
+applied.  Commit `72b56a1` adds an additive migration and a non-null
+`execution_fills.projection_applied` marker.  The audit insert remains durable,
+while accounting mutations, intent advancement, and flipping the marker to
+`true` now share a savepoint.  Recovery counts only rows whose applied outcome
+was committed.  Immutable timestamp comparison now normalizes both values to
+UTC rather than discarding timezone offsets.
+
+RED:
+
+```text
+/Users/huiliang/GitHub/algo-poc/.venv/bin/python -m pytest \
+  tests/services/portfolio_accounting/test_projector.py -q
+2 failed, 21 passed in 0.50s
+
+test_replayed_fill_accepts_equivalent_timestamp_offset:
+FillConflictError: execution identity conflicts on: executed_at
+
+test_rejected_fill_is_not_reconstructed_as_applied_for_delayed_history:
+Failed: DID NOT RAISE InvalidFillError
+```
+
+GREEN:
+
+```text
+/Users/huiliang/GitHub/algo-poc/.venv/bin/python -m pytest \
+  tests/services/portfolio_accounting/ tests/scripts/test_paper_state.py \
+  tests/backtest/test_paper_state.py tests/scripts/test_run_paper_gate.py \
+  tests/shared/test_order_ledger_models.py -q
+64 passed in 1.17s
+
+/Users/huiliang/GitHub/algo-poc/.venv/bin/python -c \
+  'import asyncio, pytest; asyncio.set_event_loop(asyncio.new_event_loop()); \
+  raise SystemExit(pytest.main(["-q"]))'
+699 passed in 12.22s
+
+python -m alembic heads
+c3a947f26510 (head)
+
+python -m compileall -q services/portfolio_accounting \
+  shared/models/order_ledger.py \
+  migrations/versions/c3a947f26510_track_fill_projection_outcome.py
+clean
+
+git diff --check
+clean
+```
+
+Files changed in the correction:
+
+- `shared/models/order_ledger.py`
+- `services/portfolio_accounting/projector.py`
+- `tests/services/portfolio_accounting/test_projector.py`
+- `migrations/versions/c3a947f26510_track_fill_projection_outcome.py`
+
+Concern: under Python 3.14, the repository's plain full-suite command has one
+pre-existing synchronous execution test that calls `asyncio.ensure_future`
+without a current event loop.  The plain run produced `1 failed, 698 passed`;
+initializing the event loop before pytest produced the clean 699-test result
+above.  This correction does not touch that execution callback or its test.
