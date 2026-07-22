@@ -43,6 +43,7 @@ from scripts.paper_state import PaperTradingState
 from scripts.run_backtest import (
     BEAR_TICKERS,
     PortfolioConfig,
+    UNIVERSE_REGISTRY,
     compute_regime_by_date,
     fetch_bars_from_ib,
     get_union_universe,
@@ -62,6 +63,7 @@ from scripts.fetch_fundamentals import (
 from scripts.fetch_earnings import load_earnings_cache, build_earnings_lookup
 from backtest._portfolio_state import SimplePortfolioState
 from backtest.portfolio_context import PortfolioContext
+from backtest.ranked_selection import ReplacementPolicy
 from backtest.aggregate_risk import AggregateRiskMonitor
 from services.risk_management.engine import RiskEngine
 from shared.order_ledger import OrderLedger
@@ -156,12 +158,15 @@ def build_portfolios(
         signals_fn=make_quality_value_signals_fn(
             fundamentals_lookup=fundamentals_lookup,
             sector_map=SECTOR_MAP,
+            bars_by_ticker=bars_by_ticker,
+            eligible_tickers=UNIVERSE_REGISTRY["quality_value"],
             top_n=15,
             position_size_pct=0.06,
             initial_capital=qv_cap,
             trailing_stop_pct=0.12,
             regime_by_date=regime_by_date,
             portfolio_context=contexts.get("quality_value"),
+            replacement_policy=ReplacementPolicy.TECHNICAL_ONLY,
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=10.0,
@@ -199,6 +204,7 @@ def build_portfolios(
         capital=them_cap,
         signals_fn=make_thematic_momentum_signals_fn(
             bars_by_ticker=bars_by_ticker,
+            eligible_tickers=UNIVERSE_REGISTRY["thematic_momentum"],
             top_n=8,
             lookback_days=63,
             position_size_pct=0.135,
@@ -206,6 +212,7 @@ def build_portfolios(
             trailing_stop_pct=0.10,
             regime_by_date=regime_by_date,
             portfolio_context=contexts.get("thematic_momentum"),
+            replacement_policy=ReplacementPolicy.TECHNICAL_ONLY,
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=15.0,

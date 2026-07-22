@@ -35,6 +35,7 @@ def test_quality_value_accepts_regime():
     fn = make_quality_value_signals_fn(
         fundamentals_lookup=lambda t, d: None,
         sector_map={},
+        bars_by_ticker={},
         trailing_stop_pct=0.12,
         initial_capital=100_000,
         regime_by_date=regime_by_date,
@@ -127,15 +128,6 @@ def test_quality_value_tightens_trailing_stop_in_bear():
     for i in range(100):
         regime_by_date[base_date + timedelta(days=i)] = "bear"
 
-    fn = make_quality_value_signals_fn(
-        fundamentals_lookup=fundamentals_lookup,
-        sector_map={"AAPL": "Technology"},
-        trailing_stop_pct=0.12,
-        initial_capital=100_000,
-        regime_by_date=regime_by_date,
-    )
-    assert callable(fn)
-
     # Build bars that simulate entry and then trailing stop
     bars = []
     for i in range(20):
@@ -152,6 +144,16 @@ def test_quality_value_tightens_trailing_stop_in_bear():
             "low": price - 1,
             "volume": 1000000,
         })
+
+    fn = make_quality_value_signals_fn(
+        fundamentals_lookup=fundamentals_lookup,
+        sector_map={"AAPL": "Technology"},
+        bars_by_ticker={"AAPL": bars},
+        trailing_stop_pct=0.12,
+        initial_capital=100_000,
+        regime_by_date=regime_by_date,
+    )
+    assert callable(fn)
 
     # Call fn several times to populate scores cache, then check entry
     for i in range(5, len(bars)):

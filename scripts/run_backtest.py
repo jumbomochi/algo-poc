@@ -8,6 +8,10 @@ Connects to IB Gateway on paper port (7497), downloads daily OHLCV bars,
 runs technical signal analysis, gates entries through the risk engine,
 and prints performance metrics.
 """
+
+# Direct script execution needs the worktree bootstrap below before local imports.
+# ruff: noqa: E402
+
 from __future__ import annotations
 
 import argparse
@@ -18,9 +22,21 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable
 
+# When invoked as ``python scripts/run_backtest.py``, prefer this worktree over
+# any editable-package path installed from the primary checkout.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from backtest.portfolio_context import PortfolioContext
+from backtest.ranked_selection import (
+    ReplacementPolicy,
+    rank_complete_universe,
+    target_deltas,
+)
 
 import numpy as np
 import pandas as pd
@@ -820,6 +836,7 @@ def make_short_term_mr_signals_fn(
 
 def make_thematic_momentum_signals_fn(
     bars_by_ticker: dict[str, list[dict]],
+    eligible_tickers: list[str] | None = None,
     top_n: int = 8,
     lookback_days: int = 63,
     ma_period: int = 50,
@@ -829,6 +846,8 @@ def make_thematic_momentum_signals_fn(
     max_loss_pct: float = 0.08,
     regime_by_date: dict | None = None,
     portfolio_context: PortfolioContext | None = None,
+    replacement_policy: ReplacementPolicy = ReplacementPolicy.TECHNICAL_ONLY,
+    replacement_score_margin: float = 0.25,
 ):
     """Create a thematic momentum signal function.
 
@@ -837,7 +856,10 @@ def make_thematic_momentum_signals_fn(
     """
     # Pre-compute date -> {ticker: close_price}
     price_by_date: dict[Any, dict[str, float]] = {}
+    eligible = set(eligible_tickers or bars_by_ticker)
     for ticker, bars in bars_by_ticker.items():
+        if ticker not in eligible:
+            continue
         for bar in bars:
             d = bar["date"]
             if d not in price_by_date:
@@ -847,6 +869,7 @@ def make_thematic_momentum_signals_fn(
     sorted_dates = sorted(price_by_date.keys())
 
     # Pre-compute date -> top N tickers by return
+    scores_by_date: dict[Any, dict[str, float]] = {}
     rankings_by_date: dict[Any, list[str]] = {}
     for i, d in enumerate(sorted_dates):
         if i < lookback_days:
@@ -855,18 +878,20 @@ def make_thematic_momentum_signals_fn(
         past_prices = price_by_date.get(past_date, {})
         current_prices = price_by_date[d]
 
-        returns = []
+        returns: dict[str, float] = {}
         for ticker in current_prices:
             if ticker in past_prices and past_prices[ticker] > 0:
                 ret = (current_prices[ticker] - past_prices[ticker]) / past_prices[ticker]
-                returns.append((ticker, ret))
+                returns[ticker] = ret
 
-        returns.sort(key=lambda x: x[1], reverse=True)
-        rankings_by_date[d] = [t for t, _ in returns[:top_n]]
+        scores_by_date[d] = returns
+        rankings_by_date[d] = rank_complete_universe(returns, top_n)
 
     tracked: dict[str, list[dict]] = {}
 
     def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
+        if ticker not in eligible:
+            return None
         min_bars = max(lookback_days + 1, ma_period + 1)
         if len(bars) < min_bars:
             return None
@@ -940,6 +965,42 @@ def make_thematic_momentum_signals_fn(
 
         # Entry: in top N AND above 50-day MA
         top_tickers = rankings_by_date.get(current_date, [])
+        scores = scores_by_date.get(current_date, {})
+        held_tickers = (
+            set(portfolio_context.positions)
+            if portfolio_context is not None
+            else set(tracked)
+        )
+        if lots and held_tickers | set(top_tickers) <= set(scores):
+            replacements = target_deltas(
+                held=held_tickers,
+                selected=set(top_tickers),
+                scores=scores,
+                policy=replacement_policy,
+                score_margin=replacement_score_margin,
+            )
+            replacement = next(
+                (item for item in replacements if item.outgoing == ticker), None
+            )
+            if replacement is not None:
+                exit_quantity = _context_exit_quantity(
+                    portfolio_context, ticker, held.quantity if held else 0
+                )
+                if exit_quantity is None:
+                    return None
+                if portfolio_context is None:
+                    tracked.pop(ticker, None)
+                return {
+                    "action": "sell",
+                    "ticker": ticker,
+                    "limit_price": current_price,
+                    "quantity": exit_quantity,
+                    "sector": "Unknown",
+                    "exit_reason": "rank_replacement",
+                    "replacement_ticker": replacement.incoming,
+                    "score_improvement": replacement.score_improvement,
+                }
+
         pending_buy_quantity = (
             portfolio_context.pending_quantity(ticker, "buy")
             if portfolio_context else 0.0
@@ -979,12 +1040,17 @@ def make_thematic_momentum_signals_fn(
 def make_quality_value_signals_fn(
     fundamentals_lookup: Callable[[str, date], dict | None],
     sector_map: dict[str, str],
+    *,
+    bars_by_ticker: dict[str, list[dict]],
+    eligible_tickers: list[str] | None = None,
     top_n: int = 15,
     position_size_pct: float = 0.10,
     initial_capital: float = 100_000,
     trailing_stop_pct: float = 0.12,
     regime_by_date: dict | None = None,
     portfolio_context: PortfolioContext | None = None,
+    replacement_policy: ReplacementPolicy = ReplacementPolicy.TECHNICAL_ONLY,
+    replacement_score_margin: float = 0.25,
 ):
     """Create a quality value signal function.
 
@@ -993,7 +1059,6 @@ def make_quality_value_signals_fn(
     Exit: trailing stop.
     """
     tracked: dict[str, list[dict]] = {}
-    scores_cache: dict[str, float] = {}
 
     def _compute_quality_score(fundamentals: dict) -> float:
         """Compute composite quality-value score. Higher = better."""
@@ -1006,6 +1071,29 @@ def make_quality_value_signals_fn(
         margin_score = margin / 0.25
 
         return (roe_score + de_score + margin_score) / 3.0
+
+    eligible = set(eligible_tickers or bars_by_ticker)
+    tickers_by_date: dict[date, set[str]] = {}
+    for candidate, candidate_bars in bars_by_ticker.items():
+        if candidate not in eligible:
+            continue
+        for bar in candidate_bars:
+            tickers_by_date.setdefault(bar["date"], set()).add(candidate)
+
+    scores_by_date: dict[date, dict[str, float]] = {}
+    rankings_by_date: dict[date, list[str]] = {}
+    for as_of, available_tickers in tickers_by_date.items():
+        complete_scores: dict[str, float] = {}
+        for candidate in available_tickers:
+            candidate_fundamentals = fundamentals_lookup(candidate, as_of)
+            if candidate_fundamentals is not None:
+                complete_scores[candidate] = _compute_quality_score(
+                    candidate_fundamentals
+                )
+        scores_by_date[as_of] = complete_scores
+        rankings_by_date[as_of] = rank_complete_universe(
+            complete_scores, top_n
+        )
 
     def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
         if len(bars) < 5:
@@ -1064,15 +1152,46 @@ def make_quality_value_signals_fn(
         if fundamentals is None:
             return None
 
-        # Compute quality score and update cache
-        score = _compute_quality_score(fundamentals)
-        scores_cache[ticker] = score
-
-        if len(scores_cache) < 3:
+        scores = scores_by_date.get(current_date, {})
+        if ticker not in scores:
             return None
+        score = scores[ticker]
+        top_tickers = rankings_by_date.get(current_date, [])
 
-        ranked = sorted(scores_cache.items(), key=lambda x: x[1], reverse=True)
-        top_tickers = [t for t, _ in ranked[:top_n]]
+        held_tickers = (
+            set(portfolio_context.positions)
+            if portfolio_context is not None
+            else set(tracked)
+        )
+        if lots and held_tickers | set(top_tickers) <= set(scores):
+            replacements = target_deltas(
+                held=held_tickers,
+                selected=set(top_tickers),
+                scores=scores,
+                policy=replacement_policy,
+                score_margin=replacement_score_margin,
+            )
+            replacement = next(
+                (item for item in replacements if item.outgoing == ticker), None
+            )
+            if replacement is not None:
+                exit_quantity = _context_exit_quantity(
+                    portfolio_context, ticker, held.quantity if held else 0
+                )
+                if exit_quantity is None:
+                    return None
+                if portfolio_context is None:
+                    tracked.pop(ticker, None)
+                return {
+                    "action": "sell",
+                    "ticker": ticker,
+                    "limit_price": current_price,
+                    "quantity": exit_quantity,
+                    "sector": sector_map.get(ticker, "Unknown"),
+                    "exit_reason": "rank_replacement",
+                    "replacement_ticker": replacement.incoming,
+                    "score_improvement": replacement.score_improvement,
+                }
 
         pending_buy_quantity = (
             portfolio_context.pending_quantity(ticker, "buy")
@@ -1807,7 +1926,23 @@ def main():
                         help="Path to a prior backtest results JSON. Skips the IB fetch "
                              "and loads the cached bars from that file. Useful when IB "
                              "Gateway is unavailable or for fast iteration.")
+    parser.add_argument(
+        "--replacement-policy",
+        choices=[policy.value for policy in ReplacementPolicy],
+        default=ReplacementPolicy.TECHNICAL_ONLY.value,
+        help="Offline ranked-candidate replacement policy (default: technical_only)",
+    )
+    parser.add_argument(
+        "--replacement-score-margin",
+        type=float,
+        default=0.25,
+        help="Minimum incoming score improvement for score_margin (default: 0.25)",
+    )
     args = parser.parse_args()
+
+    replacement_policy = ReplacementPolicy(args.replacement_policy)
+    if args.replacement_score_margin < 0:
+        parser.error("--replacement-score-margin must be non-negative")
 
     trade_start_date = None
     if args.start_date:
@@ -1918,21 +2053,28 @@ def main():
     )
     thematic_signals_fn = make_thematic_momentum_signals_fn(
         bars_by_ticker=bars_by_ticker,
+        eligible_tickers=UNIVERSE_REGISTRY["thematic_momentum"],
         top_n=8,
         lookback_days=63,
         position_size_pct=0.135,
         initial_capital=args.capital * 0.1410,
         trailing_stop_pct=0.10,
         regime_by_date=regime_by_date,
+        replacement_policy=replacement_policy,
+        replacement_score_margin=args.replacement_score_margin,
     )
     qv_signals_fn = make_quality_value_signals_fn(
         fundamentals_lookup=fundamentals_lookup,
         sector_map=SECTOR_MAP,
+        bars_by_ticker=bars_by_ticker,
+        eligible_tickers=UNIVERSE_REGISTRY["quality_value"],
         top_n=15,
         position_size_pct=0.06,
         initial_capital=args.capital * 0.1538,
         trailing_stop_pct=0.12,
         regime_by_date=regime_by_date,
+        replacement_policy=replacement_policy,
+        replacement_score_margin=args.replacement_score_margin,
     )
     ed_signals_fn = make_earnings_drift_signals_fn(
         earnings_lookup=earnings_lookup,
@@ -2125,6 +2267,8 @@ def main():
         "initial_capital": args.capital,
         "slippage_bps": args.slippage_bps,
         "commission_per_share": args.commission,
+        "replacement_policy": replacement_policy.value,
+        "replacement_score_margin": args.replacement_score_margin,
         "portfolios": {name: pc.capital for name, pc in portfolios.items()},
     }
     if len(portfolios) == 1:

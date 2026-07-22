@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 from backtest.portfolio_context import HeldPosition, PendingOrder, PortfolioContext
+from backtest.ranked_selection import ReplacementPolicy
 from scripts.run_backtest import make_thematic_momentum_signals_fn
 
 
@@ -112,3 +113,38 @@ def test_thematic_momentum_hydrated_exit_uses_full_quantity():
     signal = fn("ARKK", bars["ARKK"])
     assert signal["action"] == "sell"
     assert signal["quantity"] == 6
+
+
+def test_thematic_weakest_policy_exits_rank_dropped_holding():
+    bars = _make_trending_bars(["ARKK", "LIT"], days=100)
+    context = PortfolioContext(
+        positions={"ARKK": HeldPosition(5, 50, 60, date(2024, 1, 1))},
+        pending_orders={},
+        sleeve_budget=20_000,
+        reserved_notional=0,
+    )
+    fn = make_thematic_momentum_signals_fn(
+        bars,
+        top_n=1,
+        lookback_days=63,
+        portfolio_context=context,
+        replacement_policy=ReplacementPolicy.WEAKEST,
+    )
+
+    signal = fn("ARKK", bars["ARKK"])
+    assert signal["action"] == "sell"
+    assert signal["quantity"] == 5
+    assert signal["exit_reason"] == "rank_replacement"
+
+
+def test_thematic_ranking_uses_only_the_eligible_universe():
+    bars = _make_trending_bars(["ARKK", "AAPL"], days=100)
+    fn = make_thematic_momentum_signals_fn(
+        bars,
+        eligible_tickers=["ARKK"],
+        top_n=1,
+        lookback_days=63,
+    )
+
+    assert fn("ARKK", bars["ARKK"])["action"] == "buy"
+    assert fn("AAPL", bars["AAPL"]) is None
