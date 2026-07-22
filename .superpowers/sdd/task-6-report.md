@@ -138,3 +138,61 @@ pre-existing synchronous execution test that calls `asyncio.ensure_future`
 without a current event loop.  The plain run produced `1 failed, 698 passed`;
 initializing the event loop before pytest produced the clean 699-test result
 above.  This correction does not touch that execution callback or its test.
+
+## Migration safety correction (2026-07-22)
+
+Re-review found that defaulting pre-existing `execution_fills` rows to
+`projection_applied=false` would silently classify legacy rows whose actual
+accounting outcome is unknowable.  Commit `09328cb` makes an empty
+`execution_fills` table an explicit upgrade precondition.  The migration checks
+before any schema mutation and fails with a manual-reconciliation instruction
+when rows exist.  Because this feature branch has not been deployed, an empty
+table is the only safe automatic upgrade path.  Downgrade continues to remove
+the added column.
+
+RED:
+
+```text
+/Users/huiliang/GitHub/algo-poc/.venv/bin/python -m pytest \
+  tests/migrations/test_fill_projection_outcome_migration.py -q
+1 failed, 2 passed in 0.19s
+
+test_upgrade_refuses_to_classify_preexisting_execution_fills:
+Failed: DID NOT RAISE RuntimeError
+```
+
+GREEN:
+
+```text
+/Users/huiliang/GitHub/algo-poc/.venv/bin/python -m pytest \
+  tests/migrations/test_fill_projection_outcome_migration.py \
+  tests/services/portfolio_accounting/test_projector.py \
+  tests/shared/test_order_ledger_models.py -q
+38 passed in 0.41s
+
+/Users/huiliang/GitHub/algo-poc/.venv/bin/python -c \
+  'import asyncio, pytest; asyncio.set_event_loop(asyncio.new_event_loop()); \
+  raise SystemExit(pytest.main(["-q"]))'
+702 passed in 12.10s
+
+python -m alembic heads
+c3a947f26510 (head)
+
+python -m compileall -q \
+  migrations/versions/c3a947f26510_track_fill_projection_outcome.py \
+  tests/migrations/test_fill_projection_outcome_migration.py
+clean
+
+git diff --check
+clean
+```
+
+Files changed in the migration safety correction:
+
+- `migrations/versions/c3a947f26510_track_fill_projection_outcome.py`
+- `tests/migrations/test_fill_projection_outcome_migration.py`
+
+Concern: if an operator has independently applied the preceding durable-ledger
+migration and accumulated fill rows before applying this revision, automatic
+upgrade intentionally stops.  Those outcomes require explicit human
+reconciliation; the migration does not delete, overwrite, or classify them.
