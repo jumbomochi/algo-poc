@@ -44,8 +44,10 @@ from scripts.run_backtest import (
 from scripts.fetch_fundamentals import load_fundamentals_cache, build_fundamentals_lookup, SECTOR_MAP
 from scripts.fetch_earnings import load_earnings_cache, build_earnings_lookup
 from backtest._portfolio_state import SimplePortfolioState
+from backtest.portfolio_context import PortfolioContext
 from backtest.aggregate_risk import AggregateRiskMonitor
 from services.risk_management.engine import RiskEngine
+from shared.order_ledger import OrderLedger
 
 # Capital allocations across the 6 active sleeves.
 # mean_reversion and short_term_mr were dropped 2026-05-26 after both posted
@@ -69,6 +71,7 @@ def build_portfolios(
     regime_by_date: dict,
     fundamentals_lookup,
     earnings_lookup,
+    portfolio_contexts: dict[str, PortfolioContext] | None = None,
 ) -> dict[str, PortfolioConfig]:
     """Build the 6 active portfolio configs (same params as backtest main()).
 
@@ -78,6 +81,7 @@ def build_portfolios(
     analysis.md for revival conditions.
     """
     portfolios = {}
+    contexts = portfolio_contexts or {}
 
     mom_cap = capital * CAPITAL_ALLOCATIONS["momentum"]
     portfolios["momentum"] = PortfolioConfig(
@@ -87,6 +91,7 @@ def build_portfolios(
             bars_by_ticker=bars_by_ticker, top_n=5, lookback_days=126,
             position_size_pct=0.12, initial_capital=mom_cap,
             trailing_stop_pct=0.10, bear_tickers=BEAR_TICKERS,
+            portfolio_context=contexts.get("momentum"),
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=12.0, sector_concentration_pct=30.0,
@@ -101,6 +106,7 @@ def build_portfolios(
         signals_fn=make_sector_rotation_signals_fn(
             bars_by_ticker=bars_by_ticker, top_n=3, lookback_days=63,
             position_size_pct=0.20, initial_capital=sec_cap, trailing_stop_pct=0.08,
+            portfolio_context=contexts.get("sector_rotation"),
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=20.0, sector_concentration_pct=50.0,
@@ -116,6 +122,7 @@ def build_portfolios(
             fundamentals_lookup=fundamentals_lookup, sector_map=SECTOR_MAP,
             top_n=15, position_size_pct=0.10, initial_capital=qv_cap,
             trailing_stop_pct=0.12, regime_by_date=regime_by_date,
+            portfolio_context=contexts.get("quality_value"),
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=10.0, sector_concentration_pct=30.0,
@@ -131,6 +138,7 @@ def build_portfolios(
             earnings_lookup=earnings_lookup, surprise_threshold_pct=5.0,
             max_hold_days=20, position_size_pct=0.08, initial_capital=ed_cap,
             trailing_stop_pct=0.06, regime_by_date=regime_by_date,
+            portfolio_context=contexts.get("earnings_drift"),
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=8.0, sector_concentration_pct=30.0,
@@ -146,6 +154,7 @@ def build_portfolios(
             bars_by_ticker=bars_by_ticker, top_n=8, lookback_days=63,
             position_size_pct=0.15, initial_capital=them_cap,
             trailing_stop_pct=0.10, regime_by_date=regime_by_date,
+            portfolio_context=contexts.get("thematic_momentum"),
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=15.0, sector_concentration_pct=50.0,
@@ -160,6 +169,7 @@ def build_portfolios(
         signals_fn=make_tail_risk_hedge_signals_fn(
             regime_by_date=regime_by_date, position_size_pct=0.25,
             initial_capital=tr_cap,
+            portfolio_context=contexts.get("tail_risk_hedge"),
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=25.0, sector_concentration_pct=50.0,
@@ -179,6 +189,25 @@ def build_portfolios(
         )
 
     return portfolios
+
+
+def build_portfolio_contexts(
+    state: PaperTradingState,
+    session: Session,
+    capital: float,
+) -> dict[str, PortfolioContext]:
+    """Build per-sleeve strategy state before creating signal factories."""
+    ledger = OrderLedger(session)
+    pending_orders = ledger.load_pending_orders()
+    return {
+        name: state.build_portfolio_context(
+            name,
+            pending_orders=pending_orders,
+            sleeve_budget=capital * weight,
+            reserved_notional=ledger.active_reservations(name),
+        )
+        for name, weight in CAPITAL_ALLOCATIONS.items()
+    }
 
 
 def print_status(state: PaperTradingState) -> None:
@@ -543,6 +572,10 @@ def main():
     # Compute regime
     regime_by_date = compute_regime_by_date(bars_by_ticker)
 
+    # Hydrate durable positions and pending broker orders before factory
+    # creation so restarts preserve strategy exit state.
+    portfolio_contexts = build_portfolio_contexts(state, session, args.capital)
+
     # Build portfolios
     portfolios = build_portfolios(
         capital=args.capital,
@@ -550,6 +583,7 @@ def main():
         regime_by_date=regime_by_date,
         fundamentals_lookup=fundamentals_lookup,
         earnings_lookup=earnings_lookup,
+        portfolio_contexts=portfolio_contexts,
     )
 
     # Signal evaluation never projects fills.  Actual IB executions are the

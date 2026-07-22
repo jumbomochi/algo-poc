@@ -17,6 +17,7 @@ from scripts.run_backtest import PortfolioConfig
 from scripts.run_paper import run_daily
 from services.risk_management.engine import RiskEngine
 from shared.models.base import Base
+from shared.models.portfolio import Position
 
 
 @pytest.fixture
@@ -109,3 +110,30 @@ class TestEntryGate:
         assert len(signals) == 1
         assert state.get_positions("test_sleeve") == {}
         assert state.get_cash("test_sleeve") == pytest.approx(10_000.0)
+
+
+def test_paper_state_builds_immutable_strategy_context(state):
+    state.record_fill(
+        portfolio="test_sleeve", ticker="AAPL", action="buy",
+        quantity=5, price=100, fill_date=date(2026, 7, 1),
+    )
+    pending = type("Intent", (), {
+        "symbol": "MSFT", "action": "BUY", "requested_quantity": 3,
+        "filled_quantity": 1, "limit_price": 200,
+        "recommendation_id": "rec-1",
+    })()
+    position = state._session.query(Position).filter_by(ticker="AAPL").one()
+    position.highest_price_since_entry = 120
+
+    context = state.build_portfolio_context(
+        "test_sleeve", pending_orders=[pending], sleeve_budget=10_000,
+        reserved_notional=400,
+    )
+
+    assert context.positions["AAPL"].quantity == 5
+    assert context.positions["AAPL"].peak_price == 120
+    assert context.pending_orders["MSFT"].quantity == 2
+    assert context.sleeve_budget == 10_000
+    assert context.reserved_notional == 400
+    with pytest.raises(TypeError):
+        context.positions["MSFT"] = context.positions["AAPL"]

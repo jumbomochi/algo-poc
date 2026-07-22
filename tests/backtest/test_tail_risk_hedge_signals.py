@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+from backtest.portfolio_context import HeldPosition, PortfolioContext
 from scripts.run_backtest import make_tail_risk_hedge_signals_fn
 
 
@@ -114,3 +115,30 @@ def test_tail_risk_hedge_regime_change_sells():
     assert sell_result is not None
     assert sell_result["action"] == "sell"
     assert sell_result["exit_reason"] == "regime_change"
+
+
+def test_tail_risk_hedge_hydrated_obsolete_position_sells_full_quantity():
+    bars = _make_bars(10)
+    regime = {bar["date"]: "bull" for bar in bars}
+    context = PortfolioContext(
+        positions={"SH": HeldPosition(11, 100, 100, date(2024, 1, 1))},
+        pending_orders={}, sleeve_budget=100_000, reserved_notional=0,
+    )
+    fn = make_tail_risk_hedge_signals_fn(regime, portfolio_context=context)
+    signal = fn("SH", bars)
+    assert signal["action"] == "sell"
+    assert signal["quantity"] == 11
+
+
+def test_tail_risk_hedge_hydrates_regime_at_entry_for_shared_asset():
+    bars = _make_bars(11)
+    regime = {bar["date"]: ("bull" if i < 10 else "bear")
+              for i, bar in enumerate(bars)}
+    context = PortfolioContext(
+        positions={"GLD": HeldPosition(8, 100, 100, bars[0]["date"])},
+        pending_orders={}, sleeve_budget=100_000, reserved_notional=0,
+    )
+    fn = make_tail_risk_hedge_signals_fn(regime, portfolio_context=context)
+    signal = fn("GLD", bars)
+    assert signal["action"] == "sell"
+    assert signal["quantity"] == 8

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+from backtest.portfolio_context import HeldPosition, PendingOrder, PortfolioContext
 from scripts.run_backtest import make_momentum_signals_fn
 
 
@@ -99,3 +100,49 @@ def test_momentum_trailing_stop_exits():
     assert signal is not None
     assert signal["action"] == "sell"
     assert signal["exit_reason"] == "trailing_stop"
+
+
+def _context(*, position=None, pending=None):
+    return PortfolioContext(
+        positions={"TEST": position} if position else {},
+        pending_orders={"TEST": pending} if pending else {},
+        sleeve_budget=100_000,
+        reserved_notional=0,
+    )
+
+
+def test_momentum_hydrates_held_position_after_restart():
+    bars = _make_bars("TEST", 200, 100.0, 0.003)
+    held = HeldPosition(10, bars[-1]["close"], bars[-1]["close"], date(2024, 1, 1))
+    fn = make_momentum_signals_fn(
+        {"TEST": bars}, top_n=1, lookback_days=126,
+        portfolio_context=_context(position=held),
+    )
+    assert fn("TEST", bars) is None
+
+
+def test_momentum_hydrated_trailing_stop_sells_full_quantity_without_mutation():
+    bars = _make_bars("TEST", 200, 100.0, 0.0)
+    bars[-1]["close"] = 107.0
+    held = HeldPosition(10, 100.0, 120.0, date(2024, 1, 1))
+    context = _context(position=held)
+    fn = make_momentum_signals_fn(
+        {"TEST": bars}, top_n=1, lookback_days=126,
+        trailing_stop_pct=0.10, portfolio_context=context,
+    )
+    first = fn("TEST", bars)
+    second = fn("TEST", bars)
+    assert first == second
+    assert first["action"] == "sell"
+    assert first["quantity"] == 10
+    assert context.positions["TEST"].peak_price == 120.0
+
+
+def test_momentum_pending_buy_suppresses_duplicate_recommendation():
+    bars = _make_bars("TEST", 200, 100.0, 0.003)
+    pending = PendingOrder("TEST", "buy", 10, bars[-1]["close"], "rec-1")
+    fn = make_momentum_signals_fn(
+        {"TEST": bars}, top_n=1, lookback_days=126,
+        portfolio_context=_context(pending=pending),
+    )
+    assert fn("TEST", bars) is None

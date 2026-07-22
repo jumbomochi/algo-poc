@@ -12,6 +12,7 @@ from typing import Any
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
+from backtest.portfolio_context import HeldPosition, PendingOrder, PortfolioContext
 from shared.models.portfolio import Position, Trade
 from shared.models.equity_snapshot import EquitySnapshot
 from shared.models.portfolio_config import PortfolioConfig
@@ -339,12 +340,58 @@ class PaperTradingState:
                 "quantity": pos.quantity,
                 "avg_entry_price": pos.avg_entry_price,
                 "entry_price": pos.avg_entry_price,
-                "peak_price": pos.peak_price,
+                "peak_price": max(pos.peak_price, pos.highest_price_since_entry),
                 "entry_date": str(pos.opened_at.date()),
                 "entry_signals": pos.entry_signals,
             }
             for pos in rows
         }
+
+    def build_portfolio_context(
+        self,
+        portfolio: str,
+        *,
+        pending_orders: list[Any],
+        sleeve_budget: float,
+        reserved_notional: float,
+    ) -> PortfolioContext:
+        """Hydrate immutable strategy state from durable fills and intents."""
+        positions = {
+            ticker: HeldPosition(
+                quantity=float(position["quantity"]),
+                avg_entry_price=float(position["avg_entry_price"]),
+                peak_price=float(position["peak_price"]),
+                entry_date=date.fromisoformat(position["entry_date"]),
+            )
+            for ticker, position in self.get_positions(portfolio).items()
+        }
+        pending = {}
+        for intent in pending_orders:
+            if getattr(intent, "portfolio", portfolio) != portfolio:
+                continue
+            remaining = max(
+                0.0,
+                float(intent.requested_quantity) - float(intent.filled_quantity),
+            )
+            if remaining <= 0:
+                continue
+            pending[intent.symbol] = PendingOrder(
+                ticker=intent.symbol,
+                action=str(intent.action).lower(),
+                quantity=remaining,
+                limit_price=(
+                    float(intent.limit_price)
+                    if intent.limit_price is not None
+                    else None
+                ),
+                recommendation_id=intent.recommendation_id,
+            )
+        return PortfolioContext(
+            positions=positions,
+            pending_orders=pending,
+            sleeve_budget=float(sleeve_budget),
+            reserved_notional=float(reserved_notional),
+        )
 
     def get_trades(self, portfolio: str) -> list[dict]:
         """Return completed trades for a portfolio."""

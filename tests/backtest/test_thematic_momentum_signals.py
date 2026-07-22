@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+from backtest.portfolio_context import HeldPosition, PortfolioContext
 from scripts.run_backtest import make_thematic_momentum_signals_fn
 
 
@@ -94,3 +95,18 @@ def test_thematic_momentum_requires_min_bars():
 
     result = signals_fn("ARKK", bars["ARKK"])
     assert result is None
+
+
+def test_thematic_momentum_hydrated_exit_uses_full_quantity():
+    bars = _make_trending_bars(["ARKK"], days=100)
+    bars["ARKK"][-1]["close"] *= 0.5
+    context = PortfolioContext(
+        positions={"ARKK": HeldPosition(9, 50, 100, date(2024, 1, 1))},
+        pending_orders={}, sleeve_budget=20_000, reserved_notional=0,
+    )
+    fn = make_thematic_momentum_signals_fn(
+        bars, lookback_days=63, portfolio_context=context,
+    )
+    signal = fn("ARKK", bars["ARKK"])
+    assert signal["action"] == "sell"
+    assert signal["quantity"] == 9
