@@ -141,9 +141,30 @@ def test_replayed_buy_fill_changes_cash_once(projector, session):
     assert projector.apply(fill) is False
 
     assert get_position(session).quantity == 10
+    assert get_position(session).account_id == "DU12345"
     assert get_cash(session) == pytest.approx(8_999)
     assert fill_count(session) == 1
     assert session.scalar(select(ExecutionFill)).projection_applied is True
+
+
+def test_fill_does_not_mutate_unowned_legacy_position(projector, session):
+    seed_intent(session)
+    session.add(Position(
+        account_id=None,
+        ticker="AAPL", portfolio="momentum", con_id=265598,
+        exchange="SMART", currency="USD", quantity=1,
+        avg_entry_price=90, current_price=90, peak_price=90,
+        highest_price_since_entry=90, opened_at=NOW, status="open",
+    ))
+    session.commit()
+
+    with pytest.raises(InvalidFillError, match="account ownership"):
+        projector.apply(make_fill())
+
+    positions = list(session.scalars(select(Position)))
+    assert len(positions) == 1
+    assert positions[0].account_id is None
+    assert positions[0].quantity == 1
 
 
 def test_replayed_fill_accepts_equivalent_timestamp_offset(projector, session):

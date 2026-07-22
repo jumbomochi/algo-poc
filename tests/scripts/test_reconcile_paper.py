@@ -21,6 +21,7 @@ from scripts.reconcile_paper import (
     write_repair_plan,
 )
 from services.execution.reconciliation import PositionReconciler
+from shared.broker_state import BrokerPosition
 from shared.models import OrderIntent, OrderStatus, Position, ReconciliationReport
 from shared.models.base import Base
 
@@ -44,6 +45,7 @@ def _plan(*, unresolved=(), account_id="DUN551088") -> RepairPlan:
         actions=[
             RepairAction(
                 action="set_position_quantity",
+                account_id=account_id,
                 portfolio="momentum",
                 con_id=265598,
                 quantity=10,
@@ -55,7 +57,7 @@ def _plan(*, unresolved=(), account_id="DUN551088") -> RepairPlan:
 
 def test_report_is_persisted_as_json_without_position_mutation(session):
     session.add(Position(
-        ticker="AAPL", portfolio="momentum", con_id=265598,
+        account_id="DUN551088", ticker="AAPL", portfolio="momentum", con_id=265598,
         exchange="SMART", currency="USD", quantity=9,
         avg_entry_price=100, current_price=100, peak_price=100,
         highest_price_since_entry=100, opened_at=NOW, status="open",
@@ -95,6 +97,47 @@ def test_report_ignores_active_intents_from_other_accounts(session):
     result, _ = reconcile_snapshot(session, snapshot)
 
     assert result.entries_allowed is True
+
+
+def _owned_position(account_id):
+    return Position(
+        account_id=account_id, ticker="AAPL", portfolio="momentum",
+        con_id=265598, exchange="SMART", currency="USD", quantity=10,
+        avg_entry_price=100, current_price=100, peak_price=100,
+        highest_price_since_entry=100, opened_at=NOW, status="open",
+    )
+
+
+def test_report_reconciles_only_connected_account_positions(session):
+    session.add_all([_owned_position("DUN551088"), _owned_position("DUOTHER")])
+    session.commit()
+    snapshot = SimpleNamespace(
+        account_id="DUN551088", mode="paper",
+        positions={265598: BrokerPosition(
+            account_id="DUN551088", con_id=265598, symbol="AAPL", quantity=10,
+        )},
+        open_orders={},
+    )
+
+    result, _ = reconcile_snapshot(session, snapshot)
+
+    assert result.entries_allowed is True
+
+
+def test_report_fails_closed_on_unowned_legacy_open_position(session):
+    session.add(_owned_position(None))
+    session.commit()
+    snapshot = SimpleNamespace(
+        account_id="DUN551088", mode="paper", positions={}, open_orders={}
+    )
+
+    result, _ = reconcile_snapshot(session, snapshot)
+
+    assert result.entries_allowed is False
+    assert any(
+        item["type"] == "db_position_missing_account_id"
+        for item in result.discrepancies
+    )
 
 
 def test_write_plan_uses_json_round_trip(tmp_path):
@@ -168,7 +211,7 @@ def test_apply_requires_exact_confirmation_and_does_not_mutate(monkeypatch, tmp_
 
 def test_apply_executes_only_serialized_action_and_commits_once(monkeypatch, tmp_path, session):
     session.add(Position(
-        ticker="AAPL", portfolio="momentum", con_id=265598,
+        account_id="DUN551088", ticker="AAPL", portfolio="momentum", con_id=265598,
         exchange="SMART", currency="USD", quantity=9,
         avg_entry_price=100, current_price=100, peak_price=100,
         highest_price_since_entry=100, opened_at=NOW, status="open",
@@ -191,3 +234,64 @@ def test_apply_executes_only_serialized_action_and_commits_once(monkeypatch, tmp
     assert commits == 1
     assert session.scalar(select(Position)).quantity == 10
     assert len(list(tmp_path.glob("paper_state_pre_repair_*.json"))) == 1
+
+
+def test_apply_refuses_target_ambiguous_with_unowned_legacy_row(
+    monkeypatch, tmp_path, session
+):
+    session.add_all([_owned_position("DUN551088"), _owned_position(None)])
+    session.commit()
+    plan_path = write_repair_plan(_plan(), output_dir=tmp_path)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "APPLY PAPER REPAIR")
+
+    with pytest.raises(RepairRefusedError, match="unowned"):
+        apply_repair_plan(session, plan_path=plan_path)
+
+    assert sorted(position.quantity for position in session.scalars(select(Position))) == [10, 10]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload["actions"][0].update(quantity=True),
+        lambda payload: payload["actions"][0].update(quantity=float("nan")),
+        lambda payload: payload["actions"][0].update(quantity=float("inf")),
+        lambda payload: payload["actions"][0].update(quantity=-1),
+        lambda payload: payload["actions"][0].update(con_id=True),
+        lambda payload: payload["actions"][0].update(con_id=0),
+        lambda payload: payload["actions"][0].update(con_id=1.5),
+        lambda payload: payload["actions"][0].update(portfolio=""),
+        lambda payload: payload["actions"][0].update(portfolio="bad space"),
+        lambda payload: payload["actions"][0].update(action="delete_position"),
+        lambda payload: payload["actions"][0].update(account_id="DUOTHER"),
+        lambda payload: payload["actions"][0].update(extra="not-reviewed"),
+        lambda payload: payload["actions"][0].pop("quantity"),
+        lambda payload: payload.update(extra="not-reviewed"),
+    ],
+)
+def test_malformed_plan_is_refused_before_backup_or_database_access(
+    mutate, monkeypatch, tmp_path, session
+):
+    plan_path = write_repair_plan(_plan(), output_dir=tmp_path)
+    payload = json.loads(plan_path.read_text())
+    mutate(payload)
+    plan_path.write_text(json.dumps(payload))
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(session, "execute", lambda *_args, **_kwargs: pytest.fail("DB accessed"))
+
+    with pytest.raises(RepairRefusedError, match="invalid repair plan"):
+        apply_repair_plan(session, plan_path=plan_path)
+
+    assert not list(tmp_path.glob("paper_state_pre_repair_*.json"))
+
+
+@pytest.mark.parametrize("path_kind", ["missing", "directory"])
+def test_unreadable_plan_path_is_repair_refusal(path_kind, monkeypatch, tmp_path, session):
+    plan_path = tmp_path / "missing.json"
+    if path_kind == "directory":
+        plan_path.mkdir()
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    with pytest.raises(RepairRefusedError, match="repair plan"):
+        apply_repair_plan(session, plan_path=plan_path)

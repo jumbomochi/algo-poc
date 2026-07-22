@@ -88,7 +88,7 @@ class IBAccountReader:
 
         # A reconciliation client may differ from the client that submitted
         # orders. reqAllOpenOrders makes those account-wide orders visible.
-        trades = await _resolve(self._ib.reqAllOpenOrders())
+        trades = await _resolve(self._ib.reqAllOpenOrdersAsync())
         open_orders: dict[str, BrokerOpenOrder] = {}
         for trade in trades:
             contract = trade.contract

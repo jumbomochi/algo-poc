@@ -175,6 +175,37 @@ def test_unapplied_execution_fill_blocks_entries_even_without_active_intent():
     assert result.discrepancies[0]["type"] == "unapplied_execution_fill"
 
 
+def test_unapplied_execution_is_not_counted_as_projected_fill_quantity():
+    applied = _fill(3)
+    rejected = _fill(2)
+    rejected.execution_id = "exec-rejected"
+    rejected.projection_applied = False
+    intent = _intent(filled_quantity=3)
+    result = PositionReconciler().reconcile(
+        broker_positions={}, db_positions={}, broker_orders={}, db_orders={},
+        execution_fills=[applied, rejected], active_intents=[intent],
+    )
+
+    assert any(
+        item["type"] == "unapplied_execution_fill"
+        for item in result.discrepancies
+    )
+    assert not any(
+        item["type"] == "fill_quantity_mismatch"
+        for item in result.discrepancies
+    )
+
+
+def test_same_contract_in_another_account_does_not_reconcile():
+    result = PositionReconciler(account_id=ACCOUNT).reconcile(
+        broker_positions={265598: _position(10)},
+        db_positions={("DUOTHER", 265598): 10},
+        broker_orders={}, db_orders={},
+    )
+
+    assert result.entries_allowed is False
+
+
 def test_position_keys_include_account_identity():
     other = BrokerPosition(
         account_id="DUOTHER",

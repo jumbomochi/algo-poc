@@ -11,6 +11,7 @@ from shared.models import ExecutionFill, OrderIntent
 @dataclass(frozen=True)
 class RepairAction:
     action: str
+    account_id: str
     portfolio: str
     con_id: int
     quantity: float
@@ -87,8 +88,8 @@ class PositionReconciler:
 
     def reconcile(
         self,
-        broker_positions: Mapping[int, BrokerPosition | float | int],
-        db_positions: Mapping[int, Any],
+        broker_positions: Mapping[Any, BrokerPosition | float | int],
+        db_positions: Mapping[Any, Any],
         broker_orders: Mapping[str, BrokerOpenOrder | Any] | None = None,
         db_orders: Mapping[str, OrderIntent | Any] | None = None,
         execution_fills: Iterable[ExecutionFill | Any] = (),
@@ -99,19 +100,17 @@ class PositionReconciler:
         broker_orders = broker_orders or {}
         db_orders = db_orders or {}
 
-        for con_id in sorted(set(broker_positions) | set(db_positions)):
-            broker_value = broker_positions.get(con_id)
-            db_value = db_positions.get(con_id)
+        broker_by_contract = self._positions_for_account(
+            broker_positions, side="broker", discrepancies=discrepancies
+        )
+        db_by_contract = self._positions_for_account(
+            db_positions, side="database", discrepancies=discrepancies
+        )
+
+        for con_id in sorted(set(broker_by_contract) | set(db_by_contract)):
+            broker_value = broker_by_contract.get(con_id)
+            db_value = db_by_contract.get(con_id)
             if isinstance(broker_value, BrokerPosition):
-                if self.account_id and broker_value.account_id != self.account_id:
-                    discrepancies.append({
-                        "type": "account_mismatch",
-                        "con_id": con_id,
-                        "expected_account_id": self.account_id,
-                        "actual_account_id": broker_value.account_id,
-                        "auto_correct": False,
-                    })
-                    continue
                 broker_qty = broker_value.quantity
                 symbol = broker_value.symbol
             else:
@@ -181,7 +180,7 @@ class PositionReconciler:
                     "ib_order_id": str(getattr(fill, "ib_order_id", "")),
                     "auto_correct": False,
                 })
-            if recommendation_id:
+            elif recommendation_id:
                 fill_totals[recommendation_id] = (
                     fill_totals.get(recommendation_id, 0.0)
                     + float(fill.quantity)
@@ -221,6 +220,49 @@ class PositionReconciler:
         if isinstance(value, (int, float)):
             return float(value)
         return float(value.quantity)
+
+    def _positions_for_account(
+        self,
+        source: Mapping[Any, Any],
+        *,
+        side: str,
+        discrepancies: list[dict[str, Any]],
+    ) -> dict[int, Any]:
+        normalized: dict[int, Any] = {}
+        for raw_key, value in source.items():
+            if isinstance(raw_key, tuple) and len(raw_key) == 2:
+                account_id, con_id = raw_key
+            else:
+                con_id = raw_key
+                account_id = getattr(value, "account_id", self.account_id)
+            if self.account_id and account_id != self.account_id:
+                discrepancies.append({
+                    "type": "account_mismatch",
+                    "side": side,
+                    "con_id": con_id,
+                    "expected_account_id": self.account_id,
+                    "actual_account_id": account_id,
+                    "auto_correct": False,
+                })
+                continue
+            if not isinstance(con_id, int) or isinstance(con_id, bool) or con_id <= 0:
+                discrepancies.append({
+                    "type": "invalid_contract_key",
+                    "side": side,
+                    "con_id": con_id,
+                    "auto_correct": False,
+                })
+                continue
+            if con_id in normalized:
+                discrepancies.append({
+                    "type": "duplicate_contract_key",
+                    "side": side,
+                    "con_id": con_id,
+                    "auto_correct": False,
+                })
+                continue
+            normalized[con_id] = value
+        return normalized
 
     def _compare_order(
         self,
@@ -275,6 +317,7 @@ def build_repair_plan(result: ReconciliationResult) -> RepairPlan:
             else:
                 actions.append(RepairAction(
                     action="set_position_quantity",
+                    account_id=result.account_id,
                     portfolio=portfolio,
                     con_id=int(con_id),
                     quantity=float(discrepancy.get("ib_quantity") or 0.0),

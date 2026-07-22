@@ -106,6 +106,7 @@ class FillProjector:
                 with self.session.begin_nested():
                     cumulative = self._validate(fill, intent, execution)
                     self._paper_state._apply_fill_accounting(
+                        account_id=intent.account_id,
                         portfolio=intent.portfolio,
                         ticker=intent.symbol,
                         action=fill.side,

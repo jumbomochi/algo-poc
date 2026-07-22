@@ -105,6 +105,7 @@ def test_invalid_order_status_is_rejected_by_database(session):
 
 def test_position_accepts_broker_contract_identity(session):
     position = Position(
+        account_id="DU12345",
         ticker="BRK B",
         portfolio="quality_value",
         quantity=1.0,
@@ -125,6 +126,7 @@ def test_position_accepts_broker_contract_identity(session):
         "SMART",
         "USD",
     )
+    assert position.account_id == "DU12345"
 
 
 def test_position_broker_contract_identity_is_nullable(session):

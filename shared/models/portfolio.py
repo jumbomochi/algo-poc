@@ -8,7 +8,6 @@ from sqlalchemy import (
     DateTime,
     Float,
     Index,
-    Integer,
     JSON,
     String,
 )
@@ -22,9 +21,11 @@ class Position(Base):
     __table_args__ = (
         Index("ix_positions_ticker_status", "ticker", "status"),
         Index("ix_positions_portfolio", "portfolio"),
+        Index("ix_positions_account_contract", "account_id", "con_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
     ticker: Mapped[str] = mapped_column(String(10), nullable=False)
     portfolio: Mapped[str] = mapped_column(String(50), nullable=False)
     con_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

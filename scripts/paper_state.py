@@ -89,6 +89,7 @@ class PaperTradingState:
 
     def _apply_fill_accounting(
         self,
+        account_id: str | None,
         portfolio: str,
         ticker: str,
         action: str,
@@ -120,7 +121,7 @@ class PaperTradingState:
         if config is None:
             raise ValueError(f"unknown portfolio {portfolio}")
 
-        existing = self._session.scalar(
+        candidates = list(self._session.scalars(
             select(Position)
             .where(
                 Position.portfolio == portfolio,
@@ -128,7 +129,21 @@ class PaperTradingState:
                 Position.status == "open",
             )
             .with_for_update()
-        )
+        ))
+        if strict_quantity:
+            if not account_id:
+                raise ValueError("fill lacks position account ownership")
+            if any(position.account_id is None for position in candidates):
+                raise ValueError("position account ownership is unresolved")
+            owned = [
+                position for position in candidates
+                if position.account_id == account_id
+            ]
+            if len(owned) > 1:
+                raise ValueError("position account ownership is ambiguous")
+            existing = owned[0] if owned else None
+        else:
+            existing = candidates[0] if candidates else None
 
         if action == "buy":
             cash_delta = -(price * quantity + commission)
@@ -152,6 +167,7 @@ class PaperTradingState:
                     existing.entry_signals = entry_signals
             else:
                 pos = Position(
+                    account_id=account_id,
                     ticker=ticker,
                     portfolio=portfolio,
                     quantity=quantity,
@@ -239,6 +255,7 @@ class PaperTradingState:
         deliberately has no broker identity or idempotency semantics.
         """
         self._apply_fill_accounting(
+            account_id=None,
             portfolio=portfolio,
             ticker=ticker,
             action=action,
@@ -254,15 +271,20 @@ class PaperTradingState:
         )
 
     def update_peak_prices(
-        self, portfolio: str, current_prices: dict[str, float]
+        self,
+        portfolio: str,
+        current_prices: dict[str, float],
+        *,
+        account_id: str | None = None,
     ) -> None:
         """Update peak prices for all held positions in a portfolio."""
-        positions = self._session.execute(
-            select(Position).where(
+        stmt = select(Position).where(
                 Position.portfolio == portfolio,
                 Position.status == "open",
             )
-        ).scalars().all()
+        if account_id is not None:
+            stmt = stmt.where(Position.account_id == account_id)
+        positions = self._session.scalars(stmt).all()
 
         for pos in positions:
             if pos.ticker in current_prices:
@@ -274,16 +296,21 @@ class PaperTradingState:
         self._session.flush()
 
     def compute_equity(
-        self, portfolio: str, current_prices: dict[str, float]
+        self,
+        portfolio: str,
+        current_prices: dict[str, float],
+        *,
+        account_id: str | None = None,
     ) -> float:
         """Compute current equity (cash + market value of positions)."""
         cash = self.get_cash(portfolio)
-        positions = self._session.execute(
-            select(Position).where(
+        stmt = select(Position).where(
                 Position.portfolio == portfolio,
                 Position.status == "open",
             )
-        ).scalars().all()
+        if account_id is not None:
+            stmt = stmt.where(Position.account_id == account_id)
+        positions = self._session.scalars(stmt).all()
 
         market_value = sum(
             pos.quantity * current_prices.get(pos.ticker, pos.avg_entry_price)
@@ -326,14 +353,17 @@ class PaperTradingState:
 
         self._session.flush()
 
-    def get_positions(self, portfolio: str) -> dict[str, dict]:
+    def get_positions(
+        self, portfolio: str, *, account_id: str | None = None
+    ) -> dict[str, dict]:
         """Return open positions for a portfolio as {ticker: {...}}."""
-        rows = self._session.execute(
-            select(Position).where(
+        stmt = select(Position).where(
                 Position.portfolio == portfolio,
                 Position.status == "open",
             )
-        ).scalars().all()
+        if account_id is not None:
+            stmt = stmt.where(Position.account_id == account_id)
+        rows = self._session.scalars(stmt).all()
 
         return {
             pos.ticker: {
@@ -354,6 +384,7 @@ class PaperTradingState:
         pending_orders: list[Any],
         sleeve_budget: float,
         reserved_notional: float,
+        account_id: str | None = None,
     ) -> PortfolioContext:
         """Hydrate immutable strategy state from durable fills and intents."""
         positions = {
@@ -363,11 +394,18 @@ class PaperTradingState:
                 peak_price=float(position["peak_price"]),
                 entry_date=date.fromisoformat(position["entry_date"]),
             )
-            for ticker, position in self.get_positions(portfolio).items()
+            for ticker, position in self.get_positions(
+                portfolio, account_id=account_id
+            ).items()
         }
         pending = {}
         for intent in pending_orders:
             if getattr(intent, "portfolio", portfolio) != portfolio:
+                continue
+            if (
+                account_id is not None
+                and getattr(intent, "account_id", account_id) != account_id
+            ):
                 continue
             remaining = max(
                 0.0,

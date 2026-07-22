@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +44,15 @@ class RepairRefusedError(RuntimeError):
     """Raised before a repair whenever an operator safety guard fails."""
 
 
+_PLAN_FIELDS = {"account_id", "created_at", "actions", "unresolved"}
+_ACTION_FIELDS = {
+    "action", "account_id", "portfolio", "con_id", "quantity"
+}
+_UNRESOLVED_FIELDS = {"reason", "con_id", "ib_order_id"}
+_ACCOUNT_PATTERN = re.compile(r"^[A-Z0-9]+$")
+_PORTFOLIO_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,49}$")
+
+
 def persist_reconciliation_report(
     session: Session,
     *,
@@ -76,16 +87,104 @@ def write_repair_plan(
 def _load_plan(path: Path) -> RepairPlan:
     try:
         payload = json.loads(Path(path).read_text())
-        actions = [RepairAction(**value) for value in payload["actions"]]
-        unresolved = [UnresolvedRepair(**value) for value in payload["unresolved"]]
+        if not isinstance(payload, dict) or set(payload) != _PLAN_FIELDS:
+            raise ValueError("top-level fields do not match the repair schema")
+        account_id = payload["account_id"]
+        if (
+            not isinstance(account_id, str)
+            or not account_id
+            or _ACCOUNT_PATTERN.fullmatch(account_id) is None
+        ):
+            raise ValueError("account_id must be a non-empty broker account")
+        if not isinstance(payload["created_at"], str):
+            raise ValueError("created_at must be an ISO-8601 string")
+        created_at = datetime.fromisoformat(payload["created_at"])
+        if created_at.tzinfo is None:
+            raise ValueError("created_at must include a timezone")
+        if not isinstance(payload["actions"], list):
+            raise ValueError("actions must be a list")
+        if not isinstance(payload["unresolved"], list):
+            raise ValueError("unresolved must be a list")
+        actions = [
+            _parse_repair_action(value, account_id)
+            for value in payload["actions"]
+        ]
+        unresolved = [
+            _parse_unresolved(value) for value in payload["unresolved"]
+        ]
         return RepairPlan(
-            account_id=str(payload["account_id"]),
-            created_at=datetime.fromisoformat(payload["created_at"]),
+            account_id=account_id,
+            created_at=created_at,
             actions=actions,
             unresolved=unresolved,
         )
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        OSError,
+        UnicodeError,
+    ) as exc:
         raise RepairRefusedError(f"invalid repair plan: {exc}") from exc
+
+
+def _parse_repair_action(value: Any, plan_account_id: str) -> RepairAction:
+    if not isinstance(value, dict) or set(value) != _ACTION_FIELDS:
+        raise ValueError("repair action fields do not match the schema")
+    if value["action"] != "set_position_quantity":
+        raise ValueError("unsupported repair action")
+    if value["account_id"] != plan_account_id:
+        raise ValueError("repair action account does not match plan account")
+    portfolio = value["portfolio"]
+    if (
+        not isinstance(portfolio, str)
+        or _PORTFOLIO_PATTERN.fullmatch(portfolio) is None
+    ):
+        raise ValueError("portfolio is invalid")
+    con_id = value["con_id"]
+    if isinstance(con_id, bool) or not isinstance(con_id, int) or con_id <= 0:
+        raise ValueError("con_id must be a positive integer")
+    quantity = value["quantity"]
+    if (
+        isinstance(quantity, bool)
+        or not isinstance(quantity, (int, float))
+        or not math.isfinite(quantity)
+        or quantity < 0
+    ):
+        raise ValueError("quantity must be a finite non-negative number")
+    return RepairAction(
+        action="set_position_quantity",
+        account_id=plan_account_id,
+        portfolio=portfolio,
+        con_id=con_id,
+        quantity=float(quantity),
+    )
+
+
+def _parse_unresolved(value: Any) -> UnresolvedRepair:
+    if (
+        not isinstance(value, dict)
+        or "reason" not in value
+        or not set(value) <= _UNRESOLVED_FIELDS
+    ):
+        raise ValueError("unresolved item fields do not match the schema")
+    reason = value["reason"]
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("unresolved reason must be non-empty")
+    con_id = value.get("con_id")
+    if con_id is not None and (
+        isinstance(con_id, bool) or not isinstance(con_id, int) or con_id <= 0
+    ):
+        raise ValueError("unresolved con_id must be a positive integer")
+    ib_order_id = value.get("ib_order_id")
+    if ib_order_id is not None and (
+        not isinstance(ib_order_id, str) or not ib_order_id
+    ):
+        raise ValueError("unresolved ib_order_id must be non-empty")
+    return UnresolvedRepair(
+        reason=reason, con_id=con_id, ib_order_id=ib_order_id
+    )
 
 
 def apply_repair_plan(session: Session, *, plan_path: Path) -> None:
@@ -116,7 +215,7 @@ def apply_repair_plan(session: Session, *, plan_path: Path) -> None:
 
     try:
         for action in plan.actions:
-            _apply_action(session, action)
+            _apply_action(session, plan.account_id, action)
         session.commit()
     except Exception:
         session.rollback()
@@ -127,18 +226,28 @@ def apply_repair_plan(session: Session, *, plan_path: Path) -> None:
     )
 
 
-def _apply_action(session: Session, action: RepairAction) -> None:
+def _apply_action(
+    session: Session, plan_account_id: str, action: RepairAction
+) -> None:
     if action.action != "set_position_quantity":
         raise RepairRefusedError(
             f"unsupported serialized repair action {action.action!r}"
         )
-    positions = list(session.scalars(
+    candidates = list(session.scalars(
         select(Position).where(
             Position.portfolio == action.portfolio,
             Position.con_id == action.con_id,
             Position.status == "open",
         ).with_for_update()
     ))
+    if any(position.account_id is None for position in candidates):
+        raise RepairRefusedError(
+            "repair target overlaps an unowned legacy position"
+        )
+    positions = [
+        position for position in candidates
+        if position.account_id == plan_account_id
+    ]
     if len(positions) != 1:
         raise RepairRefusedError(
             "serialized repair target must identify exactly one open position"
@@ -162,7 +271,10 @@ def reconcile_snapshot(
             func.sum(Position.quantity),
             func.count(Position.id),
             func.min(Position.portfolio),
-        ).where(Position.status == "open").group_by(Position.con_id)
+        ).where(
+            Position.status == "open",
+            Position.account_id == snapshot.account_id,
+        ).group_by(Position.con_id)
     ))
     db_positions: dict[int, Any] = {}
     missing_contract_rows = 0
@@ -170,10 +282,18 @@ def reconcile_snapshot(
         if con_id is None:
             missing_contract_rows += int(count)
             continue
-        db_positions[int(con_id)] = SimpleNamespace(
+        db_positions[(snapshot.account_id, int(con_id))] = SimpleNamespace(
+            account_id=snapshot.account_id,
             quantity=float(quantity),
             portfolio=portfolio if count == 1 else None,
         )
+
+    unowned_position_rows = int(session.scalar(
+        select(func.count(Position.id)).where(
+            Position.status == "open",
+            Position.account_id.is_(None),
+        )
+    ) or 0)
 
     broker_order_statuses = (
         OrderStatus.SUBMITTED.value,
@@ -213,6 +333,13 @@ def reconcile_snapshot(
         result.discrepancies.append({
             "type": "db_position_missing_contract_id",
             "count": missing_contract_rows,
+            "auto_correct": False,
+        })
+        result.severity = "major"
+    if unowned_position_rows:
+        result.discrepancies.append({
+            "type": "db_position_missing_account_id",
+            "count": unowned_position_rows,
             "auto_correct": False,
         })
         result.severity = "major"

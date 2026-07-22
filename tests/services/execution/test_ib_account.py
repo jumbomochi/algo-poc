@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -23,7 +23,8 @@ def _fake_ib(accounts=("DUN551088",)):
     order = SimpleNamespace(orderId=9, action="BUY", totalQuantity=4)
     status = SimpleNamespace(status="Submitted", filled=1)
     trades = [SimpleNamespace(contract=contract, order=order, orderStatus=status)]
-    ib.reqAllOpenOrders.return_value = trades
+    ib.reqAllOpenOrders.side_effect = AssertionError("sync IB call is forbidden")
+    ib.reqAllOpenOrdersAsync = AsyncMock(return_value=trades)
     ib.openTrades.return_value = trades
     return ib
 
@@ -38,7 +39,8 @@ async def test_account_reader_returns_contract_keyed_snapshot():
     assert snapshot.net_liquidation == 1_000_000
     assert snapshot.positions[265598].quantity == 10
     assert snapshot.open_orders["9"].remaining_quantity == 3
-    ib.reqAllOpenOrders.assert_called_once_with()
+    ib.reqAllOpenOrdersAsync.assert_awaited_once_with()
+    ib.reqAllOpenOrders.assert_not_called()
 
 
 @pytest.mark.asyncio

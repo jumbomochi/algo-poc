@@ -137,3 +137,43 @@ def test_paper_state_builds_immutable_strategy_context(state):
     assert context.reserved_notional == 400
     with pytest.raises(TypeError):
         context.positions["MSFT"] = context.positions["AAPL"]
+
+
+def test_strategy_context_filters_positions_and_intents_by_account(state):
+    from datetime import datetime, timezone
+
+    state._session.add_all([
+        Position(
+            account_id="DUONE", ticker="AAPL", portfolio="test_sleeve",
+            con_id=1, quantity=1, avg_entry_price=100, current_price=100,
+            peak_price=100, highest_price_since_entry=100,
+            opened_at=datetime(2026, 7, 1, tzinfo=timezone.utc), status="open",
+        ),
+        Position(
+            account_id="DUTWO", ticker="AAPL", portfolio="test_sleeve",
+            con_id=1, quantity=9, avg_entry_price=100, current_price=100,
+            peak_price=100, highest_price_since_entry=100,
+            opened_at=datetime(2026, 7, 1, tzinfo=timezone.utc), status="open",
+        ),
+    ])
+    pending_one = type("Intent", (), {
+        "account_id": "DUONE", "portfolio": "test_sleeve",
+        "symbol": "MSFT", "action": "BUY", "requested_quantity": 3,
+        "filled_quantity": 1, "limit_price": 200,
+        "recommendation_id": "rec-one",
+    })()
+    pending_two = type("Intent", (), {
+        "account_id": "DUTWO", "portfolio": "test_sleeve",
+        "symbol": "GOOG", "action": "BUY", "requested_quantity": 4,
+        "filled_quantity": 0, "limit_price": 150,
+        "recommendation_id": "rec-two",
+    })()
+    state._session.flush()
+
+    context = state.build_portfolio_context(
+        "test_sleeve", pending_orders=[pending_one, pending_two],
+        sleeve_budget=10_000, reserved_notional=400, account_id="DUONE",
+    )
+
+    assert context.positions["AAPL"].quantity == 1
+    assert set(context.pending_orders) == {"MSFT"}
