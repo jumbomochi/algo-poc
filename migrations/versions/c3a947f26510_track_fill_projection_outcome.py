@@ -22,7 +22,15 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    has_legacy_fills = op.get_bind().scalar(
+    bind = op.get_bind()
+    scalar = getattr(bind, "scalar", None)
+    if not callable(scalar):
+        raise RuntimeError(
+            "offline migration cannot verify the execution_fills empty "
+            "precondition; run this upgrade online"
+        )
+
+    has_legacy_fills = scalar(
         sa.text("SELECT EXISTS (SELECT 1 FROM execution_fills LIMIT 1)")
     )
     if has_legacy_fills:
@@ -38,10 +46,11 @@ def upgrade() -> None:
             "projection_applied",
             sa.Boolean(),
             nullable=False,
+            # A new execution is unapplied until accounting commits.  Keeping
+            # this safe default also avoids unsupported SQLite ALTER syntax.
             server_default=sa.false(),
         ),
     )
-    op.alter_column("execution_fills", "projection_applied", server_default=None)
 
 
 def downgrade() -> None:
