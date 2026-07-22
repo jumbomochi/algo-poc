@@ -498,10 +498,27 @@ def test_fail_closed_replay_keeps_buys_unpublished_but_publishes_sells(state):
             )()
         )
     redis = FakeRedis()
+    snapshot = BrokerAccountSnapshot(
+        account_id="DUTEST",
+        mode="paper",
+        net_liquidation=10_000,
+        positions={
+            265598: BrokerPosition(
+                account_id="DUTEST",
+                con_id=265598,
+                symbol="AAPL",
+                quantity=2,
+            )
+        },
+    )
 
     assert (
         publish_unpublished_intents(
-            state._session, redis, account_id="DUTEST", entries_allowed=False
+            state._session,
+            redis,
+            account_id="DUTEST",
+            entries_allowed=False,
+            broker_snapshot=snapshot,
         )
         == 1
     )
@@ -623,3 +640,265 @@ def test_zero_broker_holding_suppresses_sell_signal(state):
     )
 
     assert signals == []
+
+
+def test_outage_replay_revalidates_and_replaces_oversized_sell(state):
+    class FakeRedis:
+        def __init__(self):
+            self.payloads = []
+
+        def xadd(self, stream, payload):
+            self.payloads.append(payload)
+
+    ledger = OrderLedger(state._session)
+    proposal = type(
+        "Proposal",
+        (),
+        {
+            "recommendation_id": "sell-original",
+            "account_id": "DUTEST",
+            "mode": "paper",
+            "portfolio": "momentum",
+            "con_id": 265598,
+            "symbol": "AAPL",
+            "exchange": "SMART",
+            "currency": "USD",
+            "action": "SELL",
+            "quantity": 10,
+            "limit_price": None,
+            "order_type": "MKT",
+        },
+    )()
+    ledger.create_intent(proposal)
+    snapshot = BrokerAccountSnapshot(
+        account_id="DUTEST",
+        mode="paper",
+        net_liquidation=10_000,
+        positions={
+            265598: BrokerPosition(
+                account_id="DUTEST",
+                con_id=265598,
+                symbol="AAPL",
+                quantity=5,
+            )
+        },
+    )
+    redis = FakeRedis()
+
+    assert (
+        publish_unpublished_intents(
+            state._session,
+            redis,
+            account_id="DUTEST",
+            entries_allowed=False,
+            broker_snapshot=snapshot,
+        )
+        == 1
+    )
+
+    original = ledger.get("sell-original")
+    replacement_id = redis.payloads[0]["recommendation_id"]
+    replacement = ledger.get(replacement_id)
+    assert original.status == OrderStatus.CANCELLED.value
+    assert replacement.requested_quantity == 5
+    assert float(redis.payloads[0]["quantity"]) == 5
+    assert (
+        publish_unpublished_intents(
+            state._session,
+            redis,
+            account_id="DUTEST",
+            entries_allowed=False,
+            broker_snapshot=snapshot,
+        )
+        == 0
+    )
+
+
+def test_outbox_sell_revalidation_deducts_active_broker_sell(state):
+    class FakeRedis:
+        def __init__(self):
+            self.payloads = []
+
+        def xadd(self, stream, payload):
+            self.payloads.append(payload)
+
+    ledger = OrderLedger(state._session)
+    ledger.create_intent(
+        type(
+            "Proposal",
+            (),
+            {
+                "recommendation_id": "sell-original",
+                "account_id": "DUTEST",
+                "mode": "paper",
+                "portfolio": "momentum",
+                "con_id": 265598,
+                "symbol": "AAPL",
+                "exchange": "SMART",
+                "currency": "USD",
+                "action": "SELL",
+                "quantity": 10,
+                "limit_price": None,
+                "order_type": "MKT",
+            },
+        )()
+    )
+    snapshot = BrokerAccountSnapshot(
+        account_id="DUTEST",
+        mode="paper",
+        net_liquidation=10_000,
+        positions={
+            265598: BrokerPosition(
+                account_id="DUTEST",
+                con_id=265598,
+                symbol="AAPL",
+                quantity=5,
+            )
+        },
+        open_orders={
+            "42": BrokerOpenOrder(
+                account_id="DUTEST",
+                ib_order_id="42",
+                con_id=265598,
+                symbol="AAPL",
+                action="SELL",
+                total_quantity=2,
+                filled_quantity=0,
+                status="Submitted",
+            )
+        },
+    )
+    redis = FakeRedis()
+
+    publish_unpublished_intents(
+        state._session,
+        redis,
+        account_id="DUTEST",
+        entries_allowed=False,
+        broker_snapshot=snapshot,
+    )
+
+    assert float(redis.payloads[0]["quantity"]) == 3
+
+
+def test_outbox_zero_sell_availability_cancels_without_publish(state):
+    class FakeRedis:
+        def xadd(self, stream, payload):
+            raise AssertionError("zero-availability sell must not publish")
+
+    ledger = OrderLedger(state._session)
+    ledger.create_intent(
+        type(
+            "Proposal",
+            (),
+            {
+                "recommendation_id": "sell-zero",
+                "account_id": "DUTEST",
+                "mode": "paper",
+                "portfolio": "momentum",
+                "con_id": 265598,
+                "symbol": "AAPL",
+                "exchange": "SMART",
+                "currency": "USD",
+                "action": "SELL",
+                "quantity": 2,
+                "limit_price": None,
+                "order_type": "MKT",
+            },
+        )()
+    )
+    snapshot = BrokerAccountSnapshot(
+        account_id="DUTEST",
+        mode="paper",
+        net_liquidation=10_000,
+    )
+
+    assert (
+        publish_unpublished_intents(
+            state._session,
+            FakeRedis(),
+            account_id="DUTEST",
+            entries_allowed=False,
+            broker_snapshot=snapshot,
+        )
+        == 0
+    )
+    assert ledger.get("sell-zero").status == OrderStatus.CANCELLED.value
+
+
+def test_ambiguous_replacement_publish_retries_same_safe_id(state):
+    class AmbiguousRedis:
+        def __init__(self):
+            self.payloads = []
+
+        def xadd(self, stream, payload):
+            self.payloads.append(payload)
+            raise ConnectionError("reply lost after xadd")
+
+    class HealthyRedis:
+        def __init__(self):
+            self.payloads = []
+
+        def xadd(self, stream, payload):
+            self.payloads.append(payload)
+
+    ledger = OrderLedger(state._session)
+    ledger.create_intent(
+        type(
+            "Proposal",
+            (),
+            {
+                "recommendation_id": "sell-ambiguous",
+                "account_id": "DUTEST",
+                "mode": "paper",
+                "portfolio": "momentum",
+                "con_id": 265598,
+                "symbol": "AAPL",
+                "exchange": "SMART",
+                "currency": "USD",
+                "action": "SELL",
+                "quantity": 10,
+                "limit_price": None,
+                "order_type": "MKT",
+            },
+        )()
+    )
+    snapshot = BrokerAccountSnapshot(
+        account_id="DUTEST",
+        mode="paper",
+        net_liquidation=10_000,
+        positions={
+            265598: BrokerPosition(
+                account_id="DUTEST",
+                con_id=265598,
+                symbol="AAPL",
+                quantity=5,
+            )
+        },
+    )
+    ambiguous = AmbiguousRedis()
+
+    with pytest.raises(ConnectionError):
+        publish_unpublished_intents(
+            state._session,
+            ambiguous,
+            account_id="DUTEST",
+            entries_allowed=False,
+            broker_snapshot=snapshot,
+        )
+    safe_id = ambiguous.payloads[0]["recommendation_id"]
+    healthy = HealthyRedis()
+
+    assert (
+        publish_unpublished_intents(
+            state._session,
+            healthy,
+            account_id="DUTEST",
+            entries_allowed=False,
+            broker_snapshot=snapshot,
+        )
+        == 1
+    )
+    assert healthy.payloads[0]["recommendation_id"] == safe_id
+    assert float(healthy.payloads[0]["quantity"]) == 5
+    assert ledger.get("sell-ambiguous").status == OrderStatus.CANCELLED.value

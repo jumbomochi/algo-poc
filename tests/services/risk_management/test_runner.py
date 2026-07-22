@@ -429,6 +429,217 @@ class TestSleeveBridgeRecommendations:
 
 
 class TestDurableRiskLifecycle:
+    @pytest.mark.asyncio
+    async def test_corrupted_redis_price_mismatch_fails_closed(
+        self, durable_runner, mock_redis
+    ):
+        runner, ledger, _ = durable_runner
+        rec = RecommendationMessage(
+            ticker="AAPL",
+            timestamp=datetime.now(timezone.utc),
+            action="buy",
+            confidence=1,
+            top_features={},
+            recommendation_id="rec-risk",
+            limit_price=101,
+            quantity=10,
+            portfolio="momentum",
+        )
+
+        await runner.process_recommendation(rec)
+
+        assert ledger.get("rec-risk").status == OrderStatus.PROPOSED.value
+        assert not any(
+            call.args[0] == "stream:approved_orders"
+            for call in mock_redis.publish.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_corrupted_redis_quantity_mismatch_fails_closed(
+        self, durable_runner, mock_redis
+    ):
+        runner, ledger, _ = durable_runner
+        rec = RecommendationMessage(
+            ticker="AAPL",
+            timestamp=datetime.now(timezone.utc),
+            action="buy",
+            confidence=1,
+            top_features={},
+            recommendation_id="rec-risk",
+            limit_price=100,
+            quantity=9,
+            portfolio="momentum",
+        )
+
+        await runner.process_recommendation(rec)
+
+        assert ledger.get("rec-risk").status == OrderStatus.PROPOSED.value
+        assert not any(
+            call.args[0] == "stream:approved_orders"
+            for call in mock_redis.publish.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_snapshot_does_not_terminally_reject_valid_exit(
+        self, durable_runner, mock_redis
+    ):
+        runner, ledger, session = durable_runner
+        snapshot = session.scalar(select(CapitalSnapshot))
+        snapshot.captured_at = datetime.now(timezone.utc) - timedelta(days=3)
+        now = datetime.now(timezone.utc)
+        session.add(
+            Position(
+                account_id="DUTEST",
+                ticker="AAPL",
+                portfolio="momentum",
+                con_id=265598,
+                quantity=5,
+                avg_entry_price=100,
+                current_price=100,
+                peak_price=100,
+                highest_price_since_entry=100,
+                opened_at=now,
+                status="open",
+            )
+        )
+        ledger.create_intent(
+            SimpleNamespace(
+                recommendation_id="sell-stale",
+                account_id="DUTEST",
+                mode="paper",
+                portfolio="momentum",
+                con_id=265598,
+                symbol="AAPL",
+                exchange="SMART",
+                currency="USD",
+                action="SELL",
+                quantity=5,
+                limit_price=None,
+                order_type="MKT",
+            )
+        )
+        session.commit()
+        rec = RecommendationMessage(
+            ticker="AAPL",
+            timestamp=now,
+            action="sell",
+            confidence=1,
+            top_features={},
+            recommendation_id="sell-stale",
+            limit_price=None,
+            quantity=5,
+            portfolio="momentum",
+        )
+
+        await runner.process_recommendation(rec)
+
+        assert ledger.get("sell-stale").status == OrderStatus.APPROVED.value
+        assert any(
+            call.args[0] == "stream:approved_orders"
+            for call in mock_redis.publish.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_unavailable_sell_validation_remains_retryable(
+        self, mock_config, mock_redis
+    ):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        session = Session(engine)
+        ledger = OrderLedger(session)
+        ledger.create_intent(
+            SimpleNamespace(
+                recommendation_id="sell-retry",
+                account_id="DUTEST",
+                mode="paper",
+                portfolio="momentum",
+                con_id=265598,
+                symbol="AAPL",
+                exchange="SMART",
+                currency="USD",
+                action="SELL",
+                quantity=5,
+                limit_price=None,
+                order_type="MKT",
+            )
+        )
+        session.commit()
+        runner = RiskServiceRunner(
+            config=mock_config,
+            redis_client=mock_redis,
+            db_session=session,
+            order_ledger=ledger,
+        )
+        rec = RecommendationMessage(
+            ticker="AAPL",
+            timestamp=datetime.now(timezone.utc),
+            action="sell",
+            confidence=1,
+            top_features={},
+            recommendation_id="sell-retry",
+            limit_price=None,
+            quantity=5,
+            portfolio="momentum",
+        )
+
+        with pytest.raises(RuntimeError, match="capital snapshot absent"):
+            await runner.process_recommendation(rec)
+
+        assert ledger.get("sell-retry").status == OrderStatus.PROPOSED.value
+        session.close()
+
+    @pytest.mark.asyncio
+    async def test_pending_sell_with_unavailable_state_is_left_for_retry(
+        self, mock_config, mock_redis
+    ):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        session = Session(engine)
+        ledger = OrderLedger(session)
+        ledger.create_intent(
+            SimpleNamespace(
+                recommendation_id="sell-pending",
+                account_id="DUTEST",
+                mode="paper",
+                portfolio="momentum",
+                con_id=265598,
+                symbol="AAPL",
+                exchange="SMART",
+                currency="USD",
+                action="SELL",
+                quantity=5,
+                limit_price=None,
+                order_type="MKT",
+            )
+        )
+        session.commit()
+        runner = RiskServiceRunner(
+            config=mock_config,
+            redis_client=mock_redis,
+            db_session=session,
+            order_ledger=ledger,
+        )
+        rec = RecommendationMessage(
+            ticker="AAPL",
+            timestamp=datetime.now(timezone.utc),
+            action="sell",
+            confidence=1,
+            top_features={},
+            recommendation_id="sell-pending",
+            limit_price=None,
+            quantity=5,
+            portfolio="momentum",
+        )
+        pending = SimpleNamespace(message_id="1-0", data=rec.to_stream_dict())
+        mock_redis.drain_pending.side_effect = [[pending], [], []]
+
+        await runner.setup()
+
+        mock_redis.ack.assert_not_awaited()
+        mock_redis.send_to_dead_letter.assert_not_awaited()
+        assert ledger.get("sell-pending").status == OrderStatus.PROPOSED.value
+        session.close()
+
     def test_restart_refreshes_account_mode_lifecycle_state_counts(
         self, mock_config, mock_redis
     ):
@@ -659,6 +870,22 @@ class TestDurableRiskLifecycle:
             order_type="MKT",
         )
         ledger.create_intent(sell)
+        now = datetime.now(timezone.utc)
+        session.add(
+            Position(
+                account_id="DUTEST",
+                ticker="AAPL",
+                portfolio="momentum",
+                con_id=265598,
+                quantity=3,
+                avg_entry_price=100,
+                current_price=100,
+                peak_price=100,
+                highest_price_since_entry=100,
+                opened_at=now,
+                status="open",
+            )
+        )
         session.commit()
         buy_rec = RecommendationMessage(
             ticker="AAPL",

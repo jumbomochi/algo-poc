@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import math
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from services.risk_management.correlation import CorrelationMonitor
 from services.risk_management.engine import PortfolioState, RiskEngine
@@ -29,6 +30,11 @@ ALERTS_STREAM = "stream:alerts"
 KILL_STREAM = "stream:kill"
 FILLS_STREAM = "stream:fills"
 CAPITAL_SNAPSHOT_MAX_AGE = timedelta(hours=36)
+
+
+class RetryableRiskStateError(RuntimeError):
+    """A durable recommendation must remain pending until state is available."""
+
 
 CONSUMER_GROUP = "risk_management"
 CONSUMER_NAME = "risk_worker_1"
@@ -181,6 +187,13 @@ class RiskServiceRunner:
                 try:
                     await handler(parser(msg.data))
                     await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
+                except RetryableRiskStateError as exc:
+                    self._logger.warning(
+                        "Retryable risk state unavailable; leaving message pending",
+                        stream=stream,
+                        message_id=msg.message_id,
+                        reason=str(exc),
+                    )
                 except Exception as exc:
                     self._logger.exception(
                         "Error replaying pending message; sending to DLQ",
@@ -295,7 +308,8 @@ class RiskServiceRunner:
 
         refresh_error = self._refresh_risk_state(intent, rec.action)
         if refresh_error is not None:
-            self._persist_risk_rejection(rec.recommendation_id, refresh_error)
+            if rec.action == "buy":
+                self._persist_risk_rejection(rec.recommendation_id, refresh_error)
             self._logger.error(
                 "Risk state refresh failed closed",
                 recommendation_id=rec.recommendation_id,
@@ -307,6 +321,8 @@ class RiskServiceRunner:
                 message=f"Rejected {rec.action} {rec.ticker}: {refresh_error}",
                 context={"recommendation_id": rec.recommendation_id},
             )
+            if rec.action == "sell":
+                raise RetryableRiskStateError(refresh_error)
             return
 
         # 1. Kill switch — highest precedence
@@ -359,7 +375,7 @@ class RiskServiceRunner:
         if rec.action == "buy":
             # Sleeve recommendations carry their own limit price; ML-path
             # ones rely on the last seen market price.
-            price = rec.limit_price or self._current_prices.get(rec.ticker, 0.0)
+            price = intent.limit_price or self._current_prices.get(intent.symbol, 0.0)
             if price <= 0:
                 self._persist_risk_rejection(rec.recommendation_id, "no usable price")
                 self._logger.warning(
@@ -377,18 +393,15 @@ class RiskServiceRunner:
                     },
                 )
                 return
-            self._current_prices[rec.ticker] = price
-            sector = self._get_sector(rec.ticker)
+            self._current_prices[intent.symbol] = price
+            sector = self._get_sector(intent.symbol)
             # Sleeve-sized quantity when provided, else estimate from the
             # config position limit.
-            if rec.quantity and rec.quantity > 0:
-                default_qty = rec.quantity
-            else:
-                default_qty = self._estimate_buy_quantity(rec.ticker, price)
+            default_qty = float(intent.requested_quantity)
 
             reserved_notional = self._active_reservations(rec)
             entry_decision = self._engine.check_entry(
-                ticker=rec.ticker,
+                ticker=intent.symbol,
                 quantity=default_qty,
                 price=price,
                 sector=sector,
@@ -426,32 +439,29 @@ class RiskServiceRunner:
 
         elif rec.action == "sell":
             # Sleeve exits carry their own account/sleeve-scoped quantity.
-            if rec.quantity and rec.quantity > 0:
-                quantity = rec.quantity
-            else:
-                quantity = 0
-            pos = self._portfolio.positions.get(rec.ticker, {})
+            quantity = float(intent.requested_quantity)
+            pos = self._portfolio.positions.get(intent.symbol, {})
             if quantity <= 0:
                 quantity = pos.get("quantity", 0) if isinstance(pos, dict) else 0
             if quantity <= 0:
                 quantity = 1  # minimum sell quantity
 
-        if rec.portfolio:
-            risk_adjustments["portfolio"] = rec.portfolio
+        if intent.portfolio:
+            risk_adjustments["portfolio"] = intent.portfolio
 
         # 4. Publish approved order
         order = ApprovedOrderMessage(
-            ticker=rec.ticker,
+            ticker=intent.symbol,
             timestamp=datetime.now(timezone.utc),
-            action=rec.action,
+            action=intent.action.lower(),
             quantity=quantity,
-            order_type="limit" if rec.action == "buy" else "market",
-            limit_price=self._current_prices.get(rec.ticker)
-            if rec.action == "buy"
+            order_type="limit" if intent.action.upper() == "BUY" else "market",
+            limit_price=self._current_prices.get(intent.symbol)
+            if intent.action.upper() == "BUY"
             else None,
             recommendation_id=rec.recommendation_id,
             risk_adjustments=risk_adjustments,
-            portfolio=rec.portfolio,
+            portfolio=intent.portfolio,
         )
 
         if not self._persist_risk_approval(rec.recommendation_id):
@@ -482,14 +492,36 @@ class RiskServiceRunner:
             OrderStatus.PROPOSED.value,
             OrderStatus.APPROVED.value,
         }
+        if intent.limit_price is None or rec.limit_price is None:
+            price_matches = intent.limit_price is None and rec.limit_price is None
+        else:
+            intent_price = float(intent.limit_price)
+            payload_price = float(rec.limit_price)
+            price_matches = (
+                math.isfinite(intent_price)
+                and math.isfinite(payload_price)
+                and math.isclose(
+                    intent_price, payload_price, rel_tol=1e-9, abs_tol=1e-6
+                )
+            )
+        if rec.quantity is None:
+            quantity_matches = False
+        else:
+            intent_quantity = float(intent.requested_quantity)
+            payload_quantity = float(rec.quantity)
+            quantity_matches = (
+                math.isfinite(intent_quantity)
+                and math.isfinite(payload_quantity)
+                and math.isclose(
+                    intent_quantity, payload_quantity, rel_tol=1e-9, abs_tol=1e-6
+                )
+            )
         matches = (
             intent.symbol == rec.ticker
             and intent.action.lower() == rec.action
             and intent.portfolio == rec.portfolio
-            and (
-                rec.quantity is None
-                or abs(float(intent.requested_quantity) - float(rec.quantity)) <= 1e-6
-            )
+            and price_matches
+            and quantity_matches
         )
         if not valid_status or not matches:
             self._order_ledger.session.rollback()
@@ -513,7 +545,10 @@ class RiskServiceRunner:
         captured_at = snapshot.captured_at
         if captured_at.tzinfo is None:
             captured_at = captured_at.replace(tzinfo=timezone.utc)
-        if datetime.now(timezone.utc) - captured_at > CAPITAL_SNAPSHOT_MAX_AGE:
+        if (
+            action == "buy"
+            and datetime.now(timezone.utc) - captured_at > CAPITAL_SNAPSHOT_MAX_AGE
+        ):
             session.rollback()
             return "matching capital snapshot is stale"
         if action == "buy" and snapshot.reconciliation_status.lower() != "ok":
@@ -553,6 +588,41 @@ class RiskServiceRunner:
                     current["highest_price_since_entry"],
                     float(row.highest_price_since_entry),
                 )
+
+        if action == "sell":
+            held_quantity = float(positions.get(intent.symbol, {}).get("quantity", 0.0))
+            other_sell_remaining = (
+                OrderIntent.requested_quantity - OrderIntent.filled_quantity
+            )
+            reserved = float(
+                session.scalar(
+                    select(func.coalesce(func.sum(other_sell_remaining), 0.0)).where(
+                        OrderIntent.account_id == intent.account_id,
+                        OrderIntent.mode == intent.mode,
+                        OrderIntent.symbol == intent.symbol,
+                        OrderIntent.recommendation_id != intent.recommendation_id,
+                        func.upper(OrderIntent.action) == "SELL",
+                        or_(
+                            OrderIntent.status.in_(
+                                (
+                                    OrderStatus.APPROVED.value,
+                                    OrderStatus.SUBMITTED.value,
+                                    OrderStatus.PARTIALLY_FILLED.value,
+                                )
+                            ),
+                            (
+                                (OrderIntent.status == OrderStatus.PROPOSED.value)
+                                & OrderIntent.published_at.is_not(None)
+                            ),
+                        ),
+                    )
+                )
+                or 0.0
+            )
+            uncovered = max(0.0, held_quantity - reserved)
+            if float(intent.requested_quantity) > uncovered + 1e-6:
+                session.rollback()
+                return "sell validation headroom unavailable"
 
         nav = float(snapshot.deployable_capital)
         market_value = sum(

@@ -27,7 +27,11 @@ class ConflictingOrderIntent(OrderLedgerError):
 
 
 ALLOWED_TRANSITIONS = {
-    OrderStatus.PROPOSED: {OrderStatus.RISK_REJECTED, OrderStatus.APPROVED},
+    OrderStatus.PROPOSED: {
+        OrderStatus.RISK_REJECTED,
+        OrderStatus.APPROVED,
+        OrderStatus.CANCELLED,
+    },
     OrderStatus.APPROVED: {
         OrderStatus.SUBMISSION_FAILED,
         OrderStatus.SUBMITTED,

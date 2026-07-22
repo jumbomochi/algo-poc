@@ -31,7 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from shared.config import AppConfig, load_config
@@ -356,12 +356,18 @@ def build_sell_availability(
             OrderIntent.account_id == broker_snapshot.account_id,
             OrderIntent.mode == broker_snapshot.mode,
             func.upper(OrderIntent.action) == "SELL",
-            OrderIntent.status.in_(
+            or_(
+                OrderIntent.status.in_(
+                    (
+                        OrderStatus.APPROVED.value,
+                        OrderStatus.SUBMITTED.value,
+                        OrderStatus.PARTIALLY_FILLED.value,
+                    )
+                ),
                 (
-                    OrderStatus.APPROVED.value,
-                    OrderStatus.SUBMITTED.value,
-                    OrderStatus.PARTIALLY_FILLED.value,
-                )
+                    (OrderIntent.status == OrderStatus.PROPOSED.value)
+                    & OrderIntent.published_at.is_not(None)
+                ),
             ),
         )
     )
@@ -678,6 +684,7 @@ def publish_unpublished_intents(
     *,
     account_id: str | None = None,
     entries_allowed: bool = True,
+    broker_snapshot: BrokerAccountSnapshot | None = None,
 ) -> int:
     """Replay the durable proposal outbox with stable recommendation IDs."""
     from shared.schemas.messages import RecommendationMessage
@@ -693,7 +700,56 @@ def publish_unpublished_intents(
     intents = list(session.scalars(stmt.order_by(OrderIntent.id)))
     ledger = OrderLedger(session)
     published = 0
+    sell_availability = (
+        build_sell_availability(session, broker_snapshot)
+        if broker_snapshot is not None
+        else None
+    )
     for intent in intents:
+        if intent.action.upper() == "SELL":
+            if broker_snapshot is None:
+                continue
+            if (
+                intent.account_id != broker_snapshot.account_id
+                or intent.mode != broker_snapshot.mode
+            ):
+                continue
+            available = max(0.0, float(sell_availability.get(intent.symbol, 0.0)))
+            requested = float(intent.requested_quantity)
+            if available <= 0:
+                ledger.transition(
+                    intent.recommendation_id,
+                    OrderStatus.CANCELLED,
+                    reason="no uncovered broker holding at outbox replay",
+                )
+                session.commit()
+                continue
+            if requested > available + 1e-6:
+                original_id = intent.recommendation_id
+                ledger.transition(
+                    original_id,
+                    OrderStatus.CANCELLED,
+                    reason=("superseded by broker-capped sell intent at outbox replay"),
+                )
+                quantity_key = f"{available:.4f}".rstrip("0").rstrip(".")
+                replacement_id = f"{original_id}-capped-{quantity_key}"
+                intent = ledger.create_intent(
+                    SimpleNamespace(
+                        recommendation_id=replacement_id,
+                        account_id=intent.account_id,
+                        mode=intent.mode,
+                        portfolio=intent.portfolio,
+                        con_id=intent.con_id,
+                        symbol=intent.symbol,
+                        exchange=intent.exchange,
+                        currency=intent.currency,
+                        action=intent.action,
+                        quantity=available,
+                        limit_price=intent.limit_price,
+                        order_type=intent.order_type,
+                    )
+                )
+                session.commit()
         message = RecommendationMessage(
             ticker=intent.symbol,
             timestamp=intent.created_at,
@@ -709,6 +765,12 @@ def publish_unpublished_intents(
         ledger.mark_published(intent.recommendation_id)
         session.commit()
         published += 1
+        if intent.action.upper() == "SELL" and sell_availability is not None:
+            sell_availability[intent.symbol] = max(
+                0.0,
+                float(sell_availability.get(intent.symbol, 0.0))
+                - float(intent.requested_quantity),
+            )
     return published
 
 
@@ -1044,6 +1106,7 @@ def main():
                     conn,
                     account_id=broker_snapshot.account_id,
                     entries_allowed=not entries_disabled,
+                    broker_snapshot=broker_snapshot,
                 )
             finally:
                 conn.close()
