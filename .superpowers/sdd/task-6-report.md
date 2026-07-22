@@ -196,3 +196,67 @@ Concern: if an operator has independently applied the preceding durable-ledger
 migration and accumulated fill rows before applying this revision, automatic
 upgrade intentionally stops.  Those outcomes require explicit human
 reconciliation; the migration does not delete, overwrite, or classify them.
+
+## Migration runtime correction (2026-07-22)
+
+Final re-review exercised the migration through Alembic rather than only the
+operation mock.  Commit `9ce1025` adds real SQLite upgrade/downgrade coverage,
+retains the safe `false` server default instead of issuing SQLite's unsupported
+`ALTER COLUMN ... DROP DEFAULT`, and explicitly rejects offline SQL generation
+because offline mode cannot query the table to enforce the empty-table safety
+precondition.  Online PostgreSQL and SQLite upgrades still query for legacy
+rows before changing the schema.
+
+RED:
+
+```text
+/Users/huiliang/GitHub/algo-poc/.venv/bin/python -m pytest \
+  tests/migrations/test_fill_projection_outcome_migration.py -q
+3 failed, 3 passed in 0.56s
+
+SQLite memory and file upgrades:
+OperationalError: near "DEFAULT": syntax error
+[SQL: ALTER TABLE execution_fills ALTER COLUMN projection_applied DROP DEFAULT]
+
+Offline PostgreSQL generation:
+AttributeError: 'MockConnection' object has no attribute 'scalar'
+```
+
+GREEN:
+
+```text
+/Users/huiliang/GitHub/algo-poc/.venv/bin/python -m pytest \
+  tests/migrations/test_fill_projection_outcome_migration.py -q
+6 passed in 0.32s
+
+/Users/huiliang/GitHub/algo-poc/.venv/bin/python -m pytest \
+  tests/migrations/test_fill_projection_outcome_migration.py \
+  tests/services/portfolio_accounting/test_projector.py \
+  tests/shared/test_order_ledger_models.py -q
+41 passed in 0.46s
+
+/Users/huiliang/GitHub/algo-poc/.venv/bin/python -c \
+  'import asyncio, pytest; asyncio.set_event_loop(asyncio.new_event_loop()); \
+  raise SystemExit(pytest.main(["-q"]))'
+705 passed in 12.34s
+
+python -m alembic heads
+c3a947f26510 (head)
+
+python -m compileall -q \
+  migrations/versions/c3a947f26510_track_fill_projection_outcome.py \
+  tests/migrations/test_fill_projection_outcome_migration.py
+clean
+
+git diff --check
+clean
+```
+
+Files changed in the runtime correction:
+
+- `migrations/versions/c3a947f26510_track_fill_projection_outcome.py`
+- `tests/migrations/test_fill_projection_outcome_migration.py`
+
+Concern: offline SQL generation is intentionally unsupported for this revision
+and raises a clear `RuntimeError`; operators must run the migration online so
+Alembic can verify that `execution_fills` is empty before adding the marker.
