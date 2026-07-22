@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from services.risk_management.correlation import CorrelationMonitor
 from services.risk_management.engine import PortfolioState, RiskEngine
@@ -12,7 +12,7 @@ from services.risk_management.kill_switch import KillSwitch
 from services.risk_management.passive_monitor import PassiveBreachMonitor
 from shared.config import AppConfig
 from shared.logging import get_logger
-from shared.models import CapitalSnapshot, OrderStatus
+from shared.models import CapitalSnapshot, OrderIntent, OrderStatus, Position
 from shared.order_ledger import OrderIntentNotFound, OrderLedger
 from shared.observability import DEFAULT_TRADING_METRICS
 from shared.schemas.messages import (
@@ -28,6 +28,7 @@ APPROVED_ORDERS_STREAM = "stream:approved_orders"
 ALERTS_STREAM = "stream:alerts"
 KILL_STREAM = "stream:kill"
 FILLS_STREAM = "stream:fills"
+CAPITAL_SNAPSHOT_MAX_AGE = timedelta(hours=36)
 
 CONSUMER_GROUP = "risk_management"
 CONSUMER_NAME = "risk_worker_1"
@@ -54,6 +55,7 @@ class RiskServiceRunner:
         redis_client: Any,
         db_session: Any = None,
         order_ledger: OrderLedger | None = None,
+        metrics: Any = None,
     ) -> None:
         self._config = config
         self._redis = redis_client
@@ -62,6 +64,7 @@ class RiskServiceRunner:
             OrderLedger(db_session) if db_session is not None else None
         )
         self._db_session = db_session
+        self._metrics = metrics or DEFAULT_TRADING_METRICS
 
         risk_cfg = config.risk
 
@@ -140,6 +143,15 @@ class RiskServiceRunner:
         self._current_prices: dict[str, float] = {
             t: p["current_price"] for t, p in self._portfolio.positions.items()
         }
+        if self._order_ledger is not None:
+            pairs = list(
+                self._order_ledger.session.execute(
+                    select(OrderIntent.account_id, OrderIntent.mode).distinct()
+                )
+            )
+            for account_id, mode in pairs:
+                self._refresh_lifecycle_metrics(account_id, mode)
+            self._order_ledger.session.rollback()
 
     async def setup(self) -> None:
         """Create consumer groups and replay pending messages.
@@ -261,6 +273,39 @@ class RiskServiceRunner:
                 "Ignoring hold recommendation",
                 ticker=rec.ticker,
                 recommendation_id=rec.recommendation_id,
+            )
+            return
+
+        intent = self._durable_intent(rec)
+        if intent is None:
+            self._logger.error(
+                "Rejecting recommendation without a matching durable intent",
+                recommendation_id=rec.recommendation_id,
+            )
+            await self._publish_alert(
+                event_type="durable_intent_missing",
+                priority="high",
+                message=(
+                    f"Rejected {rec.action} {rec.ticker}: missing or mismatched "
+                    "durable order intent"
+                ),
+                context={"recommendation_id": rec.recommendation_id},
+            )
+            return
+
+        refresh_error = self._refresh_risk_state(intent, rec.action)
+        if refresh_error is not None:
+            self._persist_risk_rejection(rec.recommendation_id, refresh_error)
+            self._logger.error(
+                "Risk state refresh failed closed",
+                recommendation_id=rec.recommendation_id,
+                reason=refresh_error,
+            )
+            await self._publish_alert(
+                event_type="risk_state_unavailable",
+                priority="high",
+                message=f"Rejected {rec.action} {rec.ticker}: {refresh_error}",
+                context={"recommendation_id": rec.recommendation_id},
             )
             return
 
@@ -425,6 +470,126 @@ class RiskServiceRunner:
             recommendation_id=rec.recommendation_id,
         )
 
+    def _durable_intent(self, rec: RecommendationMessage) -> OrderIntent | None:
+        if self._order_ledger is None:
+            return None
+        try:
+            intent = self._order_ledger.get(rec.recommendation_id)
+        except OrderIntentNotFound:
+            self._order_ledger.session.rollback()
+            return None
+        valid_status = intent.status in {
+            OrderStatus.PROPOSED.value,
+            OrderStatus.APPROVED.value,
+        }
+        matches = (
+            intent.symbol == rec.ticker
+            and intent.action.lower() == rec.action
+            and intent.portfolio == rec.portfolio
+            and (
+                rec.quantity is None
+                or abs(float(intent.requested_quantity) - float(rec.quantity)) <= 1e-6
+            )
+        )
+        if not valid_status or not matches:
+            self._order_ledger.session.rollback()
+            return None
+        return intent
+
+    def _refresh_risk_state(self, intent: OrderIntent, action: str) -> str | None:
+        session = self._order_ledger.session
+        snapshot = session.scalar(
+            select(CapitalSnapshot)
+            .where(
+                CapitalSnapshot.account_id == intent.account_id,
+                CapitalSnapshot.mode == intent.mode,
+            )
+            .order_by(CapitalSnapshot.captured_at.desc(), CapitalSnapshot.id.desc())
+            .limit(1)
+        )
+        if snapshot is None:
+            session.rollback()
+            return "matching capital snapshot absent"
+        captured_at = snapshot.captured_at
+        if captured_at.tzinfo is None:
+            captured_at = captured_at.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - captured_at > CAPITAL_SNAPSHOT_MAX_AGE:
+            session.rollback()
+            return "matching capital snapshot is stale"
+        if action == "buy" and snapshot.reconciliation_status.lower() != "ok":
+            session.rollback()
+            return "latest reconciliation is breached"
+
+        rows = list(
+            session.scalars(
+                select(Position).where(
+                    Position.account_id == intent.account_id,
+                    Position.status == "open",
+                )
+            )
+        )
+        positions: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            current = positions.get(row.ticker)
+            if current is None:
+                positions[row.ticker] = {
+                    "quantity": float(row.quantity),
+                    "avg_entry_price": float(row.avg_entry_price),
+                    "current_price": float(row.current_price),
+                    "highest_price_since_entry": float(row.highest_price_since_entry),
+                    "sector": row.sector or "Unknown",
+                }
+            else:
+                prior_quantity = current["quantity"]
+                total_quantity = prior_quantity + float(row.quantity)
+                if total_quantity > 0:
+                    current["avg_entry_price"] = (
+                        current["avg_entry_price"] * prior_quantity
+                        + float(row.avg_entry_price) * float(row.quantity)
+                    ) / total_quantity
+                current["quantity"] = total_quantity
+                current["current_price"] = float(row.current_price)
+                current["highest_price_since_entry"] = max(
+                    current["highest_price_since_entry"],
+                    float(row.highest_price_since_entry),
+                )
+
+        nav = float(snapshot.deployable_capital)
+        market_value = sum(
+            position["quantity"] * position["current_price"]
+            for position in positions.values()
+        )
+        peak_nav = float(
+            session.scalar(
+                select(func.max(CapitalSnapshot.deployable_capital)).where(
+                    CapitalSnapshot.account_id == intent.account_id,
+                    CapitalSnapshot.mode == intent.mode,
+                )
+            )
+            or nav
+        )
+        sector_exposure: dict[str, float] = {}
+        if nav > 0:
+            for position in positions.values():
+                sector = position["sector"]
+                sector_exposure[sector] = sector_exposure.get(sector, 0.0) + (
+                    position["quantity"] * position["current_price"] / nav * 100.0
+                )
+        self._cash = nav - market_value
+        self._portfolio = PortfolioState(
+            nav=nav,
+            peak_nav=max(nav, peak_nav),
+            positions=positions,
+            sector_exposure=sector_exposure,
+            total_exposure_pct=(market_value / nav * 100.0 if nav > 0 else 0.0),
+            margin_utilization_pct=0.0,
+        )
+        self._current_prices = {
+            ticker: position["current_price"] for ticker, position in positions.items()
+        }
+        session.rollback()
+        return None
+
     def _active_reservations(self, rec: RecommendationMessage) -> float:
         if self._order_ledger is None or not rec.portfolio:
             return 0.0
@@ -458,9 +623,10 @@ class RiskServiceRunner:
                 recommendation_id, OrderStatus.RISK_REJECTED, reason=reason
             )
             self._order_ledger.session.commit()
-            DEFAULT_TRADING_METRICS.lifecycle_transitions.labels(
+            self._metrics.lifecycle_transitions.labels(
                 status=OrderStatus.RISK_REJECTED.value
             ).inc()
+            self._refresh_lifecycle_metrics(intent.account_id, intent.mode)
             return True
         except OrderIntentNotFound:
             self._order_ledger.session.rollback()
@@ -480,13 +646,34 @@ class RiskServiceRunner:
                 return False
             self._order_ledger.transition(recommendation_id, OrderStatus.APPROVED)
             self._order_ledger.session.commit()
-            DEFAULT_TRADING_METRICS.lifecycle_transitions.labels(
+            self._metrics.lifecycle_transitions.labels(
                 status=OrderStatus.APPROVED.value
             ).inc()
+            self._refresh_lifecycle_metrics(intent.account_id, intent.mode)
             return True
         except OrderIntentNotFound:
             self._order_ledger.session.rollback()
             return True
+
+    def _refresh_lifecycle_metrics(self, account_id: str, mode: str) -> None:
+        if self._order_ledger is None:
+            return
+        rows = self._order_ledger.session.execute(
+            select(OrderIntent.status, func.count(OrderIntent.id))
+            .where(
+                OrderIntent.account_id == account_id,
+                OrderIntent.mode == mode,
+            )
+            .group_by(OrderIntent.status)
+        )
+        counts = {status: int(count) for status, count in rows}
+        for status in OrderStatus:
+            self._metrics.lifecycle_state.labels(
+                account_id=account_id,
+                mode=mode,
+                status=status.value,
+            ).set(counts.get(status.value, 0))
+        self._order_ledger.session.rollback()
 
     async def process_kill(self, kill_msg: KillMessage) -> None:
         """Process a kill message: activate switch and liquidate all positions.

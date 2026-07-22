@@ -16,13 +16,14 @@ from sqlalchemy.orm import sessionmaker
 from scripts.paper_state import PaperTradingState
 from scripts.run_backtest import PortfolioConfig
 from scripts.run_paper import (
+    build_sell_availability,
     create_signal_intents,
     publish_unpublished_intents,
     run_daily,
 )
 from services.risk_management.engine import RiskEngine
 from services.execution.reconciliation import ReconciliationResult
-from shared.broker_state import BrokerAccountSnapshot, BrokerPosition
+from shared.broker_state import BrokerAccountSnapshot, BrokerOpenOrder, BrokerPosition
 from shared.models import OrderStatus
 from shared.models.base import Base
 from shared.models.portfolio import Position
@@ -72,6 +73,19 @@ def build_portfolio(signals_fn) -> dict[str, PortfolioConfig]:
 
 
 class TestEntryGate:
+    def test_same_cycle_buys_accumulate_reserved_notional(self, state):
+        def buy_fn(ticker, bars):
+            return {"action": "buy", "limit_price": 100.0, "quantity": 10.0}
+
+        portfolio = build_portfolio(buy_fn)["test_sleeve"]
+        portfolio.risk_engine.position_entry_limit_pct = 100.0
+        bars = {f"T{i:02d}": make_bars() for i in range(20)}
+
+        signals = run_daily(state, {"test_sleeve": portfolio}, bars)
+
+        assert len(signals) == 10
+        assert sum(s["quantity"] * s["limit_price"] for s in signals) == 10_000
+
     def test_nav_hydrated_sleeve_budget_controls_entry_headroom(self, state):
         def large_account_fn(ticker, bars):
             return {"action": "buy", "limit_price": 100.0, "quantity": 1_000.0}
@@ -318,10 +332,64 @@ def test_signal_creates_deterministic_intent_without_position_mutation(state):
 
     create_signal_intents(state._session, signals, snapshot, run_date=date(2026, 7, 18))
 
-    intent = OrderLedger(state._session).get("sleeve-2026-07-18-test_sleeve-AAPL-buy")
+    intent = OrderLedger(state._session).get(
+        "sleeve-2026-07-18-DUTEST-paper-test_sleeve-AAPL-buy"
+    )
     assert intent.status == OrderStatus.PROPOSED.value
     assert state.get_positions("test_sleeve") == {}
     assert state.get_cash("test_sleeve") == pytest.approx(10_000)
+
+
+def test_recommendation_id_is_stable_but_account_and_mode_scoped(state):
+    signal = {
+        "action": "buy",
+        "limit_price": 100.0,
+        "quantity": 2.0,
+        "ticker": "AAPL",
+        "portfolio": "test_sleeve",
+    }
+    contract = BrokerPosition(
+        account_id="DUONE",
+        con_id=265598,
+        symbol="AAPL",
+        quantity=0,
+        exchange="SMART",
+        currency="USD",
+    )
+    one = BrokerAccountSnapshot(
+        account_id="DUONE",
+        mode="paper",
+        net_liquidation=10_000,
+        positions={265598: contract},
+    )
+    two = BrokerAccountSnapshot(
+        account_id="DUTWO",
+        mode="paper",
+        net_liquidation=10_000,
+        positions={
+            265598: BrokerPosition(
+                account_id="DUTWO",
+                con_id=265598,
+                symbol="AAPL",
+                quantity=0,
+            )
+        },
+    )
+
+    first = create_signal_intents(
+        state._session, [signal], one, run_date=date(2026, 7, 18)
+    )[0]
+    retry = create_signal_intents(
+        state._session, [signal], one, run_date=date(2026, 7, 18)
+    )[0]
+    other = create_signal_intents(
+        state._session, [signal], two, run_date=date(2026, 7, 18)
+    )[0]
+
+    assert first.id == retry.id
+    assert first.recommendation_id != other.recommendation_id
+    assert "DUONE-paper" in first.recommendation_id
+    assert "DUTWO-paper" in other.recommendation_id
 
 
 def test_unpublished_intent_is_replayed_with_same_id(state):
@@ -439,3 +507,119 @@ def test_fail_closed_replay_keeps_buys_unpublished_but_publishes_sells(state):
     )
     assert [payload["recommendation_id"] for payload in redis.payloads] == ["sell-1"]
     assert ledger.get("buy-1").published_at is None
+
+
+def test_breached_reconciliation_sell_is_capped_to_broker_holding(state):
+    state.record_fill(
+        portfolio="test_sleeve",
+        ticker="AAPL",
+        action="buy",
+        quantity=10,
+        price=100,
+        fill_date=date(2026, 7, 1),
+    )
+    snapshot = BrokerAccountSnapshot(
+        account_id="DUTEST",
+        mode="paper",
+        net_liquidation=10_000,
+        positions={
+            265598: BrokerPosition(
+                account_id="DUTEST",
+                con_id=265598,
+                symbol="AAPL",
+                quantity=5,
+            )
+        },
+    )
+    available = build_sell_availability(state._session, snapshot)
+    failed = ReconciliationResult(
+        matched=[],
+        discrepancies=[{"type": "quantity_mismatch"}],
+        severity="major",
+        account_id="DUTEST",
+    )
+
+    signals = run_daily(
+        state,
+        build_portfolio(
+            lambda ticker, bars: {
+                "action": "sell",
+                "limit_price": 100,
+                "quantity": 10,
+            }
+        ),
+        {"AAPL": make_bars()},
+        reconciliation=failed,
+        sell_availability=available,
+    )
+
+    assert signals[0]["quantity"] == 5
+
+
+def test_active_sell_orders_reduce_availability_without_double_count(state):
+    ledger = OrderLedger(state._session)
+    proposal = type(
+        "Proposal",
+        (),
+        {
+            "recommendation_id": "sell-open",
+            "account_id": "DUTEST",
+            "mode": "paper",
+            "portfolio": "test_sleeve",
+            "con_id": 265598,
+            "symbol": "AAPL",
+            "exchange": "SMART",
+            "currency": "USD",
+            "action": "SELL",
+            "quantity": 2,
+            "limit_price": None,
+            "order_type": "MKT",
+        },
+    )()
+    ledger.create_intent(proposal)
+    ledger.transition("sell-open", OrderStatus.APPROVED)
+    ledger.record_submission("sell-open", "42")
+    snapshot = BrokerAccountSnapshot(
+        account_id="DUTEST",
+        mode="paper",
+        net_liquidation=10_000,
+        positions={
+            265598: BrokerPosition(
+                account_id="DUTEST",
+                con_id=265598,
+                symbol="AAPL",
+                quantity=5,
+            )
+        },
+        open_orders={
+            "42": BrokerOpenOrder(
+                account_id="DUTEST",
+                ib_order_id="42",
+                con_id=265598,
+                symbol="AAPL",
+                action="SELL",
+                total_quantity=2,
+                filled_quantity=0,
+                status="Submitted",
+            )
+        },
+    )
+
+    assert build_sell_availability(state._session, snapshot)["AAPL"] == 3
+
+
+def test_zero_broker_holding_suppresses_sell_signal(state):
+    signals = run_daily(
+        state,
+        build_portfolio(
+            lambda ticker, bars: {
+                "action": "sell",
+                "limit_price": 100,
+                "quantity": 10,
+            }
+        ),
+        {"AAPL": make_bars()},
+        sell_availability={"AAPL": 0},
+    )
+
+    assert signals == []

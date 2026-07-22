@@ -79,10 +79,19 @@ def test_trading_metrics_cover_capital_reservations_lifecycle_and_reconciliation
     metrics.sleeve_budget.labels(portfolio="momentum").set(230_800)
     metrics.reserved_notional.labels(portfolio="momentum").set(1_000)
     metrics.lifecycle_transitions.labels(status="APPROVED").inc()
+    metrics.lifecycle_state.labels(
+        account_id="DUTEST", mode="paper", status="APPROVED"
+    ).set(3)
     metrics.reconciliation_entries_allowed.set(1)
 
     assert metrics.deployable_capital._value.get() == 1_000_000
     assert metrics.sleeve_budget.labels(portfolio="momentum")._value.get() == 230_800
     assert metrics.reserved_notional.labels(portfolio="momentum")._value.get() == 1_000
     assert metrics.lifecycle_transitions.labels(status="APPROVED")._value.get() == 1
+    assert (
+        metrics.lifecycle_state.labels(
+            account_id="DUTEST", mode="paper", status="APPROVED"
+        )._value.get()
+        == 3
+    )
     assert metrics.reconciliation_entries_allowed._value.get() == 1

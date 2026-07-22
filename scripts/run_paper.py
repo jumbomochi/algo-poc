@@ -334,6 +334,56 @@ def prepare_daily_run(
     )
 
 
+def build_sell_availability(
+    session: Session, broker_snapshot: BrokerAccountSnapshot
+) -> dict[str, float]:
+    """Return broker-held quantity not already covered by active sells."""
+    by_con_id = {
+        con_id: max(0.0, float(position.quantity))
+        for con_id, position in broker_snapshot.positions.items()
+    }
+    broker_order_ids: set[str] = set()
+    for order_id, order in broker_snapshot.open_orders.items():
+        if str(order.action).upper() != "SELL":
+            continue
+        broker_order_ids.add(str(order_id))
+        by_con_id[order.con_id] = max(
+            0.0, by_con_id.get(order.con_id, 0.0) - order.remaining_quantity
+        )
+
+    pending_sells = session.scalars(
+        select(OrderIntent).where(
+            OrderIntent.account_id == broker_snapshot.account_id,
+            OrderIntent.mode == broker_snapshot.mode,
+            func.upper(OrderIntent.action) == "SELL",
+            OrderIntent.status.in_(
+                (
+                    OrderStatus.APPROVED.value,
+                    OrderStatus.SUBMITTED.value,
+                    OrderStatus.PARTIALLY_FILLED.value,
+                )
+            ),
+        )
+    )
+    for intent in pending_sells:
+        if (
+            intent.ib_order_id is not None
+            and str(intent.ib_order_id) in broker_order_ids
+        ):
+            continue
+        remaining = max(
+            0.0, float(intent.requested_quantity) - float(intent.filled_quantity)
+        )
+        by_con_id[intent.con_id] = max(
+            0.0, by_con_id.get(intent.con_id, 0.0) - remaining
+        )
+
+    return {
+        position.symbol: by_con_id.get(con_id, 0.0)
+        for con_id, position in broker_snapshot.positions.items()
+    }
+
+
 def print_status(state: PaperTradingState) -> None:
     """Print current paper trading status."""
     print("\n" + "=" * 60)
@@ -405,12 +455,15 @@ def run_daily(
     reconciliation: ReconciliationResult | None = None,
     entries_disabled: bool = False,
     reservations_by_portfolio: Mapping[str, float] | None = None,
+    sell_availability: Mapping[str, float] | None = None,
 ) -> list[dict]:
     """Run one daily cycle: generate signals for all portfolios.
 
     Returns list of signals generated (for logging/review).
     """
     signals_generated: list[dict] = []
+    accepted_buy_notional: dict[str, float] = {}
+    remaining_sell_quantity = dict(sell_availability or {})
     today = date.today()
 
     # Build current prices from latest bar close
@@ -495,7 +548,8 @@ def run_daily(
                         existing_lots=1 if ticker in positions else 0,
                         reserved_notional=float(
                             (reservations_by_portfolio or {}).get(name, 0.0)
-                        ),
+                        )
+                        + accepted_buy_notional.get(name, 0.0),
                     )
                     if not decision.approved:
                         print(
@@ -507,10 +561,27 @@ def run_daily(
                         signal["quantity"] = qty
 
                     signals_generated.append(signal)
+                    accepted_buy_notional[name] = (
+                        accepted_buy_notional.get(name, 0.0) + qty * price
+                    )
                     print(
                         f"  BUY  {ticker:>6s}  {qty:>8.4f} @ ${price:>8.2f}  [{name}]"
                     )
                 elif action == "sell":
+                    if sell_availability is not None:
+                        uncovered = max(
+                            0.0, float(remaining_sell_quantity.get(ticker, 0.0))
+                        )
+                        requested = float(qty or uncovered)
+                        qty = min(requested, uncovered)
+                        if qty <= 0:
+                            print(
+                                f"  SKIP {ticker:>6s}  [{name}] "
+                                "(no uncovered broker holding to sell)"
+                            )
+                            continue
+                        signal["quantity"] = qty
+                        remaining_sell_quantity[ticker] = uncovered - qty
                     # Exits are never gated (matching the backtest runner:
                     # "Sell signals for existing positions are always processed").
                     signals_generated.append(signal)
@@ -576,7 +647,10 @@ def create_signal_intents(
         )
         if con_id <= 0:
             raise ValueError(f"invalid IB contract id for signal {ticker}")
-        recommendation_id = f"sleeve-{run_date}-{signal['portfolio']}-{ticker}-{action}"
+        recommendation_id = (
+            f"sleeve-{run_date}-{broker_snapshot.account_id}-"
+            f"{broker_snapshot.mode}-{signal['portfolio']}-{ticker}-{action}"
+        )
         limit_price = signal.get("limit_price")
         proposal = SimpleNamespace(
             recommendation_id=recommendation_id,
@@ -919,6 +993,7 @@ def main():
             name: context.reserved_notional
             for name, context in portfolio_contexts.items()
         }
+        sell_availability = build_sell_availability(session, broker_snapshot)
         signals = run_daily(
             state,
             portfolios,
@@ -926,6 +1001,7 @@ def main():
             reconciliation=preparation.reconciliation,
             entries_disabled=entries_disabled,
             reservations_by_portfolio=reservations,
+            sell_availability=sell_availability,
         )
         if args.publish and signals:
             contracts = resolve_contract_details_from_ib(
