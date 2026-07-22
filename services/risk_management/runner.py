@@ -4,12 +4,17 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import select
+
 from services.risk_management.correlation import CorrelationMonitor
-from services.risk_management.engine import PortfolioState, RiskDecision, RiskEngine
+from services.risk_management.engine import PortfolioState, RiskEngine
 from services.risk_management.kill_switch import KillSwitch
 from services.risk_management.passive_monitor import PassiveBreachMonitor
 from shared.config import AppConfig
 from shared.logging import get_logger
+from shared.models import CapitalSnapshot, OrderStatus
+from shared.order_ledger import OrderIntentNotFound, OrderLedger
+from shared.observability import DEFAULT_TRADING_METRICS
 from shared.schemas.messages import (
     AlertMessage,
     ApprovedOrderMessage,
@@ -48,10 +53,15 @@ class RiskServiceRunner:
         config: AppConfig,
         redis_client: Any,
         db_session: Any = None,
+        order_ledger: OrderLedger | None = None,
     ) -> None:
         self._config = config
         self._redis = redis_client
         self._logger = get_logger("risk_management")
+        self._order_ledger = order_ledger or (
+            OrderLedger(db_session) if db_session is not None else None
+        )
+        self._db_session = db_session
 
         risk_cfg = config.risk
 
@@ -75,19 +85,47 @@ class RiskServiceRunner:
             from shared.position_loader import load_portfolio_state
 
             state = load_portfolio_state(db_session)
-            self._cash = state["cash"]
+            latest_capital = db_session.scalar(
+                select(CapitalSnapshot)
+                .where(CapitalSnapshot.mode == config.mode)
+                .order_by(
+                    CapitalSnapshot.captured_at.desc(),
+                    CapitalSnapshot.id.desc(),
+                )
+                .limit(1)
+            )
+            risk_nav = (
+                float(latest_capital.deployable_capital)
+                if latest_capital is not None
+                else state["nav"]
+            )
+            market_value = sum(
+                position["quantity"] * position["current_price"]
+                for position in state["positions"].values()
+            )
+            self._cash = risk_nav - market_value
+            sector_exposure: dict[str, float] = {}
+            if risk_nav > 0:
+                for position in state["positions"].values():
+                    sector = position.get("sector") or "Unknown"
+                    value = position["quantity"] * position["current_price"]
+                    sector_exposure[sector] = (
+                        sector_exposure.get(sector, 0.0) + value / risk_nav * 100.0
+                    )
             self._portfolio = PortfolioState(
-                nav=state["nav"],
-                peak_nav=state["peak_nav"],
+                nav=risk_nav,
+                peak_nav=max(state["peak_nav"], risk_nav),
                 positions=state["positions"],
-                sector_exposure=state["sector_exposure"],
-                total_exposure_pct=0.0,
+                sector_exposure=sector_exposure,
+                total_exposure_pct=(
+                    market_value / risk_nav * 100.0 if risk_nav > 0 else 0.0
+                ),
                 margin_utilization_pct=0.0,
             )
             self._logger.info(
                 "Portfolio state loaded from DB",
-                nav=state["nav"],
-                peak_nav=state["peak_nav"],
+                nav=risk_nav,
+                peak_nav=max(state["peak_nav"], risk_nav),
                 open_positions=len(state["positions"]),
             )
         else:
@@ -110,16 +148,17 @@ class RiskServiceRunner:
         re-delivered by the normal ``">"`` read; replay them so no
         recommendation, kill, or fill is silently lost across a restart.
         """
-        await self._redis.create_consumer_group(
-            RECOMMENDATIONS_STREAM, CONSUMER_GROUP
-        )
+        await self._redis.create_consumer_group(RECOMMENDATIONS_STREAM, CONSUMER_GROUP)
         await self._redis.create_consumer_group(KILL_STREAM, CONSUMER_GROUP)
         await self._redis.create_consumer_group(FILLS_STREAM, CONSUMER_GROUP)
 
         replayed = 0
         for stream, parser, handler in (
-            (RECOMMENDATIONS_STREAM, RecommendationMessage.from_stream_dict,
-             self.process_recommendation),
+            (
+                RECOMMENDATIONS_STREAM,
+                RecommendationMessage.from_stream_dict,
+                self.process_recommendation,
+            ),
             (KILL_STREAM, KillMessage.from_stream_dict, self.process_kill),
             (FILLS_STREAM, FillMessage.from_stream_dict, self.process_fill),
         ):
@@ -200,9 +239,7 @@ class RiskServiceRunner:
             open_positions=len(positions),
         )
 
-    async def process_recommendation(
-        self, rec: RecommendationMessage
-    ) -> None:
+    async def process_recommendation(self, rec: RecommendationMessage) -> None:
         """Process a single recommendation through the risk gate.
 
         Decision precedence:
@@ -230,6 +267,7 @@ class RiskServiceRunner:
         # 1. Kill switch — highest precedence
         kill_decision = self._kill_switch.check()
         if not kill_decision.approved:
+            self._persist_risk_rejection(rec.recommendation_id, kill_decision.reason)
             self._logger.warning(
                 "Kill switch rejected recommendation",
                 ticker=rec.ticker,
@@ -239,7 +277,10 @@ class RiskServiceRunner:
                 event_type="kill_switch_rejection",
                 priority="critical",
                 message=f"Kill switch rejected {rec.action} {rec.ticker}: {kill_decision.reason}",
-                context={"ticker": rec.ticker, "recommendation_id": rec.recommendation_id},
+                context={
+                    "ticker": rec.ticker,
+                    "recommendation_id": rec.recommendation_id,
+                },
             )
             return
 
@@ -247,6 +288,9 @@ class RiskServiceRunner:
         if rec.action == "buy":
             drawdown_decision = self._engine.check_portfolio_drawdown(self._portfolio)
             if not drawdown_decision.approved:
+                self._persist_risk_rejection(
+                    rec.recommendation_id, drawdown_decision.reason
+                )
                 self._logger.warning(
                     "Drawdown check rejected buy",
                     ticker=rec.ticker,
@@ -256,7 +300,10 @@ class RiskServiceRunner:
                     event_type="drawdown_rejection",
                     priority="high",
                     message=f"Drawdown rejected buy {rec.ticker}: {drawdown_decision.reason}",
-                    context={"ticker": rec.ticker, "recommendation_id": rec.recommendation_id},
+                    context={
+                        "ticker": rec.ticker,
+                        "recommendation_id": rec.recommendation_id,
+                    },
                 )
                 return
 
@@ -269,6 +316,7 @@ class RiskServiceRunner:
             # ones rely on the last seen market price.
             price = rec.limit_price or self._current_prices.get(rec.ticker, 0.0)
             if price <= 0:
+                self._persist_risk_rejection(rec.recommendation_id, "no usable price")
                 self._logger.warning(
                     "Rejecting buy with no usable price",
                     ticker=rec.ticker,
@@ -278,7 +326,10 @@ class RiskServiceRunner:
                     event_type="entry_rejection",
                     priority="medium",
                     message=f"Rejected buy {rec.ticker}: no usable price",
-                    context={"ticker": rec.ticker, "recommendation_id": rec.recommendation_id},
+                    context={
+                        "ticker": rec.ticker,
+                        "recommendation_id": rec.recommendation_id,
+                    },
                 )
                 return
             self._current_prices[rec.ticker] = price
@@ -290,15 +341,20 @@ class RiskServiceRunner:
             else:
                 default_qty = self._estimate_buy_quantity(rec.ticker, price)
 
+            reserved_notional = self._active_reservations(rec)
             entry_decision = self._engine.check_entry(
                 ticker=rec.ticker,
                 quantity=default_qty,
                 price=price,
                 sector=sector,
                 portfolio=self._portfolio,
+                reserved_notional=reserved_notional,
             )
 
             if not entry_decision.approved:
+                self._persist_risk_rejection(
+                    rec.recommendation_id, entry_decision.reason
+                )
                 self._logger.warning(
                     "Entry check rejected buy",
                     ticker=rec.ticker,
@@ -308,7 +364,10 @@ class RiskServiceRunner:
                     event_type="entry_rejection",
                     priority="medium",
                     message=f"Entry rejected buy {rec.ticker}: {entry_decision.reason}",
-                    context={"ticker": rec.ticker, "recommendation_id": rec.recommendation_id},
+                    context={
+                        "ticker": rec.ticker,
+                        "recommendation_id": rec.recommendation_id,
+                    },
                 )
                 return
 
@@ -321,9 +380,14 @@ class RiskServiceRunner:
                 }
 
         elif rec.action == "sell":
-            # For sells, use the position quantity
+            # Sleeve exits carry their own account/sleeve-scoped quantity.
+            if rec.quantity and rec.quantity > 0:
+                quantity = rec.quantity
+            else:
+                quantity = 0
             pos = self._portfolio.positions.get(rec.ticker, {})
-            quantity = pos.get("quantity", 0) if isinstance(pos, dict) else 0
+            if quantity <= 0:
+                quantity = pos.get("quantity", 0) if isinstance(pos, dict) else 0
             if quantity <= 0:
                 quantity = 1  # minimum sell quantity
 
@@ -337,10 +401,16 @@ class RiskServiceRunner:
             action=rec.action,
             quantity=quantity,
             order_type="limit" if rec.action == "buy" else "market",
-            limit_price=self._current_prices.get(rec.ticker) if rec.action == "buy" else None,
+            limit_price=self._current_prices.get(rec.ticker)
+            if rec.action == "buy"
+            else None,
             recommendation_id=rec.recommendation_id,
             risk_adjustments=risk_adjustments,
+            portfolio=rec.portfolio,
         )
+
+        if not self._persist_risk_approval(rec.recommendation_id):
+            return
 
         await self._redis.publish(
             APPROVED_ORDERS_STREAM,
@@ -354,6 +424,69 @@ class RiskServiceRunner:
             quantity=quantity,
             recommendation_id=rec.recommendation_id,
         )
+
+    def _active_reservations(self, rec: RecommendationMessage) -> float:
+        if self._order_ledger is None or not rec.portfolio:
+            return 0.0
+        try:
+            intent = self._order_ledger.get(rec.recommendation_id)
+            value = self._order_ledger.active_reservations(
+                rec.portfolio,
+                account_id=intent.account_id,
+                exclude_recommendation_id=rec.recommendation_id,
+            )
+            # Do not carry a read-only transaction across broker/Redis awaits.
+            self._order_ledger.session.rollback()
+            return value
+        except OrderIntentNotFound:
+            self._order_ledger.session.rollback()
+            return 0.0
+
+    def _persist_risk_rejection(self, recommendation_id: str, reason: str) -> bool:
+        if self._order_ledger is None:
+            return True
+        try:
+            intent = self._order_ledger.get(recommendation_id)
+            status = OrderStatus(intent.status)
+            if status is OrderStatus.RISK_REJECTED:
+                self._order_ledger.session.rollback()
+                return False
+            if status is not OrderStatus.PROPOSED:
+                self._order_ledger.session.rollback()
+                return False
+            self._order_ledger.transition(
+                recommendation_id, OrderStatus.RISK_REJECTED, reason=reason
+            )
+            self._order_ledger.session.commit()
+            DEFAULT_TRADING_METRICS.lifecycle_transitions.labels(
+                status=OrderStatus.RISK_REJECTED.value
+            ).inc()
+            return True
+        except OrderIntentNotFound:
+            self._order_ledger.session.rollback()
+            return True
+
+    def _persist_risk_approval(self, recommendation_id: str) -> bool:
+        if self._order_ledger is None:
+            return True
+        try:
+            intent = self._order_ledger.get(recommendation_id)
+            status = OrderStatus(intent.status)
+            if status is OrderStatus.APPROVED:
+                self._order_ledger.session.rollback()
+                return True
+            if status is not OrderStatus.PROPOSED:
+                self._order_ledger.session.rollback()
+                return False
+            self._order_ledger.transition(recommendation_id, OrderStatus.APPROVED)
+            self._order_ledger.session.commit()
+            DEFAULT_TRADING_METRICS.lifecycle_transitions.labels(
+                status=OrderStatus.APPROVED.value
+            ).inc()
+            return True
+        except OrderIntentNotFound:
+            self._order_ledger.session.rollback()
+            return True
 
     async def process_kill(self, kill_msg: KillMessage) -> None:
         """Process a kill message: activate switch and liquidate all positions.
@@ -557,7 +690,9 @@ class RiskServiceRunner:
                     try:
                         kill_msg = KillMessage.from_stream_dict(msg.data)
                         await self.process_kill(kill_msg)
-                        await self._redis.ack(KILL_STREAM, CONSUMER_GROUP, msg.message_id)
+                        await self._redis.ack(
+                            KILL_STREAM, CONSUMER_GROUP, msg.message_id
+                        )
                     except Exception:
                         self._logger.exception(
                             "Error processing kill message", message_id=msg.message_id
@@ -571,7 +706,9 @@ class RiskServiceRunner:
                     try:
                         fill = FillMessage.from_stream_dict(msg.data)
                         await self.process_fill(fill)
-                        await self._redis.ack(FILLS_STREAM, CONSUMER_GROUP, msg.message_id)
+                        await self._redis.ack(
+                            FILLS_STREAM, CONSUMER_GROUP, msg.message_id
+                        )
                     except Exception:
                         self._logger.exception(
                             "Error processing fill message", message_id=msg.message_id
@@ -601,12 +738,15 @@ if __name__ == "__main__":
         # must act on actual positions, not an empty dict.
         engine = create_engine(config.database.url)
         session = sessionmaker(bind=engine)()
+        runner = RiskServiceRunner(
+            config=config,
+            redis_client=redis_client,
+            db_session=session,
+            order_ledger=OrderLedger(session),
+        )
         try:
-            runner = RiskServiceRunner(
-                config=config, redis_client=redis_client, db_session=session
-            )
+            await runner.run()
         finally:
             session.close()
-        await runner.run()
 
     asyncio.run(main())

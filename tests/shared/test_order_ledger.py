@@ -64,6 +64,17 @@ def test_active_buy_reservation_uses_unfilled_notional(session):
     assert ledger.active_reservations("momentum") == pytest.approx(600.0)
 
 
+def test_active_reservations_can_exclude_retried_recommendation(session):
+    ledger = OrderLedger(session)
+    for recommendation_id in ("rec-current", "rec-other"):
+        ledger.create_intent(make_proposal(recommendation_id, quantity=10, price=100))
+        ledger.transition(recommendation_id, OrderStatus.APPROVED)
+
+    assert ledger.active_reservations(
+        "momentum", exclude_recommendation_id="rec-current"
+    ) == pytest.approx(1_000)
+
+
 def test_create_intent_is_idempotent(session):
     ledger = OrderLedger(session)
     first = ledger.create_intent(make_proposal("rec-1"))
@@ -105,9 +116,12 @@ def test_create_intent_is_rolled_back_by_caller(session):
 
     session.rollback()
 
-    assert session.scalar(select(OrderIntent).where(
-        OrderIntent.recommendation_id == "rec-1"
-    )) is None
+    assert (
+        session.scalar(
+            select(OrderIntent).where(OrderIntent.recommendation_id == "rec-1")
+        )
+        is None
+    )
 
 
 def test_submission_pending_load_and_publication_lifecycle(session):

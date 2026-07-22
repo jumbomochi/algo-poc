@@ -142,9 +142,7 @@ class OrderLedger:
         self, ib_order_id: str | int, *, account_id: str | None = None
     ) -> OrderIntent | None:
         """Load attribution by broker order ID in any lifecycle state."""
-        stmt = select(OrderIntent).where(
-            OrderIntent.ib_order_id == str(ib_order_id)
-        )
+        stmt = select(OrderIntent).where(OrderIntent.ib_order_id == str(ib_order_id))
         if account_id is not None:
             stmt = stmt.where(OrderIntent.account_id == account_id)
         return self.session.scalar(stmt.with_for_update())
@@ -186,24 +184,39 @@ class OrderLedger:
         self.session.flush()
         return intent
 
-    def active_reservations(self, portfolio: str) -> float:
+    def active_reservations(
+        self,
+        portfolio: str,
+        *,
+        account_id: str | None = None,
+        exclude_recommendation_id: str | None = None,
+    ) -> float:
         unfilled_notional = (
-            (OrderIntent.requested_quantity - OrderIntent.filled_quantity)
-            * OrderIntent.limit_price
-        )
+            OrderIntent.requested_quantity - OrderIntent.filled_quantity
+        ) * OrderIntent.limit_price
         stmt = select(func.coalesce(func.sum(unfilled_notional), 0.0)).where(
             OrderIntent.portfolio == portfolio,
             func.upper(OrderIntent.action) == "BUY",
             OrderIntent.status.in_(ACTIVE_RESERVATION_STATUSES),
         )
+        if account_id is not None:
+            stmt = stmt.where(OrderIntent.account_id == account_id)
+        if exclude_recommendation_id is not None:
+            stmt = stmt.where(
+                OrderIntent.recommendation_id != exclude_recommendation_id
+            )
         return float(self.session.scalar(stmt) or 0.0)
 
-    def load_pending_orders(self) -> list[OrderIntent]:
+    def load_pending_orders(
+        self, *, account_id: str | None = None
+    ) -> list[OrderIntent]:
         stmt = (
             select(OrderIntent)
             .where(OrderIntent.status.in_(PENDING_ORDER_STATUSES))
             .order_by(OrderIntent.id)
         )
+        if account_id is not None:
+            stmt = stmt.where(OrderIntent.account_id == account_id)
         return list(self.session.scalars(stmt))
 
     def mark_published(
@@ -220,9 +233,7 @@ class OrderLedger:
             self.session.flush()
         return intent
 
-    def _locked(
-        self, recommendation_id: str, *, required: bool
-    ) -> OrderIntent | None:
+    def _locked(self, recommendation_id: str, *, required: bool) -> OrderIntent | None:
         stmt = (
             select(OrderIntent)
             .where(OrderIntent.recommendation_id == recommendation_id)
@@ -252,9 +263,7 @@ class OrderLedger:
         }
 
     @staticmethod
-    def _ensure_same_economics(
-        intent: OrderIntent, values: dict[str, Any]
-    ) -> None:
+    def _ensure_same_economics(intent: OrderIntent, values: dict[str, Any]) -> None:
         conflicts = [
             field
             for field in IMMUTABLE_ECONOMIC_FIELDS
