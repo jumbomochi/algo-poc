@@ -132,12 +132,12 @@ class TestIBExecutionIdentity:
         executor.set_fill_handler(handler)
         trade = MagicMock()
         trade.isDone.return_value = False
-        fill_callback = None
+        commission_callback = None
 
         class Event:
             def __iadd__(self, callback):
-                nonlocal fill_callback
-                fill_callback = callback
+                nonlocal commission_callback
+                commission_callback = callback
                 return self
 
         class StatusEvent:
@@ -145,6 +145,7 @@ class TestIBExecutionIdentity:
                 return self
 
         trade.fillEvent = Event()
+        trade.commissionReportEvent = Event()
         trade.statusEvent = StatusEvent()
         fill = MagicMock()
         fill.execution.execId = "exec-1"
@@ -156,11 +157,12 @@ class TestIBExecutionIdentity:
         fill.contract.symbol = "AAPL"
         fill.contract.exchange = ""
         fill.contract.currency = ""
-        fill.commissionReport.commission = 0.2
-        fill.commissionReport.currency = "USD"
+        fill.commissionReport.commission = 0.0
+        fill.commissionReport.currency = ""
+        report = SimpleNamespace(commission=0.2, currency="USD")
 
         executor._register_trade("9", trade, ticker="AAPL", side="buy")
-        fill_callback(trade, fill)
+        commission_callback(trade, fill, report)
         await asyncio.sleep(0)
 
         payload = handler.call_args.args[0]

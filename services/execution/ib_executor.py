@@ -241,15 +241,17 @@ class IBExecutor:
             ) from exc
 
     def _register_trade(self, order_id: str, trade: Any, ticker: str, side: str) -> None:
-        """Track the trade and wire its fill event to the registered handler."""
+        """Track the trade and publish fills after IB reports commission."""
         self._trades[order_id] = trade
 
-        def _on_fill(trade: Any, fill: Any) -> None:
+        def _on_commission_report(
+            trade: Any, fill: Any, commission_report: Any
+        ) -> None:
             commission = float(
-                getattr(fill.commissionReport, "commission", 0.0) or 0.0
+                getattr(commission_report, "commission", 0.0) or 0.0
             )
             commission_currency = str(
-                getattr(fill.commissionReport, "currency", "") or ""
+                getattr(commission_report, "currency", "") or ""
             )
             commission_fx_base_per_trading = None
             if commission_currency == "SGD" and self._ib is not None:
@@ -299,7 +301,7 @@ class IBExecutor:
                 return
             asyncio.ensure_future(self._fill_handler(payload))
 
-        trade.fillEvent += _on_fill
+        trade.commissionReportEvent += _on_commission_report
 
         def _on_status(trade: Any) -> None:
             if self._order_status_handler is None:

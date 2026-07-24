@@ -107,12 +107,6 @@ def upgrade() -> None:
         "execution_fills",
         sa.Column("commission_trading", sa.Float(), nullable=True),
     )
-    op.add_column(
-        "execution_fills",
-        sa.Column(
-            "commission_fx_base_per_trading", sa.Float(), nullable=True
-        ),
-    )
 
     op.create_table(
         "currency_conversions",
@@ -134,9 +128,6 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("currency_conversions")
-    op.drop_column(
-        "execution_fills", "commission_fx_base_per_trading"
-    )
     op.drop_column("execution_fills", "commission_trading")
     op.drop_column("execution_fills", "commission_currency")
     op.drop_column("equity_snapshots", "valuation_at")

@@ -11,11 +11,15 @@ from services.execution.ib_executor import IBExecutor
 
 class Event:
     def __init__(self) -> None:
-        self.callback = None
+        self.callbacks = []
 
     def __iadd__(self, callback):
-        self.callback = callback
+        self.callbacks.append(callback)
         return self
+
+    def emit(self, *args) -> None:
+        for callback in self.callbacks:
+            callback(*args)
 
 
 def make_account_value(
@@ -41,6 +45,7 @@ async def capture_fill_payload(
 
     trade = MagicMock()
     trade.fillEvent = Event()
+    trade.commissionReportEvent = Event()
     trade.statusEvent = Event()
     trade.isDone.return_value = False
     fill = SimpleNamespace(
@@ -57,13 +62,21 @@ async def capture_fill_payload(
             currency="USD",
         ),
         commissionReport=SimpleNamespace(
-            commission=commission,
-            currency=commission_currency,
+            commission=0.0,
+            currency="",
         ),
+    )
+    commission_report = SimpleNamespace(
+        commission=commission,
+        currency=commission_currency,
     )
 
     executor._register_trade("9", trade, ticker="AAPL", side="buy")
-    trade.fillEvent.callback(trade, fill)
+    trade.fillEvent.emit(trade, fill)
+    await asyncio.sleep(0)
+    assert handler.await_count == 0
+
+    trade.commissionReportEvent.emit(trade, fill, commission_report)
     await asyncio.sleep(0)
     return handler.await_args.args[0]
 
@@ -134,3 +147,44 @@ async def test_unsupported_commission_currency_is_not_translated():
     assert payload["commission_currency"] == "EUR"
     assert payload["commission_trading"] is None
     assert payload["commission_fx_base_per_trading"] is None
+
+
+@pytest.mark.asyncio
+async def test_duplicate_authoritative_commission_delivery_replays_same_fill():
+    executor = IBExecutor("h", 7497, 1)
+    executor._ib = MagicMock()
+    executor._ib.accountValues.return_value = []
+    handler = AsyncMock()
+    executor.set_fill_handler(handler)
+    trade = MagicMock()
+    trade.fillEvent = Event()
+    trade.commissionReportEvent = Event()
+    trade.statusEvent = Event()
+    trade.isDone.return_value = True
+    fill = SimpleNamespace(
+        execution=SimpleNamespace(
+            execId="exec-duplicate",
+            acctNumber="DU12345",
+            shares=2,
+            cumQty=2,
+            price=100,
+        ),
+        contract=SimpleNamespace(
+            conId=265598,
+            exchange="SMART",
+            currency="USD",
+        ),
+        commissionReport=SimpleNamespace(commission=0.0, currency=""),
+    )
+    report = SimpleNamespace(commission=1.25, currency="USD")
+    executor._register_trade("9", trade, ticker="AAPL", side="buy")
+
+    trade.fillEvent.emit(trade, fill)
+    trade.commissionReportEvent.emit(trade, fill, report)
+    trade.commissionReportEvent.emit(trade, fill, report)
+    await asyncio.sleep(0)
+
+    assert handler.await_count == 2
+    first, second = [call.args[0] for call in handler.await_args_list]
+    assert first == second
+    assert first["execution_id"] == "exec-duplicate"

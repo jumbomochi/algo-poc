@@ -4,6 +4,7 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
 
 from shared import models
@@ -11,6 +12,7 @@ from shared import models
 ROOT = Path(__file__).resolve().parents[2]
 PREVIOUS_HEAD = "d8f10a4b72c3"
 DUAL_CURRENCY_REVISION = "f6c2d9a84b31"
+COMMISSION_FX_REVISION = "b17c8e4a6d92"
 
 CAPITAL_COLUMNS = {
     "base_currency",
@@ -46,9 +48,12 @@ CURRENCY_CONVERSION_COLUMNS = {
     "operator",
     "executed_at",
 }
-EXECUTION_COMMISSION_COLUMNS = {
+BASE_EXECUTION_COMMISSION_COLUMNS = {
     "commission_currency",
     "commission_trading",
+}
+EXECUTION_COMMISSION_COLUMNS = {
+    *BASE_EXECUTION_COMMISSION_COLUMNS,
     "commission_fx_base_per_trading",
 }
 
@@ -125,9 +130,11 @@ def test_upgrade_preserves_existing_portfolio_and_adds_currency_schema(
             inspector, "capital_snapshots"
         )
         assert EQUITY_COLUMNS <= _column_names(inspector, "equity_snapshots")
-        assert EXECUTION_COMMISSION_COLUMNS <= _column_names(
+        execution_columns = _column_names(
             inspector, "execution_fills"
         )
+        assert BASE_EXECUTION_COMMISSION_COLUMNS <= execution_columns
+        assert "commission_fx_base_per_trading" not in execution_columns
         assert "currency" in _column_names(inspector, "portfolio_config")
         assert "currency_conversions" in inspector.get_table_names()
         assert _column_names(
@@ -149,3 +156,69 @@ def test_upgrade_preserves_existing_portfolio_and_adds_currency_schema(
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
         ).scalar_one() == DUAL_CURRENCY_REVISION
+
+
+def test_commission_fx_upgrade_preserves_existing_execution_fill(
+    monkeypatch, tmp_path
+):
+    database_url = f"sqlite:///{tmp_path / 'commission_fx.db'}"
+    monkeypatch.setenv("ALGO_DATABASE_URL", database_url)
+    config = _config(database_url)
+    command.upgrade(config, DUAL_CURRENCY_REVISION)
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text(
+            "INSERT INTO execution_fills "
+            "(account_id, execution_id, ib_order_id, recommendation_id, "
+            "portfolio, con_id, symbol, exchange, currency, side, quantity, "
+            "price, commission, commission_currency, commission_trading, "
+            "cumulative_quantity, executed_at, projection_applied) VALUES "
+            "('DU12345', 'exec-1', '9', 'rec-1', 'momentum', 265598, "
+            "'AAPL', 'SMART', 'USD', 'BUY', 2, 100, 1.25, 'USD', 1.25, "
+            "2, '2026-07-24 00:00:00', 1)"
+        ))
+        before = connection.execute(text(
+            "SELECT account_id, execution_id, commission, "
+            "commission_currency, commission_trading "
+            "FROM execution_fills WHERE execution_id = 'exec-1'"
+        )).mappings().one()
+
+    command.upgrade(config, "head")
+
+    with engine.connect() as connection:
+        assert "commission_fx_base_per_trading" in _column_names(
+            inspect(connection), "execution_fills"
+        )
+        after = connection.execute(text(
+            "SELECT account_id, execution_id, commission, "
+            "commission_currency, commission_trading, "
+            "commission_fx_base_per_trading "
+            "FROM execution_fills WHERE execution_id = 'exec-1'"
+        )).mappings().one()
+        assert {key: after[key] for key in before} == dict(before)
+        assert after["commission_fx_base_per_trading"] is None
+        assert connection.execute(
+            text("SELECT version_num FROM alembic_version")
+        ).scalar_one() == COMMISSION_FX_REVISION
+
+
+def test_fresh_upgrade_reaches_single_commission_fx_head(
+    monkeypatch, tmp_path
+):
+    database_url = f"sqlite:///{tmp_path / 'fresh_head.db'}"
+    monkeypatch.setenv("ALGO_DATABASE_URL", database_url)
+    config = _config(database_url)
+
+    assert ScriptDirectory.from_config(config).get_heads() == [
+        COMMISSION_FX_REVISION
+    ]
+    command.upgrade(config, "head")
+
+    engine = create_engine(database_url)
+    with engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT version_num FROM alembic_version")
+        ).scalar_one() == COMMISSION_FX_REVISION
+        assert "commission_fx_base_per_trading" in _column_names(
+            inspect(connection), "execution_fills"
+        )
