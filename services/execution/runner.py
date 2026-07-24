@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -58,6 +59,8 @@ class ExecutionServiceRunner:
 
         # Positions tracked locally (in production loaded from DB)
         self._positions: dict[str, int] = {}
+        self._handled_executions: set[tuple[str, str]] = set()
+        self._fill_lock = asyncio.Lock()
 
         # order_id -> ApprovedOrderMessage, so IB fills can be attributed
         # back to the originating recommendation.
@@ -337,9 +340,45 @@ class ExecutionServiceRunner:
         Args:
             fill_info: Payload from :class:`IBExecutor` — order_id, ticker,
                 side, quantity, fill_price, original commission amount and
-                currency, USD trading commission, conversion rate, and
-                order_done.
+                currency, USD trading commission, conversion rate, stable
+                broker execution identity/timestamp, and order_done.
         """
+        account_id = fill_info.get("account_id")
+        execution_id = fill_info.get("execution_id")
+        execution_key = (
+            (str(account_id), str(execution_id))
+            if account_id and execution_id
+            else None
+        )
+        async with self._fill_lock:
+            duplicate = (
+                execution_key in self._handled_executions
+                if execution_key is not None
+                else False
+            )
+            if (
+                not duplicate
+                and execution_key is not None
+                and self._order_ledger is not None
+            ):
+                duplicate = self._order_ledger.execution_fill_exists(
+                    *execution_key
+                )
+            if duplicate:
+                if self._order_ledger is not None:
+                    self._order_ledger.session.rollback()
+                self._logger.info(
+                    "Duplicate IB execution ignored",
+                    account_id=account_id,
+                    execution_id=execution_id,
+                )
+                return
+
+            await self._handle_ib_fill_once(fill_info)
+            if execution_key is not None:
+                self._handled_executions.add(execution_key)
+
+    async def _handle_ib_fill_once(self, fill_info: dict[str, Any]) -> None:
         order_id = fill_info["order_id"]
         pending = self._pending_orders.get(order_id)
         intent = self._intent_for_order(
@@ -349,7 +388,7 @@ class ExecutionServiceRunner:
 
         fill = FillMessage(
             ticker=fill_info["ticker"],
-            timestamp=datetime.now(timezone.utc),
+            timestamp=fill_info["timestamp"],
             side=fill_info["side"],
             quantity=fill_info["quantity"],
             cumulative_quantity=fill_info.get("cumulative_quantity"),

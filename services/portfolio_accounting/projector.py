@@ -260,6 +260,8 @@ class FillProjector:
             OrderStatus.SUBMITTED.value,
             OrderStatus.PARTIALLY_FILLED.value,
             OrderStatus.FILLED.value,
+            OrderStatus.CANCELLED.value,
+            OrderStatus.EXPIRED.value,
         }:
             raise InvalidFillError(
                 f"intent status {intent.status} cannot accept executions"
@@ -382,7 +384,11 @@ class FillProjector:
 
     def _advance_intent(self, intent: OrderIntent, cumulative: float) -> None:
         intent.filled_quantity = max(float(intent.filled_quantity), cumulative)
-        if intent.status == OrderStatus.FILLED.value:
+        if intent.status in {
+            OrderStatus.FILLED.value,
+            OrderStatus.CANCELLED.value,
+            OrderStatus.EXPIRED.value,
+        }:
             self.session.flush()
             return
         new_status = (

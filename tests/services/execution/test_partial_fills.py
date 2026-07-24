@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -153,6 +154,9 @@ class TestIBExecutionIdentity:
         fill.execution.shares = 2
         fill.execution.cumQty = 5
         fill.execution.price = 149.5
+        fill.execution.time = datetime(
+            2026, 7, 24, 8, 30, tzinfo=timezone.utc
+        )
         fill.contract.conId = 265598
         fill.contract.symbol = "AAPL"
         fill.contract.exchange = ""
@@ -169,6 +173,9 @@ class TestIBExecutionIdentity:
         assert payload == {
             "execution_id": "exec-1",
             "account_id": "DUN551088",
+            "timestamp": datetime(
+                2026, 7, 24, 8, 30, tzinfo=timezone.utc
+            ),
             "order_id": "9",
             "con_id": 265598,
             "ticker": "AAPL",

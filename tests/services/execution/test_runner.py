@@ -1,18 +1,32 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from services.execution.runner import ExecutionServiceRunner
+from services.portfolio_accounting.projector import FillProjector
 from shared.config import AppConfig, ExecutionConfig, IBConfig
-from shared.models import Base, OrderStatus
+from shared.models import (
+    Base,
+    ExecutionFill,
+    OrderStatus,
+    PortfolioConfig,
+    Position,
+)
 from shared.order_ledger import OrderLedger
-from shared.schemas.messages import ApprovedOrderMessage, KillMessage
+from shared.schemas.messages import (
+    ApprovedOrderMessage,
+    FillMessage,
+    KillMessage,
+)
+
+BROKER_TIME = datetime(2026, 7, 24, 8, 30, tzinfo=timezone.utc)
 
 
 def make_approved_order(
@@ -352,6 +366,7 @@ class TestDurableExecutionIdentity:
         await runner.handle_ib_fill({
             "execution_id": "exec-1",
             "account_id": "DUN551088",
+            "timestamp": BROKER_TIME,
             "order_id": "9",
             "con_id": 265598,
             "ticker": "AAPL",
@@ -378,6 +393,92 @@ class TestDurableExecutionIdentity:
         assert payload["commission_currency"] == "SGD"
         assert payload["commission_trading"] == "0.2"
         assert payload["commission_fx_base_per_trading"] == "1.25"
+        assert payload["timestamp"] == "2026-07-24T08:30:00Z"
+
+    @pytest.mark.asyncio
+    async def test_duplicate_fill_handler_is_ignored_before_publish_and_position(
+        self, durable_runner
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        runner.restore_pending_orders()
+        fill_info = {
+            "execution_id": "exec-duplicate",
+            "account_id": "DUN551088",
+            "timestamp": BROKER_TIME,
+            "order_id": "9",
+            "con_id": 265598,
+            "ticker": "AAPL",
+            "exchange": "SMART",
+            "currency": "USD",
+            "side": "buy",
+            "quantity": 5.0,
+            "cumulative_quantity": 5.0,
+            "fill_price": 149.5,
+            "commission": 0.25,
+            "commission_currency": "USD",
+            "commission_trading": 0.25,
+            "commission_fx_base_per_trading": None,
+            "order_done": False,
+        }
+
+        await runner.handle_ib_fill(fill_info)
+        await runner.handle_ib_fill(fill_info)
+
+        runner._redis.publish.assert_awaited_once()
+        assert runner._positions == {"AAPL": pytest.approx(5.0)}
+
+    @pytest.mark.asyncio
+    async def test_restart_uses_durable_execution_identity_before_side_effects(
+        self, durable_runner
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        ledger.session.add(ExecutionFill(
+            account_id="DUN551088",
+            execution_id="exec-stored",
+            ib_order_id="9",
+            recommendation_id="rec-1",
+            portfolio="momentum",
+            con_id=265598,
+            symbol="AAPL",
+            exchange="SMART",
+            currency="USD",
+            side="BUY",
+            quantity=5.0,
+            price=149.5,
+            commission=0.25,
+            commission_currency="USD",
+            commission_trading=0.25,
+            commission_fx_base_per_trading=None,
+            cumulative_quantity=5.0,
+            executed_at=BROKER_TIME,
+            projection_applied=True,
+        ))
+        ledger.session.commit()
+
+        await runner.handle_ib_fill({
+            "execution_id": "exec-stored",
+            "account_id": "DUN551088",
+            "timestamp": BROKER_TIME,
+            "order_id": "9",
+            "con_id": 265598,
+            "ticker": "AAPL",
+            "exchange": "SMART",
+            "currency": "USD",
+            "side": "buy",
+            "quantity": 5.0,
+            "cumulative_quantity": 5.0,
+            "fill_price": 149.5,
+            "commission": 0.25,
+            "commission_currency": "USD",
+            "commission_trading": 0.25,
+            "commission_fx_base_per_trading": None,
+            "order_done": False,
+        })
+
+        runner._redis.publish.assert_not_awaited()
+        assert runner._positions == {}
 
     @pytest.mark.asyncio
     async def test_late_fill_uses_terminal_intent_attribution(
@@ -392,6 +493,7 @@ class TestDurableExecutionIdentity:
 
         await runner.handle_ib_fill({
             "execution_id": "late-1", "account_id": "DUN551088",
+            "timestamp": BROKER_TIME,
             "order_id": "9", "con_id": 265598, "ticker": "AAPL",
             "exchange": "SMART", "currency": "USD", "side": "buy",
             "quantity": 1.0, "cumulative_quantity": 1.0,
@@ -401,6 +503,99 @@ class TestDurableExecutionIdentity:
         _, payload = runner._redis.publish.call_args.args
         assert payload["recommendation_id"] == "rec-1"
         assert payload["portfolio"] == "momentum"
+
+    @pytest.mark.asyncio
+    async def test_cancellation_before_commission_still_projects_fill_once(
+        self, durable_runner, ledger_session
+    ):
+        from services.execution.ib_executor import IBExecutor
+
+        class Event:
+            def __init__(self):
+                self.callbacks = []
+
+            def __iadd__(self, callback):
+                self.callbacks.append(callback)
+                return self
+
+            def emit(self, *args):
+                for callback in self.callbacks:
+                    callback(*args)
+
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        ledger_session.add(PortfolioConfig(
+            portfolio="momentum",
+            capital=10_000,
+            cash=10_000,
+            created_at=BROKER_TIME,
+            updated_at=BROKER_TIME,
+        ))
+        ledger_session.commit()
+        runner.restore_pending_orders()
+
+        executor = IBExecutor("h", 7497, 1)
+        executor._ib = MagicMock()
+        executor._ib.accountValues.return_value = []
+        executor.set_fill_handler(runner.handle_ib_fill)
+        executor.set_order_status_handler(runner.handle_ib_order_status)
+        trade = MagicMock()
+        trade.fillEvent = Event()
+        trade.commissionReportEvent = Event()
+        trade.statusEvent = Event()
+        trade.isDone.return_value = True
+        trade.orderStatus.status = "Cancelled"
+        trade.orderStatus.whyHeld = "cancelled at IB"
+        trade.orderStatus.filled = 0
+        trade.log = []
+        executor._register_trade("9", trade, ticker="AAPL", side="buy")
+
+        trade.statusEvent.emit(trade)
+        await asyncio.sleep(0)
+        intent = ledger.get("rec-1")
+        assert intent.status == OrderStatus.CANCELLED.value
+        assert intent.reason == "cancelled at IB"
+        ledger_session.rollback()
+
+        fill = SimpleNamespace(
+            execution=SimpleNamespace(
+                execId="late-exec-1",
+                acctNumber="DUN551088",
+                shares=2,
+                cumQty=2,
+                price=149.5,
+                time=BROKER_TIME,
+            ),
+            contract=SimpleNamespace(
+                conId=265598,
+                exchange="SMART",
+                currency="USD",
+            ),
+            commissionReport=SimpleNamespace(commission=0.0, currency=""),
+        )
+        report = SimpleNamespace(commission=0.25, currency="USD")
+        trade.fillEvent.emit(trade, fill)
+        trade.commissionReportEvent.emit(trade, fill, report)
+        trade.commissionReportEvent.emit(trade, fill, report)
+        await asyncio.sleep(0)
+
+        runner._redis.publish.assert_awaited_once()
+        _, payload = runner._redis.publish.await_args.args
+        message = FillMessage.from_stream_dict(payload)
+        assert message.timestamp == BROKER_TIME
+        assert runner._positions == {"AAPL": pytest.approx(2.0)}
+
+        projector = FillProjector(ledger_session)
+        assert projector.apply(message) is True
+        assert projector.apply(message) is False
+        intent = ledger.get("rec-1")
+        assert intent.status == OrderStatus.CANCELLED.value
+        assert intent.reason == "cancelled at IB"
+        assert intent.filled_quantity == pytest.approx(2)
+        assert ledger_session.scalar(select(PortfolioConfig.cash)) == pytest.approx(
+            9_700.75
+        )
+        assert ledger_session.scalar(select(Position)).quantity == pytest.approx(2)
 
     @pytest.mark.asyncio
     async def test_completed_fill_recovery_releases_reservation_without_duplicate(
@@ -500,6 +695,7 @@ class TestApprovedOrderProcessing:
         (order_id,) = runner._pending_orders.keys()
 
         await runner.handle_ib_fill({
+            "timestamp": BROKER_TIME,
             "order_id": order_id,
             "ticker": "AAPL",
             "side": "buy",
@@ -527,6 +723,7 @@ class TestApprovedOrderProcessing:
         (order_id,) = runner._pending_orders.keys()
 
         await runner.handle_ib_fill({
+            "timestamp": BROKER_TIME,
             "order_id": order_id,
             "ticker": "AAPL",
             "side": "buy",

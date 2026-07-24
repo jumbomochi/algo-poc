@@ -110,6 +110,7 @@ class IBExecutor:
         self._allow_fractional = allow_fractional
         self._ib = None  # Will hold ib_insync.IB instance
         self._trades: dict[str, Any] = {}  # order_id -> ib_insync.Trade
+        self._reported_executions: set[tuple[str, str]] = set()
         self._fill_handler: FillHandler | None = None
         self._order_status_handler: OrderStatusHandler | None = None
         self._expect_paper: bool | None = None
@@ -247,6 +248,13 @@ class IBExecutor:
         def _on_commission_report(
             trade: Any, fill: Any, commission_report: Any
         ) -> None:
+            execution_key = (
+                str(fill.execution.acctNumber),
+                str(fill.execution.execId),
+            )
+            if execution_key in self._reported_executions:
+                return
+            self._reported_executions.add(execution_key)
             commission = float(
                 getattr(commission_report, "commission", 0.0) or 0.0
             )
@@ -275,6 +283,7 @@ class IBExecutor:
             payload = {
                 "execution_id": str(fill.execution.execId),
                 "account_id": str(fill.execution.acctNumber),
+                "timestamp": fill.execution.time,
                 "order_id": order_id,
                 "con_id": int(fill.contract.conId),
                 "ticker": ticker,

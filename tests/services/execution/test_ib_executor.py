@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from services.execution.ib_executor import IBExecutor
+
+EXECUTED_AT = datetime(2026, 7, 24, 8, 30, tzinfo=timezone.utc)
 
 
 class Event:
@@ -55,6 +58,7 @@ async def capture_fill_payload(
             shares=2,
             cumQty=2,
             price=100,
+            time=EXECUTED_AT,
         ),
         contract=SimpleNamespace(
             conId=265598,
@@ -93,6 +97,7 @@ async def test_usd_commission_maps_one_to_one_without_fx_rate():
     assert payload["commission_currency"] == "USD"
     assert payload["commission_trading"] == pytest.approx(1.25)
     assert payload["commission_fx_base_per_trading"] is None
+    assert payload["timestamp"] == EXECUTED_AT
 
 
 @pytest.mark.asyncio
@@ -168,6 +173,7 @@ async def test_duplicate_authoritative_commission_delivery_replays_same_fill():
             shares=2,
             cumQty=2,
             price=100,
+            time=EXECUTED_AT,
         ),
         contract=SimpleNamespace(
             conId=265598,
@@ -184,7 +190,7 @@ async def test_duplicate_authoritative_commission_delivery_replays_same_fill():
     trade.commissionReportEvent.emit(trade, fill, report)
     await asyncio.sleep(0)
 
-    assert handler.await_count == 2
-    first, second = [call.args[0] for call in handler.await_args_list]
-    assert first == second
-    assert first["execution_id"] == "exec-duplicate"
+    handler.assert_awaited_once()
+    payload = handler.await_args.args[0]
+    assert payload["execution_id"] == "exec-duplicate"
+    assert payload["timestamp"] == EXECUTED_AT

@@ -152,6 +152,17 @@ class OrderLedger:
             stmt = stmt.where(OrderIntent.account_id == account_id)
         return self.session.scalar(stmt.with_for_update())
 
+    def execution_fill_exists(
+        self, account_id: str, execution_id: str
+    ) -> bool:
+        """Return whether a broker execution is already durably recorded."""
+        return self.session.scalar(
+            select(ExecutionFill.id).where(
+                ExecutionFill.account_id == account_id,
+                ExecutionFill.execution_id == execution_id,
+            )
+        ) is not None
+
     def transition(
         self,
         recommendation_id: str,
