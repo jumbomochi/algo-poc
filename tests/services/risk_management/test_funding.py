@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -11,7 +12,7 @@ from services.risk_management.funding import (
     check_settled_usd_funding,
     estimate_commission_usd,
 )
-from shared.models import Base, OrderStatus
+from shared.models import Base, ExecutionFill, OrderStatus
 from shared.order_ledger import OrderLedger
 
 
@@ -128,9 +129,9 @@ def test_account_buy_reservations_include_every_sleeve_and_published_proposals()
         )
         ledger.transition("other-account", OrderStatus.APPROVED)
 
-        assert ledger.active_buy_reservations_for_account("DUONE") == pytest.approx(
-            2_000
-        )
+        assert ledger.active_buy_reservations_for_account(
+            "DUONE", commission_per_share=0, minimum_commission=0
+        ) == pytest.approx(2_000)
 
 
 def test_account_buy_reservations_use_remaining_quantity_and_can_exclude_current():
@@ -148,5 +149,125 @@ def test_account_buy_reservations_use_remaining_quantity_and_can_exclude_current
         session.flush()
 
         assert ledger.active_buy_reservations_for_account(
-            "DUONE", exclude_recommendation_id="current"
+            "DUONE",
+            exclude_recommendation_id="current",
+            commission_per_share=0,
+            minimum_commission=0,
         ) == pytest.approx(1_200)
+
+
+def test_active_buy_reservations_include_conservative_commission_per_order():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        ledger = OrderLedger(session)
+        for recommendation_id in ("one", "two"):
+            ledger.create_intent(
+                _proposal(recommendation_id, quantity=10, price=100)
+            )
+            ledger.transition(recommendation_id, OrderStatus.APPROVED)
+
+        assert ledger.active_buy_reservations_for_account(
+            "DUONE",
+            commission_per_share=0.005,
+            minimum_commission=1,
+        ) == pytest.approx(2_002)
+
+
+def test_active_buy_reservations_require_commission_inputs():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        ledger = OrderLedger(session)
+        ledger.create_intent(_proposal("one", quantity=10, price=100))
+        ledger.transition("one", OrderStatus.APPROVED)
+
+        with pytest.raises(TypeError):
+            ledger.active_buy_reservations_for_account("DUONE")
+
+
+def _execution_fill(
+    *,
+    executed_at: datetime,
+    account_id: str = "DUONE",
+    quantity: float = 9,
+    price: float = 100,
+    commission: float = 1,
+    commission_currency: str | None = "USD",
+    commission_trading: float | None = None,
+) -> ExecutionFill:
+    return ExecutionFill(
+        account_id=account_id,
+        execution_id=f"exec-{account_id}-{executed_at.timestamp()}",
+        ib_order_id="42",
+        recommendation_id="filled-order",
+        portfolio="momentum",
+        con_id=1,
+        symbol="AAPL",
+        exchange="SMART",
+        currency="USD",
+        side="BUY",
+        quantity=quantity,
+        price=price,
+        commission=commission,
+        commission_currency=commission_currency,
+        commission_trading=commission_trading,
+        cumulative_quantity=quantity,
+        executed_at=executed_at,
+    )
+
+
+def test_buy_fill_spend_after_snapshot_remains_committed():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        snapshot_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+        session.add(_execution_fill(executed_at=datetime.now(timezone.utc)))
+        session.flush()
+
+        assert OrderLedger(session).buy_fill_spend_for_account_since(
+            "DUONE", captured_after=snapshot_at
+        ) == pytest.approx(901)
+
+
+def test_newer_snapshot_supersedes_fill_spend_and_other_accounts_are_isolated():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        now = datetime.now(timezone.utc)
+        session.add_all(
+            [
+                _execution_fill(executed_at=now - timedelta(minutes=2)),
+                _execution_fill(
+                    executed_at=now,
+                    account_id="DUTWO",
+                    quantity=50,
+                    price=1_000,
+                ),
+            ]
+        )
+        session.flush()
+
+        assert OrderLedger(session).buy_fill_spend_for_account_since(
+            "DUONE", captured_after=now - timedelta(minutes=1)
+        ) == 0
+
+
+def test_non_usd_commission_without_trading_value_fails_closed():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        snapshot_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+        session.add(
+            _execution_fill(
+                executed_at=datetime.now(timezone.utc),
+                commission_currency="SGD",
+                commission_trading=None,
+            )
+        )
+        session.flush()
+
+        with pytest.raises(ValueError, match="commission"):
+            OrderLedger(session).buy_fill_spend_for_account_since(
+                "DUONE", captured_after=snapshot_at
+            )

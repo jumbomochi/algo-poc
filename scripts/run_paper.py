@@ -1136,7 +1136,9 @@ def main():
         sell_availability = build_sell_availability(session, broker_snapshot)
         ledger = OrderLedger(session)
         account_buy_reservations = ledger.active_buy_reservations_for_account(
-            broker_snapshot.account_id
+            broker_snapshot.account_id,
+            commission_per_share=_config.currency.commission_per_share_usd,
+            minimum_commission=_config.currency.minimum_commission_usd,
         )
         signals = run_daily(
             state,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -7,7 +8,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from shared.models import OrderIntent, OrderStatus
+from shared.models import ExecutionFill, OrderIntent, OrderStatus
 
 
 class OrderLedgerError(RuntimeError):
@@ -215,12 +216,17 @@ class OrderLedger:
         self,
         account_id: str,
         *,
+        commission_per_share: float,
+        minimum_commission: float,
         exclude_recommendation_id: str | None = None,
     ) -> float:
-        remaining = OrderIntent.requested_quantity - OrderIntent.filled_quantity
-        statement = select(
-            func.coalesce(func.sum(remaining * OrderIntent.limit_price), 0.0)
-        ).where(
+        per_share = self._nonnegative_finite(
+            commission_per_share, "commission_per_share"
+        )
+        minimum = self._nonnegative_finite(
+            minimum_commission, "minimum_commission"
+        )
+        statement = select(OrderIntent).where(
             OrderIntent.account_id == account_id,
             func.upper(OrderIntent.action) == "BUY",
             OrderIntent.limit_price.is_not(None),
@@ -236,7 +242,51 @@ class OrderLedger:
             statement = statement.where(
                 OrderIntent.recommendation_id != exclude_recommendation_id
             )
-        return float(self.session.scalar(statement) or 0.0)
+        total = 0.0
+        for intent in self.session.scalars(statement):
+            requested = self._nonnegative_finite(
+                intent.requested_quantity, "requested_quantity"
+            )
+            filled = self._nonnegative_finite(
+                intent.filled_quantity, "filled_quantity"
+            )
+            price = self._nonnegative_finite(intent.limit_price, "limit_price")
+            remaining = requested - filled
+            if remaining < -1e-6:
+                raise ValueError("filled_quantity exceeds requested_quantity")
+            remaining = max(0.0, remaining)
+            total += remaining * price + max(minimum, remaining * per_share)
+        return total
+
+    def buy_fill_spend_for_account_since(
+        self, account_id: str, *, captured_after: datetime
+    ) -> float:
+        if not isinstance(captured_after, datetime):
+            raise ValueError("capital snapshot captured_at is required")
+        statement = select(ExecutionFill).where(
+            ExecutionFill.account_id == account_id,
+            func.upper(ExecutionFill.side) == "BUY",
+            func.upper(ExecutionFill.currency) == "USD",
+            ExecutionFill.executed_at > captured_after,
+        )
+        total = 0.0
+        for fill in self.session.scalars(statement):
+            quantity = self._nonnegative_finite(fill.quantity, "fill quantity")
+            price = self._nonnegative_finite(fill.price, "fill price")
+            if fill.commission_trading is not None:
+                commission = self._nonnegative_finite(
+                    fill.commission_trading, "trading commission"
+                )
+            elif (fill.commission_currency or "USD").upper() == "USD":
+                commission = self._nonnegative_finite(
+                    fill.commission, "USD commission"
+                )
+            else:
+                raise ValueError(
+                    "non-USD fill commission requires commission_trading"
+                )
+            total += quantity * price + commission
+        return total
 
     def load_pending_orders(
         self, *, account_id: str | None = None
@@ -305,3 +355,13 @@ class OrderLedger:
                 f"recommendation {intent.recommendation_id} conflicts on: "
                 + ", ".join(conflicts)
             )
+
+    @staticmethod
+    def _nonnegative_finite(value: Any, field: str) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be a finite non-negative number") from exc
+        if not math.isfinite(numeric) or numeric < 0:
+            raise ValueError(f"{field} must be a finite non-negative number")
+        return numeric

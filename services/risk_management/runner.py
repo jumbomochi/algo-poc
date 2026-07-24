@@ -738,11 +738,24 @@ class RiskServiceRunner:
             .limit(1)
         )
         settled_cash = snapshot.settled_cash_trading if snapshot is not None else None
-        reservations = self._order_ledger.active_buy_reservations_for_account(
-            intent.account_id,
-            exclude_recommendation_id=intent.recommendation_id,
-        )
-        session.rollback()
+        try:
+            reservations = self._order_ledger.active_buy_reservations_for_account(
+                intent.account_id,
+                exclude_recommendation_id=intent.recommendation_id,
+                commission_per_share=(
+                    self._config.currency.commission_per_share_usd
+                ),
+                minimum_commission=self._config.currency.minimum_commission_usd,
+            )
+            fill_spend = self._order_ledger.buy_fill_spend_for_account_since(
+                intent.account_id,
+                captured_after=(snapshot.captured_at if snapshot is not None else None),
+            )
+            committed_usd = reservations + fill_spend
+        except (TypeError, ValueError):
+            committed_usd = math.nan
+        finally:
+            session.rollback()
         try:
             commission = estimate_commission_usd(
                 quantity,
@@ -754,7 +767,7 @@ class RiskServiceRunner:
         return check_settled_usd_funding(
             order_notional_usd=quantity * price,
             settled_cash_usd=settled_cash,
-            active_reservations_usd=reservations,
+            active_reservations_usd=committed_usd,
             estimated_commission_usd=commission,
             minimum_reserve_usd=self._config.currency.minimum_settled_usd_reserve,
         )
