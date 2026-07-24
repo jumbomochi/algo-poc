@@ -56,10 +56,10 @@ def test_sgd_nav_builds_usd_sleeve_budgets():
     assert budget.settled_cash_trading == pytest.approx(25_000)
 
 
-def test_cap_limits_fractional_usd_budget():
+def test_usd_cap_is_applied_after_converting_fractional_sgd_budget():
     cfg = CapitalConfig(
         paper=CapitalModeConfig(
-            deployment_fraction=0.5, max_deployable_usd=200_000.0
+            deployment_fraction=0.5, max_deployable_usd=450_000.0
         )
     )
     budget = calculate_capital_budget(
@@ -71,7 +71,7 @@ def test_cap_limits_fractional_usd_budget():
     )
 
     assert budget.fractional_base == pytest.approx(500_000.0)
-    assert budget.deployable_capital == pytest.approx(200_000.0)
+    assert budget.deployable_capital == pytest.approx(400_000.0)
 
 
 def test_stale_fx_blocks_capital_calculation():
