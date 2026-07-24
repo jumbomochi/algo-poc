@@ -362,6 +362,9 @@ class TestDurableExecutionIdentity:
             "cumulative_quantity": 5.0,
             "fill_price": 149.5,
             "commission": 0.25,
+            "commission_currency": "SGD",
+            "commission_trading": 0.2,
+            "commission_fx_base_per_trading": 1.25,
             "order_done": False,
         })
 
@@ -371,6 +374,10 @@ class TestDurableExecutionIdentity:
         assert payload["execution_id"] == "exec-1"
         assert payload["account_id"] == "DUN551088"
         assert payload["cumulative_quantity"] == "5.0"
+        assert payload["commission"] == "0.25"
+        assert payload["commission_currency"] == "SGD"
+        assert payload["commission_trading"] == "0.2"
+        assert payload["commission_fx_base_per_trading"] == "1.25"
 
     @pytest.mark.asyncio
     async def test_late_fill_uses_terminal_intent_attribution(

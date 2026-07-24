@@ -336,7 +336,9 @@ class ExecutionServiceRunner:
 
         Args:
             fill_info: Payload from :class:`IBExecutor` — order_id, ticker,
-                side, quantity, fill_price, commission, order_done.
+                side, quantity, fill_price, original commission amount and
+                currency, USD trading commission, conversion rate, and
+                order_done.
         """
         order_id = fill_info["order_id"]
         pending = self._pending_orders.get(order_id)
@@ -353,6 +355,11 @@ class ExecutionServiceRunner:
             cumulative_quantity=fill_info.get("cumulative_quantity"),
             fill_price=fill_info["fill_price"],
             commission=fill_info.get("commission", 0.0),
+            commission_currency=fill_info.get("commission_currency"),
+            commission_trading=fill_info.get("commission_trading"),
+            commission_fx_base_per_trading=fill_info.get(
+                "commission_fx_base_per_trading"
+            ),
             recommendation_id=(
                 attribution.recommendation_id if attribution else "unknown"
             ),

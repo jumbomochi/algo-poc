@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
 
 from shared.logging import get_logger
@@ -10,6 +11,20 @@ logger = get_logger("ib_executor")
 # Payload passed to the fill handler on every real IB fill (partial or full).
 FillHandler = Callable[[dict[str, Any]], Awaitable[None]]
 OrderStatusHandler = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+def _commission_in_usd(
+    amount: float,
+    currency: str,
+    *,
+    fx_base_per_trading: float | None,
+) -> float | None:
+    if currency == "USD":
+        return amount
+    if currency == "SGD" and fx_base_per_trading is not None:
+        if math.isfinite(fx_base_per_trading) and fx_base_per_trading > 0:
+            return amount / fx_base_per_trading
+    return None
 
 
 @runtime_checkable
@@ -230,6 +245,31 @@ class IBExecutor:
         self._trades[order_id] = trade
 
         def _on_fill(trade: Any, fill: Any) -> None:
+            commission = float(
+                getattr(fill.commissionReport, "commission", 0.0) or 0.0
+            )
+            commission_currency = str(
+                getattr(fill.commissionReport, "currency", "") or ""
+            )
+            commission_fx_base_per_trading = None
+            if commission_currency == "SGD" and self._ib is not None:
+                rows = [
+                    row
+                    for row in (self._ib.accountValues() or ())
+                    if getattr(row, "tag", None) == "ExchangeRate"
+                    and getattr(row, "currency", None) == "USD"
+                ]
+                if len(rows) == 1:
+                    try:
+                        candidate = float(rows[0].value)
+                    except (TypeError, ValueError):
+                        candidate = None
+                    if (
+                        candidate is not None
+                        and math.isfinite(candidate)
+                        and candidate > 0
+                    ):
+                        commission_fx_base_per_trading = candidate
             payload = {
                 "execution_id": str(fill.execution.execId),
                 "account_id": str(fill.execution.acctNumber),
@@ -242,8 +282,15 @@ class IBExecutor:
                 "quantity": float(fill.execution.shares),
                 "cumulative_quantity": float(fill.execution.cumQty),
                 "fill_price": float(fill.execution.price),
-                "commission": float(
-                    getattr(fill.commissionReport, "commission", 0.0) or 0.0
+                "commission": commission,
+                "commission_currency": commission_currency,
+                "commission_trading": _commission_in_usd(
+                    commission,
+                    commission_currency,
+                    fx_base_per_trading=commission_fx_base_per_trading,
+                ),
+                "commission_fx_base_per_trading": (
+                    commission_fx_base_per_trading
                 ),
                 "order_done": trade.isDone(),
             }

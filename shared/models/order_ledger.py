@@ -125,6 +125,9 @@ class ExecutionFill(Base):
     commission_trading: Mapped[float | None] = mapped_column(
         Float, nullable=True
     )
+    commission_fx_base_per_trading: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
     cumulative_quantity: Mapped[float | None] = mapped_column(Float, nullable=True)
     executed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False

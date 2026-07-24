@@ -46,6 +46,11 @@ CURRENCY_CONVERSION_COLUMNS = {
     "operator",
     "executed_at",
 }
+EXECUTION_COMMISSION_COLUMNS = {
+    "commission_currency",
+    "commission_trading",
+    "commission_fx_base_per_trading",
+}
 
 
 def _config(database_url: str) -> Config:
@@ -68,7 +73,7 @@ def test_orm_models_expose_explicit_dual_currency_fields():
     assert EQUITY_COLUMNS <= set(
         models.EquitySnapshot.__table__.columns.keys()
     )
-    assert {"commission_currency", "commission_trading"} <= set(
+    assert EXECUTION_COMMISSION_COLUMNS <= set(
         models.ExecutionFill.__table__.columns.keys()
     )
     assert (
@@ -120,7 +125,7 @@ def test_upgrade_preserves_existing_portfolio_and_adds_currency_schema(
             inspector, "capital_snapshots"
         )
         assert EQUITY_COLUMNS <= _column_names(inspector, "equity_snapshots")
-        assert {"commission_currency", "commission_trading"} <= _column_names(
+        assert EXECUTION_COMMISSION_COLUMNS <= _column_names(
             inspector, "execution_fills"
         )
         assert "currency" in _column_names(inspector, "portfolio_config")

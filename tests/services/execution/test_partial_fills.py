@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -122,7 +123,8 @@ class TestIBExecutionIdentity:
 
         assert executor._status_reason(trade) == "Error 201: order rejected"
 
-    def test_fill_payload_contains_broker_execution_identity(self):
+    @pytest.mark.asyncio
+    async def test_fill_payload_contains_broker_execution_identity(self):
         from services.execution.ib_executor import IBExecutor
 
         executor = IBExecutor("h", 7497, 1)
@@ -155,9 +157,11 @@ class TestIBExecutionIdentity:
         fill.contract.exchange = ""
         fill.contract.currency = ""
         fill.commissionReport.commission = 0.2
+        fill.commissionReport.currency = "USD"
 
         executor._register_trade("9", trade, ticker="AAPL", side="buy")
         fill_callback(trade, fill)
+        await asyncio.sleep(0)
 
         payload = handler.call_args.args[0]
         assert payload == {
@@ -173,6 +177,9 @@ class TestIBExecutionIdentity:
             "cumulative_quantity": 5.0,
             "fill_price": 149.5,
             "commission": 0.2,
+            "commission_currency": "USD",
+            "commission_trading": 0.2,
+            "commission_fx_base_per_trading": None,
             "order_done": False,
         }
 

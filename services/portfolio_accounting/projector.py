@@ -53,6 +53,9 @@ _IMMUTABLE_FILL_FIELDS = (
     "quantity",
     "price",
     "commission",
+    "commission_currency",
+    "commission_trading",
+    "commission_fx_base_per_trading",
     "cumulative_quantity",
     "executed_at",
 )
@@ -113,7 +116,7 @@ class FillProjector:
                         quantity=fill.quantity,
                         price=fill.fill_price,
                         fill_datetime=fill.timestamp,
-                        commission=fill.commission,
+                        commission=fill.commission_trading,
                         recommendation_id=intent.recommendation_id,
                         con_id=intent.con_id,
                         exchange=intent.exchange,
@@ -156,6 +159,10 @@ class FillProjector:
                 "fill lacks enriched broker identity: " + ", ".join(missing)
             )
         numeric = (fill.quantity, fill.fill_price, fill.commission)
+        if fill.commission_trading is not None:
+            numeric += (fill.commission_trading,)
+        if fill.commission_fx_base_per_trading is not None:
+            numeric += (fill.commission_fx_base_per_trading,)
         if fill.cumulative_quantity is not None:
             numeric += (fill.cumulative_quantity,)
         if not all(isfinite(value) for value in numeric):
@@ -174,6 +181,11 @@ class FillProjector:
             "quantity": fill.quantity,
             "price": fill.fill_price,
             "commission": fill.commission,
+            "commission_currency": fill.commission_currency,
+            "commission_trading": fill.commission_trading,
+            "commission_fx_base_per_trading": (
+                fill.commission_fx_base_per_trading
+            ),
             "cumulative_quantity": fill.cumulative_quantity,
             "executed_at": fill.timestamp,
         }
@@ -258,6 +270,39 @@ class FillProjector:
             raise InvalidFillError("fill price must be positive")
         if fill.commission < 0:
             raise InvalidFillError("fill commission cannot be negative")
+        if fill.commission_currency not in {"USD", "SGD"}:
+            raise InvalidFillError("unsupported fill commission currency")
+        if fill.commission_trading is None:
+            raise InvalidFillError("fill commission requires USD translation")
+        if fill.commission_trading < 0:
+            raise InvalidFillError(
+                "fill USD trading commission cannot be negative"
+            )
+        if fill.commission_currency == "USD":
+            if not isclose(
+                fill.commission_trading,
+                fill.commission,
+                rel_tol=1e-9,
+                abs_tol=1e-9,
+            ):
+                raise InvalidFillError(
+                    "USD fill commission must map one-to-one"
+                )
+        else:
+            rate = fill.commission_fx_base_per_trading
+            if rate is None or rate <= 0:
+                raise InvalidFillError(
+                    "SGD fill commission requires a positive FX conversion"
+                )
+            if not isclose(
+                fill.commission_trading,
+                fill.commission / rate,
+                rel_tol=1e-9,
+                abs_tol=1e-9,
+            ):
+                raise InvalidFillError(
+                    "SGD fill commission conflicts with FX conversion"
+                )
 
         prior = (
             self._reconstructed_projected_quantity(intent, execution.id)
