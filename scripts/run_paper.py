@@ -305,7 +305,7 @@ def prepare_daily_run(
         )
     reconciliation, _ = reconcile_snapshot(session, broker_snapshot)
     capital = calculate_capital_budget(
-        broker_snapshot.net_liquidation,
+        broker_snapshot.net_liquidation_trading_equivalent,
         config.mode,
         config.capital,
         CAPITAL_ALLOCATIONS,

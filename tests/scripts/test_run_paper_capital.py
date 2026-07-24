@@ -34,7 +34,14 @@ def test_one_million_nav_builds_and_persists_one_million_of_sleeve_budgets(sessi
     snapshot = BrokerAccountSnapshot(
         account_id="DUTEST",
         mode="paper",
-        net_liquidation=1_000_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=1_350_000,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=1_000_000,
+        settled_cash_trading=1_000_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
         captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
     )
 
@@ -74,7 +81,14 @@ def test_legacy_unowned_position_keeps_daily_preparation_fail_closed(session):
     snapshot = BrokerAccountSnapshot(
         account_id="DUTEST",
         mode="paper",
-        net_liquidation=1_000_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=1_350_000,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=1_000_000,
+        settled_cash_trading=1_000_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
     )
 
     result = prepare_daily_run(

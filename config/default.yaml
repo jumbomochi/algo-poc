@@ -10,6 +10,14 @@ capital:
     max_deployable_usd: 0.0
     entries_enabled: false
 
+currency:
+  expected_base_currency: SGD
+  trading_currency: USD
+  max_fx_age_seconds: 300
+  minimum_settled_usd_reserve: 0.0
+  commission_per_share_usd: 0.005
+  minimum_commission_usd: 1.0
+
 universe:
   # sleeves = union universe of the active sleeves (ingest exactly what the
   # strategies trade); sp500 = SP500_TOP100; custom = only custom_tickers.

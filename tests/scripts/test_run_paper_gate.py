@@ -7,7 +7,7 @@ every entry via risk_engine.check_entry.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pytest
 from sqlalchemy import create_engine
@@ -317,7 +317,14 @@ def test_signal_creates_deterministic_intent_without_position_mutation(state):
     snapshot = BrokerAccountSnapshot(
         account_id="DUTEST",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
         positions={
             265598: BrokerPosition(
                 account_id="DUTEST",
@@ -359,13 +366,27 @@ def test_recommendation_id_is_stable_but_account_and_mode_scoped(state):
     one = BrokerAccountSnapshot(
         account_id="DUONE",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
         positions={265598: contract},
     )
     two = BrokerAccountSnapshot(
         account_id="DUTWO",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
         positions={
             265598: BrokerPosition(
                 account_id="DUTWO",
@@ -501,7 +522,14 @@ def test_fail_closed_replay_keeps_buys_unpublished_but_publishes_sells(state):
     snapshot = BrokerAccountSnapshot(
         account_id="DUTEST",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
         positions={
             265598: BrokerPosition(
                 account_id="DUTEST",
@@ -538,7 +566,14 @@ def test_breached_reconciliation_sell_is_capped_to_broker_holding(state):
     snapshot = BrokerAccountSnapshot(
         account_id="DUTEST",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
         positions={
             265598: BrokerPosition(
                 account_id="DUTEST",
@@ -599,7 +634,14 @@ def test_active_sell_orders_reduce_availability_without_double_count(state):
     snapshot = BrokerAccountSnapshot(
         account_id="DUTEST",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
         positions={
             265598: BrokerPosition(
                 account_id="DUTEST",
@@ -673,7 +715,14 @@ def test_outage_replay_revalidates_and_replaces_oversized_sell(state):
     snapshot = BrokerAccountSnapshot(
         account_id="DUTEST",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
         positions={
             265598: BrokerPosition(
                 account_id="DUTEST",
@@ -746,7 +795,14 @@ def test_outbox_sell_revalidation_deducts_active_broker_sell(state):
     snapshot = BrokerAccountSnapshot(
         account_id="DUTEST",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
         positions={
             265598: BrokerPosition(
                 account_id="DUTEST",
@@ -810,7 +866,14 @@ def test_outbox_zero_sell_availability_cancels_without_publish(state):
     snapshot = BrokerAccountSnapshot(
         account_id="DUTEST",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
     )
 
     assert (
@@ -866,7 +929,14 @@ def test_ambiguous_replacement_publish_retries_same_safe_id(state):
     snapshot = BrokerAccountSnapshot(
         account_id="DUTEST",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
         positions={
             265598: BrokerPosition(
                 account_id="DUTEST",

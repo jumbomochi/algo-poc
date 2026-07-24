@@ -1,5 +1,7 @@
 import os
 import pytest
+from pydantic import ValidationError
+
 from shared.config import AppConfig, CapitalConfig, CapitalModeConfig, load_config
 
 
@@ -82,3 +84,25 @@ def test_default_yaml_declares_mode_specific_capital_values():
     assert config.capital.live.deployment_fraction == 0.0
     assert config.capital.live.max_deployable_usd == 0.0
     assert config.capital.live.entries_enabled is False
+
+
+def test_currency_defaults_are_sgd_base_and_usd_trading():
+    cfg = AppConfig()
+    assert cfg.currency.expected_base_currency == "SGD"
+    assert cfg.currency.trading_currency == "USD"
+    assert cfg.currency.max_fx_age_seconds == 300
+    assert cfg.currency.minimum_settled_usd_reserve == 0.0
+
+
+def test_live_entries_require_positive_usd_reserve():
+    with pytest.raises(ValidationError, match="settled USD reserve"):
+        AppConfig(
+            mode="live",
+            capital=CapitalConfig(
+                live=CapitalModeConfig(
+                    deployment_fraction=0.1,
+                    max_deployable_usd=10_000,
+                    entries_enabled=True,
+                )
+            ),
+        )
