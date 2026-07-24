@@ -7,7 +7,9 @@ every entry via risk_engine.check_entry.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+import math
+from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
@@ -16,6 +18,7 @@ from sqlalchemy.orm import sessionmaker
 from scripts.paper_state import PaperTradingState
 from scripts.run_backtest import PortfolioConfig
 from scripts.run_paper import (
+    account_buy_commitments_after_snapshot,
     build_sell_availability,
     create_signal_intents,
     publish_unpublished_intents,
@@ -24,7 +27,7 @@ from scripts.run_paper import (
 from services.risk_management.engine import RiskEngine
 from services.execution.reconciliation import ReconciliationResult
 from shared.broker_state import BrokerAccountSnapshot, BrokerOpenOrder, BrokerPosition
-from shared.models import OrderStatus
+from shared.models import ExecutionFill, OrderStatus
 from shared.models.base import Base
 from shared.models.portfolio import Position
 from shared.order_ledger import OrderLedger
@@ -80,6 +83,141 @@ def run_daily(*args, **kwargs):
     kwargs.setdefault("minimum_commission_usd", 1)
     kwargs.setdefault("minimum_settled_usd_reserve", 0)
     return _run_daily(*args, **kwargs)
+
+
+def local_execution_fill(
+    *,
+    executed_at: datetime,
+    quantity: float = 9,
+    price: float = 100,
+    commission: float = 1,
+    commission_currency: str | None = "USD",
+) -> ExecutionFill:
+    return ExecutionFill(
+        account_id="DUTEST",
+        execution_id=f"exec-local-{executed_at.timestamp()}",
+        ib_order_id="42",
+        recommendation_id="prior-buy",
+        portfolio="quality_value",
+        con_id=123,
+        symbol="MSFT",
+        exchange="SMART",
+        currency="USD",
+        side="BUY",
+        quantity=quantity,
+        price=price,
+        commission=commission,
+        commission_currency=commission_currency,
+        cumulative_quantity=quantity,
+        executed_at=executed_at,
+    )
+
+
+def test_local_commitments_include_full_buy_fill_after_snapshot(state):
+    now = datetime.now(timezone.utc)
+    state._session.add(local_execution_fill(executed_at=now))
+    state._session.flush()
+
+    assert account_buy_commitments_after_snapshot(
+        state._session,
+        "DUTEST",
+        snapshot_captured_at=now - timedelta(minutes=5),
+        commission_per_share=0.005,
+        minimum_commission=1,
+    ) == pytest.approx(901)
+
+
+def test_local_commitments_include_partial_fill_and_remaining_reservation(state):
+    now = datetime.now(timezone.utc)
+    ledger = OrderLedger(state._session)
+    prior = ledger.create_intent(
+        SimpleNamespace(
+            recommendation_id="prior-buy",
+            account_id="DUTEST",
+            mode="paper",
+            portfolio="quality_value",
+            con_id=123,
+            symbol="MSFT",
+            exchange="SMART",
+            currency="USD",
+            action="BUY",
+            quantity=10,
+            limit_price=100,
+            order_type="LMT",
+        )
+    )
+    ledger.transition(prior.recommendation_id, OrderStatus.APPROVED)
+    ledger.transition(prior.recommendation_id, OrderStatus.SUBMITTED)
+    ledger.transition(prior.recommendation_id, OrderStatus.PARTIALLY_FILLED)
+    prior.filled_quantity = 4
+    state._session.add(
+        local_execution_fill(
+            executed_at=now,
+            quantity=4,
+            price=100,
+            commission=0.5,
+        )
+    )
+    state._session.flush()
+
+    assert account_buy_commitments_after_snapshot(
+        state._session,
+        "DUTEST",
+        snapshot_captured_at=now - timedelta(minutes=5),
+        commission_per_share=0.005,
+        minimum_commission=1,
+    ) == pytest.approx(1_001.5)
+
+
+def test_local_commitments_exclude_fills_reflected_by_newer_snapshot(state):
+    now = datetime.now(timezone.utc)
+    state._session.add(
+        local_execution_fill(executed_at=now - timedelta(minutes=5))
+    )
+    state._session.flush()
+
+    assert account_buy_commitments_after_snapshot(
+        state._session,
+        "DUTEST",
+        snapshot_captured_at=now,
+        commission_per_share=0.005,
+        minimum_commission=1,
+    ) == 0
+
+
+def test_invalid_local_commitment_blocks_buys_but_preserves_sells(state):
+    now = datetime.now(timezone.utc)
+    state._session.add(
+        local_execution_fill(
+            executed_at=now,
+            commission_currency="SGD",
+        )
+    )
+    state._session.flush()
+    commitments = account_buy_commitments_after_snapshot(
+        state._session,
+        "DUTEST",
+        snapshot_captured_at=now - timedelta(minutes=5),
+        commission_per_share=0.005,
+        minimum_commission=1,
+    )
+
+    def signal_fn(ticker, bars):
+        return {
+            "action": "buy" if ticker == "MSFT" else "sell",
+            "limit_price": 100,
+            "quantity": 1,
+        }
+
+    signals = run_daily(
+        state,
+        build_portfolio(signal_fn),
+        {"AAPL": make_bars(), "MSFT": make_bars()},
+        active_buy_reservations_usd=commitments,
+    )
+
+    assert math.isnan(commitments)
+    assert [signal["action"] for signal in signals] == ["sell"]
 
 
 class TestEntryGate:

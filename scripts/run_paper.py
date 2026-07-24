@@ -412,6 +412,31 @@ def build_sell_availability(
     }
 
 
+def account_buy_commitments_after_snapshot(
+    session: Session,
+    account_id: str,
+    *,
+    snapshot_captured_at: datetime | None,
+    commission_per_share: float,
+    minimum_commission: float,
+) -> float:
+    """Return durable USD buy commitments not reflected by the snapshot."""
+    ledger = OrderLedger(session)
+    try:
+        active = ledger.active_buy_reservations_for_account(
+            account_id,
+            commission_per_share=commission_per_share,
+            minimum_commission=minimum_commission,
+        )
+        filled = ledger.buy_fill_spend_for_account_since(
+            account_id,
+            captured_after=snapshot_captured_at,
+        )
+        return active + filled
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def print_status(state: PaperTradingState) -> None:
     """Print current paper trading status."""
     print("\n" + "=" * 60)
@@ -1134,9 +1159,10 @@ def main():
             for name, context in portfolio_contexts.items()
         }
         sell_availability = build_sell_availability(session, broker_snapshot)
-        ledger = OrderLedger(session)
-        account_buy_reservations = ledger.active_buy_reservations_for_account(
+        account_buy_reservations = account_buy_commitments_after_snapshot(
+            session,
             broker_snapshot.account_id,
+            snapshot_captured_at=preparation.capital_snapshot.captured_at,
             commission_per_share=_config.currency.commission_per_share_usd,
             minimum_commission=_config.currency.minimum_commission_usd,
         )
