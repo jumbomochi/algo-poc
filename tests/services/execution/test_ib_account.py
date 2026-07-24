@@ -215,6 +215,24 @@ async def test_account_reader_rejects_non_positive_nav_or_fx(tag, value):
         ).snapshot()
 
 
+@pytest.mark.asyncio
+async def test_account_reader_rejects_derived_usd_nav_overflow():
+    ib = _fake_ib()
+    next(
+        row
+        for row in ib.accountSummaryAsync.return_value
+        if row.tag == "ExchangeRate"
+    ).value = "5e-324"
+
+    with pytest.raises(AccountValidationError, match="invalid derived USD NAV"):
+        await IBAccountReader(
+            ib,
+            expected_mode="paper",
+            expected_base_currency="SGD",
+            trading_currency="USD",
+        ).snapshot()
+
+
 @pytest.mark.parametrize(
     ("expected_base_currency", "trading_currency"),
     [("USD", "USD"), ("SGD", "SGD")],

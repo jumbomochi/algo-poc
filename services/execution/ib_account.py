@@ -126,6 +126,9 @@ class IBAccountReader:
         )
         if nav_base <= 0 or fx <= 0:
             raise AccountValidationError("NAV and FX rate must be positive")
+        nav_trading_equivalent = nav_base / fx
+        if not math.isfinite(nav_trading_equivalent) or nav_trading_equivalent <= 0:
+            raise AccountValidationError("invalid derived USD NAV")
 
         positions: dict[int, BrokerPosition] = {}
         for item in await _resolve(self._ib.positions()):
@@ -184,7 +187,7 @@ class IBAccountReader:
             trading_currency=self._trading_currency,
             net_liquidation_base=nav_base,
             fx_base_per_trading=fx,
-            net_liquidation_trading_equivalent=nav_base / fx,
+            net_liquidation_trading_equivalent=nav_trading_equivalent,
             settled_cash_trading=settled_cash,
             fx_source="$LEDGER:ALL/ExchangeRate",
             fx_captured_at=captured_at,
