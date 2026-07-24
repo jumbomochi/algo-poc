@@ -481,6 +481,109 @@ class TestDurableExecutionIdentity:
         assert runner._positions == {}
 
     @pytest.mark.asyncio
+    async def test_duplicate_commission_retries_after_transient_publish_failure(
+        self, durable_runner, ledger_session
+    ):
+        from services.execution.ib_executor import IBExecutor
+
+        class Event:
+            def __init__(self):
+                self.callbacks = []
+
+            def __iadd__(self, callback):
+                self.callbacks.append(callback)
+                return self
+
+            def emit(self, *args):
+                for callback in self.callbacks:
+                    callback(*args)
+
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        ledger_session.add(PortfolioConfig(
+            portfolio="momentum",
+            capital=10_000,
+            cash=10_000,
+            created_at=BROKER_TIME,
+            updated_at=BROKER_TIME,
+        ))
+        ledger_session.commit()
+        runner.restore_pending_orders()
+
+        successful_publications = []
+        publish_attempts = 0
+
+        async def publish_with_transient_failure(stream, payload):
+            nonlocal publish_attempts
+            publish_attempts += 1
+            if publish_attempts == 1:
+                raise RuntimeError("transient Redis failure")
+            successful_publications.append((stream, payload))
+            return "message-id"
+
+        runner._redis.publish.side_effect = publish_with_transient_failure
+        handler_attempts = 0
+        handler_errors = []
+
+        async def handle_with_error_capture(payload):
+            nonlocal handler_attempts
+            handler_attempts += 1
+            try:
+                await runner.handle_ib_fill(payload)
+            except RuntimeError as exc:
+                handler_errors.append(str(exc))
+
+        executor = IBExecutor("h", 7497, 1)
+        executor._ib = MagicMock()
+        executor._ib.accountValues.return_value = []
+        executor.set_fill_handler(handle_with_error_capture)
+        trade = MagicMock()
+        trade.fillEvent = Event()
+        trade.commissionReportEvent = Event()
+        trade.statusEvent = Event()
+        trade.isDone.return_value = False
+        executor._register_trade("9", trade, ticker="AAPL", side="buy")
+        fill = SimpleNamespace(
+            execution=SimpleNamespace(
+                execId="exec-retry",
+                acctNumber="DUN551088",
+                shares=2,
+                cumQty=2,
+                price=149.5,
+                time=BROKER_TIME,
+            ),
+            contract=SimpleNamespace(
+                conId=265598,
+                exchange="SMART",
+                currency="USD",
+            ),
+            commissionReport=SimpleNamespace(commission=0.0, currency=""),
+        )
+        report = SimpleNamespace(commission=0.25, currency="USD")
+
+        trade.commissionReportEvent.emit(trade, fill, report)
+        trade.commissionReportEvent.emit(trade, fill, report)
+        await asyncio.sleep(0)
+
+        assert handler_attempts == 2
+        assert handler_errors == ["transient Redis failure"]
+        assert publish_attempts == 2
+        assert len(successful_publications) == 1
+        assert runner._positions == {"AAPL": pytest.approx(2.0)}
+
+        stream, payload = successful_publications[0]
+        assert stream == "stream:fills"
+        message = FillMessage.from_stream_dict(payload)
+        assert message.timestamp == BROKER_TIME
+        projector = FillProjector(ledger_session)
+        assert projector.apply(message) is True
+        assert projector.apply(message) is False
+        assert ledger_session.scalar(select(Position)).quantity == pytest.approx(2)
+        assert ledger_session.scalar(select(PortfolioConfig.cash)) == pytest.approx(
+            9_700.75
+        )
+
+    @pytest.mark.asyncio
     async def test_late_fill_uses_terminal_intent_attribution(
         self, durable_runner
     ):

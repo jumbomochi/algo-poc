@@ -190,7 +190,8 @@ async def test_duplicate_authoritative_commission_delivery_replays_same_fill():
     trade.commissionReportEvent.emit(trade, fill, report)
     await asyncio.sleep(0)
 
-    handler.assert_awaited_once()
-    payload = handler.await_args.args[0]
-    assert payload["execution_id"] == "exec-duplicate"
-    assert payload["timestamp"] == EXECUTED_AT
+    assert handler.await_count == 2
+    first, second = [call.args[0] for call in handler.await_args_list]
+    assert first == second
+    assert first["execution_id"] == "exec-duplicate"
+    assert first["timestamp"] == EXECUTED_AT
