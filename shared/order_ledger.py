@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -210,6 +210,33 @@ class OrderLedger:
                 OrderIntent.recommendation_id != exclude_recommendation_id
             )
         return float(self.session.scalar(stmt) or 0.0)
+
+    def active_buy_reservations_for_account(
+        self,
+        account_id: str,
+        *,
+        exclude_recommendation_id: str | None = None,
+    ) -> float:
+        remaining = OrderIntent.requested_quantity - OrderIntent.filled_quantity
+        statement = select(
+            func.coalesce(func.sum(remaining * OrderIntent.limit_price), 0.0)
+        ).where(
+            OrderIntent.account_id == account_id,
+            func.upper(OrderIntent.action) == "BUY",
+            OrderIntent.limit_price.is_not(None),
+            or_(
+                OrderIntent.status.in_(ACTIVE_RESERVATION_STATUSES),
+                and_(
+                    OrderIntent.status == OrderStatus.PROPOSED.value,
+                    OrderIntent.published_at.is_not(None),
+                ),
+            ),
+        )
+        if exclude_recommendation_id is not None:
+            statement = statement.where(
+                OrderIntent.recommendation_id != exclude_recommendation_id
+            )
+        return float(self.session.scalar(statement) or 0.0)
 
     def load_pending_orders(
         self, *, account_id: str | None = None

@@ -19,7 +19,7 @@ from scripts.run_paper import (
     build_sell_availability,
     create_signal_intents,
     publish_unpublished_intents,
-    run_daily,
+    run_daily as _run_daily,
 )
 from services.risk_management.engine import RiskEngine
 from services.execution.reconciliation import ReconciliationResult
@@ -72,7 +72,73 @@ def build_portfolio(signals_fn) -> dict[str, PortfolioConfig]:
     }
 
 
+def run_daily(*args, **kwargs):
+    """Supply valid funding inputs for tests focused on other local gates."""
+    kwargs.setdefault("settled_cash_trading", 1_000_000)
+    kwargs.setdefault("active_buy_reservations_usd", 0)
+    kwargs.setdefault("commission_per_share_usd", 0.005)
+    kwargs.setdefault("minimum_commission_usd", 1)
+    kwargs.setdefault("minimum_settled_usd_reserve", 0)
+    return _run_daily(*args, **kwargs)
+
+
 class TestEntryGate:
+    def test_settled_usd_cash_rejects_buy_despite_large_margin_headroom(self, state):
+        portfolio = build_portfolio(
+            lambda ticker, bars: {
+                "action": "buy",
+                "limit_price": 100.0,
+                "quantity": 10.0,
+            }
+        )["test_sleeve"]
+        portfolio.capital = 1_000_000
+
+        signals = run_daily(
+            state,
+            {"test_sleeve": portfolio},
+            {"AAPL": make_bars()},
+            settled_cash_trading=1_000,
+            active_buy_reservations_usd=0,
+            commission_per_share_usd=0.005,
+            minimum_commission_usd=1,
+            minimum_settled_usd_reserve=0,
+        )
+
+        assert signals == []
+
+    def test_same_cycle_buys_share_one_account_usd_cash_pool(self, state):
+        state = PaperTradingState.create_new(
+            {"momentum": 10_000, "quality_value": 10_000},
+            session=state._session,
+        )
+
+        def only(ticker_to_buy):
+            return lambda ticker, bars: (
+                {"action": "buy", "limit_price": 100.0, "quantity": 6.0}
+                if ticker == ticker_to_buy
+                else None
+            )
+
+        portfolios = {
+            "momentum": build_portfolio(only("AAPL"))["test_sleeve"],
+            "quality_value": build_portfolio(only("MSFT"))["test_sleeve"],
+        }
+
+        signals = run_daily(
+            state,
+            portfolios,
+            {"AAPL": make_bars(), "MSFT": make_bars()},
+            settled_cash_trading=1_000,
+            active_buy_reservations_usd=0,
+            commission_per_share_usd=0.005,
+            minimum_commission_usd=1,
+            minimum_settled_usd_reserve=0,
+        )
+
+        assert [(signal["portfolio"], signal["ticker"]) for signal in signals] == [
+            ("momentum", "AAPL")
+        ]
+
     def test_same_cycle_buys_accumulate_reserved_notional(self, state):
         def buy_fn(ticker, bars):
             return {"action": "buy", "limit_price": 100.0, "quantity": 10.0}

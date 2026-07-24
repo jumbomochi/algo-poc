@@ -66,6 +66,10 @@ from backtest.portfolio_context import PortfolioContext
 from backtest.ranked_selection import ReplacementPolicy
 from backtest.aggregate_risk import AggregateRiskMonitor
 from services.risk_management.engine import RiskEngine
+from services.risk_management.funding import (
+    check_settled_usd_funding,
+    estimate_commission_usd,
+)
 from shared.order_ledger import OrderLedger
 from shared.capital import CapitalBudget, calculate_capital_budget
 from shared.broker_state import BrokerAccountSnapshot
@@ -480,6 +484,11 @@ def run_daily(
     entries_disabled: bool = False,
     reservations_by_portfolio: Mapping[str, float] | None = None,
     sell_availability: Mapping[str, float] | None = None,
+    settled_cash_trading: float | None,
+    active_buy_reservations_usd: float,
+    commission_per_share_usd: float,
+    minimum_commission_usd: float,
+    minimum_settled_usd_reserve: float,
 ) -> list[dict]:
     """Run one daily cycle: generate signals for all portfolios.
 
@@ -487,6 +496,7 @@ def run_daily(
     """
     signals_generated: list[dict] = []
     accepted_buy_notional: dict[str, float] = {}
+    accepted_account_buy_reservations_usd = 0.0
     remaining_sell_quantity = dict(sell_availability or {})
     today = date.today()
 
@@ -532,6 +542,31 @@ def run_daily(
                     from shared.universe import ETF_SECTORS
 
                     sector = SECTOR_MAP.get(ticker) or ETF_SECTORS.get(ticker)
+
+                    try:
+                        estimated_commission = estimate_commission_usd(
+                            qty,
+                            per_share=commission_per_share_usd,
+                            minimum=minimum_commission_usd,
+                        )
+                    except (TypeError, ValueError):
+                        estimated_commission = float("nan")
+                    funding = check_settled_usd_funding(
+                        order_notional_usd=qty * price,
+                        settled_cash_usd=settled_cash_trading,
+                        active_reservations_usd=(
+                            active_buy_reservations_usd
+                            + accepted_account_buy_reservations_usd
+                        ),
+                        estimated_commission_usd=estimated_commission,
+                        minimum_reserve_usd=minimum_settled_usd_reserve,
+                    )
+                    if not funding.approved:
+                        print(
+                            f"  SKIP {ticker:>6s}  {qty:>8.4f} @ "
+                            f"${price:>8.2f}  [{name}] ({funding.reason})"
+                        )
+                        continue
 
                     # Gate through the sleeve's RiskEngine exactly like the
                     # backtest runner does — without it the sim books every
@@ -587,6 +622,14 @@ def run_daily(
                     signals_generated.append(signal)
                     accepted_buy_notional[name] = (
                         accepted_buy_notional.get(name, 0.0) + qty * price
+                    )
+                    accepted_account_buy_reservations_usd += (
+                        qty * price
+                        + estimate_commission_usd(
+                            qty,
+                            per_share=commission_per_share_usd,
+                            minimum=minimum_commission_usd,
+                        )
                     )
                     print(
                         f"  BUY  {ticker:>6s}  {qty:>8.4f} @ ${price:>8.2f}  [{name}]"
@@ -1091,6 +1134,10 @@ def main():
             for name, context in portfolio_contexts.items()
         }
         sell_availability = build_sell_availability(session, broker_snapshot)
+        ledger = OrderLedger(session)
+        account_buy_reservations = ledger.active_buy_reservations_for_account(
+            broker_snapshot.account_id
+        )
         signals = run_daily(
             state,
             portfolios,
@@ -1099,6 +1146,15 @@ def main():
             entries_disabled=entries_disabled,
             reservations_by_portfolio=reservations,
             sell_availability=sell_availability,
+            settled_cash_trading=preparation.capital.settled_cash_trading,
+            active_buy_reservations_usd=account_buy_reservations,
+            commission_per_share_usd=(
+                _config.currency.commission_per_share_usd
+            ),
+            minimum_commission_usd=_config.currency.minimum_commission_usd,
+            minimum_settled_usd_reserve=(
+                _config.currency.minimum_settled_usd_reserve
+            ),
         )
         if args.publish and signals:
             contracts = resolve_contract_details_from_ib(

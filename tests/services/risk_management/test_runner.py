@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 from services.risk_management.engine import PortfolioState, RiskDecision
 from services.risk_management.runner import RiskServiceRunner
-from shared.config import AppConfig, RiskConfig
+from shared.config import AppConfig, CurrencyConfig, RiskConfig
 from shared.models import Base, CapitalSnapshot, OrderStatus, Position
 from shared.order_ledger import OrderLedger
 from shared.observability import create_trading_metrics
@@ -56,6 +56,7 @@ def mock_config():
     config = MagicMock(spec=AppConfig)
     config.mode = "paper"
     config.risk = RiskConfig()
+    config.currency = CurrencyConfig()
     return config
 
 
@@ -118,7 +119,6 @@ class TestRecommendationProcessing:
             call.args[0] == "stream:approved_orders"
             for call in mock_redis.publish.call_args_list
         )
-
     @pytest.mark.asyncio
     async def test_rejected_entry_does_not_publish(
         self, runner, mock_redis, mock_portfolio
@@ -178,7 +178,6 @@ class TestRecommendationProcessing:
             call.args[0] == "stream:approved_orders"
             for call in mock_redis.publish.call_args_list
         )
-
     @pytest.mark.asyncio
     async def test_hold_recommendation_ignored(
         self, runner, mock_redis, mock_portfolio
@@ -488,6 +487,7 @@ class TestDurableRiskLifecycle:
                     deployment_fraction=1,
                     max_deployable_usd=None,
                     deployable_capital=100_000,
+                    settled_cash_trading=100_000,
                     sleeve_budgets={},
                     reconciliation_status="ok",
                     captured_at=now,
@@ -910,6 +910,7 @@ class TestDurableRiskLifecycle:
                     deployment_fraction=1,
                     max_deployable_usd=None,
                     deployable_capital=100_000,
+                    settled_cash_trading=100_000,
                     sleeve_budgets={},
                     reconciliation_status="ok",
                     captured_at=now,
@@ -921,6 +922,7 @@ class TestDurableRiskLifecycle:
                     deployment_fraction=1,
                     max_deployable_usd=None,
                     deployable_capital=900_000,
+                    settled_cash_trading=900_000,
                     sleeve_budgets={},
                     reconciliation_status="ok",
                     captured_at=now,
@@ -1100,6 +1102,7 @@ class TestDurableRiskLifecycle:
                 deployment_fraction=1,
                 max_deployable_usd=None,
                 deployable_capital=200_000,
+                settled_cash_trading=200_000,
                 sleeve_budgets={},
                 reconciliation_status="ok",
                 captured_at=now,
@@ -1181,6 +1184,7 @@ class TestDurableRiskLifecycle:
                 deployment_fraction=1,
                 max_deployable_usd=None,
                 deployable_capital=100_000,
+                settled_cash_trading=100_000,
                 sleeve_budgets={},
                 reconciliation_status="ok",
                 captured_at=datetime.now(timezone.utc),
@@ -1294,3 +1298,159 @@ class TestDurableRiskLifecycle:
             await runner.process_recommendation(rec)
 
         assert check_entry.call_args.kwargs["reserved_notional"] == pytest.approx(1000)
+
+    @pytest.mark.asyncio
+    async def test_account_wide_usd_funding_rejects_buy_despite_large_nav(
+        self, durable_runner, mock_redis
+    ):
+        runner, ledger, session = durable_runner
+        snapshot = session.scalar(select(CapitalSnapshot))
+        snapshot.deployable_capital = 1_000_000
+        snapshot.net_liquidation = 1_000_000
+        snapshot.settled_cash_trading = 1_200
+        ledger.create_intent(
+            SimpleNamespace(
+                recommendation_id="other-sleeve",
+                account_id="DUTEST",
+                mode="paper",
+                portfolio="quality_value",
+                con_id=123,
+                symbol="MSFT",
+                exchange="SMART",
+                currency="USD",
+                action="BUY",
+                quantity=5,
+                limit_price=100,
+                order_type="LMT",
+            )
+        )
+        ledger.transition("other-sleeve", OrderStatus.APPROVED)
+        session.commit()
+        rec = RecommendationMessage(
+            ticker="AAPL",
+            timestamp=datetime.now(timezone.utc),
+            action="buy",
+            confidence=1,
+            top_features={},
+            recommendation_id="rec-risk",
+            limit_price=100,
+            quantity=10,
+            portfolio="momentum",
+        )
+
+        with patch.object(runner._engine, "check_entry") as check_entry:
+            await runner.process_recommendation(rec)
+
+        assert ledger.get("rec-risk").status == OrderStatus.RISK_REJECTED.value
+        assert "settled USD cash" in ledger.get("rec-risk").reason
+        check_entry.assert_not_called()
+        assert not any(
+            call.args[0] == "stream:approved_orders"
+            for call in mock_redis.publish.call_args_list
+        )
+        assert any(
+            call.args[0] == "stream:alerts"
+            and call.args[1]["event_type"] == "entry_rejection"
+            for call in mock_redis.publish.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_invalid_settled_cash_rejects_buy_without_deleting_positions(
+        self, durable_runner
+    ):
+        runner, ledger, session = durable_runner
+        snapshot = session.scalar(select(CapitalSnapshot))
+        snapshot.settled_cash_trading = None
+        now = datetime.now(timezone.utc)
+        session.add(
+            Position(
+                account_id="DUTEST",
+                ticker="MSFT",
+                portfolio="quality_value",
+                con_id=123,
+                quantity=2,
+                avg_entry_price=200,
+                current_price=210,
+                peak_price=210,
+                highest_price_since_entry=210,
+                opened_at=now,
+                status="open",
+            )
+        )
+        session.commit()
+        rec = RecommendationMessage(
+            ticker="AAPL",
+            timestamp=now,
+            action="buy",
+            confidence=1,
+            top_features={},
+            recommendation_id="rec-risk",
+            limit_price=100,
+            quantity=10,
+            portfolio="momentum",
+        )
+
+        await runner.process_recommendation(rec)
+
+        assert ledger.get("rec-risk").status == OrderStatus.RISK_REJECTED.value
+        assert "invalid settled USD cash" in ledger.get("rec-risk").reason
+        assert session.scalar(select(Position).where(Position.ticker == "MSFT"))
+
+    @pytest.mark.asyncio
+    async def test_sell_bypasses_invalid_settled_usd_funding(
+        self, durable_runner, mock_redis
+    ):
+        runner, ledger, session = durable_runner
+        snapshot = session.scalar(select(CapitalSnapshot))
+        snapshot.settled_cash_trading = None
+        sell = SimpleNamespace(
+            recommendation_id="sell-risk",
+            account_id="DUTEST",
+            mode="paper",
+            portfolio="momentum",
+            con_id=265598,
+            symbol="AAPL",
+            exchange="SMART",
+            currency="USD",
+            action="SELL",
+            quantity=3,
+            limit_price=None,
+            order_type="MKT",
+        )
+        ledger.create_intent(sell)
+        now = datetime.now(timezone.utc)
+        session.add(
+            Position(
+                account_id="DUTEST",
+                ticker="AAPL",
+                portfolio="momentum",
+                con_id=265598,
+                quantity=3,
+                avg_entry_price=100,
+                current_price=100,
+                peak_price=100,
+                highest_price_since_entry=100,
+                opened_at=now,
+                status="open",
+            )
+        )
+        session.commit()
+        rec = RecommendationMessage(
+            ticker="AAPL",
+            timestamp=now,
+            action="sell",
+            confidence=1,
+            top_features={},
+            recommendation_id="sell-risk",
+            limit_price=None,
+            quantity=3,
+            portfolio="momentum",
+        )
+
+        await runner.process_recommendation(rec)
+
+        assert ledger.get("sell-risk").status == OrderStatus.APPROVED.value
+        assert any(
+            call.args[0] == "stream:approved_orders"
+            for call in mock_redis.publish.call_args_list
+        )

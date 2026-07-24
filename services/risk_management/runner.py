@@ -9,6 +9,11 @@ from sqlalchemy import func, or_, select
 
 from services.risk_management.correlation import CorrelationMonitor
 from services.risk_management.engine import PortfolioState, RiskEngine
+from services.risk_management.funding import (
+    FundingDecision,
+    check_settled_usd_funding,
+    estimate_commission_usd,
+)
 from services.risk_management.kill_switch import KillSwitch
 from services.risk_management.passive_monitor import PassiveBreachMonitor
 from shared.config import AppConfig
@@ -403,6 +408,36 @@ class RiskServiceRunner:
             # config position limit.
             default_qty = float(intent.requested_quantity)
 
+            funding_decision = self._check_settled_usd_funding(
+                intent, quantity=default_qty, price=price
+            )
+            if not funding_decision.approved:
+                self._persist_risk_rejection(
+                    rec.recommendation_id, funding_decision.reason
+                )
+                self._logger.warning(
+                    "Settled USD funding rejected buy",
+                    ticker=rec.ticker,
+                    reason=funding_decision.reason,
+                    required_usd=funding_decision.required_usd,
+                    remaining_usd=funding_decision.remaining_usd,
+                )
+                await self._publish_alert(
+                    event_type="entry_rejection",
+                    priority="medium",
+                    message=(
+                        f"Entry rejected buy {rec.ticker}: "
+                        f"{funding_decision.reason}"
+                    ),
+                    context={
+                        "ticker": rec.ticker,
+                        "recommendation_id": rec.recommendation_id,
+                        "required_usd": funding_decision.required_usd,
+                        "remaining_usd": funding_decision.remaining_usd,
+                    },
+                )
+                return
+
             reserved_notional = self._active_reservations(rec)
             entry_decision = self._engine.check_entry(
                 ticker=intent.symbol,
@@ -688,6 +723,41 @@ class RiskServiceRunner:
         except OrderIntentNotFound:
             self._order_ledger.session.rollback()
             return 0.0
+
+    def _check_settled_usd_funding(
+        self, intent: OrderIntent, *, quantity: float, price: float
+    ) -> FundingDecision:
+        session = self._order_ledger.session
+        snapshot = session.scalar(
+            select(CapitalSnapshot)
+            .where(
+                CapitalSnapshot.account_id == intent.account_id,
+                CapitalSnapshot.mode == intent.mode,
+            )
+            .order_by(CapitalSnapshot.captured_at.desc(), CapitalSnapshot.id.desc())
+            .limit(1)
+        )
+        settled_cash = snapshot.settled_cash_trading if snapshot is not None else None
+        reservations = self._order_ledger.active_buy_reservations_for_account(
+            intent.account_id,
+            exclude_recommendation_id=intent.recommendation_id,
+        )
+        session.rollback()
+        try:
+            commission = estimate_commission_usd(
+                quantity,
+                per_share=self._config.currency.commission_per_share_usd,
+                minimum=self._config.currency.minimum_commission_usd,
+            )
+        except (TypeError, ValueError):
+            commission = math.nan
+        return check_settled_usd_funding(
+            order_notional_usd=quantity * price,
+            settled_cash_usd=settled_cash,
+            active_reservations_usd=reservations,
+            estimated_commission_usd=commission,
+            minimum_reserve_usd=self._config.currency.minimum_settled_usd_reserve,
+        )
 
     def _persist_risk_rejection(self, recommendation_id: str, reason: str) -> bool:
         if self._order_ledger is None:
