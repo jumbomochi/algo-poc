@@ -65,9 +65,14 @@ def test_sgd_nav_builds_and_persists_usd_sleeve_budgets(session):
     assert stored.net_liquidation_base == pytest.approx(1_001_757.23)
     assert stored.net_liquidation_trading_equivalent == pytest.approx(774_855.87)
     assert stored.fx_base_per_trading == pytest.approx(1.2928304)
+    assert stored.fx_captured_at.replace(tzinfo=UTC) == captured_at
+    assert stored.fractional_base == pytest.approx(1_001_757.23)
     assert stored.settled_cash_trading == pytest.approx(25_000)
+    assert stored.deployment_fraction == pytest.approx(1.0)
+    assert stored.max_deployable_usd is None
     assert stored.net_liquidation == pytest.approx(774_855.87)
     assert stored.deployable_capital == pytest.approx(774_855.87)
+    assert stored.sleeve_budgets == pytest.approx(result.capital.sleeve_budgets)
     assert stored.reconciliation_status == "ok"
     assert result.reconciliation.entries_allowed is True
 
