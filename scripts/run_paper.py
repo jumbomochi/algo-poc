@@ -303,17 +303,28 @@ def prepare_daily_run(
             f"broker snapshot mode {broker_snapshot.mode!r} does not match "
             f"configured mode {config.mode!r}"
         )
-    reconciliation, _ = reconcile_snapshot(session, broker_snapshot)
     capital = calculate_capital_budget(
-        broker_snapshot.net_liquidation_trading_equivalent,
+        broker_snapshot,
         config.mode,
         config.capital,
+        config.currency,
         CAPITAL_ALLOCATIONS,
     )
+    reconciliation, _ = reconcile_snapshot(session, broker_snapshot)
     capital_snapshot = CapitalSnapshot(
         account_id=broker_snapshot.account_id,
         mode=config.mode,
-        net_liquidation=capital.net_liquidation,
+        net_liquidation=capital.net_liquidation_trading_equivalent,
+        base_currency=capital.base_currency,
+        trading_currency=capital.trading_currency,
+        net_liquidation_base=capital.net_liquidation_base,
+        net_liquidation_trading_equivalent=(
+            capital.net_liquidation_trading_equivalent
+        ),
+        fx_base_per_trading=capital.fx_base_per_trading,
+        fx_captured_at=capital.fx_captured_at,
+        fractional_base=capital.fractional_base,
+        settled_cash_trading=capital.settled_cash_trading,
         deployment_fraction=capital.deployment_fraction,
         max_deployable_usd=capital.max_deployable_usd,
         deployable_capital=capital.deployable_capital,
@@ -1018,9 +1029,13 @@ def main():
     entries_disabled = args.entries_disabled or not mode_capital.entries_enabled
     if not preparation.reconciliation.entries_allowed:
         entries_disabled = True
+    capital = preparation.capital
     print(
-        f"Broker NAV: ${preparation.capital.net_liquidation:,.2f}; "
-        f"deployable: ${preparation.capital.deployable_capital:,.2f}; "
+        f"Broker NAV: SGD {capital.net_liquidation_base:,.2f} "
+        f"(USD {capital.net_liquidation_trading_equivalent:,.2f}); "
+        f"FX: {capital.fx_base_per_trading:.7f} SGD/USD; "
+        f"settled USD: {capital.settled_cash_trading:,.2f}; "
+        f"deployable USD: {capital.deployable_capital:,.2f}; "
         f"reconciliation: {preparation.reconciliation.severity}; "
         f"entries: {'disabled' if entries_disabled else 'enabled'}"
     )
