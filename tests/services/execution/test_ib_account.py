@@ -11,9 +11,16 @@ from services.execution.ib_account import AccountValidationError, IBAccountReade
 def _fake_ib(accounts=("DUN551088",)):
     ib = MagicMock()
     ib.managedAccounts.return_value = list(accounts)
-    ib.accountSummary.return_value = [
-        SimpleNamespace(account=accounts[0] if accounts else "", tag="NetLiquidation", value="1000000", currency="USD")
-    ]
+    nav_row = SimpleNamespace(
+        account=accounts[0] if accounts else "",
+        tag="NetLiquidation",
+        value="1000000",
+        currency="USD",
+    )
+    ib.accountSummary.side_effect = AssertionError(
+        "sync accountSummary is forbidden inside the async reader"
+    )
+    ib.accountSummaryAsync = AsyncMock(return_value=[nav_row])
     contract = SimpleNamespace(
         conId=265598, symbol="AAPL", localSymbol="AAPL", exchange="SMART", currency="USD"
     )
@@ -39,6 +46,8 @@ async def test_account_reader_returns_contract_keyed_snapshot():
     assert snapshot.net_liquidation == 1_000_000
     assert snapshot.positions[265598].quantity == 10
     assert snapshot.open_orders["9"].remaining_quantity == 3
+    ib.accountSummaryAsync.assert_awaited_once_with()
+    ib.accountSummary.assert_not_called()
     ib.reqAllOpenOrdersAsync.assert_awaited_once_with()
     ib.reqAllOpenOrders.assert_not_called()
 
@@ -64,6 +73,6 @@ async def test_account_reader_rejects_paper_account_in_live_mode():
 @pytest.mark.asyncio
 async def test_account_reader_requires_net_liquidation():
     ib = _fake_ib()
-    ib.accountSummary.return_value = []
+    ib.accountSummaryAsync.return_value = []
     with pytest.raises(AccountValidationError, match="NetLiquidation"):
         await IBAccountReader(ib, expected_mode="paper").snapshot()

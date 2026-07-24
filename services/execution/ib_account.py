@@ -47,7 +47,7 @@ class IBAccountReader:
                 f"live mode requires a U account; connected to {account_id}"
             )
 
-        summary = list(await _resolve(self._ib.accountSummary()))
+        summary = list(await _resolve(self._ib.accountSummaryAsync()))
         nav_values = [
             item for item in summary
             if getattr(item, "tag", None) == "NetLiquidation"
