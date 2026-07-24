@@ -782,7 +782,13 @@ def publish_unpublished_intents(
 
 
 async def read_broker_snapshot(
-    *, host: str, port: int, client_id: int, mode: str
+    *,
+    host: str,
+    port: int,
+    client_id: int,
+    mode: str,
+    expected_base_currency: str,
+    trading_currency: str,
 ) -> BrokerAccountSnapshot:
     """Read account truth before any signal or capital decision."""
     from ib_insync import IB
@@ -790,7 +796,12 @@ async def read_broker_snapshot(
     ib = IB()
     try:
         await ib.connectAsync(host, port, clientId=client_id, readonly=True, timeout=15)
-        return await IBAccountReader(ib, expected_mode=mode).snapshot()
+        return await IBAccountReader(
+            ib,
+            expected_mode=mode,
+            expected_base_currency=expected_base_currency,
+            trading_currency=trading_currency,
+        ).snapshot()
     finally:
         if ib.isConnected():
             ib.disconnect()
@@ -988,6 +999,8 @@ def main():
             port=args.ib_port,
             client_id=args.ib_client_id,
             mode=_config.mode,
+            expected_base_currency=_config.currency.expected_base_currency,
+            trading_currency=_config.currency.trading_currency,
         )
     )
     try:

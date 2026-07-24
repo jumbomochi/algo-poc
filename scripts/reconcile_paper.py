@@ -353,7 +353,13 @@ def reconcile_snapshot(
     return result, build_repair_plan(result)
 
 
-async def _read_broker_snapshot(args: argparse.Namespace, mode: str) -> Any:
+async def _read_broker_snapshot(
+    args: argparse.Namespace,
+    mode: str,
+    *,
+    expected_base_currency: str,
+    trading_currency: str,
+) -> Any:
     from ib_insync import IB
 
     ib = IB()
@@ -365,7 +371,12 @@ async def _read_broker_snapshot(args: argparse.Namespace, mode: str) -> Any:
             readonly=True,
             timeout=15,
         )
-        return await IBAccountReader(ib, expected_mode=mode).snapshot()
+        return await IBAccountReader(
+            ib,
+            expected_mode=mode,
+            expected_base_currency=expected_base_currency,
+            trading_currency=trading_currency,
+        ).snapshot()
     finally:
         if ib.isConnected():
             ib.disconnect()
@@ -402,7 +413,14 @@ def main() -> int:
                 return 2
             return 0
 
-        snapshot = asyncio.run(_read_broker_snapshot(args, "paper"))
+        snapshot = asyncio.run(
+            _read_broker_snapshot(
+                args,
+                "paper",
+                expected_base_currency=config.currency.expected_base_currency,
+                trading_currency=config.currency.trading_currency,
+            )
+        )
         result, plan = reconcile_snapshot(session, snapshot)
         plan_path = write_repair_plan(plan, output_dir=args.output_dir)
         session.commit()

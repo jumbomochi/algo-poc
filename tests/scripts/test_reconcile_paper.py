@@ -6,6 +6,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -15,6 +16,7 @@ from scripts.reconcile_paper import (
     RepairAction,
     RepairPlan,
     RepairRefusedError,
+    _read_broker_snapshot,
     apply_repair_plan,
     persist_reconciliation_report,
     reconcile_snapshot,
@@ -24,7 +26,6 @@ from services.execution.reconciliation import PositionReconciler
 from shared.broker_state import BrokerPosition
 from shared.models import OrderIntent, OrderStatus, Position, ReconciliationReport
 from shared.models.base import Base
-
 
 NOW = datetime(2026, 7, 22, tzinfo=timezone.utc)
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +37,40 @@ def session():
     Base.metadata.create_all(engine)
     with Session(engine) as value:
         yield value
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_reader_passes_explicit_currency_configuration(
+    monkeypatch,
+):
+    ib = MagicMock()
+    ib.connectAsync = AsyncMock()
+    ib.isConnected.return_value = True
+    monkeypatch.setitem(sys.modules, "ib_insync", SimpleNamespace(IB=lambda: ib))
+    snapshot = object()
+    reader = MagicMock()
+    reader.snapshot = AsyncMock(return_value=snapshot)
+    args = SimpleNamespace(ib_host="127.0.0.1", ib_port=7497, ib_client_id=57)
+
+    with patch(
+        "scripts.reconcile_paper.IBAccountReader", return_value=reader
+    ) as reader_class:
+        result = await _read_broker_snapshot(
+            args,
+            "paper",
+            expected_base_currency="SGD",
+            trading_currency="USD",
+        )
+
+    assert result is snapshot
+    reader_class.assert_called_once_with(
+        ib,
+        expected_mode="paper",
+        expected_base_currency="SGD",
+        trading_currency="USD",
+    )
+    reader.snapshot.assert_awaited_once_with()
+    ib.disconnect.assert_called_once_with()
 
 
 def _plan(*, unresolved=(), account_id="DUN551088") -> RepairPlan:
