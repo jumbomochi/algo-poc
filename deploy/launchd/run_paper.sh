@@ -32,6 +32,22 @@ fi
 # pipeline (risk -> execution -> real IB paper orders) for gates 4-6
 # evidence; the simulated book commits regardless.
 cd "$ALGO_DIR"
+
+# Fail loudly if the paper DB schema is behind the code's migrations.
+# Without this, a migration landing without `alembic upgrade head` surfaces
+# mid-run as a cryptic psycopg2 UndefinedColumn error (2026-07-25 incident).
+ALEMBIC="$ALGO_DIR/.venv/bin/alembic"
+DB_REV=$("$ALEMBIC" current 2>/dev/null | grep -oE '[0-9a-f]{12}' | head -1)
+HEAD_REV=$("$ALEMBIC" heads 2>/dev/null | grep -oE '[0-9a-f]{12}' | head -1)
+if [ -z "$HEAD_REV" ]; then
+    echo "$(date): ERROR - could not determine alembic head revision" >> "$LOG_FILE"
+    exit 1
+fi
+if [ "$DB_REV" != "$HEAD_REV" ]; then
+    echo "$(date): ERROR - paper DB schema out of date (DB at '${DB_REV:-none}', head '$HEAD_REV'); run '.venv/bin/alembic upgrade head' with ALGO_DATABASE_URL set" >> "$LOG_FILE"
+    exit 1
+fi
+
 "$VENV" scripts/run_paper.py --publish >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
 
