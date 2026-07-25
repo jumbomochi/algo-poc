@@ -1,18 +1,32 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 
 from services.execution.runner import ExecutionServiceRunner
+from services.portfolio_accounting.projector import FillProjector
 from shared.config import AppConfig, ExecutionConfig, IBConfig
-from shared.models import Base, OrderStatus
+from shared.models import (
+    Base,
+    ExecutionFill,
+    OrderStatus,
+    PortfolioConfig,
+    Position,
+)
 from shared.order_ledger import OrderLedger
-from shared.schemas.messages import ApprovedOrderMessage, KillMessage
+from shared.schemas.messages import (
+    ApprovedOrderMessage,
+    FillMessage,
+    KillMessage,
+)
+
+BROKER_TIME = datetime(2026, 7, 24, 8, 30, tzinfo=timezone.utc)
 
 
 def make_approved_order(
@@ -89,14 +103,17 @@ def seed_approved_intent(
     *,
     ib_order_id: str | None = None,
     filled_quantity: float = 0,
+    symbol: str = "AAPL",
+    con_id: int = 265598,
+    portfolio: str = "momentum",
 ):
     proposal = SimpleNamespace(
         recommendation_id=recommendation_id,
         account_id="DUN551088",
         mode="paper",
-        portfolio="momentum",
-        con_id=265598,
-        symbol="AAPL",
+        portfolio=portfolio,
+        con_id=con_id,
+        symbol=symbol,
         exchange="SMART",
         currency="USD",
         action="BUY",
@@ -111,6 +128,85 @@ def seed_approved_intent(
     intent.filled_quantity = filled_quantity
     ledger.session.commit()
     return intent
+
+
+def make_durable_fill_info(
+    *,
+    execution_id: str,
+    order_id: str,
+    ticker: str = "AAPL",
+    con_id: int = 265598,
+    quantity: float = 5.0,
+) -> dict[str, object]:
+    return {
+        "execution_id": execution_id,
+        "account_id": "DUN551088",
+        "timestamp": BROKER_TIME,
+        "order_id": order_id,
+        "con_id": con_id,
+        "ticker": ticker,
+        "exchange": "SMART",
+        "currency": "USD",
+        "side": "buy",
+        "quantity": quantity,
+        "cumulative_quantity": quantity,
+        "fill_price": 100.0,
+        "commission": 0.0,
+        "commission_currency": "USD",
+        "commission_trading": 0.0,
+        "commission_fx_base_per_trading": None,
+        "order_done": False,
+    }
+
+
+def project_durable_fill(
+    session: Session,
+    fill_info: dict[str, object],
+    *,
+    recommendation_id: str,
+    portfolio: str = "momentum",
+) -> None:
+    assert FillProjector(session).apply(FillMessage(
+        ticker=str(fill_info["ticker"]),
+        timestamp=fill_info["timestamp"],
+        side=str(fill_info["side"]),
+        quantity=float(fill_info["quantity"]),
+        cumulative_quantity=float(fill_info["cumulative_quantity"]),
+        fill_price=float(fill_info["fill_price"]),
+        commission=float(fill_info["commission"]),
+        commission_currency=str(fill_info["commission_currency"]),
+        commission_trading=float(fill_info["commission_trading"]),
+        commission_fx_base_per_trading=None,
+        recommendation_id=recommendation_id,
+        order_id=str(fill_info["order_id"]),
+        execution_id=str(fill_info["execution_id"]),
+        account_id=str(fill_info["account_id"]),
+        portfolio=portfolio,
+        con_id=int(fill_info["con_id"]),
+        exchange=str(fill_info["exchange"]),
+        currency=str(fill_info["currency"]),
+    )) is True
+
+
+def kill_message() -> KillMessage:
+    return KillMessage(
+        timestamp=BROKER_TIME,
+        triggered_by="test",
+        reason="reconcile managed positions",
+    )
+
+
+def seed_portfolio_config(
+    session: Session, portfolio: str = "momentum"
+) -> None:
+    session.add(PortfolioConfig(
+        portfolio=portfolio,
+        capital=10_000,
+        cash=10_000,
+        created_at=BROKER_TIME,
+        updated_at=BROKER_TIME,
+    ))
+    session.commit()
 
 
 @pytest.fixture()
@@ -245,6 +341,209 @@ class TestDurableExecutionIdentity:
         assert ledger.active_reservations("momentum") == 0
 
     @pytest.mark.asyncio
+    async def test_late_projection_after_startup_is_liquidated_on_kill(
+        self, durable_runner, ledger_session
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        seed_portfolio_config(ledger_session)
+        runner.restore_pending_orders()
+        assert runner._positions == {}
+
+        fill_info = make_durable_fill_info(
+            execution_id="late-projection", order_id="9", quantity=4
+        )
+        project_durable_fill(
+            ledger_session, fill_info, recommendation_id="rec-1"
+        )
+
+        await runner.handle_ib_fill(fill_info)
+        await runner.process_kill(kill_message())
+
+        runner._order_manager.submit_exit.assert_awaited_once()
+        assert runner._order_manager.submit_exit.await_args.kwargs[
+            "ticker"
+        ] == "AAPL"
+        assert runner._order_manager.submit_exit.await_args.kwargs[
+            "quantity"
+        ] == pytest.approx(4)
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_publish_projected_before_raise_is_liquidated(
+        self, durable_runner, ledger_session
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        seed_portfolio_config(ledger_session)
+        runner.restore_pending_orders()
+        fill_info = make_durable_fill_info(
+            execution_id="ambiguous-publish", order_id="9", quantity=3
+        )
+
+        async def project_then_raise(stream, payload):
+            assert stream == "stream:fills"
+            assert FillProjector(ledger_session).apply(
+                FillMessage.from_stream_dict(payload)
+            ) is True
+            raise RuntimeError("Redis acknowledgement lost")
+
+        runner._redis.publish.side_effect = project_then_raise
+        with pytest.raises(RuntimeError, match="acknowledgement lost"):
+            await runner.handle_ib_fill(fill_info)
+
+        runner._redis.publish.side_effect = None
+        runner._redis.publish.return_value = "message-id"
+        await runner.handle_ib_fill(fill_info)
+        await runner.process_kill(kill_message())
+
+        runner._order_manager.submit_exit.assert_awaited_once()
+        assert runner._order_manager.submit_exit.await_args.kwargs[
+            "quantity"
+        ] == pytest.approx(3)
+
+    @pytest.mark.asyncio
+    async def test_unprojected_local_fill_survives_durable_reload(
+        self, durable_runner, ledger_session
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, "rec-aapl", ib_order_id="9")
+        seed_approved_intent(
+            ledger,
+            "rec-msft",
+            ib_order_id="10",
+            symbol="MSFT",
+            con_id=272093,
+        )
+        seed_portfolio_config(ledger_session)
+        runner.restore_pending_orders()
+        aapl_fill = make_durable_fill_info(
+            execution_id="projected-aapl", order_id="9", quantity=3
+        )
+        project_durable_fill(
+            ledger_session, aapl_fill, recommendation_id="rec-aapl"
+        )
+        msft_fill = make_durable_fill_info(
+            execution_id="pending-msft",
+            order_id="10",
+            ticker="MSFT",
+            con_id=272093,
+            quantity=2,
+        )
+
+        await runner.handle_ib_fill(msft_fill)
+        await runner.handle_ib_fill(aapl_fill)
+        await runner.process_kill(kill_message())
+
+        exits = {
+            call.kwargs["ticker"]: call.kwargs["quantity"]
+            for call in runner._order_manager.submit_exit.await_args_list
+        }
+        assert exits == {
+            "AAPL": pytest.approx(3),
+            "MSFT": pytest.approx(2),
+        }
+
+    @pytest.mark.asyncio
+    async def test_projected_and_pending_fills_same_ticker_are_combined(
+        self, durable_runner, ledger_session
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, "rec-projected", ib_order_id="9")
+        seed_approved_intent(ledger, "rec-pending", ib_order_id="10")
+        seed_portfolio_config(ledger_session)
+        runner.restore_pending_orders()
+        projected_fill = make_durable_fill_info(
+            execution_id="projected-same-ticker", order_id="9", quantity=3
+        )
+        project_durable_fill(
+            ledger_session,
+            projected_fill,
+            recommendation_id="rec-projected",
+        )
+
+        await runner.handle_ib_fill(make_durable_fill_info(
+            execution_id="pending-same-ticker", order_id="10", quantity=2
+        ))
+        await runner.process_kill(kill_message())
+
+        runner._order_manager.submit_exit.assert_awaited_once()
+        assert runner._order_manager.submit_exit.await_args.kwargs[
+            "quantity"
+        ] == pytest.approx(5)
+
+    @pytest.mark.asyncio
+    async def test_projected_duplicate_does_not_over_liquidate_or_add_unowned(
+        self, durable_runner, ledger_session
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        seed_portfolio_config(ledger_session)
+        runner.restore_pending_orders()
+        fill_info = make_durable_fill_info(
+            execution_id="projected-after-local", order_id="9", quantity=2
+        )
+
+        await runner.handle_ib_fill(fill_info)
+        _, payload = runner._redis.publish.await_args.args
+        assert FillProjector(ledger_session).apply(
+            FillMessage.from_stream_dict(payload)
+        ) is True
+        ledger_session.add(Position(
+            account_id="OTHER",
+            ticker="TSLA",
+            portfolio="manual",
+            con_id=76792991,
+            exchange="SMART",
+            currency="USD",
+            quantity=99,
+            avg_entry_price=200,
+            current_price=200,
+            peak_price=200,
+            highest_price_since_entry=200,
+            opened_at=BROKER_TIME,
+            status="open",
+        ))
+        ledger_session.commit()
+
+        await runner.handle_ib_fill(fill_info)
+        await runner.handle_ib_fill(fill_info)
+        await runner.process_kill(kill_message())
+
+        runner._order_manager.submit_exit.assert_awaited_once()
+        assert runner._order_manager.submit_exit.await_args.kwargs[
+            "ticker"
+        ] == "AAPL"
+        assert runner._order_manager.submit_exit.await_args.kwargs[
+            "quantity"
+        ] == pytest.approx(2)
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_reads_projection_and_positions_atomically(
+        self, durable_runner, ledger_session
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        seed_portfolio_config(ledger_session)
+        runner.restore_pending_orders()
+        await runner.handle_ib_fill(make_durable_fill_info(
+            execution_id="snapshot-pending", order_id="9", quantity=2
+        ))
+        selects: list[str] = []
+
+        def record_select(_conn, _cursor, statement, *_args):
+            if statement.lstrip().upper().startswith("SELECT"):
+                selects.append(statement)
+
+        engine = ledger_session.get_bind()
+        event.listen(engine, "before_cursor_execute", record_select)
+        try:
+            await runner.process_kill(kill_message())
+        finally:
+            event.remove(engine, "before_cursor_execute", record_select)
+
+        assert len(selects) == 1
+
+    @pytest.mark.asyncio
     async def test_inactive_before_fill_is_submission_failed(
         self, durable_runner
     ):
@@ -352,6 +651,7 @@ class TestDurableExecutionIdentity:
         await runner.handle_ib_fill({
             "execution_id": "exec-1",
             "account_id": "DUN551088",
+            "timestamp": BROKER_TIME,
             "order_id": "9",
             "con_id": 265598,
             "ticker": "AAPL",
@@ -362,6 +662,9 @@ class TestDurableExecutionIdentity:
             "cumulative_quantity": 5.0,
             "fill_price": 149.5,
             "commission": 0.25,
+            "commission_currency": "SGD",
+            "commission_trading": 0.2,
+            "commission_fx_base_per_trading": 1.25,
             "order_done": False,
         })
 
@@ -371,6 +674,199 @@ class TestDurableExecutionIdentity:
         assert payload["execution_id"] == "exec-1"
         assert payload["account_id"] == "DUN551088"
         assert payload["cumulative_quantity"] == "5.0"
+        assert payload["commission"] == "0.25"
+        assert payload["commission_currency"] == "SGD"
+        assert payload["commission_trading"] == "0.2"
+        assert payload["commission_fx_base_per_trading"] == "1.25"
+        assert payload["timestamp"] == "2026-07-24T08:30:00Z"
+
+    @pytest.mark.asyncio
+    async def test_duplicate_fill_handler_is_ignored_before_publish_and_position(
+        self, durable_runner
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        runner.restore_pending_orders()
+        fill_info = {
+            "execution_id": "exec-duplicate",
+            "account_id": "DUN551088",
+            "timestamp": BROKER_TIME,
+            "order_id": "9",
+            "con_id": 265598,
+            "ticker": "AAPL",
+            "exchange": "SMART",
+            "currency": "USD",
+            "side": "buy",
+            "quantity": 5.0,
+            "cumulative_quantity": 5.0,
+            "fill_price": 149.5,
+            "commission": 0.25,
+            "commission_currency": "USD",
+            "commission_trading": 0.25,
+            "commission_fx_base_per_trading": None,
+            "order_done": False,
+        }
+
+        await runner.handle_ib_fill(fill_info)
+        await runner.handle_ib_fill(fill_info)
+
+        runner._redis.publish.assert_awaited_once()
+        assert runner._positions == {"AAPL": pytest.approx(5.0)}
+
+    @pytest.mark.asyncio
+    async def test_restart_uses_durable_execution_identity_before_side_effects(
+        self, durable_runner
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        ledger.session.add(ExecutionFill(
+            account_id="DUN551088",
+            execution_id="exec-stored",
+            ib_order_id="9",
+            recommendation_id="rec-1",
+            portfolio="momentum",
+            con_id=265598,
+            symbol="AAPL",
+            exchange="SMART",
+            currency="USD",
+            side="BUY",
+            quantity=5.0,
+            price=149.5,
+            commission=0.25,
+            commission_currency="USD",
+            commission_trading=0.25,
+            commission_fx_base_per_trading=None,
+            cumulative_quantity=5.0,
+            executed_at=BROKER_TIME,
+            projection_applied=True,
+        ))
+        ledger.session.commit()
+
+        await runner.handle_ib_fill({
+            "execution_id": "exec-stored",
+            "account_id": "DUN551088",
+            "timestamp": BROKER_TIME,
+            "order_id": "9",
+            "con_id": 265598,
+            "ticker": "AAPL",
+            "exchange": "SMART",
+            "currency": "USD",
+            "side": "buy",
+            "quantity": 5.0,
+            "cumulative_quantity": 5.0,
+            "fill_price": 149.5,
+            "commission": 0.25,
+            "commission_currency": "USD",
+            "commission_trading": 0.25,
+            "commission_fx_base_per_trading": None,
+            "order_done": False,
+        })
+
+        runner._redis.publish.assert_not_awaited()
+        assert runner._positions == {}
+
+    @pytest.mark.asyncio
+    async def test_duplicate_commission_retries_after_transient_publish_failure(
+        self, durable_runner, ledger_session
+    ):
+        from services.execution.ib_executor import IBExecutor
+
+        class Event:
+            def __init__(self):
+                self.callbacks = []
+
+            def __iadd__(self, callback):
+                self.callbacks.append(callback)
+                return self
+
+            def emit(self, *args):
+                for callback in self.callbacks:
+                    callback(*args)
+
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        ledger_session.add(PortfolioConfig(
+            portfolio="momentum",
+            capital=10_000,
+            cash=10_000,
+            created_at=BROKER_TIME,
+            updated_at=BROKER_TIME,
+        ))
+        ledger_session.commit()
+        runner.restore_pending_orders()
+
+        successful_publications = []
+        publish_attempts = 0
+
+        async def publish_with_transient_failure(stream, payload):
+            nonlocal publish_attempts
+            publish_attempts += 1
+            if publish_attempts == 1:
+                raise RuntimeError("transient Redis failure")
+            successful_publications.append((stream, payload))
+            return "message-id"
+
+        runner._redis.publish.side_effect = publish_with_transient_failure
+        handler_attempts = 0
+        handler_errors = []
+
+        async def handle_with_error_capture(payload):
+            nonlocal handler_attempts
+            handler_attempts += 1
+            try:
+                await runner.handle_ib_fill(payload)
+            except RuntimeError as exc:
+                handler_errors.append(str(exc))
+
+        executor = IBExecutor("h", 7497, 1)
+        executor._ib = MagicMock()
+        executor._ib.accountValues.return_value = []
+        executor.set_fill_handler(handle_with_error_capture)
+        trade = MagicMock()
+        trade.fillEvent = Event()
+        trade.commissionReportEvent = Event()
+        trade.statusEvent = Event()
+        trade.isDone.return_value = False
+        executor._register_trade("9", trade, ticker="AAPL", side="buy")
+        fill = SimpleNamespace(
+            execution=SimpleNamespace(
+                execId="exec-retry",
+                acctNumber="DUN551088",
+                shares=2,
+                cumQty=2,
+                price=149.5,
+                time=BROKER_TIME,
+            ),
+            contract=SimpleNamespace(
+                conId=265598,
+                exchange="SMART",
+                currency="USD",
+            ),
+            commissionReport=SimpleNamespace(commission=0.0, currency=""),
+        )
+        report = SimpleNamespace(commission=0.25, currency="USD")
+
+        trade.commissionReportEvent.emit(trade, fill, report)
+        trade.commissionReportEvent.emit(trade, fill, report)
+        await asyncio.sleep(0)
+
+        assert handler_attempts == 2
+        assert handler_errors == ["transient Redis failure"]
+        assert publish_attempts == 2
+        assert len(successful_publications) == 1
+        assert runner._positions == {"AAPL": pytest.approx(2.0)}
+
+        stream, payload = successful_publications[0]
+        assert stream == "stream:fills"
+        message = FillMessage.from_stream_dict(payload)
+        assert message.timestamp == BROKER_TIME
+        projector = FillProjector(ledger_session)
+        assert projector.apply(message) is True
+        assert projector.apply(message) is False
+        assert ledger_session.scalar(select(Position)).quantity == pytest.approx(2)
+        assert ledger_session.scalar(select(PortfolioConfig.cash)) == pytest.approx(
+            9_700.75
+        )
 
     @pytest.mark.asyncio
     async def test_late_fill_uses_terminal_intent_attribution(
@@ -385,6 +881,7 @@ class TestDurableExecutionIdentity:
 
         await runner.handle_ib_fill({
             "execution_id": "late-1", "account_id": "DUN551088",
+            "timestamp": BROKER_TIME,
             "order_id": "9", "con_id": 265598, "ticker": "AAPL",
             "exchange": "SMART", "currency": "USD", "side": "buy",
             "quantity": 1.0, "cumulative_quantity": 1.0,
@@ -394,6 +891,99 @@ class TestDurableExecutionIdentity:
         _, payload = runner._redis.publish.call_args.args
         assert payload["recommendation_id"] == "rec-1"
         assert payload["portfolio"] == "momentum"
+
+    @pytest.mark.asyncio
+    async def test_cancellation_before_commission_still_projects_fill_once(
+        self, durable_runner, ledger_session
+    ):
+        from services.execution.ib_executor import IBExecutor
+
+        class Event:
+            def __init__(self):
+                self.callbacks = []
+
+            def __iadd__(self, callback):
+                self.callbacks.append(callback)
+                return self
+
+            def emit(self, *args):
+                for callback in self.callbacks:
+                    callback(*args)
+
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        ledger_session.add(PortfolioConfig(
+            portfolio="momentum",
+            capital=10_000,
+            cash=10_000,
+            created_at=BROKER_TIME,
+            updated_at=BROKER_TIME,
+        ))
+        ledger_session.commit()
+        runner.restore_pending_orders()
+
+        executor = IBExecutor("h", 7497, 1)
+        executor._ib = MagicMock()
+        executor._ib.accountValues.return_value = []
+        executor.set_fill_handler(runner.handle_ib_fill)
+        executor.set_order_status_handler(runner.handle_ib_order_status)
+        trade = MagicMock()
+        trade.fillEvent = Event()
+        trade.commissionReportEvent = Event()
+        trade.statusEvent = Event()
+        trade.isDone.return_value = True
+        trade.orderStatus.status = "Cancelled"
+        trade.orderStatus.whyHeld = "cancelled at IB"
+        trade.orderStatus.filled = 0
+        trade.log = []
+        executor._register_trade("9", trade, ticker="AAPL", side="buy")
+
+        trade.statusEvent.emit(trade)
+        await asyncio.sleep(0)
+        intent = ledger.get("rec-1")
+        assert intent.status == OrderStatus.CANCELLED.value
+        assert intent.reason == "cancelled at IB"
+        ledger_session.rollback()
+
+        fill = SimpleNamespace(
+            execution=SimpleNamespace(
+                execId="late-exec-1",
+                acctNumber="DUN551088",
+                shares=2,
+                cumQty=2,
+                price=149.5,
+                time=BROKER_TIME,
+            ),
+            contract=SimpleNamespace(
+                conId=265598,
+                exchange="SMART",
+                currency="USD",
+            ),
+            commissionReport=SimpleNamespace(commission=0.0, currency=""),
+        )
+        report = SimpleNamespace(commission=0.25, currency="USD")
+        trade.fillEvent.emit(trade, fill)
+        trade.commissionReportEvent.emit(trade, fill, report)
+        trade.commissionReportEvent.emit(trade, fill, report)
+        await asyncio.sleep(0)
+
+        runner._redis.publish.assert_awaited_once()
+        _, payload = runner._redis.publish.await_args.args
+        message = FillMessage.from_stream_dict(payload)
+        assert message.timestamp == BROKER_TIME
+        assert runner._positions == {"AAPL": pytest.approx(2.0)}
+
+        projector = FillProjector(ledger_session)
+        assert projector.apply(message) is True
+        assert projector.apply(message) is False
+        intent = ledger.get("rec-1")
+        assert intent.status == OrderStatus.CANCELLED.value
+        assert intent.reason == "cancelled at IB"
+        assert intent.filled_quantity == pytest.approx(2)
+        assert ledger_session.scalar(select(PortfolioConfig.cash)) == pytest.approx(
+            9_700.75
+        )
+        assert ledger_session.scalar(select(Position)).quantity == pytest.approx(2)
 
     @pytest.mark.asyncio
     async def test_completed_fill_recovery_releases_reservation_without_duplicate(
@@ -493,6 +1083,7 @@ class TestApprovedOrderProcessing:
         (order_id,) = runner._pending_orders.keys()
 
         await runner.handle_ib_fill({
+            "timestamp": BROKER_TIME,
             "order_id": order_id,
             "ticker": "AAPL",
             "side": "buy",
@@ -520,6 +1111,7 @@ class TestApprovedOrderProcessing:
         (order_id,) = runner._pending_orders.keys()
 
         await runner.handle_ib_fill({
+            "timestamp": BROKER_TIME,
             "order_id": order_id,
             "ticker": "AAPL",
             "side": "buy",

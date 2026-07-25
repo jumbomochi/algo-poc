@@ -4,13 +4,13 @@ from datetime import datetime
 from enum import StrEnum
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
     Float,
     Index,
-    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -119,6 +119,15 @@ class ExecutionFill(Base):
     quantity: Mapped[float] = mapped_column(Float, nullable=False)
     price: Mapped[float] = mapped_column(Float, nullable=False)
     commission: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    commission_currency: Mapped[str | None] = mapped_column(
+        String(8), nullable=True
+    )
+    commission_trading: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    commission_fx_base_per_trading: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
     cumulative_quantity: Mapped[float | None] = mapped_column(Float, nullable=True)
     executed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
@@ -135,6 +144,26 @@ class CapitalSnapshot(Base):
     account_id: Mapped[str] = mapped_column(String(50), nullable=False)
     mode: Mapped[str] = mapped_column(String(20), nullable=False)
     net_liquidation: Mapped[float] = mapped_column(Float, nullable=False)
+    base_currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    trading_currency: Mapped[str | None] = mapped_column(
+        String(8), nullable=True
+    )
+    net_liquidation_base: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    net_liquidation_trading_equivalent: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    fx_base_per_trading: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    fx_captured_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    fractional_base: Mapped[float | None] = mapped_column(Float, nullable=True)
+    settled_cash_trading: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
     deployment_fraction: Mapped[float] = mapped_column(Float, nullable=False)
     max_deployable_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     deployable_capital: Mapped[float] = mapped_column(Float, nullable=False)

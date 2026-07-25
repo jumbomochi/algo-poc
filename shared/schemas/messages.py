@@ -115,6 +115,9 @@ class FillMessage(StreamSerializable):
     quantity: float
     fill_price: float
     commission: float
+    commission_currency: str | None = None
+    commission_trading: float | None = None
+    commission_fx_base_per_trading: float | None = None
     recommendation_id: str
     order_id: str
     execution_id: str | None = None

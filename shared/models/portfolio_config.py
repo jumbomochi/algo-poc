@@ -15,6 +15,9 @@ class PortfolioConfig(Base):
     portfolio: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)
     capital: Mapped[float] = mapped_column(Float, nullable=False)
     cash: Mapped[float] = mapped_column(Float, nullable=False)
+    currency: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="USD"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )

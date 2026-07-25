@@ -7,7 +7,9 @@ every entry via risk_engine.check_entry.
 
 from __future__ import annotations
 
-from datetime import date
+import math
+from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
@@ -16,15 +18,16 @@ from sqlalchemy.orm import sessionmaker
 from scripts.paper_state import PaperTradingState
 from scripts.run_backtest import PortfolioConfig
 from scripts.run_paper import (
+    account_buy_commitments_after_snapshot,
     build_sell_availability,
     create_signal_intents,
     publish_unpublished_intents,
-    run_daily,
+    run_daily as _run_daily,
 )
 from services.risk_management.engine import RiskEngine
 from services.execution.reconciliation import ReconciliationResult
 from shared.broker_state import BrokerAccountSnapshot, BrokerOpenOrder, BrokerPosition
-from shared.models import OrderStatus
+from shared.models import ExecutionFill, OrderStatus
 from shared.models.base import Base
 from shared.models.portfolio import Position
 from shared.order_ledger import OrderLedger
@@ -72,7 +75,208 @@ def build_portfolio(signals_fn) -> dict[str, PortfolioConfig]:
     }
 
 
+def run_daily(*args, **kwargs):
+    """Supply valid funding inputs for tests focused on other local gates."""
+    kwargs.setdefault("settled_cash_trading", 1_000_000)
+    kwargs.setdefault("active_buy_reservations_usd", 0)
+    kwargs.setdefault("commission_per_share_usd", 0.005)
+    kwargs.setdefault("minimum_commission_usd", 1)
+    kwargs.setdefault("minimum_settled_usd_reserve", 0)
+    return _run_daily(*args, **kwargs)
+
+
+def local_execution_fill(
+    *,
+    executed_at: datetime,
+    quantity: float = 9,
+    price: float = 100,
+    commission: float = 1,
+    commission_currency: str | None = "USD",
+) -> ExecutionFill:
+    return ExecutionFill(
+        account_id="DUTEST",
+        execution_id=f"exec-local-{executed_at.timestamp()}",
+        ib_order_id="42",
+        recommendation_id="prior-buy",
+        portfolio="quality_value",
+        con_id=123,
+        symbol="MSFT",
+        exchange="SMART",
+        currency="USD",
+        side="BUY",
+        quantity=quantity,
+        price=price,
+        commission=commission,
+        commission_currency=commission_currency,
+        cumulative_quantity=quantity,
+        executed_at=executed_at,
+    )
+
+
+def test_local_commitments_include_full_buy_fill_after_snapshot(state):
+    now = datetime.now(timezone.utc)
+    state._session.add(local_execution_fill(executed_at=now))
+    state._session.flush()
+
+    assert account_buy_commitments_after_snapshot(
+        state._session,
+        "DUTEST",
+        snapshot_captured_at=now - timedelta(minutes=5),
+        commission_per_share=0.005,
+        minimum_commission=1,
+    ) == pytest.approx(901)
+
+
+def test_local_commitments_include_partial_fill_and_remaining_reservation(state):
+    now = datetime.now(timezone.utc)
+    ledger = OrderLedger(state._session)
+    prior = ledger.create_intent(
+        SimpleNamespace(
+            recommendation_id="prior-buy",
+            account_id="DUTEST",
+            mode="paper",
+            portfolio="quality_value",
+            con_id=123,
+            symbol="MSFT",
+            exchange="SMART",
+            currency="USD",
+            action="BUY",
+            quantity=10,
+            limit_price=100,
+            order_type="LMT",
+        )
+    )
+    ledger.transition(prior.recommendation_id, OrderStatus.APPROVED)
+    ledger.transition(prior.recommendation_id, OrderStatus.SUBMITTED)
+    ledger.transition(prior.recommendation_id, OrderStatus.PARTIALLY_FILLED)
+    prior.filled_quantity = 4
+    state._session.add(
+        local_execution_fill(
+            executed_at=now,
+            quantity=4,
+            price=100,
+            commission=0.5,
+        )
+    )
+    state._session.flush()
+
+    assert account_buy_commitments_after_snapshot(
+        state._session,
+        "DUTEST",
+        snapshot_captured_at=now - timedelta(minutes=5),
+        commission_per_share=0.005,
+        minimum_commission=1,
+    ) == pytest.approx(1_001.5)
+
+
+def test_local_commitments_exclude_fills_reflected_by_newer_snapshot(state):
+    now = datetime.now(timezone.utc)
+    state._session.add(
+        local_execution_fill(executed_at=now - timedelta(minutes=5))
+    )
+    state._session.flush()
+
+    assert account_buy_commitments_after_snapshot(
+        state._session,
+        "DUTEST",
+        snapshot_captured_at=now,
+        commission_per_share=0.005,
+        minimum_commission=1,
+    ) == 0
+
+
+def test_invalid_local_commitment_blocks_buys_but_preserves_sells(state):
+    now = datetime.now(timezone.utc)
+    state._session.add(
+        local_execution_fill(
+            executed_at=now,
+            commission_currency="SGD",
+        )
+    )
+    state._session.flush()
+    commitments = account_buy_commitments_after_snapshot(
+        state._session,
+        "DUTEST",
+        snapshot_captured_at=now - timedelta(minutes=5),
+        commission_per_share=0.005,
+        minimum_commission=1,
+    )
+
+    def signal_fn(ticker, bars):
+        return {
+            "action": "buy" if ticker == "MSFT" else "sell",
+            "limit_price": 100,
+            "quantity": 1,
+        }
+
+    signals = run_daily(
+        state,
+        build_portfolio(signal_fn),
+        {"AAPL": make_bars(), "MSFT": make_bars()},
+        active_buy_reservations_usd=commitments,
+    )
+
+    assert math.isnan(commitments)
+    assert [signal["action"] for signal in signals] == ["sell"]
+
+
 class TestEntryGate:
+    def test_settled_usd_cash_rejects_buy_despite_large_margin_headroom(self, state):
+        portfolio = build_portfolio(
+            lambda ticker, bars: {
+                "action": "buy",
+                "limit_price": 100.0,
+                "quantity": 10.0,
+            }
+        )["test_sleeve"]
+        portfolio.capital = 1_000_000
+
+        signals = run_daily(
+            state,
+            {"test_sleeve": portfolio},
+            {"AAPL": make_bars()},
+            settled_cash_trading=1_000,
+            active_buy_reservations_usd=0,
+            commission_per_share_usd=0.005,
+            minimum_commission_usd=1,
+            minimum_settled_usd_reserve=0,
+        )
+
+        assert signals == []
+
+    def test_same_cycle_buys_share_one_account_usd_cash_pool(self, state):
+        state = PaperTradingState.create_new(
+            {"momentum": 10_000, "quality_value": 10_000},
+            session=state._session,
+        )
+
+        def only(ticker_to_buy):
+            return lambda ticker, bars: (
+                {"action": "buy", "limit_price": 100.0, "quantity": 6.0}
+                if ticker == ticker_to_buy
+                else None
+            )
+
+        portfolios = {
+            "momentum": build_portfolio(only("AAPL"))["test_sleeve"],
+            "quality_value": build_portfolio(only("MSFT"))["test_sleeve"],
+        }
+
+        signals = run_daily(
+            state,
+            portfolios,
+            {"AAPL": make_bars(), "MSFT": make_bars()},
+            settled_cash_trading=1_000,
+            active_buy_reservations_usd=0,
+            commission_per_share_usd=0.005,
+            minimum_commission_usd=1,
+            minimum_settled_usd_reserve=0,
+        )
+
+        assert [(signal["portfolio"], signal["ticker"]) for signal in signals] == [
+            ("momentum", "AAPL")
+        ]
+
     def test_same_cycle_buys_accumulate_reserved_notional(self, state):
         def buy_fn(ticker, bars):
             return {"action": "buy", "limit_price": 100.0, "quantity": 10.0}
@@ -317,7 +521,14 @@ def test_signal_creates_deterministic_intent_without_position_mutation(state):
     snapshot = BrokerAccountSnapshot(
         account_id="DUTEST",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
         positions={
             265598: BrokerPosition(
                 account_id="DUTEST",
@@ -359,13 +570,27 @@ def test_recommendation_id_is_stable_but_account_and_mode_scoped(state):
     one = BrokerAccountSnapshot(
         account_id="DUONE",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
         positions={265598: contract},
     )
     two = BrokerAccountSnapshot(
         account_id="DUTWO",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
         positions={
             265598: BrokerPosition(
                 account_id="DUTWO",
@@ -501,7 +726,14 @@ def test_fail_closed_replay_keeps_buys_unpublished_but_publishes_sells(state):
     snapshot = BrokerAccountSnapshot(
         account_id="DUTEST",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
         positions={
             265598: BrokerPosition(
                 account_id="DUTEST",
@@ -538,7 +770,14 @@ def test_breached_reconciliation_sell_is_capped_to_broker_holding(state):
     snapshot = BrokerAccountSnapshot(
         account_id="DUTEST",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
         positions={
             265598: BrokerPosition(
                 account_id="DUTEST",
@@ -599,7 +838,14 @@ def test_active_sell_orders_reduce_availability_without_double_count(state):
     snapshot = BrokerAccountSnapshot(
         account_id="DUTEST",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
         positions={
             265598: BrokerPosition(
                 account_id="DUTEST",
@@ -673,7 +919,14 @@ def test_outage_replay_revalidates_and_replaces_oversized_sell(state):
     snapshot = BrokerAccountSnapshot(
         account_id="DUTEST",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
         positions={
             265598: BrokerPosition(
                 account_id="DUTEST",
@@ -746,7 +999,14 @@ def test_outbox_sell_revalidation_deducts_active_broker_sell(state):
     snapshot = BrokerAccountSnapshot(
         account_id="DUTEST",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
         positions={
             265598: BrokerPosition(
                 account_id="DUTEST",
@@ -810,7 +1070,14 @@ def test_outbox_zero_sell_availability_cancels_without_publish(state):
     snapshot = BrokerAccountSnapshot(
         account_id="DUTEST",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
     )
 
     assert (
@@ -866,7 +1133,14 @@ def test_ambiguous_replacement_publish_retries_same_safe_id(state):
     snapshot = BrokerAccountSnapshot(
         account_id="DUTEST",
         mode="paper",
-        net_liquidation=10_000,
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
         positions={
             265598: BrokerPosition(
                 account_id="DUTEST",

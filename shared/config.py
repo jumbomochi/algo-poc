@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class RiskConfig(BaseModel):
@@ -129,6 +129,15 @@ class CapitalConfig(BaseModel):
     )
 
 
+class CurrencyConfig(BaseModel):
+    expected_base_currency: Literal["SGD"] = "SGD"
+    trading_currency: Literal["USD"] = "USD"
+    max_fx_age_seconds: int = Field(default=300, gt=0)
+    minimum_settled_usd_reserve: float = Field(default=0.0, ge=0.0)
+    commission_per_share_usd: float = Field(default=0.005, ge=0.0)
+    minimum_commission_usd: float = Field(default=1.0, ge=0.0)
+
+
 class AppConfig(BaseModel):
     # Literal so a typo'd ALGO_MODE (e.g. "liv") fails at startup instead of
     # silently falling through to the paper port in live deployments.
@@ -145,6 +154,16 @@ class AppConfig(BaseModel):
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
     capital: CapitalConfig = Field(default_factory=CapitalConfig)
+    currency: CurrencyConfig = Field(default_factory=CurrencyConfig)
+
+    @model_validator(mode="after")
+    def validate_live_currency_safety(self) -> AppConfig:
+        if (
+            self.capital.live.entries_enabled
+            and self.currency.minimum_settled_usd_reserve <= 0
+        ):
+            raise ValueError("live entries require a positive settled USD reserve")
+        return self
 
 
 ENV_PREFIX = "ALGO_"

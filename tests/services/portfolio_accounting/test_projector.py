@@ -20,6 +20,7 @@ from shared.models import (
     PortfolioConfig,
     Position,
 )
+from shared.order_ledger import OrderLedger
 from shared.schemas.messages import FillMessage
 
 
@@ -47,6 +48,7 @@ def seed_intent(
     quantity: float = 10,
     status: OrderStatus = OrderStatus.SUBMITTED,
     filled_quantity: float = 0,
+    reason: str | None = None,
 ) -> OrderIntent:
     session.add(
         PortfolioConfig(
@@ -73,6 +75,7 @@ def seed_intent(
         reserved_notional=quantity * 100 if action == "BUY" else 0,
         filled_quantity=filled_quantity,
         status=status.value,
+        reason=reason,
         ib_order_id="42",
         created_at=NOW,
         updated_at=NOW,
@@ -91,11 +94,16 @@ def make_fill(
     cumulative: float | None = 10,
     price: float = 100,
     commission: float = 1,
+    commission_currency: str | None = "USD",
+    commission_trading: float | None = None,
+    commission_fx_base_per_trading: float | None = None,
     order_id: str = "42",
     account_id: str = "DU12345",
     ticker: str = "AAPL",
     timestamp: datetime = NOW,
 ) -> FillMessage:
+    if commission_trading is None and commission_currency == "USD":
+        commission_trading = commission
     return FillMessage(
         ticker=ticker,
         timestamp=timestamp,
@@ -103,6 +111,9 @@ def make_fill(
         quantity=quantity,
         fill_price=price,
         commission=commission,
+        commission_currency=commission_currency,
+        commission_trading=commission_trading,
+        commission_fx_base_per_trading=commission_fx_base_per_trading,
         recommendation_id=recommendation_id,
         order_id=order_id,
         execution_id=execution_id,
@@ -145,6 +156,159 @@ def test_replayed_buy_fill_changes_cash_once(projector, session):
     assert get_cash(session) == pytest.approx(8_999)
     assert fill_count(session) == 1
     assert session.scalar(select(ExecutionFill)).projection_applied is True
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [OrderStatus.CANCELLED, OrderStatus.EXPIRED],
+)
+def test_late_fill_applies_without_reopening_terminal_intent(
+    projector, session, terminal_status
+):
+    seed_intent(
+        session,
+        status=terminal_status,
+        reason="broker terminal remainder",
+    )
+
+    assert projector.apply(make_fill(
+        quantity=2,
+        cumulative=2,
+        commission=1,
+    )) is True
+
+    intent = session.scalar(select(OrderIntent))
+    assert intent.status == terminal_status.value
+    assert intent.reason == "broker terminal remainder"
+    assert intent.filled_quantity == pytest.approx(2)
+    assert get_position(session).quantity == pytest.approx(2)
+    assert get_cash(session) == pytest.approx(9_799)
+
+
+def test_late_partial_remainder_fill_preserves_cancellation_and_is_idempotent(
+    projector, session
+):
+    seed_intent(session)
+    assert projector.apply(make_fill(
+        "e-1", quantity=4, cumulative=4, commission=0
+    )) is True
+    OrderLedger(session).transition(
+        "rec-1",
+        OrderStatus.CANCELLED,
+        reason="partial remainder cancelled",
+    )
+    session.commit()
+    late = make_fill("e-2", quantity=2, cumulative=6, commission=1)
+
+    assert projector.apply(late) is True
+    assert projector.apply(late) is False
+
+    intent = session.scalar(select(OrderIntent))
+    assert intent.status == OrderStatus.CANCELLED.value
+    assert intent.reason == "partial remainder cancelled"
+    assert intent.filled_quantity == pytest.approx(6)
+    assert get_position(session).quantity == pytest.approx(6)
+    assert get_cash(session) == pytest.approx(9_399)
+
+
+@pytest.mark.parametrize(
+    "impossible_status",
+    [OrderStatus.RISK_REJECTED, OrderStatus.SUBMISSION_FAILED],
+)
+def test_fill_still_rejects_impossible_pre_submission_terminal_status(
+    projector, session, impossible_status
+):
+    seed_intent(session, status=impossible_status)
+
+    with pytest.raises(InvalidFillError, match="cannot accept"):
+        projector.apply(make_fill())
+
+    assert get_position(session) is None
+    assert get_cash(session) == pytest.approx(10_000)
+    assert session.scalar(select(ExecutionFill)).projection_applied is False
+
+
+def test_usd_commission_is_preserved_and_applied_in_trading_currency(
+    projector, session
+):
+    seed_intent(session)
+
+    assert projector.apply(make_fill(
+        commission=1.25,
+        commission_currency="USD",
+        commission_trading=1.25,
+    )) is True
+
+    stored = session.scalar(select(ExecutionFill))
+    assert stored.commission == pytest.approx(1.25)
+    assert stored.commission_currency == "USD"
+    assert stored.commission_trading == pytest.approx(1.25)
+    assert stored.commission_fx_base_per_trading is None
+    assert get_cash(session) == pytest.approx(8_998.75)
+
+
+def test_sgd_commission_preserves_original_and_applies_translated_usd(
+    projector, session
+):
+    seed_intent(session)
+
+    assert projector.apply(make_fill(
+        commission=1.25,
+        commission_currency="SGD",
+        commission_trading=1.0,
+        commission_fx_base_per_trading=1.25,
+    )) is True
+
+    stored = session.scalar(select(ExecutionFill))
+    assert stored.commission == pytest.approx(1.25)
+    assert stored.commission_currency == "SGD"
+    assert stored.commission_trading == pytest.approx(1.0)
+    assert stored.commission_fx_base_per_trading == pytest.approx(1.25)
+    assert get_cash(session) == pytest.approx(8_999.0)
+
+
+@pytest.mark.parametrize(
+    ("commission_currency", "commission_trading"),
+    [("SGD", None), ("EUR", None)],
+)
+def test_untranslated_commission_is_audited_without_sleeve_mutation(
+    projector, session, commission_currency, commission_trading
+):
+    seed_intent(session)
+
+    with pytest.raises(InvalidFillError, match="commission"):
+        projector.apply(make_fill(
+            commission=1.25,
+            commission_currency=commission_currency,
+            commission_trading=commission_trading,
+        ))
+
+    stored = session.scalar(select(ExecutionFill))
+    assert stored.commission_currency == commission_currency
+    assert stored.commission_trading is None
+    assert stored.projection_applied is False
+    assert get_cash(session) == pytest.approx(10_000)
+
+
+def test_replayed_execution_rejects_changed_commission_translation(
+    projector, session
+):
+    seed_intent(session)
+    fill = make_fill(
+        commission=1.25,
+        commission_currency="SGD",
+        commission_trading=1.0,
+        commission_fx_base_per_trading=1.25,
+    )
+    assert projector.apply(fill) is True
+
+    with pytest.raises(FillConflictError, match="commission_trading"):
+        projector.apply(make_fill(
+            commission=1.25,
+            commission_currency="SGD",
+            commission_trading=0.99,
+            commission_fx_base_per_trading=1.25,
+        ))
 
 
 def test_fill_does_not_mutate_unowned_legacy_position(projector, session):

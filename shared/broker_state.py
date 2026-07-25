@@ -35,7 +35,14 @@ class BrokerOpenOrder:
 class BrokerAccountSnapshot:
     account_id: str
     mode: str
-    net_liquidation: float
+    base_currency: str
+    trading_currency: str
+    net_liquidation_base: float
+    fx_base_per_trading: float
+    net_liquidation_trading_equivalent: float
+    settled_cash_trading: float
+    fx_source: str
+    fx_captured_at: datetime
     positions: dict[int, BrokerPosition] = field(default_factory=dict)
     open_orders: dict[str, BrokerOpenOrder] = field(default_factory=dict)
     captured_at: datetime = field(

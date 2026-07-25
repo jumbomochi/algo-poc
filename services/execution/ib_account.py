@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -19,15 +20,60 @@ async def _resolve(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
 
 
+def _matching_rows(
+    rows: list[Any],
+    *,
+    tag: str,
+    currency: str,
+    account_id: str,
+    allow_all: bool = False,
+) -> list[Any]:
+    accepted_accounts = {"", account_id}
+    if allow_all:
+        accepted_accounts.add("All")
+    return [
+        row
+        for row in rows
+        if str(getattr(row, "tag", "")) == tag
+        and str(getattr(row, "currency", "")) == currency
+        and str(getattr(row, "account", account_id)) in accepted_accounts
+    ]
+
+
+def _one_float(rows: list[Any], *, label: str) -> float:
+    if len(rows) != 1:
+        raise AccountValidationError(f"expected exactly one {label} value")
+    try:
+        value = float(rows[0].value)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise AccountValidationError(f"invalid {label} value") from exc
+    if not math.isfinite(value):
+        raise AccountValidationError(f"invalid {label} value")
+    return value
+
+
 class IBAccountReader:
     """Read one validated IB account into contract-keyed immutable state."""
 
-    def __init__(self, ib: Any, *, expected_mode: str) -> None:
+    def __init__(
+        self,
+        ib: Any,
+        *,
+        expected_mode: str,
+        expected_base_currency: str,
+        trading_currency: str,
+    ) -> None:
         mode = expected_mode.lower()
         if mode not in {"paper", "live"}:
             raise ValueError("expected_mode must be 'paper' or 'live'")
+        if expected_base_currency != "SGD" or trading_currency != "USD":
+            raise ValueError(
+                "account snapshots require SGD base currency and USD trading currency"
+            )
         self._ib = ib
         self._expected_mode = mode
+        self._expected_base_currency = expected_base_currency
+        self._trading_currency = trading_currency
 
     async def snapshot(self) -> BrokerAccountSnapshot:
         accounts = list(await _resolve(self._ib.managedAccounts()))
@@ -48,20 +94,44 @@ class IBAccountReader:
             )
 
         summary = list(await _resolve(self._ib.accountSummaryAsync()))
-        nav_values = [
-            item for item in summary
-            if getattr(item, "tag", None) == "NetLiquidation"
-            and getattr(item, "account", account_id) in {"", account_id}
-            and getattr(item, "currency", "USD") in {"", "USD", "BASE"}
-        ]
-        if len(nav_values) != 1:
-            raise AccountValidationError(
-                "expected exactly one USD/BASE NetLiquidation value"
-            )
-        try:
-            net_liquidation = float(nav_values[0].value)
-        except (TypeError, ValueError) as exc:
-            raise AccountValidationError("invalid NetLiquidation value") from exc
+        captured_at = datetime.now(timezone.utc)
+        nav_base = _one_float(
+            _matching_rows(
+                summary,
+                tag="NetLiquidation",
+                currency=self._expected_base_currency,
+                account_id=account_id,
+            ),
+            label=f"{self._expected_base_currency} NetLiquidation",
+        )
+        fx = _one_float(
+            _matching_rows(
+                summary,
+                tag="ExchangeRate",
+                currency=self._trading_currency,
+                account_id=account_id,
+                allow_all=True,
+            ),
+            label=f"{self._trading_currency} ExchangeRate",
+        )
+        # IB does not report SettledCash per currency; TotalCashBalance is the
+        # per-currency settled cash figure. It may be negative when the account
+        # is short the trading currency against its base-currency holdings.
+        settled_cash = _one_float(
+            _matching_rows(
+                summary,
+                tag="TotalCashBalance",
+                currency=self._trading_currency,
+                account_id=account_id,
+                allow_all=True,
+            ),
+            label=f"{self._trading_currency} TotalCashBalance",
+        )
+        if nav_base <= 0 or fx <= 0:
+            raise AccountValidationError("NAV and FX rate must be positive")
+        nav_trading_equivalent = nav_base / fx
+        if not math.isfinite(nav_trading_equivalent) or nav_trading_equivalent <= 0:
+            raise AccountValidationError("invalid derived USD NAV")
 
         positions: dict[int, BrokerPosition] = {}
         for item in await _resolve(self._ib.positions()):
@@ -116,8 +186,15 @@ class IBAccountReader:
         return BrokerAccountSnapshot(
             account_id=account_id,
             mode=self._expected_mode,
-            net_liquidation=net_liquidation,
+            base_currency=self._expected_base_currency,
+            trading_currency=self._trading_currency,
+            net_liquidation_base=nav_base,
+            fx_base_per_trading=fx,
+            net_liquidation_trading_equivalent=nav_trading_equivalent,
+            settled_cash_trading=settled_cash,
+            fx_source="$LEDGER:ALL/ExchangeRate",
+            fx_captured_at=captured_at,
             positions=positions,
             open_orders=open_orders,
-            captured_at=datetime.now(timezone.utc),
+            captured_at=captured_at,
         )

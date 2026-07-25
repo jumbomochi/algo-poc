@@ -66,6 +66,10 @@ from backtest.portfolio_context import PortfolioContext
 from backtest.ranked_selection import ReplacementPolicy
 from backtest.aggregate_risk import AggregateRiskMonitor
 from services.risk_management.engine import RiskEngine
+from services.risk_management.funding import (
+    check_settled_usd_funding,
+    estimate_commission_usd,
+)
 from shared.order_ledger import OrderLedger
 from shared.capital import CapitalBudget, calculate_capital_budget
 from shared.broker_state import BrokerAccountSnapshot
@@ -303,17 +307,28 @@ def prepare_daily_run(
             f"broker snapshot mode {broker_snapshot.mode!r} does not match "
             f"configured mode {config.mode!r}"
         )
-    reconciliation, _ = reconcile_snapshot(session, broker_snapshot)
     capital = calculate_capital_budget(
-        broker_snapshot.net_liquidation,
+        broker_snapshot,
         config.mode,
         config.capital,
+        config.currency,
         CAPITAL_ALLOCATIONS,
     )
+    reconciliation, _ = reconcile_snapshot(session, broker_snapshot)
     capital_snapshot = CapitalSnapshot(
         account_id=broker_snapshot.account_id,
         mode=config.mode,
-        net_liquidation=capital.net_liquidation,
+        net_liquidation=capital.net_liquidation_trading_equivalent,
+        base_currency=capital.base_currency,
+        trading_currency=capital.trading_currency,
+        net_liquidation_base=capital.net_liquidation_base,
+        net_liquidation_trading_equivalent=(
+            capital.net_liquidation_trading_equivalent
+        ),
+        fx_base_per_trading=capital.fx_base_per_trading,
+        fx_captured_at=capital.fx_captured_at,
+        fractional_base=capital.fractional_base,
+        settled_cash_trading=capital.settled_cash_trading,
         deployment_fraction=capital.deployment_fraction,
         max_deployable_usd=capital.max_deployable_usd,
         deployable_capital=capital.deployable_capital,
@@ -397,6 +412,31 @@ def build_sell_availability(
     }
 
 
+def account_buy_commitments_after_snapshot(
+    session: Session,
+    account_id: str,
+    *,
+    snapshot_captured_at: datetime | None,
+    commission_per_share: float,
+    minimum_commission: float,
+) -> float:
+    """Return durable USD buy commitments not reflected by the snapshot."""
+    ledger = OrderLedger(session)
+    try:
+        active = ledger.active_buy_reservations_for_account(
+            account_id,
+            commission_per_share=commission_per_share,
+            minimum_commission=minimum_commission,
+        )
+        filled = ledger.buy_fill_spend_for_account_since(
+            account_id,
+            captured_after=snapshot_captured_at,
+        )
+        return active + filled
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def print_status(state: PaperTradingState) -> None:
     """Print current paper trading status."""
     print("\n" + "=" * 60)
@@ -469,6 +509,11 @@ def run_daily(
     entries_disabled: bool = False,
     reservations_by_portfolio: Mapping[str, float] | None = None,
     sell_availability: Mapping[str, float] | None = None,
+    settled_cash_trading: float | None,
+    active_buy_reservations_usd: float,
+    commission_per_share_usd: float,
+    minimum_commission_usd: float,
+    minimum_settled_usd_reserve: float,
 ) -> list[dict]:
     """Run one daily cycle: generate signals for all portfolios.
 
@@ -476,6 +521,7 @@ def run_daily(
     """
     signals_generated: list[dict] = []
     accepted_buy_notional: dict[str, float] = {}
+    accepted_account_buy_reservations_usd = 0.0
     remaining_sell_quantity = dict(sell_availability or {})
     today = date.today()
 
@@ -521,6 +567,31 @@ def run_daily(
                     from shared.universe import ETF_SECTORS
 
                     sector = SECTOR_MAP.get(ticker) or ETF_SECTORS.get(ticker)
+
+                    try:
+                        estimated_commission = estimate_commission_usd(
+                            qty,
+                            per_share=commission_per_share_usd,
+                            minimum=minimum_commission_usd,
+                        )
+                    except (TypeError, ValueError):
+                        estimated_commission = float("nan")
+                    funding = check_settled_usd_funding(
+                        order_notional_usd=qty * price,
+                        settled_cash_usd=settled_cash_trading,
+                        active_reservations_usd=(
+                            active_buy_reservations_usd
+                            + accepted_account_buy_reservations_usd
+                        ),
+                        estimated_commission_usd=estimated_commission,
+                        minimum_reserve_usd=minimum_settled_usd_reserve,
+                    )
+                    if not funding.approved:
+                        print(
+                            f"  SKIP {ticker:>6s}  {qty:>8.4f} @ "
+                            f"${price:>8.2f}  [{name}] ({funding.reason})"
+                        )
+                        continue
 
                     # Gate through the sleeve's RiskEngine exactly like the
                     # backtest runner does — without it the sim books every
@@ -576,6 +647,14 @@ def run_daily(
                     signals_generated.append(signal)
                     accepted_buy_notional[name] = (
                         accepted_buy_notional.get(name, 0.0) + qty * price
+                    )
+                    accepted_account_buy_reservations_usd += (
+                        qty * price
+                        + estimate_commission_usd(
+                            qty,
+                            per_share=commission_per_share_usd,
+                            minimum=minimum_commission_usd,
+                        )
                     )
                     print(
                         f"  BUY  {ticker:>6s}  {qty:>8.4f} @ ${price:>8.2f}  [{name}]"
@@ -782,7 +861,13 @@ def publish_unpublished_intents(
 
 
 async def read_broker_snapshot(
-    *, host: str, port: int, client_id: int, mode: str
+    *,
+    host: str,
+    port: int,
+    client_id: int,
+    mode: str,
+    expected_base_currency: str,
+    trading_currency: str,
 ) -> BrokerAccountSnapshot:
     """Read account truth before any signal or capital decision."""
     from ib_insync import IB
@@ -790,7 +875,12 @@ async def read_broker_snapshot(
     ib = IB()
     try:
         await ib.connectAsync(host, port, clientId=client_id, readonly=True, timeout=15)
-        return await IBAccountReader(ib, expected_mode=mode).snapshot()
+        return await IBAccountReader(
+            ib,
+            expected_mode=mode,
+            expected_base_currency=expected_base_currency,
+            trading_currency=trading_currency,
+        ).snapshot()
     finally:
         if ib.isConnected():
             ib.disconnect()
@@ -988,6 +1078,8 @@ def main():
             port=args.ib_port,
             client_id=args.ib_client_id,
             mode=_config.mode,
+            expected_base_currency=_config.currency.expected_base_currency,
+            trading_currency=_config.currency.trading_currency,
         )
     )
     try:
@@ -1005,9 +1097,13 @@ def main():
     entries_disabled = args.entries_disabled or not mode_capital.entries_enabled
     if not preparation.reconciliation.entries_allowed:
         entries_disabled = True
+    capital = preparation.capital
     print(
-        f"Broker NAV: ${preparation.capital.net_liquidation:,.2f}; "
-        f"deployable: ${preparation.capital.deployable_capital:,.2f}; "
+        f"Broker NAV: SGD {capital.net_liquidation_base:,.2f} "
+        f"(USD {capital.net_liquidation_trading_equivalent:,.2f}); "
+        f"FX: {capital.fx_base_per_trading:.7f} SGD/USD; "
+        f"settled USD: {capital.settled_cash_trading:,.2f}; "
+        f"deployable USD: {capital.deployable_capital:,.2f}; "
         f"reconciliation: {preparation.reconciliation.severity}; "
         f"entries: {'disabled' if entries_disabled else 'enabled'}"
     )
@@ -1063,6 +1159,13 @@ def main():
             for name, context in portfolio_contexts.items()
         }
         sell_availability = build_sell_availability(session, broker_snapshot)
+        account_buy_reservations = account_buy_commitments_after_snapshot(
+            session,
+            broker_snapshot.account_id,
+            snapshot_captured_at=preparation.capital_snapshot.captured_at,
+            commission_per_share=_config.currency.commission_per_share_usd,
+            minimum_commission=_config.currency.minimum_commission_usd,
+        )
         signals = run_daily(
             state,
             portfolios,
@@ -1071,6 +1174,15 @@ def main():
             entries_disabled=entries_disabled,
             reservations_by_portfolio=reservations,
             sell_availability=sell_availability,
+            settled_cash_trading=preparation.capital.settled_cash_trading,
+            active_buy_reservations_usd=account_buy_reservations,
+            commission_per_share_usd=(
+                _config.currency.commission_per_share_usd
+            ),
+            minimum_commission_usd=_config.currency.minimum_commission_usd,
+            minimum_settled_usd_reserve=(
+                _config.currency.minimum_settled_usd_reserve
+            ),
         )
         if args.publish and signals:
             contracts = resolve_contract_details_from_ib(

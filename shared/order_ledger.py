@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import math
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, exists, false, func, literal, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from shared.models import OrderIntent, OrderStatus
+from shared.models import ExecutionFill, OrderIntent, OrderStatus, Position
 
 
 class OrderLedgerError(RuntimeError):
@@ -151,6 +153,66 @@ class OrderLedger:
             stmt = stmt.where(OrderIntent.account_id == account_id)
         return self.session.scalar(stmt.with_for_update())
 
+    def execution_fill_exists(
+        self, account_id: str, execution_id: str
+    ) -> bool:
+        """Return whether a broker execution is already durably recorded."""
+        return self.session.scalar(
+            select(ExecutionFill.id).where(
+                ExecutionFill.account_id == account_id,
+                ExecutionFill.execution_id == execution_id,
+            )
+        ) is not None
+
+    def managed_position_snapshot(
+        self, execution_keys: Iterable[tuple[str, str]]
+    ) -> tuple[list[tuple[str, float]], set[tuple[str, str]]]:
+        """Read managed positions and projected identities in one snapshot."""
+        keys = list(execution_keys)
+        managed_sleeve = exists(
+            select(OrderIntent.id).where(
+                OrderIntent.account_id == Position.account_id,
+                OrderIntent.portfolio == Position.portfolio,
+            )
+        )
+        position_rows = select(
+            literal("position").label("row_kind"),
+            literal(None).label("account_id"),
+            literal(None).label("execution_id"),
+            Position.ticker.label("ticker"),
+            Position.quantity.label("quantity"),
+        ).where(
+            Position.status == "open",
+            Position.quantity > 0,
+            Position.account_id.is_not(None),
+            managed_sleeve,
+        )
+        projected_rows = select(
+            literal("execution").label("row_kind"),
+            ExecutionFill.account_id.label("account_id"),
+            ExecutionFill.execution_id.label("execution_id"),
+            literal(None).label("ticker"),
+            literal(None).label("quantity"),
+        ).where(
+            (
+                tuple_(
+                    ExecutionFill.account_id, ExecutionFill.execution_id
+                ).in_(keys)
+                if keys
+                else false()
+            ),
+            ExecutionFill.projection_applied.is_(True),
+        )
+
+        positions: list[tuple[str, float]] = []
+        projected_keys: set[tuple[str, str]] = set()
+        for row in self.session.execute(position_rows.union_all(projected_rows)):
+            if row.row_kind == "position":
+                positions.append((row.ticker, float(row.quantity)))
+            else:
+                projected_keys.add((row.account_id, row.execution_id))
+        return positions, projected_keys
+
     def transition(
         self,
         recommendation_id: str,
@@ -210,6 +272,82 @@ class OrderLedger:
                 OrderIntent.recommendation_id != exclude_recommendation_id
             )
         return float(self.session.scalar(stmt) or 0.0)
+
+    def active_buy_reservations_for_account(
+        self,
+        account_id: str,
+        *,
+        commission_per_share: float,
+        minimum_commission: float,
+        exclude_recommendation_id: str | None = None,
+    ) -> float:
+        per_share = self._nonnegative_finite(
+            commission_per_share, "commission_per_share"
+        )
+        minimum = self._nonnegative_finite(
+            minimum_commission, "minimum_commission"
+        )
+        statement = select(OrderIntent).where(
+            OrderIntent.account_id == account_id,
+            func.upper(OrderIntent.action) == "BUY",
+            OrderIntent.limit_price.is_not(None),
+            or_(
+                OrderIntent.status.in_(ACTIVE_RESERVATION_STATUSES),
+                and_(
+                    OrderIntent.status == OrderStatus.PROPOSED.value,
+                    OrderIntent.published_at.is_not(None),
+                ),
+            ),
+        )
+        if exclude_recommendation_id is not None:
+            statement = statement.where(
+                OrderIntent.recommendation_id != exclude_recommendation_id
+            )
+        total = 0.0
+        for intent in self.session.scalars(statement):
+            requested = self._nonnegative_finite(
+                intent.requested_quantity, "requested_quantity"
+            )
+            filled = self._nonnegative_finite(
+                intent.filled_quantity, "filled_quantity"
+            )
+            price = self._nonnegative_finite(intent.limit_price, "limit_price")
+            remaining = requested - filled
+            if remaining < -1e-6:
+                raise ValueError("filled_quantity exceeds requested_quantity")
+            remaining = max(0.0, remaining)
+            total += remaining * price + max(minimum, remaining * per_share)
+        return total
+
+    def buy_fill_spend_for_account_since(
+        self, account_id: str, *, captured_after: datetime
+    ) -> float:
+        if not isinstance(captured_after, datetime):
+            raise ValueError("capital snapshot captured_at is required")
+        statement = select(ExecutionFill).where(
+            ExecutionFill.account_id == account_id,
+            func.upper(ExecutionFill.side) == "BUY",
+            func.upper(ExecutionFill.currency) == "USD",
+            ExecutionFill.executed_at > captured_after,
+        )
+        total = 0.0
+        for fill in self.session.scalars(statement):
+            quantity = self._nonnegative_finite(fill.quantity, "fill quantity")
+            price = self._nonnegative_finite(fill.price, "fill price")
+            if fill.commission_trading is not None:
+                commission = self._nonnegative_finite(
+                    fill.commission_trading, "trading commission"
+                )
+            elif (fill.commission_currency or "USD").upper() == "USD":
+                commission = self._nonnegative_finite(
+                    fill.commission, "USD commission"
+                )
+            else:
+                raise ValueError(
+                    "non-USD fill commission requires commission_trading"
+                )
+            total += quantity * price + commission
+        return total
 
     def load_pending_orders(
         self, *, account_id: str | None = None
@@ -278,3 +416,13 @@ class OrderLedger:
                 f"recommendation {intent.recommendation_id} conflicts on: "
                 + ", ".join(conflicts)
             )
+
+    @staticmethod
+    def _nonnegative_finite(value: Any, field: str) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be a finite non-negative number") from exc
+        if not math.isfinite(numeric) or numeric < 0:
+            raise ValueError(f"{field} must be a finite non-negative number")
+        return numeric
