@@ -9,7 +9,7 @@ from typing import Any
 from shared.config import AppConfig
 from shared.logging import get_logger
 from shared.models import OrderStatus
-from shared.order_ledger import OrderLedger, TERMINAL_STATUSES
+from shared.order_ledger import TERMINAL_STATUSES, OrderLedger
 from shared.schemas.messages import (
     AlertMessage,
     ApprovedOrderMessage,
@@ -30,6 +30,14 @@ CONSUMER_NAME = "execution_worker_1"
 class PendingOrderAttribution:
     recommendation_id: str
     portfolio: str | None
+
+
+@dataclass(frozen=True)
+class LocalFillEffect:
+    account_id: str
+    portfolio: str
+    ticker: str
+    quantity_delta: float
 
 
 class ExecutionServiceRunner:
@@ -58,8 +66,11 @@ class ExecutionServiceRunner:
         self._running = False
 
         # Positions tracked locally (in production loaded from DB)
-        self._positions: dict[str, int] = {}
+        self._positions: dict[str, float] = {}
         self._handled_executions: set[tuple[str, str]] = set()
+        self._local_fill_effects: dict[
+            tuple[str, str], LocalFillEffect
+        ] = {}
         self._fill_lock = asyncio.Lock()
 
         # order_id -> ApprovedOrderMessage, so IB fills can be attributed
@@ -365,8 +376,7 @@ class ExecutionServiceRunner:
                     *execution_key
                 )
             if duplicate:
-                if self._order_ledger is not None:
-                    self._order_ledger.session.rollback()
+                self._reconcile_managed_positions()
                 self._logger.info(
                     "Duplicate IB execution ignored",
                     account_id=account_id,
@@ -374,11 +384,15 @@ class ExecutionServiceRunner:
                 )
                 return
 
-            await self._handle_ib_fill_once(fill_info)
+            local_effect = await self._handle_ib_fill_once(fill_info)
             if execution_key is not None:
                 self._handled_executions.add(execution_key)
+                if local_effect is not None:
+                    self._local_fill_effects[execution_key] = local_effect
 
-    async def _handle_ib_fill_once(self, fill_info: dict[str, Any]) -> None:
+    async def _handle_ib_fill_once(
+        self, fill_info: dict[str, Any]
+    ) -> LocalFillEffect | None:
         order_id = fill_info["order_id"]
         pending = self._pending_orders.get(order_id)
         intent = self._intent_for_order(
@@ -410,6 +424,17 @@ class ExecutionServiceRunner:
             exchange=fill_info.get("exchange"),
             currency=fill_info.get("currency"),
         )
+        local_effect = None
+        if fill.account_id and fill.portfolio:
+            quantity_delta = float(fill.quantity)
+            if fill.side.lower() != "buy":
+                quantity_delta = -quantity_delta
+            local_effect = LocalFillEffect(
+                account_id=fill.account_id,
+                portfolio=fill.portfolio,
+                ticker=fill.ticker,
+                quantity_delta=quantity_delta,
+            )
         if self._order_ledger is not None:
             # Fill publication awaits Redis. End the read-only SQLAlchemy
             # transaction first so status callbacks never share an active
@@ -443,6 +468,42 @@ class ExecutionServiceRunner:
         if fill_info.get("order_done"):
             self._pending_orders.pop(order_id, None)
             self._order_manager.open_orders.pop(order_id, None)
+        return local_effect
+
+    def _reconcile_managed_positions(self) -> None:
+        """Overlay unprojected local fills on durable managed positions."""
+        if self._order_ledger is None:
+            return
+
+        try:
+            durable_positions, projected_keys = (
+                self._order_ledger.managed_position_snapshot(
+                    self._local_fill_effects
+                )
+            )
+            reconciled: dict[str, float] = {}
+            for ticker, quantity in durable_positions:
+                reconciled[ticker] = reconciled.get(ticker, 0.0) + quantity
+
+            for execution_key in projected_keys:
+                self._local_fill_effects.pop(execution_key, None)
+            for effect in self._local_fill_effects.values():
+                reconciled[effect.ticker] = (
+                    reconciled.get(effect.ticker, 0.0)
+                    + effect.quantity_delta
+                )
+
+            self._positions = {
+                ticker: quantity
+                for ticker, quantity in reconciled.items()
+                if quantity > 0
+            }
+        except Exception:
+            self._logger.exception(
+                "Unable to reconcile managed positions; using local cache"
+            )
+        finally:
+            self._order_ledger.session.rollback()
 
     async def handle_ib_order_status(
         self, status_info: dict[str, Any]
@@ -514,11 +575,15 @@ class ExecutionServiceRunner:
             triggered_by=kill_msg.triggered_by,
         )
 
+        async with self._fill_lock:
+            self._reconcile_managed_positions()
+            positions_to_liquidate = dict(self._positions)
+
         # Cancel all open orders
         await self._order_manager.cancel_all_orders()
 
         # Emit market sell orders for all positions
-        for ticker, quantity in self._positions.items():
+        for ticker, quantity in positions_to_liquidate.items():
             if quantity <= 0:
                 continue
 
@@ -543,7 +608,7 @@ class ExecutionServiceRunner:
             message=f"Kill switch activated by {kill_msg.triggered_by}: {kill_msg.reason}",
             context={
                 "triggered_by": kill_msg.triggered_by,
-                "positions_liquidated": len(self._positions),
+                "positions_liquidated": len(positions_to_liquidate),
             },
         )
         await self._redis.publish(ALERTS_STREAM, alert.to_stream_dict())

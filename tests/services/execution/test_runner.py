@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 
 from services.execution.runner import ExecutionServiceRunner
@@ -103,14 +103,17 @@ def seed_approved_intent(
     *,
     ib_order_id: str | None = None,
     filled_quantity: float = 0,
+    symbol: str = "AAPL",
+    con_id: int = 265598,
+    portfolio: str = "momentum",
 ):
     proposal = SimpleNamespace(
         recommendation_id=recommendation_id,
         account_id="DUN551088",
         mode="paper",
-        portfolio="momentum",
-        con_id=265598,
-        symbol="AAPL",
+        portfolio=portfolio,
+        con_id=con_id,
+        symbol=symbol,
         exchange="SMART",
         currency="USD",
         action="BUY",
@@ -125,6 +128,85 @@ def seed_approved_intent(
     intent.filled_quantity = filled_quantity
     ledger.session.commit()
     return intent
+
+
+def make_durable_fill_info(
+    *,
+    execution_id: str,
+    order_id: str,
+    ticker: str = "AAPL",
+    con_id: int = 265598,
+    quantity: float = 5.0,
+) -> dict[str, object]:
+    return {
+        "execution_id": execution_id,
+        "account_id": "DUN551088",
+        "timestamp": BROKER_TIME,
+        "order_id": order_id,
+        "con_id": con_id,
+        "ticker": ticker,
+        "exchange": "SMART",
+        "currency": "USD",
+        "side": "buy",
+        "quantity": quantity,
+        "cumulative_quantity": quantity,
+        "fill_price": 100.0,
+        "commission": 0.0,
+        "commission_currency": "USD",
+        "commission_trading": 0.0,
+        "commission_fx_base_per_trading": None,
+        "order_done": False,
+    }
+
+
+def project_durable_fill(
+    session: Session,
+    fill_info: dict[str, object],
+    *,
+    recommendation_id: str,
+    portfolio: str = "momentum",
+) -> None:
+    assert FillProjector(session).apply(FillMessage(
+        ticker=str(fill_info["ticker"]),
+        timestamp=fill_info["timestamp"],
+        side=str(fill_info["side"]),
+        quantity=float(fill_info["quantity"]),
+        cumulative_quantity=float(fill_info["cumulative_quantity"]),
+        fill_price=float(fill_info["fill_price"]),
+        commission=float(fill_info["commission"]),
+        commission_currency=str(fill_info["commission_currency"]),
+        commission_trading=float(fill_info["commission_trading"]),
+        commission_fx_base_per_trading=None,
+        recommendation_id=recommendation_id,
+        order_id=str(fill_info["order_id"]),
+        execution_id=str(fill_info["execution_id"]),
+        account_id=str(fill_info["account_id"]),
+        portfolio=portfolio,
+        con_id=int(fill_info["con_id"]),
+        exchange=str(fill_info["exchange"]),
+        currency=str(fill_info["currency"]),
+    )) is True
+
+
+def kill_message() -> KillMessage:
+    return KillMessage(
+        timestamp=BROKER_TIME,
+        triggered_by="test",
+        reason="reconcile managed positions",
+    )
+
+
+def seed_portfolio_config(
+    session: Session, portfolio: str = "momentum"
+) -> None:
+    session.add(PortfolioConfig(
+        portfolio=portfolio,
+        capital=10_000,
+        cash=10_000,
+        created_at=BROKER_TIME,
+        updated_at=BROKER_TIME,
+    ))
+    session.commit()
 
 
 @pytest.fixture()
@@ -257,6 +339,209 @@ class TestDurableExecutionIdentity:
 
         assert ledger.get("rec-1").status == OrderStatus.CANCELLED.value
         assert ledger.active_reservations("momentum") == 0
+
+    @pytest.mark.asyncio
+    async def test_late_projection_after_startup_is_liquidated_on_kill(
+        self, durable_runner, ledger_session
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        seed_portfolio_config(ledger_session)
+        runner.restore_pending_orders()
+        assert runner._positions == {}
+
+        fill_info = make_durable_fill_info(
+            execution_id="late-projection", order_id="9", quantity=4
+        )
+        project_durable_fill(
+            ledger_session, fill_info, recommendation_id="rec-1"
+        )
+
+        await runner.handle_ib_fill(fill_info)
+        await runner.process_kill(kill_message())
+
+        runner._order_manager.submit_exit.assert_awaited_once()
+        assert runner._order_manager.submit_exit.await_args.kwargs[
+            "ticker"
+        ] == "AAPL"
+        assert runner._order_manager.submit_exit.await_args.kwargs[
+            "quantity"
+        ] == pytest.approx(4)
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_publish_projected_before_raise_is_liquidated(
+        self, durable_runner, ledger_session
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        seed_portfolio_config(ledger_session)
+        runner.restore_pending_orders()
+        fill_info = make_durable_fill_info(
+            execution_id="ambiguous-publish", order_id="9", quantity=3
+        )
+
+        async def project_then_raise(stream, payload):
+            assert stream == "stream:fills"
+            assert FillProjector(ledger_session).apply(
+                FillMessage.from_stream_dict(payload)
+            ) is True
+            raise RuntimeError("Redis acknowledgement lost")
+
+        runner._redis.publish.side_effect = project_then_raise
+        with pytest.raises(RuntimeError, match="acknowledgement lost"):
+            await runner.handle_ib_fill(fill_info)
+
+        runner._redis.publish.side_effect = None
+        runner._redis.publish.return_value = "message-id"
+        await runner.handle_ib_fill(fill_info)
+        await runner.process_kill(kill_message())
+
+        runner._order_manager.submit_exit.assert_awaited_once()
+        assert runner._order_manager.submit_exit.await_args.kwargs[
+            "quantity"
+        ] == pytest.approx(3)
+
+    @pytest.mark.asyncio
+    async def test_unprojected_local_fill_survives_durable_reload(
+        self, durable_runner, ledger_session
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, "rec-aapl", ib_order_id="9")
+        seed_approved_intent(
+            ledger,
+            "rec-msft",
+            ib_order_id="10",
+            symbol="MSFT",
+            con_id=272093,
+        )
+        seed_portfolio_config(ledger_session)
+        runner.restore_pending_orders()
+        aapl_fill = make_durable_fill_info(
+            execution_id="projected-aapl", order_id="9", quantity=3
+        )
+        project_durable_fill(
+            ledger_session, aapl_fill, recommendation_id="rec-aapl"
+        )
+        msft_fill = make_durable_fill_info(
+            execution_id="pending-msft",
+            order_id="10",
+            ticker="MSFT",
+            con_id=272093,
+            quantity=2,
+        )
+
+        await runner.handle_ib_fill(msft_fill)
+        await runner.handle_ib_fill(aapl_fill)
+        await runner.process_kill(kill_message())
+
+        exits = {
+            call.kwargs["ticker"]: call.kwargs["quantity"]
+            for call in runner._order_manager.submit_exit.await_args_list
+        }
+        assert exits == {
+            "AAPL": pytest.approx(3),
+            "MSFT": pytest.approx(2),
+        }
+
+    @pytest.mark.asyncio
+    async def test_projected_and_pending_fills_same_ticker_are_combined(
+        self, durable_runner, ledger_session
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, "rec-projected", ib_order_id="9")
+        seed_approved_intent(ledger, "rec-pending", ib_order_id="10")
+        seed_portfolio_config(ledger_session)
+        runner.restore_pending_orders()
+        projected_fill = make_durable_fill_info(
+            execution_id="projected-same-ticker", order_id="9", quantity=3
+        )
+        project_durable_fill(
+            ledger_session,
+            projected_fill,
+            recommendation_id="rec-projected",
+        )
+
+        await runner.handle_ib_fill(make_durable_fill_info(
+            execution_id="pending-same-ticker", order_id="10", quantity=2
+        ))
+        await runner.process_kill(kill_message())
+
+        runner._order_manager.submit_exit.assert_awaited_once()
+        assert runner._order_manager.submit_exit.await_args.kwargs[
+            "quantity"
+        ] == pytest.approx(5)
+
+    @pytest.mark.asyncio
+    async def test_projected_duplicate_does_not_over_liquidate_or_add_unowned(
+        self, durable_runner, ledger_session
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        seed_portfolio_config(ledger_session)
+        runner.restore_pending_orders()
+        fill_info = make_durable_fill_info(
+            execution_id="projected-after-local", order_id="9", quantity=2
+        )
+
+        await runner.handle_ib_fill(fill_info)
+        _, payload = runner._redis.publish.await_args.args
+        assert FillProjector(ledger_session).apply(
+            FillMessage.from_stream_dict(payload)
+        ) is True
+        ledger_session.add(Position(
+            account_id="OTHER",
+            ticker="TSLA",
+            portfolio="manual",
+            con_id=76792991,
+            exchange="SMART",
+            currency="USD",
+            quantity=99,
+            avg_entry_price=200,
+            current_price=200,
+            peak_price=200,
+            highest_price_since_entry=200,
+            opened_at=BROKER_TIME,
+            status="open",
+        ))
+        ledger_session.commit()
+
+        await runner.handle_ib_fill(fill_info)
+        await runner.handle_ib_fill(fill_info)
+        await runner.process_kill(kill_message())
+
+        runner._order_manager.submit_exit.assert_awaited_once()
+        assert runner._order_manager.submit_exit.await_args.kwargs[
+            "ticker"
+        ] == "AAPL"
+        assert runner._order_manager.submit_exit.await_args.kwargs[
+            "quantity"
+        ] == pytest.approx(2)
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_reads_projection_and_positions_atomically(
+        self, durable_runner, ledger_session
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        seed_portfolio_config(ledger_session)
+        runner.restore_pending_orders()
+        await runner.handle_ib_fill(make_durable_fill_info(
+            execution_id="snapshot-pending", order_id="9", quantity=2
+        ))
+        selects: list[str] = []
+
+        def record_select(_conn, _cursor, statement, *_args):
+            if statement.lstrip().upper().startswith("SELECT"):
+                selects.append(statement)
+
+        engine = ledger_session.get_bind()
+        event.listen(engine, "before_cursor_execute", record_select)
+        try:
+            await runner.process_kill(kill_message())
+        finally:
+            event.remove(engine, "before_cursor_execute", record_select)
+
+        assert len(selects) == 1
 
     @pytest.mark.asyncio
     async def test_inactive_before_fill_is_submission_failed(

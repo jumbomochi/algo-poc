@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, exists, false, func, literal, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from shared.models import ExecutionFill, OrderIntent, OrderStatus
+from shared.models import ExecutionFill, OrderIntent, OrderStatus, Position
 
 
 class OrderLedgerError(RuntimeError):
@@ -162,6 +163,55 @@ class OrderLedger:
                 ExecutionFill.execution_id == execution_id,
             )
         ) is not None
+
+    def managed_position_snapshot(
+        self, execution_keys: Iterable[tuple[str, str]]
+    ) -> tuple[list[tuple[str, float]], set[tuple[str, str]]]:
+        """Read managed positions and projected identities in one snapshot."""
+        keys = list(execution_keys)
+        managed_sleeve = exists(
+            select(OrderIntent.id).where(
+                OrderIntent.account_id == Position.account_id,
+                OrderIntent.portfolio == Position.portfolio,
+            )
+        )
+        position_rows = select(
+            literal("position").label("row_kind"),
+            literal(None).label("account_id"),
+            literal(None).label("execution_id"),
+            Position.ticker.label("ticker"),
+            Position.quantity.label("quantity"),
+        ).where(
+            Position.status == "open",
+            Position.quantity > 0,
+            Position.account_id.is_not(None),
+            managed_sleeve,
+        )
+        projected_rows = select(
+            literal("execution").label("row_kind"),
+            ExecutionFill.account_id.label("account_id"),
+            ExecutionFill.execution_id.label("execution_id"),
+            literal(None).label("ticker"),
+            literal(None).label("quantity"),
+        ).where(
+            (
+                tuple_(
+                    ExecutionFill.account_id, ExecutionFill.execution_id
+                ).in_(keys)
+                if keys
+                else false()
+            ),
+            ExecutionFill.projection_applied.is_(True),
+        )
+
+        positions: list[tuple[str, float]] = []
+        projected_keys: set[tuple[str, str]] = set()
+        for row in self.session.execute(position_rows.union_all(projected_rows)):
+            if row.row_kind == "position":
+                positions.append((row.ticker, float(row.quantity)))
+            else:
+                projected_keys.add((row.account_id, row.execution_id))
+        return positions, projected_keys
 
     def transition(
         self,
