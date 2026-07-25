@@ -114,15 +114,18 @@ class IBAccountReader:
             ),
             label=f"{self._trading_currency} ExchangeRate",
         )
+        # IB does not report SettledCash per currency; TotalCashBalance is the
+        # per-currency settled cash figure. It may be negative when the account
+        # is short the trading currency against its base-currency holdings.
         settled_cash = _one_float(
             _matching_rows(
                 summary,
-                tag="SettledCash",
+                tag="TotalCashBalance",
                 currency=self._trading_currency,
                 account_id=account_id,
                 allow_all=True,
             ),
-            label=f"{self._trading_currency} SettledCash",
+            label=f"{self._trading_currency} TotalCashBalance",
         )
         if nav_base <= 0 or fx <= 0:
             raise AccountValidationError("NAV and FX rate must be positive")

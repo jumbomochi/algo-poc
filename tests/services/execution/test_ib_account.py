@@ -24,8 +24,8 @@ def _summary_rows(account_id="DUN551088"):
         ),
         SimpleNamespace(
             account="All",
-            tag="SettledCash",
-            value="25000.00",
+            tag="TotalCashBalance",
+            value="-4711.26",
             currency="USD",
         ),
     ]
@@ -72,7 +72,7 @@ async def test_account_reader_returns_contract_keyed_snapshot():
     assert snapshot.net_liquidation_base == pytest.approx(1_001_757.23)
     assert snapshot.fx_base_per_trading == pytest.approx(1.2928304)
     assert snapshot.net_liquidation_trading_equivalent == pytest.approx(774_855.87)
-    assert snapshot.settled_cash_trading == pytest.approx(25_000)
+    assert snapshot.settled_cash_trading == pytest.approx(-4_711.26)
     assert snapshot.fx_source == "$LEDGER:ALL/ExchangeRate"
     assert snapshot.fx_captured_at == snapshot.captured_at
     assert snapshot.captured_at.tzinfo is not None
@@ -126,8 +126,8 @@ async def test_account_reader_rejects_paper_account_in_live_mode():
         ("NetLiquidation", 2, "SGD NetLiquidation"),
         ("ExchangeRate", 0, "USD ExchangeRate"),
         ("ExchangeRate", 2, "USD ExchangeRate"),
-        ("SettledCash", 0, "USD SettledCash"),
-        ("SettledCash", 2, "USD SettledCash"),
+        ("TotalCashBalance", 0, "USD TotalCashBalance"),
+        ("TotalCashBalance", 2, "USD TotalCashBalance"),
     ],
 )
 async def test_account_reader_requires_exactly_one_currency_value(
@@ -150,6 +150,34 @@ async def test_account_reader_requires_exactly_one_currency_value(
 
 
 @pytest.mark.asyncio
+async def test_account_reader_selects_trading_currency_cash_among_currencies():
+    # IB returns TotalCashBalance per currency (SGD/USD/BASE); the reader must
+    # pick the trading-currency (USD) row and tolerate a negative balance.
+    ib = _fake_ib()
+    summary = _summary_rows()
+    summary.extend(
+        [
+            SimpleNamespace(
+                account="All", tag="TotalCashBalance", value="1001993.27", currency="SGD"
+            ),
+            SimpleNamespace(
+                account="All", tag="TotalCashBalance", value="995912.98", currency="BASE"
+            ),
+        ]
+    )
+    ib.accountSummaryAsync.return_value = summary
+
+    snapshot = await IBAccountReader(
+        ib,
+        expected_mode="paper",
+        expected_base_currency="SGD",
+        trading_currency="USD",
+    ).snapshot()
+
+    assert snapshot.settled_cash_trading == pytest.approx(-4_711.26)
+
+
+@pytest.mark.asyncio
 async def test_account_reader_rejects_nav_in_wrong_currency():
     ib = _fake_ib()
     ib.accountSummaryAsync.return_value[0].currency = "USD"
@@ -169,7 +197,7 @@ async def test_account_reader_rejects_nav_in_wrong_currency():
     [
         ("NetLiquidation", "nan", "invalid SGD NetLiquidation"),
         ("ExchangeRate", "inf", "invalid USD ExchangeRate"),
-        ("SettledCash", "-inf", "invalid USD SettledCash"),
+        ("TotalCashBalance", "-inf", "invalid USD TotalCashBalance"),
         ("NetLiquidation", "not-a-number", "invalid SGD NetLiquidation"),
     ],
 )
