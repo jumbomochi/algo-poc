@@ -387,12 +387,26 @@ git commit -m "feat: re-enable paper entries (guarded by fail-closed reconciliat
 
 ### Task 6: First entries-enabled monitored run + confirm fills persist — OPERATOR ACTION
 
-- [ ] **Step 1 (decision, operator):** For the first live-path sessions, consider lowering `capital.paper.deployment_fraction` (currently `1.0`) so the initial rebuild deploys conservatively. Optional; a config + monthly-review decision, not required to clear the gate.
+> **Two gates discovered 2026-07-28** when the first attempt was a no-op (`entries: disabled` despite `entries_enabled: true`). Both must be cleared before entries fire:
+> 1. **CLI opt-in:** `--entries-disabled` is `BooleanOptionalAction` with `default=True`, and the wrappers run `run_paper.py --publish` *without* `--no-entries-disabled`. Since `entries_disabled = args.entries_disabled OR not config.entries_enabled`, you must pass `--no-entries-disabled` in addition to the config flag.
+> 2. **Stale services:** the docker stack has been "Up 2 weeks" — it predates the durable-ledger and dual-currency merges, so the running execution/risk containers would mishandle the SGD account. Rebuild before entries-on.
+>
+> Deployment scale is already contained via `capital.paper.max_deployable_usd: 20000` (committed `e0d3add`) — supersedes the earlier "consider lowering deployment_fraction" note.
 
-- [ ] **Step 2: Run the wrapper with entries enabled**
+- [ ] **Step 1: Rebuild + restart the stale services** (operator; recreates the paper services — not `down -v`, volumes safe):
 ```bash
-~/ibc/run_paper.sh
+docker compose build execution risk-management
+docker compose up -d execution risk-management
+docker image inspect algo-poc-execution:latest algo-poc-risk-management:latest  # fresh timestamps
 ```
+- [ ] **Step 2: Monitored entries-on run — DURING US MARKET HOURS** (so limit orders fill; the scheduled 04:15 SGT job runs after close, so do the first one manually while the market is open):
+```bash
+cd ~/GitHub/algo-poc && \
+ALGO_DATABASE_URL="postgresql://algo:algo@localhost:55432/algo_poc" \
+ALGO_REDIS_URL="redis://localhost:56379/0" \
+.venv/bin/python scripts/run_paper.py --publish --no-entries-disabled
+```
+Expected: the run logs `entries: enabled`, publishes recommendations, and a handful of BUYs route (capped at $20k deployable).
 - [ ] **Step 3: Confirm the live-order path actually records fills** — the single most important check, because `execution_fills` has **0 rows ever**:
 ```bash
 PGPASSWORD=algo psql -h localhost -p 55432 -U algo -d algo_poc -c \
@@ -400,7 +414,8 @@ PGPASSWORD=algo psql -h localhost -p 55432 -U algo -d algo_poc -c \
 ```
 Expected after fills route: `count > 0`. If it stays 0 while orders were placed, the fill-recording path is broken and must be debugged before Gate 4 can accrue.
 - [ ] **Step 4: Confirm positions are now broker-owned** — `SELECT count(*) FROM positions WHERE account_id IS NOT NULL;` returns the newly filled positions (account_id + con_id populated), and the next day's reconciliation stays `ok`.
-- [ ] **Step 5: Accumulate Gate 4 evidence** over subsequent sessions — median slippage ≤ 20 bps and failed-order rate ≤ 1% (the divergence monitor and reconciliation reports carry these).
+- [ ] **Step 5: Make entries persistent for scheduled runs** — once the monitored run confirms fills persist, add `--no-entries-disabled` to the `run_paper.py --publish` line in **both** `deploy/launchd/run_paper.sh` and `~/ibc/run_paper.sh`, commit, and push the held commits (`f17bd88` entries-enable, `e0d3add` cap, + the wrapper change).
+- [ ] **Step 6: Accumulate Gate 4 evidence** over subsequent sessions — median slippage ≤ 20 bps and failed-order rate ≤ 1% (the divergence monitor and reconciliation reports carry these).
 
 ---
 
