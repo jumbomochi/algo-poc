@@ -80,7 +80,7 @@ def test_default_yaml_declares_mode_specific_capital_values():
 
     assert config.capital.paper.deployment_fraction == 1.0
     assert config.capital.paper.max_deployable_usd is None
-    assert config.capital.paper.entries_enabled is False
+    assert config.capital.paper.entries_enabled is True
     assert config.capital.live.deployment_fraction == 0.0
     assert config.capital.live.max_deployable_usd == 0.0
     assert config.capital.live.entries_enabled is False
@@ -106,3 +106,19 @@ def test_live_entries_require_positive_usd_reserve():
                 )
             ),
         )
+
+
+def test_paper_entries_enabled_and_guarded_by_reconciliation():
+    from services.execution.reconciliation import ReconciliationResult
+
+    cfg = load_config("config/default.yaml")
+    assert cfg.capital.paper.entries_enabled is True
+
+    # A major reconciliation must still fail-close entries regardless of config.
+    major = ReconciliationResult(
+        matched=[],
+        discrepancies=[{"type": "missing_in_db", "auto_correct": False}],
+        severity="major",
+        account_id="DUN551088",
+    )
+    assert major.entries_allowed is False

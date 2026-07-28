@@ -4,7 +4,7 @@ capital:
   paper:
     deployment_fraction: 1.0
     max_deployable_usd: null
-    entries_enabled: false
+    entries_enabled: true
   live:
     deployment_fraction: 0.0
     max_deployable_usd: 0.0
