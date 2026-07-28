@@ -3,7 +3,7 @@ mode: paper  # live | backtest | paper
 capital:
   paper:
     deployment_fraction: 1.0
-    max_deployable_usd: null
+    max_deployable_usd: 20000  # contained first entries-on run; raise after fills verified
     entries_enabled: true
   live:
     deployment_fraction: 0.0
