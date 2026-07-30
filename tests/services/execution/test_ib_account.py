@@ -86,6 +86,41 @@ async def test_account_reader_returns_contract_keyed_snapshot():
 
 
 @pytest.mark.asyncio
+async def test_account_reader_excludes_currency_cash_positions():
+    """FX currency (secType=CASH) holdings are cash, not equity-ledger positions.
+
+    A SGD->USD conversion shows up in ib.positions() as a CASH USD.SGD position.
+    It must NOT be reconciled against the durable equity book (it is already
+    captured in NAV / settled cash) — otherwise funding USD to trade creates a
+    'missing_in_db' discrepancy that force-disables entries (the catch-22).
+    """
+    ib = _fake_ib()
+    stk = SimpleNamespace(
+        conId=265598, symbol="AAPL", localSymbol="AAPL",
+        exchange="SMART", currency="USD", secType="STK",
+    )
+    cash = SimpleNamespace(
+        conId=37928772, symbol="USD", localSymbol="USD.SGD",
+        exchange="IDEALPRO", currency="SGD", secType="CASH",
+    )
+    ib.positions.return_value = [
+        SimpleNamespace(account="DUN551088", contract=stk, position=10, avgCost=100),
+        SimpleNamespace(account="DUN551088", contract=cash, position=100000, avgCost=1.29),
+    ]
+
+    snapshot = await IBAccountReader(
+        ib,
+        expected_mode="paper",
+        expected_base_currency="SGD",
+        trading_currency="USD",
+    ).snapshot()
+
+    assert 265598 in snapshot.positions          # equity position kept
+    assert 37928772 not in snapshot.positions     # FX cash position excluded
+    assert len(snapshot.positions) == 1
+
+
+@pytest.mark.asyncio
 async def test_account_reader_requires_exactly_one_managed_account():
     with pytest.raises(AccountValidationError, match="exactly one"):
         await IBAccountReader(

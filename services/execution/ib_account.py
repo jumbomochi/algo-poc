@@ -141,6 +141,13 @@ class IBAccountReader:
                     f"position belongs to unexpected account {item_account}"
                 )
             contract = item.contract
+            # FX currency (secType=CASH) holdings are cash, not equity-ledger
+            # positions — they arise from SGD->USD funding conversions and are
+            # already captured in NAV / settled_cash_trading. Reconciling them
+            # against the durable equity book would flag a spurious
+            # "missing_in_db" discrepancy and force-disable entries.
+            if str(getattr(contract, "secType", "") or "") == "CASH":
+                continue
             con_id = int(contract.conId)
             if con_id <= 0 or con_id in positions:
                 raise AccountValidationError(
