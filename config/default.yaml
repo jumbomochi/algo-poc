@@ -3,7 +3,7 @@ mode: paper  # live | backtest | paper
 capital:
   paper:
     deployment_fraction: 1.0
-    max_deployable_usd: 20000  # contained first entries-on run; raise after fills verified
+    max_deployable_usd: 100000  # deploy full converted USD book (raised from 20k)
     entries_enabled: true
   live:
     deployment_fraction: 0.0

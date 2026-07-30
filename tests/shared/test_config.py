@@ -79,7 +79,7 @@ def test_default_yaml_declares_mode_specific_capital_values():
     config = load_config("config/default.yaml")
 
     assert config.capital.paper.deployment_fraction == 1.0
-    assert config.capital.paper.max_deployable_usd == 20000
+    assert config.capital.paper.max_deployable_usd == 100000
     assert config.capital.paper.entries_enabled is True
     assert config.capital.live.deployment_fraction == 0.0
     assert config.capital.live.max_deployable_usd == 0.0
