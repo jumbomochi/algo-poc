@@ -1051,6 +1051,69 @@ class TestDurableRiskLifecycle:
         session.close()
 
     @pytest.mark.asyncio
+    async def test_drawdown_peak_excludes_uncapped_pre_rebaseline_snapshots(
+        self, mock_config, mock_redis
+    ):
+        """Peak NAV for the drawdown breaker must ignore pre-re-baseline
+        (uncapped, max_deployable_usd IS NULL) snapshots.
+
+        Before the deployment cap existed, deployable_capital == full account
+        NAV (~776k). After re-baselining and capping to 100k, an unfiltered
+        max(deployable_capital) peak reads (776k-100k)/776k = ~87% phantom
+        drawdown and liquidation-rejects every buy on an empty book.
+        """
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        session = Session(engine)
+        ledger = OrderLedger(session)
+        now = datetime.now(timezone.utc)
+        ledger.create_intent(
+            SimpleNamespace(
+                recommendation_id="cap-one", account_id="DUCAP", mode="paper",
+                portfolio="momentum", con_id=1, symbol="AAPL", exchange="SMART",
+                currency="USD", action="BUY", quantity=1, limit_price=100,
+                order_type="LMT",
+            )
+        )
+        session.add_all(
+            [
+                CapitalSnapshot(  # retired uncapped book (pre-re-baseline)
+                    account_id="DUCAP", mode="paper", net_liquidation=776_000,
+                    deployment_fraction=1, max_deployable_usd=None,
+                    deployable_capital=776_000, settled_cash_trading=776_000,
+                    sleeve_budgets={}, reconciliation_status="ok",
+                    captured_at=now - timedelta(days=3),
+                ),
+                CapitalSnapshot(  # current capped book
+                    account_id="DUCAP", mode="paper", net_liquidation=776_000,
+                    deployment_fraction=1, max_deployable_usd=100_000,
+                    deployable_capital=100_000, settled_cash_trading=100_000,
+                    sleeve_budgets={}, reconciliation_status="ok", captured_at=now,
+                ),
+            ]
+        )
+        session.commit()
+        runner = RiskServiceRunner(
+            config=mock_config, redis_client=mock_redis,
+            db_session=session, order_ledger=ledger,
+        )
+        rec = RecommendationMessage(
+            ticker="AAPL", timestamp=now, action="buy", confidence=1,
+            top_features={}, recommendation_id="cap-one", limit_price=100,
+            quantity=1, portfolio="momentum",
+        )
+        with patch.object(
+            runner._engine, "check_portfolio_drawdown",
+            return_value=RiskDecision(False, "captured", 0),
+        ) as drawdown:
+            await runner.process_recommendation(rec)
+
+        portfolio = drawdown.call_args.args[0]
+        assert portfolio.nav == 100_000
+        assert portfolio.peak_nav == 100_000  # NOT 776_000 (uncapped excluded)
+        session.close()
+
+    @pytest.mark.asyncio
     async def test_stale_capital_snapshot_fails_closed(
         self, durable_runner, mock_redis
     ):

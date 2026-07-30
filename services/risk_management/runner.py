@@ -676,11 +676,17 @@ class RiskServiceRunner:
             position["quantity"] * position["current_price"]
             for position in positions.values()
         )
+        # Drawdown high-water mark must ignore pre-re-baseline snapshots: before
+        # max_deployable_usd existed, deployable_capital == full account NAV
+        # (~776k), so an unfiltered peak makes a capped deployment (e.g. 100k)
+        # read as an ~87% phantom drawdown. Only capped-era (post-re-baseline)
+        # snapshots represent the current book. Falls back to nav when none.
         peak_nav = float(
             session.scalar(
                 select(func.max(CapitalSnapshot.deployable_capital)).where(
                     CapitalSnapshot.account_id == intent.account_id,
                     CapitalSnapshot.mode == intent.mode,
+                    CapitalSnapshot.max_deployable_usd.is_not(None),
                 )
             )
             or nav
