@@ -393,12 +393,18 @@ git commit -m "feat: re-enable paper entries (guarded by fail-closed reconciliat
 >
 > Deployment scale is already contained via `capital.paper.max_deployable_usd: 20000` (committed `e0d3add`) — supersedes the earlier "consider lowering deployment_fraction" note.
 
-- [ ] **Step 1: Rebuild + restart the stale services** (operator; recreates the paper services — not `down -v`, volumes safe):
+- [x] **Step 1: Rebuild + restart the stale services** (operator; recreates the paper services — not `down -v`, volumes safe):
 ```bash
 docker compose build execution risk-management
 docker compose up -d execution risk-management
 docker image inspect algo-poc-execution:latest algo-poc-risk-management:latest  # fresh timestamps
 ```
+
+> **Done 2026-07-29.** Two things surfaced beyond the written step:
+> 1. **Docker daemon was wedged** by the prior night's host disk-full event (the `Docker.raw` sparse file couldn't grow → VM I/O errors → daemon hung since 22:55). Recovery: `osascript -e 'quit app "Docker"'`, then `pkill -9 -f com.docker.backend`/`com.docker.virtualization` (VM data on volumes is safe across a hard VM stop), then `open -a Docker`. Server 28.3.2 responded after ~45s. Host now has ample free space; VM internal disk had 792G free (never the constraint).
+> 2. **`migrate` was also stale and must be rebuilt too.** `up -d execution risk-management` pulls in the `migrate` service via `depends_on`; the 2-week-old migrate image predated migration `b17c8e4a6d92` (which the DB is stamped at), so it aborted with `Can't locate revision 'b17c8e4a6d92'` and **blocked every dependent service from starting**. Fix: `docker compose build migrate` then re-run `up -d`. `b17c8e4a6d92` is the current *head*, so the re-run is a pure no-op upgrade (exit 0, **zero DDL applied**). Add `migrate` to this step's build list.
+>
+> The full stack was subsequently rebuilt for consistency (`docker compose build api notifications data-ingestion signal-generation ml-model` + `up -d`); all 9 services now run fresh images with clean startup logs (execution connected to IB paper `DUN551088` on 7497; risk-management loaded an empty book, nav=20000).
 - [ ] **Step 2: Monitored entries-on run — DURING US MARKET HOURS** (so limit orders fill; the scheduled 04:15 SGT job runs after close, so do the first one manually while the market is open):
 ```bash
 cd ~/GitHub/algo-poc && \
