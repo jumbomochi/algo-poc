@@ -7,6 +7,8 @@ RUN pip install --no-cache-dir .
 
 COPY shared/ shared/
 COPY scripts/ scripts/
+# projector -> scripts.paper_state -> backtest.portfolio_context
+COPY backtest/ backtest/
 COPY services/__init__.py services/__init__.py
 COPY services/portfolio_accounting/ services/portfolio_accounting/
 COPY config/ config/

@@ -162,5 +162,24 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
 
+  # Consumes stream:fills and projects fills into the durable ledger
+  # (execution_fills, positions, order-intent FILLED status). Without this
+  # service, fills publish to Redis but never persist — execution_fills stays
+  # empty and the DB book never reflects real broker positions.
+  portfolio-accounting:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: services/portfolio_accounting/Dockerfile
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      execution:
+        condition: service_started
+    environment:
+      - ALGO_MODE=paper
+      - ALGO_DATABASE_URL=postgresql://algo:algo@postgres:5432/algo_poc
+      - ALGO_REDIS_URL=redis://redis:6379/0
+
 volumes:
   pgdata:
