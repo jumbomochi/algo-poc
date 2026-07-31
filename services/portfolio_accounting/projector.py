@@ -237,13 +237,16 @@ class FillProjector:
                 f"unknown recommendation {fill.recommendation_id}"
             )
 
+        # Exchange is intentionally NOT compared: a SMART-routed intent
+        # (exchange="SMART") fills on a specific venue (NASDAQ/ARCA/IBKRATS/NYSE),
+        # so intent.exchange != fill.exchange for every real fill. Order identity
+        # is account + order_id + con_id + symbol + side; the venue is metadata.
         expected = {
             "account": (intent.account_id, fill.account_id),
             "order": (str(intent.ib_order_id), str(fill.order_id)),
             "portfolio": (intent.portfolio, fill.portfolio),
             "contract": (intent.con_id, fill.con_id),
             "symbol": (intent.symbol, fill.ticker),
-            "exchange": (intent.exchange, fill.exchange),
             "currency": (intent.currency, fill.currency),
             "side": (intent.action.upper(), fill.side.upper()),
         }

@@ -100,6 +100,7 @@ def make_fill(
     order_id: str = "42",
     account_id: str = "DU12345",
     ticker: str = "AAPL",
+    exchange: str = "SMART",
     timestamp: datetime = NOW,
 ) -> FillMessage:
     if commission_trading is None and commission_currency == "USD":
@@ -121,7 +122,7 @@ def make_fill(
         cumulative_quantity=cumulative,
         portfolio="momentum",
         con_id=265598,
-        exchange="SMART",
+        exchange=exchange,
         currency="USD",
     )
 
@@ -142,6 +143,20 @@ def get_cash(session: Session) -> float:
 
 def fill_count(session: Session) -> int:
     return int(session.scalar(select(func.count(ExecutionFill.id))) or 0)
+
+
+def test_smart_routed_fill_accepts_actual_execution_venue(projector, session):
+    """A SMART-routed order fills on a specific venue (NASDAQ/ARCA/IBKRATS/NYSE),
+    never 'SMART'. The projector must not treat the intent(SMART) vs fill(venue)
+    difference as an attribution conflict — otherwise every real fill is DLQ'd
+    and execution_fills never populates.
+    """
+    seed_intent(session)  # intent.exchange == "SMART"
+
+    assert projector.apply(make_fill(exchange="NASDAQ")) is True
+
+    assert get_position(session).quantity == 10
+    assert get_position(session).account_id == "DU12345"
 
 
 def test_replayed_buy_fill_changes_cash_once(projector, session):
