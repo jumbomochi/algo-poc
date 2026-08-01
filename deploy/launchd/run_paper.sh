@@ -30,7 +30,9 @@ fi
 
 # Run paper trading. --publish bridges the signals into the service
 # pipeline (risk -> execution -> real IB paper orders) for gates 4-6
-# evidence; the simulated book commits regardless.
+# evidence; the simulated book commits regardless. --no-entries-disabled
+# opts entries in (the CLI flag defaults True; the config gate + fail-closed
+# reconciliation still block buys unless reconciliation is `ok`).
 cd "$ALGO_DIR"
 
 # Fail loudly if the paper DB schema is behind the code's migrations.
@@ -48,7 +50,7 @@ if [ "$DB_REV" != "$HEAD_REV" ]; then
     exit 1
 fi
 
-"$VENV" scripts/run_paper.py --publish >> "$LOG_FILE" 2>&1
+"$VENV" scripts/run_paper.py --publish --no-entries-disabled >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
 
 echo "$(date): Paper trading run completed (exit code: $EXIT_CODE)" >> "$LOG_FILE"
