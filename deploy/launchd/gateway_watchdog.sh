@@ -22,6 +22,11 @@ LOG_DIR="$HOME/ibc/logs"
 LOG_FILE="$LOG_DIR/gateway_watchdog_$(date +%Y%m%d).log"
 MARKER="$HOME/ibc/.gateway_down_marker"
 AUTH_MARKER="$HOME/ibc/.gateway_auth_failure_alerted"
+# Written by the execution service on IB Error 1100 (server-connectivity lost);
+# the API port stays OPEN during a 1100, so the port check above is blind to it.
+CONN_MARKER="$HOME/ibc/state/gateway_connectivity_lost"
+CONN_ALERT_MARKER="$HOME/ibc/.gateway_connectivity_alerted"
+CONN_SUSTAINED_SECS=180        # ignore a 1100 that self-heals within one cycle
 ENV_FILE="/Users/huiliang/GitHub/algo-poc/.env"
 
 mkdir -p "$LOG_DIR"
@@ -44,6 +49,36 @@ if nc -z -G 3 127.0.0.1 "$PORT" 2>/dev/null; then
         echo "$(ts): port $PORT recovered" >> "$LOG_FILE"
         [ -f "$AUTH_MARKER" ] && telegram "✅ IB Gateway recovered: port $PORT is up again after the login problem."
         rm -f "$MARKER" "$AUTH_MARKER"
+    fi
+
+    # Port is up, but is IB *server* connectivity up? The execution service
+    # drops CONN_MARKER (epoch of the loss) on Error 1100 and removes it on
+    # recovery (1101/1102). Alert on a SUSTAINED 1100 — no kickstart, since a
+    # 1100 usually self-heals and restarting would disrupt the session.
+    if [ -f "$CONN_MARKER" ]; then
+        LOST_AT=$(cat "$CONN_MARKER" 2>/dev/null)
+        [ -n "$LOST_AT" ] || LOST_AT=0          # unreadable → treat as very old
+        AGE=$(( $(date +%s) - LOST_AT ))
+        if [ "$AGE" -ge "$CONN_SUSTAINED_SECS" ]; then
+            REALERT_SECS=$((12 * 3600))
+            NEED_ALERT=0
+            if [ ! -f "$CONN_ALERT_MARKER" ]; then
+                NEED_ALERT=1
+            else
+                LAST_ALERT=$(stat -f %m "$CONN_ALERT_MARKER" 2>/dev/null || echo 0)
+                [ $(( $(date +%s) - LAST_ALERT )) -ge "$REALERT_SECS" ] && NEED_ALERT=1
+            fi
+            if [ "$NEED_ALERT" -eq 1 ]; then
+                echo "$(ts): IB Error 1100 sustained ${AGE}s (port $PORT up) — alerting; NOT restarting" >> "$LOG_FILE"
+                telegram "🚨 IB Gateway lost server connectivity (Error 1100) for ~$((AGE / 60)) min — port $PORT is up but no market data / order routing. Watchdog will NOT restart (a 1100 usually self-heals). Check the Gateway. (Repeats every 12h until it recovers.)"
+                touch "$CONN_ALERT_MARKER"
+            fi
+        fi
+    elif [ -f "$CONN_ALERT_MARKER" ]; then
+        # 1100 cleared (execution removed CONN_MARKER on 1102) after we alerted.
+        echo "$(ts): IB connectivity restored (Error 1100 cleared)" >> "$LOG_FILE"
+        telegram "✅ IB Gateway server connectivity restored (Error 1100 cleared)."
+        rm -f "$CONN_ALERT_MARKER"
     fi
     exit 0
 fi

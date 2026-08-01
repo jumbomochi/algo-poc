@@ -115,12 +115,21 @@ services:
         condition: service_started
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    volumes:
+      # Shared with the host Gateway watchdog: execution drops a marker here on
+      # IB Error 1100 (server-connectivity lost), which the watchdog reads. The
+      # API port stays open during a 1100, so the watchdog's port check is blind
+      # to it without this signal. Defaults to the same ~/ibc tree the watchdog
+      # keeps its other markers in.
+      - ${ALGO_GATEWAY_STATE_DIR_HOST:-${HOME}/ibc/state}:/var/algo/state
     environment:
       - ALGO_MODE=paper
       - ALGO_DATABASE_URL=postgresql://algo:algo@postgres:5432/algo_poc
       - ALGO_REDIS_URL=redis://redis:6379/0
       # IB Gateway runs on the host, not in a container; reach it via the host alias.
       - ALGO_IB_HOST=host.docker.internal
+      # Where execution writes the Error-1100 marker for the host watchdog.
+      - ALGO_GATEWAY_STATE_DIR=/var/algo/state
 
   api:
     restart: unless-stopped

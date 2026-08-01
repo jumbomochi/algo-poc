@@ -2,11 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
+import time
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
 
 from shared.logging import get_logger
 
 logger = get_logger("ib_executor")
+
+# IB API system codes for server-connectivity state (delivered via errorEvent).
+IB_CONNECTIVITY_LOST = 1100  # connectivity between IB and the Gateway lost
+IB_CONNECTIVITY_RESTORED = (1101, 1102)  # restored (data lost / data maintained)
+
+# File the host Gateway watchdog reads to learn about a 1100 — the API port
+# stays open during a connectivity loss, so the watchdog's port check is blind
+# to it. Written under ALGO_GATEWAY_STATE_DIR (a host-bind-mounted dir).
+CONNECTIVITY_MARKER_NAME = "gateway_connectivity_lost"
 
 # Payload passed to the fill handler on every real IB fill (partial or full).
 FillHandler = Callable[[dict[str, Any]], Awaitable[None]]
@@ -103,6 +115,7 @@ class IBExecutor:
         port: int,
         client_id: int,
         allow_fractional: bool = False,
+        state_dir: str | Path | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -114,6 +127,13 @@ class IBExecutor:
         self._order_status_handler: OrderStatusHandler | None = None
         self._expect_paper: bool | None = None
         self._logger = get_logger("ib_executor")
+        # Where to drop the connectivity-lost marker for the host watchdog.
+        # Defaults to ALGO_GATEWAY_STATE_DIR; None disables the observer.
+        if state_dir is None:
+            state_dir = os.environ.get("ALGO_GATEWAY_STATE_DIR")
+        self._conn_marker: Path | None = (
+            Path(state_dir) / CONNECTIVITY_MARKER_NAME if state_dir else None
+        )
 
     def _effective_quantity(self, ticker: str, quantity: float) -> float:
         """Round to whole shares when the account can't trade fractions.
@@ -140,6 +160,42 @@ class IBExecutor:
     @property
     def is_connected(self) -> bool:
         return self._ib is not None and self._ib.isConnected()
+
+    def _on_ib_error(
+        self, reqId: int, errorCode: int, errorString: str, contract: Any = None
+    ) -> None:
+        """ib_insync ``errorEvent`` handler: track server connectivity.
+
+        Error 1100 means the Gateway lost its link to IB while the API socket
+        (and port) stay up — invisible to the watchdog's port check. Drop a
+        marker the host watchdog reads; clear it when connectivity is restored
+        (1101/1102). Best-effort: marker I/O must never disturb order routing.
+        """
+        if errorCode == IB_CONNECTIVITY_LOST:
+            self._mark_connectivity_lost()
+        elif errorCode in IB_CONNECTIVITY_RESTORED:
+            self._clear_connectivity_marker()
+
+    def _mark_connectivity_lost(self) -> None:
+        if self._conn_marker is None:
+            return
+        try:
+            self._conn_marker.parent.mkdir(parents=True, exist_ok=True)
+            self._conn_marker.write_text(str(int(time.time())))
+            self._logger.warning(
+                "IB connectivity lost (Error 1100) — wrote watchdog marker",
+                marker=str(self._conn_marker),
+            )
+        except Exception:
+            self._logger.exception("Failed to write connectivity-lost marker")
+
+    def _clear_connectivity_marker(self) -> None:
+        if self._conn_marker is None:
+            return
+        try:
+            self._conn_marker.unlink(missing_ok=True)
+        except Exception:
+            self._logger.exception("Failed to clear connectivity-lost marker")
 
     def set_fill_handler(self, handler: FillHandler) -> None:
         """Register the async callback invoked on every real IB fill."""
@@ -179,6 +235,9 @@ class IBExecutor:
             await self._ib.connectAsync(
                 self._host, self._port, clientId=self._client_id
             )
+            # Observe server-connectivity events (Error 1100/1101/1102). The IB
+            # instance is recreated per connect, so re-attach every time.
+            self._ib.errorEvent += self._on_ib_error
             accounts = self._ib.managedAccounts()
 
             if expect_paper:
@@ -192,6 +251,9 @@ class IBExecutor:
                         "Re-login the Gateway with the paper credentials."
                     )
 
+            # A healthy session proves server connectivity: clear any stale
+            # lost-marker left by a socket that dropped without a 1102.
+            self._clear_connectivity_marker()
             self._logger.info(
                 "Connected to IB",
                 host=self._host,
