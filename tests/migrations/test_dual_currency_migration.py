@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parents[2]
 PREVIOUS_HEAD = "d8f10a4b72c3"
 DUAL_CURRENCY_REVISION = "f6c2d9a84b31"
 COMMISSION_FX_REVISION = "b17c8e4a6d92"
+# Research candidates migration sits on top of commission_fx and is the head.
+CURRENT_HEAD_REVISION = "9b3d1c7e4a20"
 
 CAPITAL_COLUMNS = {
     "base_currency",
@@ -199,10 +201,10 @@ def test_commission_fx_upgrade_preserves_existing_execution_fill(
         assert after["commission_fx_base_per_trading"] is None
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
-        ).scalar_one() == COMMISSION_FX_REVISION
+        ).scalar_one() == CURRENT_HEAD_REVISION
 
 
-def test_fresh_upgrade_reaches_single_commission_fx_head(
+def test_fresh_upgrade_reaches_single_head(
     monkeypatch, tmp_path
 ):
     database_url = f"sqlite:///{tmp_path / 'fresh_head.db'}"
@@ -210,7 +212,7 @@ def test_fresh_upgrade_reaches_single_commission_fx_head(
     config = _config(database_url)
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        COMMISSION_FX_REVISION
+        CURRENT_HEAD_REVISION
     ]
     command.upgrade(config, "head")
 
@@ -218,7 +220,8 @@ def test_fresh_upgrade_reaches_single_commission_fx_head(
     with engine.connect() as connection:
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
-        ).scalar_one() == COMMISSION_FX_REVISION
+        ).scalar_one() == CURRENT_HEAD_REVISION
+        # commission_fx sits in the applied chain below the head.
         assert "commission_fx_base_per_trading" in _column_names(
             inspect(connection), "execution_fills"
         )

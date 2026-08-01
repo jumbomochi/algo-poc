@@ -1,7 +1,7 @@
 """add research candidates
 
 Revision ID: 9b3d1c7e4a20
-Revises: 1f7ead32f0fa
+Revises: b17c8e4a6d92
 """
 
 from typing import Sequence, Union
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 
 
 revision: str = "9b3d1c7e4a20"
-down_revision: Union[str, Sequence[str], None] = "1f7ead32f0fa"
+down_revision: Union[str, Sequence[str], None] = "b17c8e4a6d92"
 branch_labels = None
 depends_on = None
 

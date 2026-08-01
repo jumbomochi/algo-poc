@@ -13,6 +13,17 @@ from services.risk_management.engine import RiskEngine
 from shared.models.base import Base
 
 
+def run_daily(*args, **kwargs):
+    """Supply valid funding inputs so these shadow-scoping tests exercise the
+    observer path without tripping the settled-cash/reservation gates."""
+    kwargs.setdefault("settled_cash_trading", 1_000_000)
+    kwargs.setdefault("active_buy_reservations_usd", 0)
+    kwargs.setdefault("commission_per_share_usd", 0.005)
+    kwargs.setdefault("minimum_commission_usd", 1)
+    kwargs.setdefault("minimum_settled_usd_reserve", 0)
+    return run_paper.run_daily(*args, **kwargs)
+
+
 class Observer:
     def __init__(self, *, raises: bool = False, mutates: bool = False) -> None:
         self.calls: list[dict] = []
@@ -85,7 +96,7 @@ def test_paper_run_observes_raw_buy_candidate_with_final_bar_date():
     session, state, portfolios, bars = make_state_and_portfolio()
     observer = Observer()
 
-    signals = run_paper.run_daily(
+    signals = run_daily(
         state, portfolios, bars, candidate_observer=observer
     )
 
@@ -104,7 +115,7 @@ def test_paper_run_observes_candidate_rejected_by_risk():
     )
     observer = Observer()
 
-    signals = run_paper.run_daily(
+    signals = run_daily(
         state, portfolios, bars, candidate_observer=observer
     )
 
@@ -118,11 +129,11 @@ def test_paper_run_observes_candidate_rejected_by_risk():
 
 def test_observer_failure_leaves_established_fill_and_signal_unchanged():
     baseline_session, baseline_state, portfolios, bars = make_state_and_portfolio()
-    expected = run_paper.run_daily(baseline_state, portfolios, bars)
+    expected = run_daily(baseline_state, portfolios, bars)
     expected_state = deepcopy(established_paper_state(baseline_state))
 
     session, state, portfolios, bars = make_state_and_portfolio()
-    actual = run_paper.run_daily(
+    actual = run_daily(
         state, portfolios, bars, candidate_observer=Observer(raises=True)
     )
 
@@ -135,13 +146,15 @@ def test_observer_failure_leaves_established_fill_and_signal_unchanged():
 def test_mutating_observer_cannot_change_established_fill_or_signal():
     session, state, portfolios, bars = make_state_and_portfolio()
 
-    signals = run_paper.run_daily(
+    signals = run_daily(
         state, portfolios, bars, candidate_observer=Observer(mutates=True)
     )
 
     assert signals[0]["quantity"] == 1.0
     assert signals[0]["metadata"] == {"source": "established"}
-    assert state.get_positions("momentum")["AAPL"]["quantity"] == 1.0
+    # run_daily emits signals only; real IB fills are the sole input that
+    # mutates the durable book, so a mutating observer cannot leak a position.
+    assert state.get_positions("momentum") == {}
     session.close()
 
 
