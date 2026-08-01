@@ -23,7 +23,17 @@ automated assessment; record the results alongside manual verification.
 
 - [ ] Minimum **60 calendar days** of continuous paper trading completed.
 - Days elapsed: ______
-- Paper start date: ______
+- Paper start date: **2026-07-30** (clock RESTARTED — first clean
+  entries-enabled fills after the Path A re-baseline; see note below. Supersedes
+  the earlier 2026-06-24 service-stack start.)
+
+#### Clock restart — 2026-07-30 (Path A re-baseline complete)
+
+The Path A re-baseline (flatten + retire both books to empty, re-fund USD, enable
+entries) completed 2026-07-30 with the first real fills recorded. Because the
+durable book was reset to a clean, broker-reconciled baseline on that date, the
+continuous-60-day clock restarts from **2026-07-30** — this is the first day the
+live order path actually recorded fills against a reconciled book.
 
 #### Documented exception — 2026-07-01 (IB Gateway outages)
 
@@ -63,10 +73,18 @@ section below.
 
 ### Gate 4 — Execution Quality
 
+**Now ACCRUING (from 2026-07-30).** The live-order path is validated end-to-end:
+recommendations → risk-approved → execution → real IB paper fills → durable
+`execution_fills` (12 fills persisted on the first clean entries-enabled run,
+the 07-30 US open). This required deploying the previously-missing
+`portfolio-accounting` fill projector and fixing its SMART-vs-venue exchange
+check; `execution_fills` had **0 rows ever** before this. Slippage / fail-rate
+metrics accrue from here via the divergence monitor + reconciliation reports.
+
 - [ ] Median slippage **<= 20 bps**.
 - [ ] Failed-order rate **<= 1%**.
-- Median slippage: ______ bps
-- Failed-order rate: ______%
+- Median slippage: ______ bps  (accruing since 2026-07-30)
+- Failed-order rate: ______%  (accruing since 2026-07-30)
 
 ### Gate 5 — Reliability
 
@@ -76,9 +94,12 @@ section below.
 
 ### Gate 6 — Data Integrity
 
-- [ ] Latest reconciliation checks pass with **no unresolved major
+- [x] Latest reconciliation checks pass with **no unresolved major
   discrepancies**.
-- Reconciliation status: ______
+- Reconciliation status: **ok — CLEARED 2026-07-30.** Path A re-baseline
+  complete; the durable DB now matches the IB paper account exactly (12
+  broker-owned positions, con_ids match). The FX-funding CASH position no longer
+  trips reconciliation (`ib_account.py` filters `secType=CASH`).
 
 ### Gate 7 — Model Governance
 
