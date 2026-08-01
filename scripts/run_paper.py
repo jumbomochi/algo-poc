@@ -745,48 +745,6 @@ def _bar_date(value: object) -> date:
     return date.fromisoformat(str(value))
 
 
-def publish_recommendations(signals: list[dict], redis_url: str, run_date: date) -> int:
-    """Publish sleeve signals to stream:recommendations (the pipeline bridge).
-
-    Each signal becomes a RecommendationMessage carrying the sleeve's own
-    limit price and sizing; the risk service gates it and the execution
-    service places a real IB paper order. Deterministic recommendation ids
-    (date+portfolio+ticker+action) make re-runs idempotent downstream.
-
-    Returns the number of recommendations published.
-    """
-    import redis as redis_sync
-
-    from shared.schemas.messages import RecommendationMessage
-
-    conn = redis_sync.Redis.from_url(redis_url)
-    published = 0
-    try:
-        for signal in signals:
-            action = signal.get("action")
-            if action not in ("buy", "sell"):
-                continue
-            message = RecommendationMessage(
-                ticker=signal["ticker"],
-                timestamp=datetime.now(timezone.utc),
-                action=action,
-                confidence=1.0,  # rule-based sleeves carry no model confidence
-                top_features={},
-                recommendation_id=(
-                    f"sleeve-{run_date}-{signal['portfolio']}-"
-                    f"{signal['ticker']}-{action}"
-                ),
-                limit_price=signal.get("limit_price"),
-                quantity=signal.get("quantity") or None,
-                portfolio=signal.get("portfolio"),
-            )
-            conn.xadd("stream:recommendations", message.to_stream_dict())
-            published += 1
-    finally:
-        conn.close()
-    return published
-
-
 def create_signal_intents(
     session: Session,
     signals: list[dict],
