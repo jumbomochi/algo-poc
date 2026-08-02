@@ -85,6 +85,13 @@ def test_research_package_has_no_prohibited_static_imports_or_loaders():
     assert _boundary_violations(RESEARCH_ROOT) == []
 
 
+def test_evaluation_subpackage_is_scanned_by_boundary():
+    from pathlib import Path
+
+    scanned = {str(p) for p in Path("research").rglob("*.py")}
+    assert any("research/evaluation/" in p for p in scanned)
+
+
 @pytest.mark.parametrize(
     ("source", "expected_target"),
     [
