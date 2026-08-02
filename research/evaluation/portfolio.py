@@ -43,7 +43,7 @@ def quantile_long_only(
         fwd_row = fwd_row[valid]
         k = max(1, int(len(score_row) * quantile))
         held = set(score_row.sort_values(ascending=False).index[:k])
-        rets.append(float(fwd_row[list(held)].mean()))
+        rets.append(float(fwd_row[sorted(held)].mean()))
         denom = max(1, len(held))
         turns.append(len(held.symmetric_difference(prev_held)) / denom)
         ics.append(float(score_row.rank().corr(fwd_row.rank())))
