@@ -37,7 +37,8 @@ def attribute(
     forward: pd.DataFrame,
 ) -> OverlapReport:
     buckets: dict[str, list[float]] = {cohort: [] for cohort in _COHORTS}
-    for day, factor_names in factor_selections.items():
+    for day in factor_selections.keys() | baseline_selections.keys():
+        factor_names = factor_selections.get(day, set())
         baseline_names = baseline_selections.get(day, set())
         timestamp = pd.Timestamp(day)
         if timestamp not in forward.index:
