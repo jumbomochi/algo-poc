@@ -5,8 +5,15 @@ import argparse
 import hashlib
 import json
 import subprocess
+import sys
 from datetime import date
 from pathlib import Path
+
+# Allow `python scripts/run_factor_evaluation.py` to resolve first-party
+# packages when the project is not pip-installed (matches sibling scripts).
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from research.evaluation.evaluator import EvaluationConfig, evaluate_factors
 from research.evaluation.runcard import build_run_card, write_run_card
