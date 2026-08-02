@@ -18,13 +18,11 @@ def sharpe(returns: pd.Series, periods_per_year: float) -> float:
     sd = r.std(ddof=1)
     mean = r.mean()
     if sd == 0:
-        # Zero variance with zero mean is a genuine no-signal case; zero
-        # variance with a nonzero mean (e.g. a constant positive return
-        # stream) has a mathematically unbounded Sharpe ratio, so floor the
-        # denominator instead of collapsing it to 0.0.
-        if mean == 0:
-            return 0.0
-        sd = 1e-12
+        # Zero variance yields an undefined Sharpe ratio regardless of mean
+        # (constant series, positive or zero). Returning 0.0 keeps this
+        # consistent with sharpe_stats() and avoids astronomically large or
+        # non-finite values that would break JSON-serialized run cards.
+        return 0.0
     return float(mean / sd * math.sqrt(periods_per_year))
 
 

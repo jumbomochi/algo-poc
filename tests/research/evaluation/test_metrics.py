@@ -22,10 +22,15 @@ def test_norm_cdf_known_points():
 
 
 def test_sharpe_and_drawdown():
-    r = pd.Series([0.01, 0.01, 0.01, 0.01])
+    r = pd.Series([0.01, 0.02, 0.015, 0.012])
     assert sharpe(r, periods_per_year=252) > 0
     dd = max_drawdown(pd.Series([0.1, -0.5, 0.0]))
     assert round(dd, 3) == -0.5
+
+
+def test_sharpe_zero_variance_is_zero():
+    assert sharpe(pd.Series([0.01, 0.01, 0.01, 0.01]), periods_per_year=252) == 0.0
+    assert sharpe(pd.Series([0.0, 0.0, 0.0, 0.0]), periods_per_year=252) == 0.0
 
 
 def test_probabilistic_sharpe_rises_with_stronger_track_record():
