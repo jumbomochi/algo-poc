@@ -50,6 +50,31 @@ class SignalsConfig(BaseModel):
     staleness_thresholds: SignalStalenessConfig = Field(default_factory=SignalStalenessConfig)
 
 
+class SentimentSourceConfig(BaseModel):
+    enabled: bool = False
+
+
+class RedditSentimentConfig(SentimentSourceConfig):
+    subreddits: list[str] = Field(
+        default_factory=lambda: ["wallstreetbets", "stocks", "investing"]
+    )
+    posts_per_subreddit: int = 100
+
+
+class DiscordSentimentConfig(SentimentSourceConfig):
+    # Channel ids only — the bot token comes from DISCORD_BOT_TOKEN env.
+    channel_ids: list[str] = Field(default_factory=list)
+
+
+class SentimentConfig(BaseModel):
+    finnhub_news: SentimentSourceConfig = Field(default_factory=SentimentSourceConfig)
+    stocktwits: SentimentSourceConfig = Field(default_factory=SentimentSourceConfig)
+    reddit: RedditSentimentConfig = Field(default_factory=RedditSentimentConfig)
+    discord: DiscordSentimentConfig = Field(default_factory=DiscordSentimentConfig)
+    zscore_baseline_days: int = 60
+    zscore_min_baseline_days: int = 20
+
+
 class MLModelConfig(BaseModel):
     retrain_cadence_months: int = 6
     target_forward_weeks: int = 8
@@ -145,6 +170,7 @@ class AppConfig(BaseModel):
     universe: UniverseConfig = Field(default_factory=UniverseConfig)
     data_ingestion: DataIngestionConfig = Field(default_factory=DataIngestionConfig)
     signals: SignalsConfig = Field(default_factory=SignalsConfig)
+    sentiment: SentimentConfig = Field(default_factory=SentimentConfig)
     ml_model: MLModelConfig = Field(default_factory=MLModelConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
