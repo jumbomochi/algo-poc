@@ -13,3 +13,4 @@ output/
 .DS_Store
 .worktrees/
 data/cache/*.json
+.superpowers/
