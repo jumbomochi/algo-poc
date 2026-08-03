@@ -16,7 +16,7 @@ from research.evaluation.metrics import (
 )
 from research.evaluation.multiple_testing import control
 from research.evaluation.overlap import attribute, baseline_selections_from_records
-from research.evaluation.portfolio import quantile_long_only
+from research.evaluation.portfolio import quantile_long_only, top_quantile_names
 from research.factors.catalog import DEFAULT_FACTOR_IDS, build_default_registry
 from research.factors.engine import FactorEngine
 from research.factors.panel import build_factor_panel
@@ -65,6 +65,12 @@ def evaluate_factors(
     factor_ids = tuple(factor_ids) if factor_ids is not None else DEFAULT_FACTOR_IDS
     registry = build_default_registry()
     panel = build_factor_panel(bars_by_ticker)
+    # Ranking uses RAW factor scores. This is equivalent to the engine's normalized
+    #  frames ONLY while the catalog is price-only with normalization_policy='none'
+    #  (cross-sectional rank is invariant to monotone normalization). A future
+    #  cross_sectional_zscore factor masks to universe members, so before Phase 4
+    #  introduces such factors the evaluator must rank on the engine's normalized
+    #  frames, not raw compute().
     engine_snapshot = FactorEngine(registry).compute(panel, factor_ids)
     forward = forward_excess_returns(panel, config.horizon)
     n_dates = len(panel.field("close").index)
@@ -76,6 +82,8 @@ def evaluate_factors(
     per_factor_series: dict[str, dict] = {}
 
     for factor_id in factor_ids:
+        # Raw scores used for ranking — see the normalization-assumption note
+        # above the FactorEngine.compute() call.
         scores = registry.get(factor_id).compute(panel).astype(float)
         oos_returns: list[pd.Series] = []
         oos_ic: list[pd.Series] = []
@@ -97,11 +105,11 @@ def evaluate_factors(
             oos_turnover.append(series.turnover)
             for i in range(0, len(test_scores.index), config.horizon):
                 day = test_scores.index[i]
-                row = test_scores.loc[day].dropna()
-                if len(row) < config.min_names:
-                    continue
-                k = max(1, int(len(row) * quantile))
-                factor_selection[day.date()] = set(row.sort_values(ascending=False).index[:k])
+                names = top_quantile_names(
+                    test_scores.loc[day], test_forward.loc[day], quantile, config.min_names
+                )
+                if names:
+                    factor_selection[day.date()] = set(names)
         returns = pd.concat(oos_returns) if oos_returns else pd.Series(dtype=float)
         ic = pd.concat(oos_ic) if oos_ic else pd.Series(dtype=float)
         turnover = pd.concat(oos_turnover) if oos_turnover else pd.Series(dtype=float)
