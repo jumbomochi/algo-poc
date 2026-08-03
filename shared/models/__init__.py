@@ -16,6 +16,7 @@ from shared.models.order_ledger import (
 )
 from shared.models.portfolio import Position, Trade
 from shared.models.portfolio_config import PortfolioConfig
+from shared.models.research import ResearchCandidate
 from shared.models.signals import SignalRecord
 
 __all__ = [
@@ -35,6 +36,7 @@ __all__ = [
     "PortfolioConfig",
     "Position",
     "ReconciliationReport",
+    "ResearchCandidate",
     "SignalRecord",
     "Trade",
 ]

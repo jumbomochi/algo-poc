@@ -21,6 +21,7 @@ from scripts.paper_state import PaperTradingState
 from shared.models.base import Base
 from shared.models.equity_snapshot import EquitySnapshot
 from shared.models.portfolio import Position, Trade
+from shared.models.research import ResearchCandidate
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -73,6 +74,43 @@ class TestDumpAndReset:
         seed_state(session)
         reset_paper_state(session)
 
+        assert session.query(Position).count() == 0
+        assert session.query(Trade).count() == 0
+        assert session.query(EquitySnapshot).count() == 0
+        with pytest.raises(ValueError):
+            PaperTradingState.load(session)
+        session.close()
+
+    def test_reset_preserves_research_audit_history(self):
+        from scripts.run_paper import reset_paper_state
+
+        session = make_session("sqlite:///:memory:")
+        seed_state(session)
+        session.add(
+            ResearchCandidate(
+                candidate_key="a" * 64,
+                portfolio="momentum",
+                ticker="AAPL",
+                as_of=date(2026, 7, 7),
+                action="buy",
+                raw_signal={"action": "buy"},
+                factor_values={"price_momentum_126d@1.0.0": 0.25},
+                provenance={
+                    "data_cutoff": "2026-07-07",
+                    "universe_snapshot_id": "sha256:" + "1" * 64,
+                    "code_revision": "sha256:" + "2" * 64,
+                    "input_artifact_checksum": "sha256:" + "3" * 64,
+                },
+                risk_approved=False,
+                risk_reason="position cap",
+            )
+        )
+        session.commit()
+
+        reset_paper_state(session)
+
+        candidate = session.query(ResearchCandidate).one()
+        assert candidate.candidate_key == "a" * 64
         assert session.query(Position).count() == 0
         assert session.query(Trade).count() == 0
         assert session.query(EquitySnapshot).count() == 0
