@@ -163,6 +163,18 @@ class CurrencyConfig(BaseModel):
     minimum_commission_usd: float = Field(default=1.0, ge=0.0)
 
 
+class ResearchConfig(BaseModel):
+    shadow_enabled: bool = False
+    factor_ids: list[str] = Field(
+        default_factory=lambda: [
+            "price_momentum_126d",
+            "high_52w",
+            "low_volatility_63d",
+            "liquidity_20d",
+        ]
+    )
+
+
 class AppConfig(BaseModel):
     # Literal so a typo'd ALGO_MODE (e.g. "liv") fails at startup instead of
     # silently falling through to the paper port in live deployments.
@@ -181,6 +193,7 @@ class AppConfig(BaseModel):
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
     capital: CapitalConfig = Field(default_factory=CapitalConfig)
     currency: CurrencyConfig = Field(default_factory=CurrencyConfig)
+    research: ResearchConfig = Field(default_factory=ResearchConfig)
 
     @model_validator(mode="after")
     def validate_live_currency_safety(self) -> AppConfig:

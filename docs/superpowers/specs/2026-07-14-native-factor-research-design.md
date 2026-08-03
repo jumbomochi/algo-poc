@@ -392,3 +392,24 @@ No research exception may activate the portfolio kill switch unless it has alrea
 7. Ongoing decay, divergence, suspension, and retirement automation
 
 Each phase must preserve the isolation boundary and be independently deployable. Live promotion cannot be enabled until all prior validation phases and forward evidence gates pass.
+
+## Implementation status
+
+- Phases 1–2: native factor foundation and six-sleeve shadow scoring implemented.
+- Research remains disabled by default and observational only.
+- Paper/live research candidate generation is not enabled.
+- Phases 3–7, including validation, promotion, capital allocation, live recommendations, and lifecycle automation, remain unimplemented.
+
+Phase 1–2 acceptance is codified by the following automated evidence:
+
+| Boundary or behavior | Evidence |
+|---|---|
+| Four reviewed, versioned price factors and causal/future-mutation behavior | `tests/research/test_catalog.py`, `tests/research/test_engine.py`, `tests/research/test_panel.py` |
+| Rejected raw candidates retained and observer failures isolated from established backtests | `tests/backtest/test_research_shadow.py` |
+| The six canonical sleeves (`momentum`, `sector_rotation`, `thematic_momentum`, `quality_value`, `earnings_drift`, `tail_risk_hedge`) use opt-in, separately recorded shadow artifacts over one immutable snapshot; serialization preserves every sleeve's shadow field; disabled/setup-failure paths are no-ops | `tests/backtest/test_multi_portfolio.py`, `tests/backtest/test_save_results.py` |
+| Paper shadow persistence is opt-in, idempotent, independently sessioned, and failure-isolated | `tests/research/test_shadow.py`, `tests/scripts/test_run_paper_research_shadow.py` |
+| In-memory reset-helper regression clears reset-owned paper state while preserving a seeded research audit row | `tests/scripts/test_run_paper_reset.py` |
+| Research defaults off | `tests/shared/test_config.py` |
+| Research has no prohibited static import of broker, execution/risk service, Redis publishing, runtime-script, or recommendation-contract surfaces; imports of `importlib`, `runpy`, and `builtins.__import__`, plus direct `__import__` calls, are prohibited | `tests/research/test_architecture.py` |
+
+Repository-wide tests and wheel-content inspection remain release gates for this phase; command evidence and the verified commit are recorded in the Task 8 delivery report.

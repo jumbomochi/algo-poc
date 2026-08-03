@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -1821,6 +1822,7 @@ def save_results(
     metrics: dict,
     bars: dict[str, list[dict]],
     output_dir: str = "output",
+    shadow_candidates: list[dict] | None = None,
 ) -> str:
     """Serialize backtest output to a timestamped JSON file.
 
@@ -1845,6 +1847,7 @@ def save_results(
         "dates": dates,
         "metrics": metrics,
         "bars": bars,
+        "shadow_candidates": shadow_candidates or [],
     }
 
     with open(path, "w") as f:
@@ -1883,6 +1886,7 @@ def save_multi_portfolio_results(
             "portfolio_values": result.portfolio_values,
             "dates": result.dates,
             "metrics": result.metrics,
+            "shadow_candidates": result.shadow_candidates,
         }
 
     payload = {
@@ -1897,6 +1901,40 @@ def save_multi_portfolio_results(
 
     print(f"Results saved to {path}")
     return path
+
+
+def _create_backtest_shadow_recorders(
+    *,
+    enabled: bool,
+    bars_by_ticker: dict[str, list[dict]],
+    portfolio_names: Iterable[str],
+) -> dict[str, Any]:
+    """Create isolated per-sleeve observers over one factor snapshot index."""
+    if not enabled:
+        return {}
+
+    try:
+        from research.factors.catalog import (
+            DEFAULT_FACTOR_IDS,
+            build_default_registry,
+        )
+        from research.factors.engine import FactorEngine
+        from research.factors.panel import build_factor_panel
+        from research.shadow import InMemoryShadowRecorder
+
+        snapshots = FactorEngine(build_default_registry()).compute(
+            build_factor_panel(bars_by_ticker), DEFAULT_FACTOR_IDS
+        )
+        return {
+            name: InMemoryShadowRecorder(snapshots)
+            for name in portfolio_names
+        }
+    except Exception as exc:
+        print(
+            "WARNING: Research shadow setup failed; backtest is unchanged "
+            f"({exc})"
+        )
+        return {}
 
 
 def main():
@@ -1937,6 +1975,11 @@ def main():
         type=float,
         default=0.25,
         help="Minimum incoming score improvement for score_margin (default: 0.25)",
+    )
+    parser.add_argument(
+        "--research-shadow",
+        action="store_true",
+        help="Record factor snapshots for every raw sleeve buy candidate",
     )
     args = parser.parse_args()
 
@@ -2187,6 +2230,12 @@ def main():
                 risk_engine=pc.risk_engine,
             )
 
+    shadow_recorders = _create_backtest_shadow_recorders(
+        enabled=args.research_shadow,
+        bars_by_ticker=bars_by_ticker,
+        portfolio_names=portfolios,
+    )
+
     # 3. Run backtest for each portfolio
     print(f"Step 3: Running backtest ({len(portfolios)} portfolio(s))...")
     t0 = time.time()
@@ -2194,7 +2243,14 @@ def main():
     for name, pc in portfolios.items():
         print(f"  Running portfolio '{name}' (${pc.capital:,.0f})...")
         runner = BacktestRunner(executor=executor, initial_capital=pc.capital)
-        results[name] = runner.run(bars_by_ticker, pc.signals_fn, pc.risk_engine, trade_start_date=trade_start_date)
+        results[name] = runner.run(
+            bars_by_ticker,
+            pc.signals_fn,
+            pc.risk_engine,
+            trade_start_date=trade_start_date,
+            candidate_observer=shadow_recorders.get(name),
+            portfolio_name=name,
+        )
     elapsed = time.time() - t0
 
     # Enrich trades with bar-derived features (for ML training)
@@ -2281,6 +2337,7 @@ def main():
             metrics=result.metrics,
             bars=bars_by_ticker,
             output_dir=args.output_dir,
+            shadow_candidates=result.shadow_candidates,
         )
     else:
         save_multi_portfolio_results(

@@ -202,7 +202,7 @@ def test_commission_fx_upgrade_preserves_existing_execution_fill(
         ).scalar_one() == COMMISSION_FX_REVISION
 
 
-def test_fresh_upgrade_reaches_single_commission_fx_head(
+def test_fresh_upgrade_reaches_single_head(
     monkeypatch, tmp_path
 ):
     database_url = f"sqlite:///{tmp_path / 'fresh_head.db'}"

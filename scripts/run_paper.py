@@ -19,11 +19,12 @@ import argparse
 import asyncio
 import json
 import sys
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 # When invoked as ``python scripts/run_paper.py``, Python otherwise resolves
 # editable-package imports from the primary checkout instead of this worktree.
@@ -77,6 +78,13 @@ from shared.models import CapitalSnapshot, OrderIntent, OrderStatus
 from shared.observability import DEFAULT_TRADING_METRICS
 from services.execution.ib_account import IBAccountReader
 from services.execution.reconciliation import ReconciliationResult
+from shared.logging import get_logger
+
+if TYPE_CHECKING:
+    from research.shadow import CandidateObserver
+
+
+logger = get_logger("run_paper")
 
 # Capital allocations across the 6 active sleeves.
 # mean_reversion and short_term_mr were dropped 2026-05-26 after both posted
@@ -514,6 +522,7 @@ def run_daily(
     commission_per_share_usd: float,
     minimum_commission_usd: float,
     minimum_settled_usd_reserve: float,
+    candidate_observer: CandidateObserver | None = None,
 ) -> list[dict]:
     """Run one daily cycle: generate signals for all portfolios.
 
@@ -635,6 +644,20 @@ def run_daily(
                         )
                         + accepted_buy_notional.get(name, 0.0),
                     )
+                    if candidate_observer is not None:
+                        try:
+                            candidate_observer.observe(
+                                portfolio=name,
+                                ticker=ticker,
+                                as_of=_bar_date(bars[-1]["date"]),
+                                signal=deepcopy(signal),
+                                risk_approved=bool(decision.approved),
+                                risk_reason=str(decision.reason),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Research shadow observer failed; paper trading is unchanged"
+                            )
                     if not decision.approved:
                         print(
                             f"  SKIP {ticker:>6s}  {qty:>8.4f} @ ${price:>8.2f}  [{name}] ({decision.reason})"
@@ -712,6 +735,14 @@ def _contract_by_symbol(
     }
     result.update(contract_details or {})
     return result
+
+
+def _bar_date(value: object) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value))
 
 
 def create_signal_intents(
@@ -987,7 +1018,60 @@ def _parser(default_db_url: str, default_redis_url: str) -> argparse.ArgumentPar
     parser.add_argument(
         "--redis-url", default=default_redis_url, help="Redis URL for --publish"
     )
+    parser.add_argument(
+        "--research-shadow",
+        action="store_true",
+        help="Record observational factor snapshots for raw buy candidates",
+    )
     return parser
+
+
+def _create_research_shadow(
+    *,
+    enabled: bool,
+    bars_by_ticker: dict[str, list[dict]],
+    factor_ids: list[str] | None,
+    db_url: str,
+) -> tuple[CandidateObserver | None, Session | None]:
+    """Build optional paper shadow scoring without entering the paper session.
+
+    Every setup failure is observational: the caller receives no observer and
+    proceeds with the established paper run. A session created before recorder
+    construction fails is closed here; successful sessions are returned for
+    the caller to close after signal execution.
+    """
+    if not enabled:
+        return None, None
+
+    research_session: Session | None = None
+    try:
+        from research.factors.catalog import (
+            DEFAULT_FACTOR_IDS,
+            build_default_registry,
+        )
+        from research.factors.engine import FactorEngine
+        from research.factors.panel import build_factor_panel
+        from research.shadow import SQLShadowRecorder
+
+        selected_factor_ids = (
+            list(factor_ids) if factor_ids is not None else list(DEFAULT_FACTOR_IDS)
+        )
+        snapshots = FactorEngine(build_default_registry()).compute(
+            build_factor_panel(bars_by_ticker), selected_factor_ids
+        )
+        research_session = make_db_session(db_url)
+        observer = SQLShadowRecorder(research_session, snapshots)
+        return observer, research_session
+    except Exception:
+        if research_session is not None:
+            try:
+                research_session.close()
+            except Exception:
+                logger.exception("Research shadow setup session close failed")
+        logger.exception(
+            "Research shadow setup failed; paper trading is unchanged"
+        )
+        return None, None
 
 
 def main():
@@ -1153,6 +1237,12 @@ def main():
     # Signal evaluation never projects fills.  Actual IB executions are the
     # only input allowed to mutate durable cash and positions.
     print(f"\nRunning signals across {len(portfolios)} portfolios...")
+    candidate_observer, research_session = _create_research_shadow(
+        enabled=args.research_shadow,
+        bars_by_ticker=bars_by_ticker,
+        factor_ids=_config.research.factor_ids if _config is not None else None,
+        db_url=args.db_url,
+    )
     try:
         reservations = {
             name: context.reserved_notional
@@ -1183,6 +1273,7 @@ def main():
             minimum_settled_usd_reserve=(
                 _config.currency.minimum_settled_usd_reserve
             ),
+            candidate_observer=candidate_observer,
         )
         if args.publish and signals:
             contracts = resolve_contract_details_from_ib(
@@ -1203,6 +1294,16 @@ def main():
         session.rollback()
         print("\nERROR: daily run failed; database changes rolled back")
         raise
+    finally:
+        # Only the research shadow session is closed here; the paper `session`
+        # stays open for the publish bridge below and is closed at the end.
+        if research_session is not None:
+            try:
+                research_session.close()
+            except Exception:
+                logger.exception(
+                    "Research shadow session close failed; paper trading is unchanged"
+                )
 
     if signals:
         print(f"\n{len(signals)} signals generated")
