@@ -5,7 +5,7 @@ Additive only: three new tables for the social-sentiment research pipeline
 No existing table is touched.
 
 Revision ID: 52cd3dc99a3f
-Revises: b17c8e4a6d92
+Revises: 9b3d1c7e4a20
 Create Date: 2026-08-02
 
 """
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 
 
 revision: str = "52cd3dc99a3f"
-down_revision: Union[str, Sequence[str], None] = "b17c8e4a6d92"
+down_revision: Union[str, Sequence[str], None] = "9b3d1c7e4a20"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
