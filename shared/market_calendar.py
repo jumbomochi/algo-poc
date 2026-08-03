@@ -30,13 +30,13 @@ class MarketCalendar:
     def get_last_session_close(self, dt: datetime) -> datetime:
         d = dt.astimezone(ET).date()
         prev = self._cal.previous_close(d)
-        return prev.to_pydatetime().replace(tzinfo=ET)
+        return prev.to_pydatetime().astimezone(ET)
 
     def get_next_market_close(self, dt: datetime) -> datetime:
         d = dt.astimezone(ET).date()
-        if self._cal.is_session(d):
-            close = self._cal.session_close(d)
-            return close.to_pydatetime().replace(tzinfo=ET)
-        next_session = self._cal.next_session(d)
-        close = self._cal.session_close(next_session)
-        return close.to_pydatetime().replace(tzinfo=ET)
+        # date_to_session(direction="next") returns d itself when d is
+        # already a session, otherwise the next session after d — this
+        # also handles weekends/holidays, which next_session() rejects.
+        session = self._cal.date_to_session(d, direction="next")
+        close = self._cal.session_close(session)
+        return close.to_pydatetime().astimezone(ET)
