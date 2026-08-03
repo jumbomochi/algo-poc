@@ -43,7 +43,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["shared", "services", "backtest"]
+packages = ["shared", "services", "backtest", "sentiment"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
