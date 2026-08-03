@@ -183,7 +183,7 @@ def test_commission_fx_upgrade_preserves_existing_execution_fill(
             "FROM execution_fills WHERE execution_id = 'exec-1'"
         )).mappings().one()
 
-    command.upgrade(config, "head")
+    command.upgrade(config, COMMISSION_FX_REVISION)
 
     with engine.connect() as connection:
         assert "commission_fx_base_per_trading" in _column_names(
@@ -209,16 +209,15 @@ def test_fresh_upgrade_reaches_single_commission_fx_head(
     monkeypatch.setenv("ALGO_DATABASE_URL", database_url)
     config = _config(database_url)
 
-    assert ScriptDirectory.from_config(config).get_heads() == [
-        COMMISSION_FX_REVISION
-    ]
+    heads = ScriptDirectory.from_config(config).get_heads()
+    assert len(heads) == 1
     command.upgrade(config, "head")
 
     engine = create_engine(database_url)
     with engine.connect() as connection:
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
-        ).scalar_one() == COMMISSION_FX_REVISION
+        ).scalar_one() == heads[0]
         assert "commission_fx_base_per_trading" in _column_names(
             inspect(connection), "execution_fills"
         )
