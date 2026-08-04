@@ -115,11 +115,15 @@ def judge(
 def evaluate_source(session: Session, source: str, bars: dict[str, list[dict]]) -> SourceVerdict:
     daily = load_daily(session, source)
     all_sessions = sorted({d for bars_ in bars.values() for d in (b["date"] for b in bars_)})
-    if len(daily):
-        window = [
-            s for s in all_sessions
-            if daily["session_date"].min() <= s <= daily["session_date"].max()
-        ]
+    if len(daily) and all_sessions:
+        # Window runs from this source's first observed session (sources
+        # legitimately start collecting at different times — leading
+        # absence isn't an outage) through the LAST session in the bars
+        # cache (the end of the evaluation period), so a source that goes
+        # dark and never resumes still shows up as a growing gap fraction
+        # instead of being clipped to its own last-seen date.
+        start = daily["session_date"].min()
+        window = [s for s in all_sessions if s >= start]
     else:
         window = []
     _, gap_fraction = gap_report(daily, window)
