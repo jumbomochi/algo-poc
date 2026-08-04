@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.algopoc.sentiment-collect</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>python3</string>
+        <string>scripts/collect_sentiment.py</string>
+        <string>--aggregate-days</string>
+        <string>5</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/huiliang/GitHub/algo-poc</string>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Fill in before bootstrapping; never commit real values. -->
+        <key>FINNHUB_API_KEY</key>
+        <string>REPLACE_ME</string>
+        <key>REDDIT_CLIENT_ID</key>
+        <string>REPLACE_ME</string>
+        <key>REDDIT_CLIENT_SECRET</key>
+        <string>REPLACE_ME</string>
+        <key>REDDIT_USER_AGENT</key>
+        <string>algo-poc-sentiment/0.1</string>
+        <key>DISCORD_BOT_TOKEN</key>
+        <string>REPLACE_ME</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/huiliang/GitHub/algo-poc/output/logs/sentiment-collect.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/huiliang/GitHub/algo-poc/output/logs/sentiment-collect.err.log</string>
+</dict>
+</plist>
