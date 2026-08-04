@@ -63,3 +63,24 @@ def test_cursor_default_then_roundtrip(session):
     assert get_cursor(session, "reddit", default) == default
     set_cursor(session, "reddit", NOW)
     assert get_cursor(session, "reddit", default) == NOW
+
+
+def test_store_truncates_oversized_url(session):
+    # A 600-char url would overflow the sentiment_messages.url VARCHAR(500)
+    # column on Postgres and abort the whole batch commit (SQLite, used in
+    # this test, doesn't enforce the length at all — the defensive
+    # truncation in store_messages is what actually protects production).
+    long_url = "https://example.com/" + ("a" * 600)
+    msg = RawMessage(
+        source="stocktwits",
+        source_id="m-long-url",
+        ticker="AAPL",
+        text="great quarter",
+        posted_at=NOW,
+        url=long_url,
+    )
+    n = store_messages(session, [msg], FakeScorer())
+    assert n == 1
+    row = session.query(SentimentMessage).one()
+    assert len(row.url) == 500
+    assert row.url == long_url[:500]

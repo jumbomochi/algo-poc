@@ -27,40 +27,57 @@ class DiscordSource:
 
     def __init__(self, bot_token: str, channel_ids: list[str], http_client=None) -> None:
         self._headers = {"Authorization": f"Bot {bot_token}"}
-        self._channel_ids = channel_ids
+        self.channel_ids = channel_ids
         self._client = http_client or httpx.Client(timeout=30)
 
-    def fetch(self, tickers: list[str], since: datetime) -> list[RawMessage]:
+    def cursor_key(self, channel_id: str) -> str:
+        """Per-channel cursor key (shared/models/sentiment.py documents this
+        convention): channels are independent streams with independent
+        history, so a stalled channel shouldn't hold back the others behind
+        a single shared `discord` cursor."""
+        return f"discord:{channel_id}"
+
+    def fetch_channel(self, channel_id: str, tickers: list[str], since: datetime) -> list[RawMessage]:
         universe = set(tickers)
         out: list[RawMessage] = []
-        for channel_id in self._channel_ids:
-            after = snowflake_for(since)
-            while True:
-                resp = self._client.get(
-                    f"{self.BASE_URL}/channels/{channel_id}/messages",
-                    params={"after": after, "limit": _PAGE_SIZE},
-                    headers=self._headers,
-                )
-                resp.raise_for_status()
-                batch = sorted(resp.json(), key=lambda m: int(m["id"]))
-                if not batch:
-                    break
-                for item in batch:
-                    posted = datetime.fromisoformat(item["timestamp"])
-                    for ticker in extract_tickers(item.get("content", ""), universe):
-                        out.append(
-                            RawMessage(
-                                source=self.name,
-                                source_id=f"{channel_id}:{item['id']}",
-                                ticker=ticker,
-                                text=item["content"],
-                                posted_at=posted,
-                                author=(item.get("author") or {}).get("username"),
-                                provider_score=None,
-                                meta={"channel_id": channel_id},
-                            )
+        after = snowflake_for(since)
+        while True:
+            resp = self._client.get(
+                f"{self.BASE_URL}/channels/{channel_id}/messages",
+                params={"after": after, "limit": _PAGE_SIZE},
+                headers=self._headers,
+            )
+            resp.raise_for_status()
+            batch = sorted(resp.json(), key=lambda m: int(m["id"]))
+            if not batch:
+                break
+            for item in batch:
+                posted = datetime.fromisoformat(item["timestamp"])
+                for ticker in extract_tickers(item.get("content", ""), universe):
+                    out.append(
+                        RawMessage(
+                            source=self.name,
+                            source_id=f"{channel_id}:{item['id']}",
+                            ticker=ticker,
+                            text=item["content"],
+                            posted_at=posted,
+                            author=(item.get("author") or {}).get("username"),
+                            provider_score=None,
+                            meta={"channel_id": channel_id},
                         )
-                after = batch[-1]["id"]
-                if len(batch) < _PAGE_SIZE:
-                    break
+                    )
+            after = batch[-1]["id"]
+            if len(batch) < _PAGE_SIZE:
+                break
+        return out
+
+    def fetch(self, tickers: list[str], since: datetime) -> list[RawMessage]:
+        """Single-cursor fetch across all channels — satisfies
+        SentimentSourceProtocol for callers that don't need per-channel
+        cursors. `scripts/collect_sentiment.py` uses `fetch_channel` directly
+        instead, so each channel's cursor advances independently.
+        """
+        out: list[RawMessage] = []
+        for channel_id in self.channel_ids:
+            out.extend(self.fetch_channel(channel_id, tickers, since))
         return out
