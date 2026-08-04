@@ -7,11 +7,7 @@
     <string>com.algopoc.sentiment-collect</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/env</string>
-        <string>python3</string>
-        <string>scripts/collect_sentiment.py</string>
-        <string>--aggregate-days</string>
-        <string>5</string>
+        <string>/Users/huiliang/GitHub/algo-poc/ops/launchd/run_sentiment_collect.sh</string>
     </array>
     <key>WorkingDirectory</key>
     <string>/Users/huiliang/GitHub/algo-poc</string>

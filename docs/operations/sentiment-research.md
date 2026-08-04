@@ -16,6 +16,36 @@ This pipeline is research-only. It never touches the trading path.
 3. Copy `ops/launchd/com.algopoc.sentiment-collect.plist` to
    `~/Library/LaunchAgents/`, fill in the env vars, then:
    `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.algopoc.sentiment-collect.plist`
+   (the plist points at the committed `ops/launchd/run_sentiment_collect.sh`
+   wrapper, which does the `cd`, `ALGO_DATABASE_URL` export, and invokes
+   `.venv/bin/python`; secrets stay in the plist's `EnvironmentVariables`).
+
+### First-run verification
+
+After bootstrapping, wait for the first hourly cycle (or run
+`ops/launchd/run_sentiment_collect.sh` once by hand) and confirm:
+
+- A `collection_cycle_done` line appears in
+  `output/logs/sentiment-collect.log` — this confirms the wrapper's
+  `.venv/bin/python` resolution and `ALGO_DATABASE_URL` wiring both work end
+  to end, not just that the plist loaded.
+- StockTwits returns HTTP 200 from the launchd host on day one. It 403'd
+  from a dev network during implementation — StockTwits has no credentials
+  to fail loudly on, so per-source failure isolation would otherwise let a
+  403 degrade silently into a permanent collection gap for that source.
+  Check with: `grep stocktwits output/logs/sentiment-collect.log` and
+  confirm `source_collected` (not `source_fetch_failed`) for `stocktwits`.
+
+## Recovery after an outage
+
+Raw messages survive gaps (a stopped launchd job just means a longer `since`
+window on the next run), but the hourly job only rebuilds the last 5
+sessions of `sentiment_daily` (`--aggregate-days 5`), so a longer outage
+leaves a hole in the aggregate table that the routine cycle will never
+backfill on its own. After downtime, rerun the aggregation with a window
+wide enough to cover the hole:
+`python scripts/collect_sentiment.py --aggregate-days <N>` where `<N>` is
+at least the number of days of the outage plus a few days of padding.
 
 ## Daily operation
 
