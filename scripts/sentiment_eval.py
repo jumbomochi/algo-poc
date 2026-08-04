@@ -57,6 +57,13 @@ class SourceVerdict:
     verdict: str
 
 
+# NOTE: IC and event-study direction are computed on `weighted_score` (the
+# default score_column below), while sentiment_zscore/volume_zscore spike
+# detection is derived from mean_score upstream in sentiment/aggregate.py.
+# This is intentional, not an inconsistency to fix — the two scores answer
+# different questions (weighted_score favors high-engagement messages for
+# the return-prediction tests here; mean_score treats every message equally
+# for the plain "is this an anomalous day" spike test).
 def load_daily(session: Session, source: str, score_column: str = "weighted_score") -> pd.DataFrame:
     rows = session.execute(
         select(SentimentDaily).where(SentimentDaily.source == source)

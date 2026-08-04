@@ -38,7 +38,7 @@ class FinnhubNewsSource:
             resp.raise_for_status()
             for item in resp.json():
                 posted = datetime.fromtimestamp(item["datetime"], tz=timezone.utc)
-                if posted < since:
+                if posted <= since:
                     continue
                 text = item["headline"]
                 if item.get("summary"):
