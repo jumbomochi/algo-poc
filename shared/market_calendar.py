@@ -40,3 +40,9 @@ class MarketCalendar:
         session = self._cal.date_to_session(d, direction="next")
         close = self._cal.session_close(session)
         return close.to_pydatetime().astimezone(ET)
+
+    def trading_sessions(self, start: date, end: date) -> list[date]:
+        """Trading session dates in [start, end], ascending. Used to build a
+        zero-filled baseline (sentiment/aggregate.py) that includes quiet
+        sessions the raw archive has no row for."""
+        return [ts.date() for ts in self._cal.sessions_in_range(start, end)]
