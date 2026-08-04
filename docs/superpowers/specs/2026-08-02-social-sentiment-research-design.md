@@ -96,7 +96,11 @@ One Alembic migration adding three tables (SQLAlchemy models in
 - **`sentiment_daily`** — per `(ticker, date, source)`: `message_count`,
   `mean_score`, `weighted_score`, `score_std`, `unique_authors`,
   `sentiment_zscore`, `volume_zscore` (both vs that ticker's trailing 60-day
-  baseline). Rebuilt from raw by `aggregate.py`; the day boundary is NYSE
+  baseline). Volume z-score baselines are session-based with zero-fill for
+  quiet sessions (a ticker's silence still counts as a real zero); score
+  z-score baselines remain message-days only, since sentiment on a day with
+  no mentions is undefined rather than zero (decision 2026-08-04, pre-data).
+  Rebuilt from raw by `aggregate.py`; the day boundary is NYSE
   close via `shared/market_calendar.py`. Rebuildable at any time from
   `sentiment_messages`.
 - **`sentiment_cursors`** — last-fetched position per source/channel, so

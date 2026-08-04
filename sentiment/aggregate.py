@@ -106,6 +106,9 @@ def rebuild_daily(
             session.add(row)
         session.flush()
 
+        # Score baseline: message-days only — a ticker's sentiment on days it
+        # wasn't mentioned is undefined, not zero, so those days are simply
+        # absent from the sample (trailing `baseline_days` ROWS with data).
         baseline_rows = session.execute(
             select(SentimentDaily)
             .where(
@@ -117,10 +120,44 @@ def rebuild_daily(
             .limit(baseline_days)
         ).scalars().all()
         score_baseline = [r.mean_score for r in baseline_rows if r.mean_score is not None]
-        volume_baseline = [float(r.message_count) for r in baseline_rows]
         row.sentiment_zscore = (
             _zscore(mean, score_baseline, min_baseline_days) if mean is not None else None
         )
+
+        # Volume baseline: trailing `baseline_days` SESSIONS (not rows),
+        # zero-filling sessions with no row. Rows-only baselines are biased
+        # high for sparsely-mentioned tickers (quiet sessions just don't
+        # contribute a data point instead of contributing a real zero),
+        # which understates how anomalous a spike actually is. The zero-fill
+        # window is bounded below by this ticker's first-seen session for
+        # this source — sessions before the ticker was ever observed aren't
+        # "quiet", they don't exist yet, so they must not be zero-filled.
+        first_seen = session.execute(
+            select(SentimentDaily.session_date)
+            .where(
+                SentimentDaily.ticker == ticker,
+                SentimentDaily.source == source,
+                SentimentDaily.session_date < session_day,
+            )
+            .order_by(SentimentDaily.session_date.asc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if first_seen is None:
+            volume_baseline: list[float] = []
+        else:
+            # Generous calendar padding (>2x baseline_days) so the trading
+            # calendar has more than enough sessions to trim to the trailing
+            # `baseline_days`, weekends/holidays included.
+            padded_start = session_day - timedelta(days=baseline_days * 2 + 15)
+            candidate_sessions = cal.trading_sessions(padded_start, session_day - timedelta(days=1))
+            window_sessions = candidate_sessions[-baseline_days:] if candidate_sessions else []
+            fill_sessions = [s for s in window_sessions if s >= first_seen]
+            counts_by_session = {
+                r.session_date: r.message_count
+                for r in baseline_rows
+                if r.session_date >= (window_sessions[0] if window_sessions else session_day)
+            }
+            volume_baseline = [float(counts_by_session.get(s, 0)) for s in fill_sessions]
         row.volume_zscore = _zscore(float(len(msgs)), volume_baseline, min_baseline_days)
         upserted += 1
 

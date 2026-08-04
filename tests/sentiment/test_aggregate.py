@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import statistics
 from datetime import date, datetime, timezone
 
 import pytest
@@ -114,3 +115,52 @@ def test_zscore_with_planted_baseline(session):
     )
     assert loud.volume_zscore is not None and loud.volume_zscore > 2
     assert loud.sentiment_zscore is not None and loud.sentiment_zscore > 2
+
+
+def test_volume_baseline_zero_fills_quiet_sessions(session):
+    # Sparse mentions: real activity on only every OTHER trading session,
+    # nothing at all (no row) on the rest — a rows-only baseline would only
+    # ever see the constant "2 messages" days and (with std == 0) report
+    # volume_zscore as None for the spike. Zero-filling the quiet sessions
+    # is what makes the spike detectable at all.
+    all_days = [d for d in (date(2026, 6, 1 + i) for i in range(0, 26)) if CAL.is_trading_day(d)]
+    sessions = all_days[:-1]
+    spike_day = all_days[-1]
+    assert len(sessions) >= 10
+
+    active_count = {}
+    for i, d in enumerate(sessions):
+        if i % 2 == 0:
+            dt = datetime(d.year, d.month, d.day, 15, 0, tzinfo=timezone.utc)
+            add_message(session, "AAPL", dt, provider=0.1, author=f"u{i}a", source_id=f"s{i}a")
+            add_message(session, "AAPL", dt, provider=0.1, author=f"u{i}b", source_id=f"s{i}b")
+            active_count[d] = 2
+
+    spike_dt = datetime(spike_day.year, spike_day.month, spike_day.day, 15, 0, tzinfo=timezone.utc)
+    for i in range(8):
+        add_message(session, "AAPL", spike_dt, provider=0.5, author=f"spike{i}", source_id=f"spike{i}")
+
+    rebuild_daily(session, CAL, sessions[0], spike_day, baseline_days=60, min_baseline_days=5)
+
+    loud = (
+        session.query(SentimentDaily)
+        .filter(SentimentDaily.ticker == "AAPL", SentimentDaily.session_date == spike_day)
+        .one()
+    )
+    assert loud.message_count == 8
+
+    # Independently reconstruct the expected zero-filled baseline: every
+    # session strictly before the spike, real count where a message landed,
+    # 0.0 where it didn't (this is exactly what the fix is meant to produce —
+    # the rows-only method would have silently dropped the zero days).
+    expected_baseline = [float(active_count.get(d, 0)) for d in sessions]
+    expected_mean = statistics.fmean(expected_baseline)
+    expected_std = statistics.pstdev(expected_baseline)
+    expected_z = (8.0 - expected_mean) / expected_std
+
+    # Under the old rows-only method the baseline would have been a constant
+    # [2.0, 2.0, ...] (std == 0), which by design yields volume_zscore=None —
+    # the zero-fill is what makes this a real, non-None number.
+    assert loud.volume_zscore is not None
+    assert loud.volume_zscore == pytest.approx(expected_z)
+    assert loud.volume_zscore > 2
