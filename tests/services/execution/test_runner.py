@@ -223,6 +223,47 @@ def durable_runner(
     return runner, ledger
 
 
+class TestAbsentOrderRecovery:
+    @pytest.mark.asyncio
+    async def test_absent_order_expires_partially_filled_intent(
+        self, durable_runner, ledger_session
+    ):
+        """An order gone from IB after a session boundary terminalizes a
+        partially-filled intent to EXPIRED while preserving the filled shares."""
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="16", filled_quantity=6)
+        ledger.transition("rec-1", OrderStatus.PARTIALLY_FILLED)
+        ledger_session.commit()
+
+        await runner.handle_ib_order_status({
+            "order_id": "16",
+            "status": "Expired",
+            "reason": "order absent from IB after session boundary",
+            "order_absent_at_ib": True,
+        })
+
+        intent = ledger.get("rec-1")
+        assert intent.status == OrderStatus.EXPIRED.value
+        assert intent.filled_quantity == pytest.approx(6)
+        assert intent.terminal_at is not None
+
+    @pytest.mark.asyncio
+    async def test_absent_order_expires_unfilled_submitted_intent(
+        self, durable_runner, ledger_session
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="17", filled_quantity=0)
+        ledger_session.commit()
+
+        await runner.handle_ib_order_status({
+            "order_id": "17",
+            "status": "Expired",
+            "order_absent_at_ib": True,
+        })
+
+        assert ledger.get("rec-1").status == OrderStatus.EXPIRED.value
+
+
 class TestDurableExecutionIdentity:
     @pytest.mark.asyncio
     async def test_submission_persists_order_id_before_return(

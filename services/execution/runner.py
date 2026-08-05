@@ -530,7 +530,13 @@ class ExecutionServiceRunner:
         ):
             reason = "IB completed order is Inactive"
         target: OrderStatus | None = None
-        if broker_status in {"Cancelled", "ApiCancelled"}:
+        if status_info.get("order_absent_at_ib") is True:
+            # Order vanished from IB after a session boundary (see
+            # IBExecutor.restore_order_by_ref). Terminalize to EXPIRED whether or
+            # not it partially filled — any filled shares are already recorded
+            # and are preserved by the transition.
+            target = OrderStatus.EXPIRED
+        elif broker_status in {"Cancelled", "ApiCancelled"}:
             target = OrderStatus.CANCELLED
         elif broker_status == "Inactive" and reason:
             target = (
