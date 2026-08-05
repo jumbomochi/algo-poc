@@ -278,6 +278,44 @@ class TestIBExecutionIdentity:
         })
 
     @pytest.mark.asyncio
+    async def test_restart_expires_order_absent_from_ib_entirely(self):
+        """A day order gone from both open and completed history at IB after a
+        session boundary must be terminalized, not left to crash the service."""
+        from services.execution.ib_executor import IBExecutor
+
+        executor = IBExecutor("h", 7497, 1)
+        fake_ib = MagicMock()
+        fake_ib.isConnected.return_value = True
+        fake_ib.openTrades.return_value = []
+        fake_ib.reqCompletedOrdersAsync = AsyncMock(return_value=[])
+        executor._ib = fake_ib
+        handler = AsyncMock()
+        executor.set_order_status_handler(handler)
+
+        restored = await executor.restore_order_by_ref("rec-1", "9")
+
+        assert restored is False
+        payload = handler.await_args.args[0]
+        assert payload["order_id"] == "9"
+        assert payload["order_absent_at_ib"] is True
+        assert payload["status"] == "Expired"
+
+    @pytest.mark.asyncio
+    async def test_absent_order_without_handler_still_fails_closed(self):
+        """Without a status handler there is no safe terminalization path, so
+        the fail-closed None (caller raises) is preserved."""
+        from services.execution.ib_executor import IBExecutor
+
+        executor = IBExecutor("h", 7497, 1)
+        fake_ib = MagicMock()
+        fake_ib.isConnected.return_value = True
+        fake_ib.openTrades.return_value = []
+        fake_ib.reqCompletedOrdersAsync = AsyncMock(return_value=[])
+        executor._ib = fake_ib
+
+        assert await executor.restore_order_by_ref("rec-1", "9") is None
+
+    @pytest.mark.asyncio
     async def test_completed_inactive_restore_uses_trade_log_reason(self):
         from services.execution.ib_executor import IBExecutor
 

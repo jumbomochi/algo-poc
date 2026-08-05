@@ -480,6 +480,24 @@ class IBExecutor:
                     "completed_order_confirmed": True,
                 })
             return False
+
+        # Absent from both open trades and completed-order history. IB does not
+        # retain order state across session boundaries, so a day order that
+        # filled or expired before a restart is simply gone the next session —
+        # the normal case, not a fault. Terminalize it (EXPIRED) via the status
+        # handler so the ledger intent stops wedging restarts and reconciliation.
+        # Position-level safety (a fill missed while disconnected) is caught
+        # independently by the reconciler's broker-vs-DB position comparison.
+        # Without a handler there is no safe terminalization path, so preserve
+        # the fail-closed None (the caller raises).
+        if self._order_status_handler is not None:
+            await self._order_status_handler({
+                "order_id": str(expected_order_id),
+                "status": "Expired",
+                "reason": "order absent from IB after session boundary",
+                "order_absent_at_ib": True,
+            })
+            return False
         return None
 
     async def submit_limit_order(

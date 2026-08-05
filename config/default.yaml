@@ -39,6 +39,21 @@ signals:
     fundamentals_days: 7
     events_hours: 48
 
+sentiment:
+  finnhub_news:
+    enabled: true
+  stocktwits:
+    enabled: true
+  reddit:
+    enabled: true
+    subreddits: [wallstreetbets, stocks, investing]
+    posts_per_subreddit: 100
+  discord:
+    enabled: false   # flip on once servers/channels are confirmed
+    channel_ids: []
+  zscore_baseline_days: 60
+  zscore_min_baseline_days: 20
+
 ml_model:
   retrain_cadence_months: 6
   target_forward_weeks: 8
