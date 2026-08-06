@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -136,6 +137,12 @@ class RiskServiceRunner:
                     market_value / risk_nav * 100.0 if risk_nav > 0 else 0.0
                 ),
                 margin_utilization_pct=0.0,
+                # Drawdown is judged on the real marked book (cash + MTM), not
+                # the capped deployment budget in nav. load_portfolio_state
+                # already computes both from PortfolioConfig.cash + positions
+                # and the EquitySnapshot high-water mark.
+                book_equity=state["nav"],
+                book_peak_equity=state["peak_nav"],
             )
             self._logger.info(
                 "Portfolio state loaded from DB",
@@ -164,6 +171,15 @@ class RiskServiceRunner:
             for account_id, mode in pairs:
                 self._refresh_lifecycle_metrics(account_id, mode)
             self._order_ledger.session.rollback()
+
+        # Periodic risk driver: reuse the passive-scan cadence to run the
+        # intraday stop-loss, hard-ceiling auto-trim, and drawdown gauge. Track
+        # the last run on a monotonic clock so the interval survives wall-clock
+        # jumps. ``None`` means "run on the first loop iteration".
+        self._passive_scan_interval_seconds = max(
+            1, int(risk_cfg.passive_scan_interval_minutes) * 60
+        )
+        self._last_periodic_scan_at: float | None = None
 
     async def setup(self) -> None:
         """Create consumer groups and replay pending messages.
@@ -699,6 +715,9 @@ class RiskServiceRunner:
                     position["quantity"] * position["current_price"] / nav * 100.0
                 )
         self._cash = nav - market_value
+        # Drawdown is judged on real marked book equity, not the capped
+        # deployment budget (nav). Position sizing still uses nav below.
+        book_equity, book_peak_equity = self._book_equity_from_db(session)
         self._portfolio = PortfolioState(
             nav=nav,
             peak_nav=max(nav, peak_nav),
@@ -706,12 +725,31 @@ class RiskServiceRunner:
             sector_exposure=sector_exposure,
             total_exposure_pct=(market_value / nav * 100.0 if nav > 0 else 0.0),
             margin_utilization_pct=0.0,
+            book_equity=book_equity,
+            book_peak_equity=book_peak_equity,
         )
         self._current_prices = {
             ticker: position["current_price"] for ticker, position in positions.items()
         }
         session.rollback()
         return None
+
+    def _book_equity_from_db(self, session: Any) -> tuple[float | None, float | None]:
+        """Return (book_equity, book_peak_equity) from the DB, or (None, None).
+
+        Book equity is real cash across sleeves plus mark-to-market positions;
+        the peak is the highest daily aggregate equity ever snapshotted. This is
+        the denominator the drawdown check needs — unlike ``deployable_capital``,
+        it actually falls when the book loses money.
+        """
+        from shared.position_loader import load_portfolio_state
+
+        try:
+            state = load_portfolio_state(session)
+        except Exception:  # pragma: no cover - defensive; never block the gate
+            self._logger.exception("Book-equity load failed; drawdown falls back to nav")
+            return None, None
+        return state["nav"], state["peak_nav"]
 
     def _active_reservations(self, rec: RecommendationMessage) -> float:
         if self._order_ledger is None or not rec.portfolio:
@@ -921,12 +959,56 @@ class RiskServiceRunner:
                     "target_pct": breach.target_pct,
                 },
             )
+            # A hard-ceiling breach on a real position is auto-trimmed back to
+            # the soft ceiling; a soft breach is advisory only. The margin
+            # sentinel ("__margin__") has no single position to sell, so it
+            # stays alert-only until margin trimming is designed.
+            if breach.action_type == "trim" and breach.ticker != "__margin__":
+                await self._trim_position_to_target(breach)
 
         if breaches:
             self._logger.info(
                 "Passive scan completed",
                 breach_count=len(breaches),
             )
+
+    async def _trim_position_to_target(self, breach: Any) -> None:
+        """Emit a market sell that reduces a position to its target ceiling."""
+        pos = self._portfolio.positions.get(breach.ticker)
+        price = self._current_prices.get(breach.ticker, 0.0)
+        nav = self._portfolio.nav
+        if pos is None or price <= 0 or nav <= 0:
+            return
+        quantity = pos.get("quantity", 0) if isinstance(pos, dict) else 0
+        if quantity <= 0:
+            return
+        target_value = nav * breach.target_pct / 100.0
+        sell_quantity = round((quantity * price - target_value) / price, 4)
+        if sell_quantity <= 0:
+            return
+
+        order = ApprovedOrderMessage(
+            ticker=breach.ticker,
+            timestamp=datetime.now(timezone.utc),
+            action="sell",
+            quantity=sell_quantity,
+            order_type="market",
+            limit_price=None,
+            recommendation_id=f"passive-trim-{uuid.uuid4()}",
+            risk_adjustments={
+                "passive_trim": True,
+                "target_pct": breach.target_pct,
+                "current_pct": breach.current_pct,
+            },
+        )
+        await self._redis.publish(APPROVED_ORDERS_STREAM, order.to_stream_dict())
+        self._logger.warning(
+            "Hard-ceiling auto-trim order published",
+            ticker=breach.ticker,
+            sell_quantity=sell_quantity,
+            current_pct=breach.current_pct,
+            target_pct=breach.target_pct,
+        )
 
     async def run_stop_loss_check(self) -> None:
         """Check all positions for trailing stop-loss triggers.
@@ -974,6 +1056,125 @@ class RiskServiceRunner:
                     context={"ticker": ticker, "quantity": quantity},
                 )
 
+    async def run_periodic_risk_checks(self) -> None:
+        """Drive the intraday safety controls the daily sleeve run does not.
+
+        Refresh marks from the DB, fire trailing stop-losses, auto-trim
+        hard-ceiling breaches, and raise a drawdown gauge measured on real book
+        equity. These mechanisms exist and are tested but had zero live callers
+        before this driver (review findings 2.1–2.3).
+        """
+        self._refresh_portfolio_from_db()
+        await self.run_stop_loss_check()
+        await self.run_passive_scan()
+        await self._emit_drawdown_gauge()
+
+    async def maybe_run_periodic_checks(self, now: float) -> bool:
+        """Run the periodic checks if the scan interval has elapsed.
+
+        ``now`` is a monotonic timestamp (seconds). Returns True when the checks
+        ran. The first call always runs.
+        """
+        last = self._last_periodic_scan_at
+        if (
+            last is not None
+            and (now - last) < self._passive_scan_interval_seconds
+        ):
+            return False
+        self._last_periodic_scan_at = now
+        # The sweep is best-effort: a failure here must never propagate and tear
+        # down the main run() loop, which would halt recommendation, kill, and
+        # fill processing for the whole service.
+        try:
+            await self.run_periodic_risk_checks()
+        except Exception:
+            self._logger.exception("Periodic risk checks failed; continuing")
+        return True
+
+    def _refresh_portfolio_from_db(self) -> None:
+        """Reload positions, marks, cash and book equity from the DB.
+
+        The risk service has no market-data feed, so the freshest available
+        marks are the ones the data pipeline has written to ``positions``. This
+        refresh lets the periodic stop-loss and ceiling scan act on them. It
+        no-ops without a DB session (unit tests drive the in-memory book
+        directly).
+        """
+        if self._db_session is None:
+            return
+        from shared.position_loader import load_portfolio_state
+
+        try:
+            state = load_portfolio_state(self._db_session)
+            positions = state["positions"]
+            book_equity = float(state["nav"])
+            book_peak = float(state["peak_nav"])
+            # The ceiling / sizing denominator stays on the deployment budget,
+            # consistent with the entry path (_refresh_risk_state). Only the
+            # drawdown gauge (book_equity/book_peak) moves to real book equity.
+            snapshot = self._db_session.scalar(
+                select(CapitalSnapshot)
+                .where(CapitalSnapshot.mode == self._config.mode)
+                .order_by(
+                    CapitalSnapshot.captured_at.desc(), CapitalSnapshot.id.desc()
+                )
+                .limit(1)
+            )
+            nav = (
+                float(snapshot.deployable_capital)
+                if snapshot is not None
+                else book_equity
+            )
+            market_value = sum(
+                p["quantity"] * p["current_price"] for p in positions.values()
+            )
+            self._cash = nav - market_value
+            self._current_prices = {
+                ticker: p["current_price"] for ticker, p in positions.items()
+            }
+            self._portfolio = PortfolioState(
+                nav=nav,
+                peak_nav=nav,
+                positions=positions,
+                sector_exposure=state["sector_exposure"],
+                total_exposure_pct=(
+                    market_value / nav * 100.0 if nav > 0 else 0.0
+                ),
+                margin_utilization_pct=0.0,
+                book_equity=book_equity,
+                book_peak_equity=book_peak,
+            )
+        except Exception:  # pragma: no cover - defensive
+            self._logger.exception(
+                "Periodic portfolio refresh failed; using last in-memory state"
+            )
+        finally:
+            try:
+                self._db_session.rollback()
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+    async def _emit_drawdown_gauge(self) -> None:
+        """Publish an alert when real book-equity drawdown breaches a threshold.
+
+        The pause already rejects new buys inside ``process_recommendation``.
+        This surfaces the breach to the operator on the periodic cadence; wiring
+        the 20% breaker to an actual liquidation is T1's responsibility.
+        """
+        decision = self._engine.check_portfolio_drawdown(self._portfolio)
+        if decision.approved:
+            return
+        breaker = "circuit breaker" in decision.reason.lower()
+        await self._publish_alert(
+            event_type="drawdown_circuit_breaker" if breaker else "drawdown_pause",
+            priority="critical" if breaker else "high",
+            message=decision.reason,
+            context={
+                "book_equity": self._portfolio.book_equity,
+                "book_peak_equity": self._portfolio.book_peak_equity,
+            },
+        )
+
     def _estimate_buy_quantity(self, ticker: str, price: float) -> int:
         """Estimate the number of shares to buy based on position limit.
 
@@ -1020,6 +1221,12 @@ class RiskServiceRunner:
 
         try:
             while True:
+                # Intraday safety sweep: stop-loss, hard-ceiling trim, drawdown
+                # gauge — gated to the passive-scan interval on a monotonic clock.
+                await self.maybe_run_periodic_checks(
+                    asyncio.get_running_loop().time()
+                )
+
                 # Read recommendations
                 messages = await self._redis.read_group(
                     RECOMMENDATIONS_STREAM,

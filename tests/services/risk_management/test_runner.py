@@ -349,6 +349,214 @@ class TestPassiveMonitoring:
         assert len(alert_calls) >= 1
 
 
+def _approved_orders(mock_redis):
+    """Reconstruct every ApprovedOrderMessage published to approved_orders."""
+    from shared.schemas.messages import ApprovedOrderMessage
+
+    return [
+        ApprovedOrderMessage.from_stream_dict(c.args[1])
+        for c in mock_redis.publish.call_args_list
+        if c.args[0] == "stream:approved_orders"
+    ]
+
+
+class TestPeriodicRiskEnforcement:
+    """T2: the periodic driver must actually fire stop-loss, hard-ceiling
+    auto-trim, and a real-equity drawdown gauge on the live path — the
+    mechanisms the review found were written but never invoked."""
+
+    @pytest.mark.asyncio
+    async def test_hard_ceiling_breach_auto_trims_to_soft(self, runner, mock_redis):
+        """A position over the hard ceiling must emit a sell that reduces it to
+        the soft ceiling — not merely an advisory alert."""
+        runner._portfolio = make_portfolio(
+            nav=100_000,
+            positions={"AAPL": {"quantity": 200, "sector": "Technology"}},
+        )
+        runner._current_prices = {"AAPL": 100.0}  # 200*100 = 20% of NAV (>15% hard)
+
+        await runner.run_passive_scan()
+
+        orders = _approved_orders(mock_redis)
+        trims = [o for o in orders if o.ticker == "AAPL" and o.action == "sell"]
+        assert len(trims) == 1
+        # Reduce 20% -> 7% soft ceiling: sell (20000 - 7000)/100 = 130 shares.
+        assert trims[0].quantity == pytest.approx(130.0)
+
+    @pytest.mark.asyncio
+    async def test_soft_ceiling_breach_does_not_trim(self, runner, mock_redis):
+        """A soft-ceiling breach is advisory only — no sell order is emitted."""
+        runner._portfolio = make_portfolio(
+            nav=100_000,
+            positions={"AAPL": {"quantity": 100, "sector": "Technology"}},
+        )
+        runner._current_prices = {"AAPL": 100.0}  # 10% of NAV (soft<x<hard)
+
+        await runner.run_passive_scan()
+
+        assert _approved_orders(mock_redis) == []
+
+    @pytest.mark.asyncio
+    async def test_periodic_checks_drive_stop_loss(self, runner, mock_redis):
+        """run_periodic_risk_checks must fire an intraday trailing stop without
+        waiting for the daily EOD sleeve exit."""
+        runner._portfolio = make_portfolio(
+            nav=100_000,
+            positions={
+                "AAPL": {
+                    "quantity": 10,
+                    "sector": "Technology",
+                    "highest_price_since_entry": 100.0,
+                }
+            },
+        )
+        runner._current_prices = {"AAPL": 84.0}  # 16% below high (>15% stop)
+
+        await runner.run_periodic_risk_checks()
+
+        orders = _approved_orders(mock_redis)
+        sells = [o for o in orders if o.ticker == "AAPL" and o.action == "sell"]
+        assert len(sells) == 1
+        assert sells[0].quantity == pytest.approx(10.0)
+
+    @pytest.mark.asyncio
+    async def test_periodic_checks_drive_passive_trim(self, runner, mock_redis):
+        """run_periodic_risk_checks must also run the passive scan / auto-trim."""
+        runner._portfolio = make_portfolio(
+            nav=100_000,
+            positions={"AAPL": {"quantity": 200, "sector": "Technology"}},
+        )
+        runner._current_prices = {"AAPL": 100.0}
+
+        await runner.run_periodic_risk_checks()
+
+        orders = _approved_orders(mock_redis)
+        assert any(o.ticker == "AAPL" and o.action == "sell" for o in orders)
+
+    @pytest.mark.asyncio
+    async def test_periodic_drawdown_gauge_uses_book_equity(self, runner, mock_redis):
+        """A real book-equity drawdown must raise a drawdown alert even when nav
+        (the capped deployment budget) shows none."""
+        pf = make_portfolio(nav=100_000, peak_nav=100_000)
+        pf.book_equity = 80_000  # 20% real drawdown
+        pf.book_peak_equity = 100_000
+        runner._portfolio = pf
+        runner._current_prices = {}
+
+        await runner.run_periodic_risk_checks()
+
+        alerts = [
+            c.args[1]
+            for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert any(
+            "drawdown" in str(a).lower() or "circuit breaker" in str(a).lower()
+            for a in alerts
+        )
+
+    @pytest.mark.asyncio
+    async def test_maybe_run_respects_interval(self, runner):
+        """The driver runs once, then not again until the scan interval elapses."""
+        runner.run_periodic_risk_checks = AsyncMock()
+        interval = runner._config.risk.passive_scan_interval_minutes * 60
+
+        await runner.maybe_run_periodic_checks(now=1000.0)  # first call -> runs
+        await runner.maybe_run_periodic_checks(now=1000.0 + interval - 1)  # too soon
+        await runner.maybe_run_periodic_checks(now=1000.0 + interval + 1)  # elapsed
+
+        assert runner.run_periodic_risk_checks.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_periodic_failure_does_not_propagate(self, runner):
+        """A raising periodic sweep must be swallowed — it must never propagate
+        and tear down the main run() loop (which would stop processing
+        recommendations, kills, and fills for the whole service)."""
+        runner.run_periodic_risk_checks = AsyncMock(side_effect=RuntimeError("boom"))
+
+        ran = await runner.maybe_run_periodic_checks(now=1000.0)
+
+        assert ran is True  # timer advanced, exception swallowed, loop survives
+
+
+class TestPeriodicRefreshDenominator:
+    """The periodic scan's nav (its ceiling/sizing denominator) must stay on the
+    deployment budget, consistent with the entry path — only the drawdown gauge
+    moves to real book equity."""
+
+    def test_refresh_keeps_nav_on_deployable_capital(self, mock_config, mock_redis):
+        from datetime import date as date_cls
+
+        from shared.models.equity_snapshot import EquitySnapshot
+        from shared.models.portfolio_config import PortfolioConfig
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        session = Session(engine)
+        now = datetime.now(timezone.utc)
+        session.add(
+            CapitalSnapshot(
+                account_id="DUTEST",
+                mode="paper",
+                net_liquidation=1_000_000,
+                deployment_fraction=1,
+                max_deployable_usd=100_000,
+                deployable_capital=100_000,  # budget pinned at the cap
+                settled_cash_trading=40_000,
+                sleeve_budgets={},
+                reconciliation_status="ok",
+                captured_at=now,
+            )
+        )
+        session.add(
+            PortfolioConfig(
+                portfolio="momentum",
+                capital=40_000,
+                cash=40_000,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.add(
+            Position(
+                account_id="DUTEST",
+                ticker="AAPL",
+                portfolio="momentum",
+                con_id=1,
+                quantity=50,
+                avg_entry_price=100,
+                current_price=100,  # MTM 5,000
+                peak_price=100,
+                highest_price_since_entry=100,
+                opened_at=now,
+                status="open",
+            )
+        )
+        session.add(
+            EquitySnapshot(
+                portfolio="momentum",
+                date=date_cls(2026, 7, 1),
+                equity=48_000,
+                cash=43_000,
+                market_value=5_000,
+                created_at=now,
+            )
+        )
+        session.commit()
+
+        runner = RiskServiceRunner(
+            config=mock_config, redis_client=mock_redis, db_session=session
+        )
+        runner._refresh_portfolio_from_db()
+
+        # nav (ceiling / sizing basis) stays on the capped deployment budget.
+        assert runner._portfolio.nav == pytest.approx(100_000)
+        # drawdown gauge tracks real book equity (40k cash + 5k MTM) and its peak.
+        assert runner._portfolio.book_equity == pytest.approx(45_000)
+        assert runner._portfolio.book_peak_equity == pytest.approx(48_000)
+        session.close()
+
+
 class TestAuditLogging:
     @pytest.mark.asyncio
     async def test_decisions_are_logged(self, runner, mock_redis, mock_portfolio):
