@@ -309,6 +309,131 @@ class TestKillSwitchIntegration:
         assert len(order_calls) == 2
 
 
+def _kill_msg(reason="emergency", triggered_by="admin***"):
+    return KillMessage(
+        timestamp=datetime(2026, 8, 7, 12, 0, 0, tzinfo=timezone.utc),
+        triggered_by=triggered_by,
+        reason=reason,
+    )
+
+
+class TestKillLiquidation:
+    """Kill liquidation must reload authoritative DB positions, route exits
+    through the ledger with deterministic ids (idempotent on replay), always
+    alert, and not abort on a single-position failure (review 1.3–1.5)."""
+
+    @pytest.fixture
+    def db_runner(self, mock_config, mock_redis):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        session = Session(engine)
+        now = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        for ticker, con_id, qty in [("AAPL", 111, 10.0), ("MSFT", 222, 5.0)]:
+            session.add(
+                Position(
+                    account_id="DUTEST",
+                    ticker=ticker,
+                    portfolio="momentum",
+                    con_id=con_id,
+                    exchange="SMART",
+                    currency="USD",
+                    quantity=qty,
+                    avg_entry_price=100,
+                    current_price=100,
+                    peak_price=100,
+                    highest_price_since_entry=100,
+                    opened_at=now,
+                    status="open",
+                )
+            )
+        session.commit()
+        ledger = OrderLedger(session)
+        runner = RiskServiceRunner(
+            config=mock_config,
+            redis_client=mock_redis,
+            db_session=session,
+            order_ledger=ledger,
+        )
+        # Stale/empty in-memory book: the kill MUST reload from the DB, not this.
+        runner._portfolio.positions = {}
+        return runner, ledger, session
+
+    @pytest.mark.asyncio
+    async def test_kill_liquidates_authoritative_db_positions(
+        self, db_runner, mock_redis
+    ):
+        runner, ledger, session = db_runner
+        await runner.process_kill(_kill_msg())
+
+        orders = _approved_orders(mock_redis)
+        sells = {o.ticker: o for o in orders if o.action == "sell"}
+        assert set(sells) == {"AAPL", "MSFT"}
+        assert sells["AAPL"].quantity == pytest.approx(10.0)
+        # Each exit is backed by a deterministic ledger intent so execution can
+        # actually place it (not a synthetic id it would reject).
+        intent = ledger.get(sells["AAPL"].recommendation_id)
+        assert intent.action == "SELL"
+        assert intent.con_id == 111
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_replayed_kill_does_not_double_submit(self, db_runner, mock_redis):
+        runner, ledger, session = db_runner
+        await runner.process_kill(_kill_msg())
+        first_ids = {o.recommendation_id for o in _approved_orders(mock_redis)}
+
+        # Same kill message redelivered (crash-replay): must reuse the same
+        # deterministic intents, not mint new ones.
+        await runner.process_kill(_kill_msg())
+        all_ids = {o.recommendation_id for o in _approved_orders(mock_redis)}
+        assert all_ids == first_ids  # no new exit ids
+
+        from shared.models import OrderIntent
+
+        intent_count = session.query(OrderIntent).count()
+        assert intent_count == 2  # two positions, not four
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_kill_always_alerts_even_with_no_positions(
+        self, runner, mock_redis
+    ):
+        runner._portfolio.positions = {}
+        await runner.process_kill(_kill_msg())
+
+        alerts = [
+            c.args[1]
+            for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert any("kill" in str(a).lower() for a in alerts)
+
+    @pytest.mark.asyncio
+    async def test_kill_per_position_failure_does_not_abort_rest(
+        self, db_runner, mock_redis
+    ):
+        runner, ledger, session = db_runner
+        original = runner._emit_liquidation_exit
+
+        async def flaky(pos, **kwargs):
+            if pos["ticker"] == "AAPL":
+                raise RuntimeError("IB disconnected for AAPL")
+            return await original(pos, **kwargs)
+
+        runner._emit_liquidation_exit = flaky
+        await runner.process_kill(_kill_msg())
+
+        orders = _approved_orders(mock_redis)
+        assert any(o.ticker == "MSFT" for o in orders)  # MSFT still liquidated
+        alerts = [
+            c.args[1]
+            for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert any("kill" in str(a).lower() for a in alerts)  # alert still fired
+        session.rollback()
+
+
 class TestKillFailsClosedOnRestart:
     """A restart after a kill must stay halted (review 1.1)."""
 

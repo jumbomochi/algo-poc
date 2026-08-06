@@ -4,6 +4,7 @@ import asyncio
 import math
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import func, or_, select
@@ -19,9 +20,14 @@ from services.risk_management.kill_switch import KillSwitch
 from services.risk_management.passive_monitor import PassiveBreachMonitor
 from shared.config import AppConfig
 from shared.halt_state import HaltStateRepository
+from shared.liquidation import liquidation_exit_id, load_liquidation_targets
 from shared.logging import get_logger
 from shared.models import CapitalSnapshot, OrderIntent, OrderStatus, Position
-from shared.order_ledger import OrderIntentNotFound, OrderLedger
+from shared.order_ledger import (
+    ConflictingOrderIntent,
+    OrderIntentNotFound,
+    OrderLedger,
+)
 from shared.observability import DEFAULT_TRADING_METRICS
 from shared.schemas.messages import (
     AlertMessage,
@@ -902,6 +908,7 @@ class RiskServiceRunner:
         self._kill_switch.activate(
             reason=kill_msg.reason,
             triggered_by=kill_msg.triggered_by,
+            source="kill",
         )
 
         self._logger.critical(
@@ -910,40 +917,142 @@ class RiskServiceRunner:
             triggered_by=kill_msg.triggered_by,
         )
 
-        # Emit market sell orders for all open positions
-        for ticker, pos_data in self._portfolio.positions.items():
-            quantity = pos_data.get("quantity", 0) if isinstance(pos_data, dict) else 0
-            if quantity <= 0:
-                continue
-
-            order = ApprovedOrderMessage(
-                ticker=ticker,
-                timestamp=datetime.now(timezone.utc),
-                action="sell",
-                quantity=quantity,
-                order_type="market",
-                limit_price=None,
-                recommendation_id=f"kill-{uuid.uuid4()}",
-                risk_adjustments={"kill_switch": True, "reason": kill_msg.reason},
-            )
-
-            await self._redis.publish(
-                APPROVED_ORDERS_STREAM,
-                order.to_stream_dict(),
-            )
-
-            self._logger.info(
-                "Kill liquidation order published",
-                ticker=ticker,
-                quantity=quantity,
-            )
-
-        await self._publish_alert(
+        # Deterministic per-kill epoch: both risk and execution receive the same
+        # KillMessage, so exits for one kill converge on the same ledger ids
+        # (replay is idempotent) while a later kill re-liquidates.
+        epoch = int(kill_msg.timestamp.timestamp())
+        await self._liquidate_all(
+            epoch=epoch,
+            reason=kill_msg.reason,
+            triggered_by=kill_msg.triggered_by,
             event_type="kill_switch_activated",
-            priority="critical",
-            message=f"Kill switch activated by {kill_msg.triggered_by}: {kill_msg.reason}",
-            context={"triggered_by": kill_msg.triggered_by},
         )
+
+    async def _liquidate_all(
+        self,
+        *,
+        epoch: int,
+        reason: str,
+        triggered_by: str,
+        event_type: str,
+    ) -> None:
+        """Flatten the whole book. Reloads authoritative positions, routes each
+        exit through the ledger with a deterministic id, guards each position so
+        one failure never aborts the rest, and always publishes a critical alert.
+        """
+        positions = self._authoritative_open_positions()
+        liquidated = 0
+        for pos in positions:
+            try:
+                if await self._emit_liquidation_exit(pos, epoch=epoch, reason=reason):
+                    liquidated += 1
+            except Exception:
+                self._logger.exception(
+                    "Liquidation emit failed for a position; continuing",
+                    ticker=pos.get("ticker"),
+                )
+
+        # Always alert, even on zero positions or partial failure — the operator
+        # must always learn a kill/breaker fired.
+        await self._publish_alert(
+            event_type=event_type,
+            priority="critical",
+            message=f"{event_type} by {triggered_by}: {reason}",
+            context={
+                "triggered_by": triggered_by,
+                "reason": reason,
+                "positions_seen": len(positions),
+                "positions_liquidated": liquidated,
+            },
+        )
+
+    def _authoritative_open_positions(self) -> list[dict[str, Any]]:
+        """Reload open positions from the DB (broker truth), aggregated by
+        ticker, so liquidation acts on real holdings — not a stale or empty
+        in-memory book (review 1.4). Falls back to the in-memory book when no DB
+        session is wired (unit paths)."""
+        if self._order_ledger is None:
+            return [
+                {
+                    "ticker": ticker,
+                    "quantity": (
+                        pos.get("quantity", 0) if isinstance(pos, dict) else 0
+                    ),
+                    "con_id": None,
+                    "account_id": None,
+                    "exchange": None,
+                    "currency": None,
+                    "portfolio": None,
+                }
+                for ticker, pos in self._portfolio.positions.items()
+            ]
+
+        targets = load_liquidation_targets(self._order_ledger.session)
+        self._order_ledger.session.rollback()
+        return targets
+
+    def _liquidation_exit_id(self, ticker: str, epoch: int) -> str:
+        return liquidation_exit_id(self._config.mode, ticker, epoch)
+
+    async def _emit_liquidation_exit(
+        self, pos: dict[str, Any], *, epoch: int, reason: str
+    ) -> bool:
+        """Create the deterministic exit intent (idempotent) and publish it.
+
+        Returns True when an exit was published. The ledger intent is what lets
+        execution actually place the sell (a synthetic id with no intent is
+        rejected), and the deterministic id makes a replay a no-op.
+        """
+        quantity = pos["quantity"]
+        if quantity is None or quantity <= 0:
+            return False
+        exit_id = self._liquidation_exit_id(pos["ticker"], epoch)
+
+        if self._order_ledger is not None and pos.get("con_id") is not None:
+            proposal = SimpleNamespace(
+                recommendation_id=exit_id,
+                account_id=pos["account_id"] or "",
+                mode=self._config.mode,
+                portfolio=pos["portfolio"] or "__liquidation__",
+                con_id=pos["con_id"],
+                symbol=pos["ticker"],
+                exchange=pos["exchange"] or "SMART",
+                currency=pos["currency"] or "USD",
+                action="SELL",
+                quantity=quantity,
+                limit_price=None,
+                order_type="MKT",
+            )
+            try:
+                self._order_ledger.create_intent(proposal)
+                self._order_ledger.session.commit()
+            except ConflictingOrderIntent:
+                # An intent for this deterministic id already exists (a replay or
+                # the concurrent execution-side net). Keep it — that is exactly
+                # the idempotency guarantee.
+                self._order_ledger.session.rollback()
+            except Exception:
+                self._order_ledger.session.rollback()
+                raise
+
+        order = ApprovedOrderMessage(
+            ticker=pos["ticker"],
+            timestamp=datetime.now(timezone.utc),
+            action="sell",
+            quantity=quantity,
+            order_type="market",
+            limit_price=None,
+            recommendation_id=exit_id,
+            risk_adjustments={"kill_switch": True, "reason": reason},
+        )
+        await self._redis.publish(APPROVED_ORDERS_STREAM, order.to_stream_dict())
+        self._logger.info(
+            "Liquidation order published",
+            ticker=pos["ticker"],
+            quantity=quantity,
+            recommendation_id=exit_id,
+        )
+        return True
 
     async def run_passive_scan(self) -> None:
         """Run passive breach monitoring scan.

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from shared.config import AppConfig
+from shared.liquidation import liquidation_exit_id
 from shared.logging import get_logger
 from shared.models import OrderStatus
-from shared.order_ledger import TERMINAL_STATUSES, OrderLedger
+from shared.order_ledger import (
+    TERMINAL_STATUSES,
+    OrderIntentNotFound,
+    OrderLedger,
+)
 from shared.schemas.messages import (
     AlertMessage,
     ApprovedOrderMessage,
@@ -588,25 +592,45 @@ class ExecutionServiceRunner:
         # Cancel all open orders
         await self._order_manager.cancel_all_orders()
 
-        # Emit market sell orders for all positions
+        # Deterministic per-kill epoch: exits for one kill converge on the same
+        # ids across a replay and across the risk-side authoritative path, so we
+        # never double-sell.
+        epoch = int(kill_msg.timestamp.timestamp())
+        liquidated = 0
         for ticker, quantity in positions_to_liquidate.items():
             if quantity <= 0:
                 continue
+            exit_id = liquidation_exit_id(self._config.mode, ticker, epoch)
+            try:
+                if self._exit_already_in_flight(exit_id):
+                    self._logger.info(
+                        "Kill exit already in flight; skipping",
+                        ticker=ticker,
+                        recommendation_id=exit_id,
+                    )
+                    continue
+                await self._order_manager.submit_exit(
+                    ticker=ticker,
+                    quantity=quantity,
+                    recommendation_id=exit_id,
+                )
+                liquidated += 1
+                self._logger.info(
+                    "Kill liquidation order submitted",
+                    ticker=ticker,
+                    quantity=quantity,
+                    recommendation_id=exit_id,
+                )
+            except Exception:
+                # One position failing (e.g. IB disconnected mid-loop) must not
+                # abort the rest, and the critical alert below must still fire.
+                self._logger.exception(
+                    "Kill liquidation failed for a position; continuing",
+                    ticker=ticker,
+                )
 
-            kill_rec_id = f"kill-{uuid.uuid4()}"
-            await self._order_manager.submit_exit(
-                ticker=ticker,
-                quantity=quantity,
-                recommendation_id=kill_rec_id,
-            )
-
-            self._logger.info(
-                "Kill liquidation order submitted",
-                ticker=ticker,
-                quantity=quantity,
-            )
-
-        # Publish alert
+        # Always publish the critical alert — even on zero positions or partial
+        # failure, the operator must learn the kill fired.
         alert = AlertMessage(
             timestamp=datetime.now(timezone.utc),
             event_type="kill_switch_liquidation",
@@ -614,10 +638,29 @@ class ExecutionServiceRunner:
             message=f"Kill switch activated by {kill_msg.triggered_by}: {kill_msg.reason}",
             context={
                 "triggered_by": kill_msg.triggered_by,
-                "positions_liquidated": len(positions_to_liquidate),
+                "positions_seen": len(positions_to_liquidate),
+                "positions_liquidated": liquidated,
             },
         )
         await self._redis.publish(ALERTS_STREAM, alert.to_stream_dict())
+
+    def _exit_already_in_flight(self, exit_id: str) -> bool:
+        """True if an intent for this deterministic exit id is already submitted
+        or terminal — the risk-side authoritative path (or a prior pass/replay)
+        has it, so this defense-in-depth net defers to avoid a double-sell."""
+        if self._order_ledger is None:
+            return False
+        try:
+            intent = self._order_ledger.get(exit_id)
+            in_flight = OrderStatus(intent.status) in TERMINAL_STATUSES or intent.status in {
+                OrderStatus.SUBMITTED.value,
+                OrderStatus.PARTIALLY_FILLED.value,
+            }
+        except OrderIntentNotFound:
+            in_flight = False
+        finally:
+            self._order_ledger.session.rollback()
+        return in_flight
 
     async def shutdown(self) -> None:
         """Graceful shutdown: cancel all open orders to avoid orphans."""
