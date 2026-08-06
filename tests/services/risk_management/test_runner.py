@@ -434,6 +434,85 @@ class TestKillLiquidation:
         session.rollback()
 
 
+class TestCircuitBreakerLiquidation:
+    """The 20% circuit breaker must liquidate, not merely pause buys (1.2)."""
+
+    @pytest.fixture
+    def db_runner(self, mock_config, mock_redis):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        session = Session(engine)
+        now = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        session.add(
+            Position(
+                account_id="DUTEST",
+                ticker="AAPL",
+                portfolio="momentum",
+                con_id=111,
+                exchange="SMART",
+                currency="USD",
+                quantity=10.0,
+                avg_entry_price=100,
+                current_price=100,
+                peak_price=100,
+                highest_price_since_entry=100,
+                opened_at=now,
+                status="open",
+            )
+        )
+        session.commit()
+        runner = RiskServiceRunner(
+            config=mock_config,
+            redis_client=mock_redis,
+            db_session=session,
+            order_ledger=OrderLedger(session),
+        )
+        return runner, session
+
+    @pytest.mark.asyncio
+    async def test_breaker_liquidates_and_halts(self, db_runner, mock_redis):
+        from shared.halt_state import HaltStateRepository
+
+        runner, session = db_runner
+        runner._portfolio.book_equity = 70_000  # 30% drawdown
+        runner._portfolio.book_peak_equity = 100_000
+
+        await runner._emit_drawdown_gauge()
+
+        assert runner._kill_switch.is_active is True
+        orders = _approved_orders(mock_redis)
+        assert any(o.ticker == "AAPL" and o.action == "sell" for o in orders)
+        halt = HaltStateRepository(session).load_active_halt(mode="paper")
+        assert halt is not None and halt.source == "circuit_breaker"
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_breaker_does_not_reliquidate_when_already_halted(
+        self, db_runner, mock_redis
+    ):
+        runner, session = db_runner
+        runner._portfolio.book_equity = 70_000
+        runner._portfolio.book_peak_equity = 100_000
+
+        await runner._emit_drawdown_gauge()
+        first = len(_approved_orders(mock_redis))
+        await runner._emit_drawdown_gauge()  # still drawn down, already halted
+        assert len(_approved_orders(mock_redis)) == first  # no re-liquidation
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_pause_only_alerts_no_liquidation(self, db_runner, mock_redis):
+        runner, session = db_runner
+        runner._portfolio.book_equity = 88_000  # 12% -> pause, not breaker
+        runner._portfolio.book_peak_equity = 100_000
+
+        await runner._emit_drawdown_gauge()
+
+        assert runner._kill_switch.is_active is False
+        assert _approved_orders(mock_redis) == []
+        session.rollback()
+
+
 class TestKillFailsClosedOnRestart:
     """A restart after a kill must stay halted (review 1.1)."""
 

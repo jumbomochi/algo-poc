@@ -1276,19 +1276,38 @@ class RiskServiceRunner:
                 pass
 
     async def _emit_drawdown_gauge(self) -> None:
-        """Publish an alert when real book-equity drawdown breaches a threshold.
+        """Act on a real book-equity drawdown breach.
 
-        The pause already rejects new buys inside ``process_recommendation``.
-        This surfaces the breach to the operator on the periodic cadence; wiring
-        the 20% breaker to an actual liquidation is T1's responsibility.
+        The pause already rejects new buys inside ``process_recommendation``; here
+        it raises a high alert. The 20% circuit breaker **liquidates** — it halts
+        (fail-closed, persisted) and flattens the book, once per incident.
         """
         decision = self._engine.check_portfolio_drawdown(self._portfolio)
         if decision.approved:
             return
         breaker = "circuit breaker" in decision.reason.lower()
+        if breaker:
+            # Fire once per halt incident: an already-active (persisted) halt
+            # means we have already liquidated — don't re-sell every scan.
+            if not self._kill_switch.is_active:
+                self._kill_switch.activate(
+                    reason=decision.reason,
+                    triggered_by="circuit_breaker",
+                    source="circuit_breaker",
+                )
+                activated = self._kill_switch.activated_at or datetime.now(
+                    timezone.utc
+                )
+                await self._liquidate_all(
+                    epoch=int(activated.timestamp()),
+                    reason=decision.reason,
+                    triggered_by="circuit_breaker",
+                    event_type="circuit_breaker_liquidation",
+                )
+            return
         await self._publish_alert(
-            event_type="drawdown_circuit_breaker" if breaker else "drawdown_pause",
-            priority="critical" if breaker else "high",
+            event_type="drawdown_pause",
+            priority="high",
             message=decision.reason,
             context={
                 "book_equity": self._portfolio.book_equity,

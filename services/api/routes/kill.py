@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from services.api.auth import APIUser, require_role
+from shared.halt_state import HaltStateRepository
 from shared.logging import get_logger
 from shared.schemas.messages import KillMessage
 
@@ -73,5 +74,48 @@ async def trigger_kill_switch(
         "triggered_by": triggered_by,
         "reason": reason,
         "message_id": str(message_id),
+        "timestamp": now.isoformat(),
+    }
+
+
+@router.delete("")
+async def clear_kill_switch(
+    request: Request,
+    user: APIUser = Depends(require_role("admin")),
+) -> dict:
+    """Clear a persisted halt so trading can resume (admin only).
+
+    This is the explicit human clear the fail-closed kill switch requires. It
+    marks the durable halt cleared; the risk service re-syncs from the DB on its
+    periodic cadence (and reloads the cleared state on any restart).
+    """
+    sessionmaker = getattr(request.app.state, "db_sessionmaker", None)
+    if sessionmaker is None:
+        logger.critical("kill_clear_unavailable_no_db", triggered_by=user.api_key[:4])
+        raise HTTPException(
+            status_code=503,
+            detail="Kill clear unavailable: API has no database connection",
+        )
+
+    mode = getattr(request.app.state, "mode", "paper")
+    cleared_by = user.api_key[:4] + "***"
+    now = datetime.now(timezone.utc)
+    with sessionmaker() as session:
+        cleared = HaltStateRepository(session).clear_halt(
+            mode=mode, cleared_by=cleared_by, now=now
+        )
+        session.commit()
+
+    logger.critical(
+        "kill_switch_cleared_via_api",
+        cleared=cleared,
+        cleared_by=cleared_by,
+        mode=mode,
+    )
+    return {
+        "status": "cleared" if cleared else "no_active_halt",
+        "cleared": cleared,
+        "cleared_by": cleared_by,
+        "mode": mode,
         "timestamp": now.isoformat(),
     }
