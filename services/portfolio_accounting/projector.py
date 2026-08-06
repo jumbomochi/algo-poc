@@ -12,6 +12,7 @@ from scripts.paper_state import PaperTradingState
 from shared.models import ExecutionFill, OrderIntent, OrderStatus
 from shared.order_ledger import OrderLedger
 from shared.schemas.messages import FillMessage
+from shared.universe import lookup_sector
 
 
 class FillProjectionError(RuntimeError):
@@ -123,6 +124,11 @@ class FillProjector:
                         currency=intent.currency,
                         strict_quantity=True,
                         exit_reason=intent.reason,
+                        # Sector never travels on the intent or the IB fill;
+                        # resolve it here or the position row lands NULL and
+                        # the risk service's concentration check degrades to
+                        # one account-wide "Unknown" bucket.
+                        sector=lookup_sector(intent.symbol),
                     )
                     self._advance_intent(intent, cumulative)
                     execution.projection_applied = True

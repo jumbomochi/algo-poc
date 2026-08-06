@@ -62,3 +62,42 @@ class TestResolveWatchlist:
     def test_unknown_source_raises(self):
         with pytest.raises(ValueError, match="watchlist_source"):
             resolve_watchlist("sp5000", [])
+
+
+class TestSectorLookup:
+    def test_equity_resolves_from_sector_map(self):
+        from shared.universe import lookup_sector
+
+        assert lookup_sector("AAPL") == "Technology"
+        assert lookup_sector("HUM") == "Healthcare"
+
+    def test_etf_resolves_from_etf_sectors(self):
+        from shared.universe import lookup_sector
+
+        assert lookup_sector("XLK") == "Technology"
+        assert lookup_sector("HACK") == "Thematic ETF"
+        assert lookup_sector("TLT") == "Bonds"
+
+    def test_unmapped_ticker_falls_back_to_unknown(self):
+        from shared.universe import lookup_sector
+
+        assert lookup_sector("ZZZTEST") == "Unknown"
+
+    def test_fetch_fundamentals_reexports_the_same_map(self):
+        """scripts must re-export shared.universe.SECTOR_MAP, not fork it."""
+        from scripts.fetch_fundamentals import SECTOR_MAP as legacy_map
+        import shared.universe as u
+
+        assert legacy_map is u.SECTOR_MAP
+
+    def test_every_active_universe_ticker_has_a_sector(self):
+        """Every ticker a sleeve can buy must resolve to a real sector —
+        otherwise the account-level concentration limit degrades back into
+        one big 'Unknown' bucket."""
+        from shared.universe import ACTIVE_SLEEVES, get_union_universe, lookup_sector
+
+        unmapped = [
+            t for t in get_union_universe(ACTIVE_SLEEVES)
+            if lookup_sector(t) == "Unknown"
+        ]
+        assert unmapped == []

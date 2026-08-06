@@ -12,7 +12,14 @@ from types import SimpleNamespace
 from services.risk_management.engine import PortfolioState, RiskDecision
 from services.risk_management.runner import RiskServiceRunner
 from shared.config import AppConfig, CurrencyConfig, RiskConfig
-from shared.models import Base, CapitalSnapshot, ExecutionFill, OrderStatus, Position
+from shared.models import (
+    Base,
+    CapitalSnapshot,
+    ExecutionFill,
+    OrderIntent,
+    OrderStatus,
+    Position,
+)
 from shared.order_ledger import OrderLedger
 from shared.observability import create_trading_metrics
 from shared.schemas.messages import (
@@ -445,6 +452,38 @@ class TestFillProcessing:
         assert pos["avg_entry_price"] == pytest.approx(110.0)
 
 
+class TestSectorResolution:
+    """Sector must resolve from shared.universe, not degrade to 'Unknown'.
+
+    Positions written by the fill projector between 2026-07-19 and 2026-08-07
+    have NULL sectors; new tickers are never in the positions dict at all.
+    Both used to collapse into one 'Unknown' pseudo-sector whose exposure
+    tripped the concentration limit and froze all new entries.
+    """
+
+    def test_get_sector_for_unheld_ticker_uses_universe_map(self, runner):
+        runner._portfolio = make_portfolio()
+        assert runner._get_sector("AAPL") == "Technology"
+
+    def test_get_sector_prefers_position_sector(self, runner):
+        runner._portfolio = make_portfolio(
+            positions={"AAPL": {"quantity": 1.0, "sector": "Tech"}}
+        )
+        assert runner._get_sector("AAPL") == "Tech"
+
+    def test_get_sector_falls_back_when_position_sector_unknown(self, runner):
+        runner._portfolio = make_portfolio(
+            positions={"AAPL": {"quantity": 1.0, "sector": "Unknown"}}
+        )
+        assert runner._get_sector("AAPL") == "Technology"
+
+    @pytest.mark.asyncio
+    async def test_buy_fill_records_real_sector(self, runner):
+        runner._cash = 10_000.0
+        fill = TestFillProcessing()._fill(side="buy", quantity=10, price=100)
+        await runner.process_fill(fill)
+        assert runner._portfolio.positions["AAPL"]["sector"] == "Technology"
+
 class TestSleeveBridgeRecommendations:
     """Sleeve recommendations (run_paper --publish) carry price + sizing."""
 
@@ -657,6 +696,27 @@ class TestDurableRiskLifecycle:
             call.args[0] == "stream:approved_orders"
             for call in mock_redis.publish.call_args_list
         )
+
+    @pytest.mark.asyncio
+    async def test_refresh_risk_state_resolves_null_position_sectors(
+        self, sleeve_sell_case
+    ):
+        """The fixture's Position rows carry sector=NULL (as the fill
+        projector wrote them); the rebuilt portfolio must resolve them via
+        shared.universe instead of one 'Unknown' bucket."""
+        runner, ledger, _rec = sleeve_sell_case(
+            momentum_quantity=10,
+            quality_quantity=0,
+            requested_quantity=5,
+        )
+        intent = ledger.session.scalar(
+            select(OrderIntent).where(
+                OrderIntent.recommendation_id == "sell-current"
+            )
+        )
+        assert runner._refresh_risk_state(intent, "sell") is None
+        assert runner._portfolio.positions["AAPL"]["sector"] == "Technology"
+        assert "Unknown" not in runner._portfolio.sector_exposure
 
     @pytest.mark.asyncio
     async def test_corrupted_redis_price_mismatch_fails_closed(

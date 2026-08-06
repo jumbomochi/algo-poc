@@ -573,9 +573,9 @@ def run_daily(
                             f"${price:>8.2f}  [{name}] ({reason})"
                         )
                         continue
-                    from shared.universe import ETF_SECTORS
+                    from shared.universe import lookup_sector
 
-                    sector = SECTOR_MAP.get(ticker) or ETF_SECTORS.get(ticker)
+                    sector = lookup_sector(ticker)
 
                     try:
                         estimated_commission = estimate_commission_usd(
@@ -636,7 +636,7 @@ def run_daily(
                         ticker=ticker,
                         quantity=qty,
                         price=price,
-                        sector=sector or "Unknown",
+                        sector=sector,
                         portfolio=portfolio_state,
                         existing_lots=1 if ticker in positions else 0,
                         reserved_notional=float(

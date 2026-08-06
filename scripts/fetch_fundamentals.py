@@ -15,35 +15,10 @@ from datetime import date
 from typing import Any, Callable
 
 
-SECTOR_MAP: dict[str, str] = {
-    "AAPL": "Technology", "MSFT": "Technology", "NVDA": "Technology", "AMZN": "Consumer Discretionary",
-    "GOOGL": "Communication Services", "META": "Communication Services", "BRK B": "Financials",
-    "LLY": "Healthcare", "AVGO": "Technology", "JPM": "Financials", "TSLA": "Consumer Discretionary",
-    "UNH": "Healthcare", "XOM": "Energy", "V": "Financials", "MA": "Financials",
-    "PG": "Consumer Staples", "COST": "Consumer Staples", "JNJ": "Healthcare", "HD": "Consumer Discretionary",
-    "ABBV": "Healthcare", "WMT": "Consumer Staples", "NFLX": "Communication Services",
-    "CRM": "Technology", "BAC": "Financials", "CVX": "Energy", "MRK": "Healthcare",
-    "KO": "Consumer Staples", "AMD": "Technology", "PEP": "Consumer Staples",
-    "TMO": "Healthcare", "LIN": "Materials", "ACN": "Technology", "CSCO": "Technology",
-    "ADBE": "Technology", "MCD": "Consumer Discretionary", "ABT": "Healthcare",
-    "WFC": "Financials", "DHR": "Healthcare", "TXN": "Technology", "PM": "Consumer Staples",
-    "GE": "Industrials", "QCOM": "Technology", "ISRG": "Healthcare", "INTU": "Technology",
-    "CMCSA": "Communication Services", "AMAT": "Technology", "VZ": "Communication Services",
-    "NOW": "Technology", "IBM": "Technology", "AMGN": "Healthcare",
-    "CAT": "Industrials", "MS": "Financials", "NEE": "Utilities", "LOW": "Consumer Discretionary",
-    "UPS": "Industrials", "SPGI": "Financials", "RTX": "Industrials", "HON": "Industrials",
-    "ELV": "Healthcare", "BLK": "Financials", "SYK": "Healthcare", "BKNG": "Consumer Discretionary",
-    "MDLZ": "Consumer Staples", "ADP": "Industrials", "VRTX": "Healthcare",
-    "SCHW": "Financials", "GILD": "Healthcare", "AMT": "Real Estate", "REGN": "Healthcare",
-    "LRCX": "Technology", "PANW": "Technology", "BSX": "Healthcare", "CB": "Financials",
-    "MMC": "Financials", "KLAC": "Technology", "TMUS": "Communication Services",
-    "SHW": "Materials", "SO": "Utilities", "EQIX": "Real Estate", "MO": "Consumer Staples",
-    "PGR": "Financials", "ZTS": "Healthcare", "CME": "Financials", "CI": "Healthcare",
-    "DUK": "Utilities", "ICE": "Financials", "SNPS": "Technology", "CL": "Consumer Staples",
-    "AON": "Financials", "MCO": "Financials", "WM": "Industrials", "CDNS": "Technology",
-    "TGT": "Consumer Discretionary", "BDX": "Healthcare", "NOC": "Industrials",
-    "APH": "Technology", "ITW": "Industrials", "FI": "Financials", "HUM": "Healthcare",
-}
+# The equity sector map moved to shared/universe.py so services (risk
+# management, fill projector) can resolve sectors too. Re-exported here
+# for existing importers (run_paper.py, validate_replacement_policy.py).
+from shared.universe import SECTOR_MAP  # noqa: F401
 
 
 def save_fundamentals_cache(data: dict[str, list[dict]], path: str) -> None:

@@ -20,6 +20,7 @@ from shared.config import AppConfig
 from shared.logging import get_logger
 from shared.models import CapitalSnapshot, OrderIntent, OrderStatus, Position
 from shared.order_ledger import OrderIntentNotFound, OrderLedger
+from shared.universe import lookup_sector
 from shared.observability import DEFAULT_TRADING_METRICS
 from shared.schemas.messages import (
     AlertMessage,
@@ -233,7 +234,7 @@ class RiskServiceRunner:
                     "avg_entry_price": fill.fill_price,
                     "current_price": fill.fill_price,
                     "highest_price_since_entry": fill.fill_price,
-                    "sector": "Unknown",
+                    "sector": lookup_sector(fill.ticker),
                 }
             else:
                 total = pos["quantity"] + fill.quantity
@@ -611,7 +612,7 @@ class RiskServiceRunner:
                     "avg_entry_price": float(row.avg_entry_price),
                     "current_price": float(row.current_price),
                     "highest_price_since_entry": float(row.highest_price_since_entry),
-                    "sector": row.sector or "Unknown",
+                    "sector": row.sector or lookup_sector(row.ticker),
                 }
             else:
                 prior_quantity = current["quantity"]
@@ -987,14 +988,19 @@ class RiskServiceRunner:
         return max(1, int(max_value / price))
 
     def _get_sector(self, ticker: str) -> str:
-        """Look up the sector for a ticker from existing positions.
+        """Look up the sector for a ticker.
 
-        Falls back to "Unknown" if not found.
+        Prefers the held position's stored sector; falls back to the shared
+        universe maps for new tickers (or legacy NULL-sector rows), so a buy
+        of an unheld ticker is judged against its real sector instead of an
+        "Unknown" bucket shared with the whole book.
         """
         pos = self._portfolio.positions.get(ticker, {})
         if isinstance(pos, dict):
-            return pos.get("sector", "Unknown")
-        return "Unknown"
+            sector = pos.get("sector")
+            if sector and sector != "Unknown":
+                return sector
+        return lookup_sector(ticker)
 
     async def _publish_alert(
         self,

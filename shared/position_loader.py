@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from shared.models.equity_snapshot import EquitySnapshot
 from shared.models.portfolio import Position
 from shared.models.portfolio_config import PortfolioConfig
+from shared.universe import lookup_sector
 
 
 def load_open_positions(session: Session) -> dict[str, dict[str, Any]]:
@@ -45,7 +46,9 @@ def load_open_positions(session: Session) -> dict[str, dict[str, Any]]:
                 "avg_entry_price": pos.avg_entry_price,
                 "current_price": pos.current_price,
                 "highest_price_since_entry": pos.highest_price_since_entry,
-                "sector": pos.sector or "Unknown",
+                # NULL-sector rows (written by the sector-blind fill projector,
+                # 2026-07-19 – 2026-08-07) resolve via the universe maps.
+                "sector": pos.sector or lookup_sector(pos.ticker),
             }
         else:
             total_qty = agg["quantity"] + pos.quantity

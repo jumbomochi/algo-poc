@@ -159,6 +159,17 @@ def test_smart_routed_fill_accepts_actual_execution_venue(projector, session):
     assert get_position(session).account_id == "DU12345"
 
 
+def test_new_position_gets_sector_from_universe_map(projector, session):
+    """A projected buy fill must write the ticker's real sector. NULL-sector
+    rows collapse into one 'Unknown' bucket in the risk service, which trips
+    the sector concentration limit and freezes all new entries."""
+    seed_intent(session)
+
+    assert projector.apply(make_fill()) is True
+
+    assert get_position(session).sector == "Technology"  # AAPL
+
+
 def test_replayed_buy_fill_changes_cash_once(projector, session):
     seed_intent(session)
     fill = make_fill()

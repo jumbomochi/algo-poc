@@ -59,9 +59,21 @@ class TestLoadOpenPositions:
         assert agg["avg_entry_price"] == pytest.approx(115.0)  # (10*100+30*120)/40
         assert agg["highest_price_since_entry"] == 125.0
 
-    def test_missing_sector_defaults_to_unknown(self, session):
-        add_position(session, sector=None)
-        assert load_open_positions(session)["AAPL"]["sector"] == "Unknown"
+    def test_missing_sector_resolves_from_universe_map(self, session):
+        """NULL sector rows (written by the sector-blind fill projector,
+        2026-07-19 to 2026-08-07) must resolve via shared.universe instead of
+        collapsing into one 'Unknown' bucket that trips the concentration
+        limit."""
+        add_position(session, sector=None)  # AAPL
+        assert load_open_positions(session)["AAPL"]["sector"] == "Technology"
+
+    def test_stored_sector_wins_over_universe_map(self, session):
+        add_position(session, sector="Tech")  # AAPL, explicit row value
+        assert load_open_positions(session)["AAPL"]["sector"] == "Tech"
+
+    def test_missing_sector_unmapped_ticker_defaults_to_unknown(self, session):
+        add_position(session, ticker="ZZZTEST", sector=None)
+        assert load_open_positions(session)["ZZZTEST"]["sector"] == "Unknown"
 
 
 class TestLoadPortfolioState:
