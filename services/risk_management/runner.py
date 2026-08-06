@@ -18,6 +18,7 @@ from services.risk_management.funding import (
 from services.risk_management.kill_switch import KillSwitch
 from services.risk_management.passive_monitor import PassiveBreachMonitor
 from shared.config import AppConfig
+from shared.halt_state import HaltStateRepository
 from shared.logging import get_logger
 from shared.models import CapitalSnapshot, OrderIntent, OrderStatus, Position
 from shared.order_ledger import OrderIntentNotFound, OrderLedger
@@ -89,7 +90,15 @@ class RiskServiceRunner:
             drawdown_pause_pct=risk_cfg.drawdown_pause_pct,
             drawdown_circuit_breaker_pct=risk_cfg.drawdown_circuit_breaker_pct,
         )
-        self._kill_switch = KillSwitch(logger=self._logger)
+        # Durable kill switch: persist halts so a restart stays halted
+        # (fail-closed) instead of silently resuming trading (review 1.1).
+        halt_store = (
+            HaltStateRepository(db_session) if db_session is not None else None
+        )
+        self._kill_switch = KillSwitch(
+            logger=self._logger, halt_store=halt_store, mode=config.mode
+        )
+        self._kill_switch.reload_from_store()
         self._passive_monitor = PassiveBreachMonitor(config=risk_cfg)
         self._correlation_monitor = CorrelationMonitor()
 
@@ -1064,6 +1073,9 @@ class RiskServiceRunner:
         equity. These mechanisms exist and are tested but had zero live callers
         before this driver (review findings 2.1–2.3).
         """
+        # Reconcile the durable halt first: adopt an out-of-band halt, or resume
+        # after the admin clear endpoint has cleared it in the DB.
+        self._kill_switch.sync_from_store()
         self._refresh_portfolio_from_db()
         await self.run_stop_loss_check()
         await self.run_passive_scan()

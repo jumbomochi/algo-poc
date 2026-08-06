@@ -309,6 +309,37 @@ class TestKillSwitchIntegration:
         assert len(order_calls) == 2
 
 
+class TestKillFailsClosedOnRestart:
+    """A restart after a kill must stay halted (review 1.1)."""
+
+    def test_runner_reloads_persisted_halt_on_construction(
+        self, mock_config, mock_redis
+    ):
+        from shared.halt_state import HaltStateRepository
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        session = Session(engine)
+        # A prior process persisted an active halt for this mode.
+        HaltStateRepository(session).record_halt(
+            mode="paper",
+            source="kill",
+            reason="prior emergency",
+            triggered_by="admin***",
+            now=datetime.now(timezone.utc),
+        )
+        session.commit()
+
+        # A fresh runner (simulating a restart) must come up already halted.
+        runner = RiskServiceRunner(
+            config=mock_config, redis_client=mock_redis, db_session=session
+        )
+
+        assert runner._kill_switch.is_active is True
+        assert runner._kill_switch.check().approved is False
+        session.close()
+
+
 class TestDrawdownCheck:
     @pytest.mark.asyncio
     async def test_drawdown_rejects_new_buy(self, runner, mock_redis):
