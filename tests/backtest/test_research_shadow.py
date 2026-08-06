@@ -5,6 +5,7 @@ from datetime import date
 from unittest.mock import MagicMock
 
 from backtest.runner import BacktestResult, BacktestRunner
+from backtest.costs import CostModel
 from backtest.simulator import SimulatedExecutor
 
 
@@ -64,7 +65,7 @@ def run_with(observer):
             "sector": "Technology",
         }
     runner = BacktestRunner(
-        SimulatedExecutor(slippage_bps=0, commission_per_share=0), 10_000
+        SimulatedExecutor(CostModel(slippage_bps=0, commission_per_share=0, commission_minimum=0.0)), 10_000
     )
     return runner.run(
         bars,
@@ -90,8 +91,16 @@ def run_approved_with(observer):
                 "date": date(2026, 1, 3),
                 "open": 102,
                 "high": 103,
-                "low": 101,
+                "low": 99,
                 "close": 102,
+                "volume": 1000,
+            },
+            {
+                "date": date(2026, 1, 4),
+                "open": 104,
+                "high": 105,
+                "low": 103,
+                "close": 104,
                 "volume": 1000,
             },
         ]
@@ -101,6 +110,8 @@ def run_approved_with(observer):
         approved=True, adjusted_quantity=1.0, reason="approved"
     )
 
+    # Entry decided on 1/2 fills at 1/3's low-touched limit; the exit decided
+    # on 1/3 fills at 1/4's open.
     def signal_fn(ticker, history):
         if len(history) == 1:
             return {
@@ -114,7 +125,7 @@ def run_approved_with(observer):
         return {"action": "sell", "ticker": ticker, "exit_reason": "test"}
 
     runner = BacktestRunner(
-        SimulatedExecutor(slippage_bps=0, commission_per_share=0), 10_000
+        SimulatedExecutor(CostModel(slippage_bps=0, commission_per_share=0, commission_minimum=0.0)), 10_000
     )
     return runner.run(
         bars,
@@ -213,7 +224,7 @@ def test_signal_snapshot_failure_does_not_change_backtest_result():
         }
 
     runner = BacktestRunner(
-        SimulatedExecutor(slippage_bps=0, commission_per_share=0), 10_000
+        SimulatedExecutor(CostModel(slippage_bps=0, commission_per_share=0, commission_minimum=0.0)), 10_000
     )
     result = runner.run(
         bars,

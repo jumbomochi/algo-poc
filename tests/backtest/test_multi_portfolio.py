@@ -4,6 +4,7 @@ from datetime import date
 from unittest.mock import MagicMock
 
 from backtest.runner import BacktestResult, BacktestRunner
+from backtest.costs import CostModel
 from backtest.simulator import SimulatedExecutor
 from scripts.run_backtest import (
     PortfolioConfig,
@@ -67,7 +68,7 @@ def test_each_portfolio_keeps_its_own_shadow_candidates():
     for portfolio in ("momentum", "quality_value"):
         observer = _PortfolioObserver()
         results[portfolio] = BacktestRunner(
-            SimulatedExecutor(slippage_bps=0, commission_per_share=0), 10_000
+            SimulatedExecutor(CostModel(slippage_bps=0, commission_per_share=0, commission_minimum=0.0)), 10_000
         ).run(
             bars,
             signal_fn,
@@ -426,7 +427,7 @@ def test_split_portfolios_run_independently():
         ],
     }
 
-    executor = SimulatedExecutor(slippage_bps=0, commission_per_share=0)
+    executor = SimulatedExecutor(CostModel(slippage_bps=0, commission_per_share=0, commission_minimum=0.0))
 
     configs = {
         "mr": PortfolioConfig("mr", 60_000, lambda t, b: None, RiskEngine()),
@@ -520,7 +521,7 @@ def test_split_portfolios_aggregate_metrics_are_valid():
         ],
     }
 
-    executor = SimulatedExecutor(slippage_bps=0, commission_per_share=0)
+    executor = SimulatedExecutor(CostModel(slippage_bps=0, commission_per_share=0, commission_minimum=0.0))
 
     configs = {
         "strat_a": PortfolioConfig("strat_a", 60_000, simple_buy_sell, RiskEngine()),
@@ -566,7 +567,7 @@ def test_five_portfolios_aggregate_correctly():
             for d in range(1, 6)
         ],
     }
-    executor = SimulatedExecutor(slippage_bps=0, commission_per_share=0)
+    executor = SimulatedExecutor(CostModel(slippage_bps=0, commission_per_share=0, commission_minimum=0.0))
 
     # 5 portfolios with different allocations summing to 100k
     allocations = {
@@ -613,7 +614,7 @@ def test_seven_portfolios_aggregate_correctly():
             for d in range(1, 6)
         ],
     }
-    executor = SimulatedExecutor(slippage_bps=0, commission_per_share=0)
+    executor = SimulatedExecutor(CostModel(slippage_bps=0, commission_per_share=0, commission_minimum=0.0))
 
     allocations = {
         "mr": 14_000,
