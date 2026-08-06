@@ -1,6 +1,8 @@
 # Implementation Review — algo-poc
 
-**Status:** Draft — 2026-08-06
+**Status:** Final — adopted 2026-08-06
+**Owner:** Huiliang Lui (operator)
+**Tracking:** work threads **T1–T9** = issues #2–#10, draft PRs #12–#20; this doc = PR #11. Finding-level traceability in § 12.
 **Reviewer:** 6-agent read-only review (execution, risk/capital, alpha pipeline, backtest/research, infra/reliability, security). No code changed.
 **Scope:** ~19.7K LOC production across 8 services + backtest/research/sentiment stacks, cross-checked against the [IPS](investment-policy-statement.md) and live topology.
 **Companion:** this doc is the source-of-truth backlog; each *work thread* in § 9 maps to one branch/PR.
@@ -129,3 +131,48 @@ Dependencies: T1 and T7 both touch `execution/runner.py` (sequence or coordinate
 - Fail-closed funding gate (`funding.py`); dual-currency USD-vs-USD discipline (`capital.py`).
 - The `research/` factor framework's methodology (purged/embargoed CV, DSR, BH-FDR, point-in-time panel).
 - The incident-hardened ops layer (watchdog, heartbeat, backups, preflight).
+
+---
+
+## 12. Findings register
+
+Traceability for every numbered finding → work thread → tracking issue / draft PR → status. **Status as of adoption (2026-08-06): all Open (tracked).** Update the Status column as threads land.
+
+| ID | Finding | Sev | Thread | Issue | PR | Status |
+|---|---|---|---|:--:|:--:|---|
+| 1.1 | Kill switch fails OPEN on restart | High | T1 | #2 | #12 | Open |
+| 1.2 | 20% circuit breaker never liquidates | High | T1 | #2 | #12 | Open |
+| 1.3 | Kill liquidation not idempotent (can short) | High | T1 | #2 | #12 | Open |
+| 1.4 | Kill uses stale in-memory positions | Med | T1 | #2 | #12 | Open |
+| 1.5 | Kill during IB disconnect aborts, no alert | Med | T1 | #2 | #12 | Open |
+| 2.1 | No independent/intraday stop-loss (dead) | High | T2 | #3 | #13 | Open |
+| 2.2 | No hard-ceiling / margin auto-trim (dead) | Med-High | T2 | #3 | #13 | Open |
+| 2.3 | Drawdown measured on budget, not equity | Med | T2 | #3 | #13 | Open |
+| 2.4 | Reprice / partial-fill loop dead | Med | T7 | #8 | #18 | Open |
+| 3.1 | Risk `process_fill` double-counts on replay | High | T4 | #5 | #15 | Open |
+| 3.2 | `process_fill` mixes commission currency | Med | T4 | #5 | #15 | Open |
+| 3.3 | Poison messages silently parked (no DLQ) | Med | T4 | #5 | #15 | Open |
+| 3.4 | `:dlq` unmonitored; notifications DLQ no-ack | Med | T4 | #5 | #15 | Open |
+| 3.5 | ml/signal no `drain_pending`; ack-on-buffer | Med | T4 | #5 | #15 | Open |
+| 4.1 | Survivorship / winner-preselected universe | High | T5 | #6 | #16 | Open |
+| 4.2 | Same-bar entry fill (look-ahead) | High | T5 | #6 | #16 | Open |
+| 4.3 | Same-bar exit fill at day's open | High | T5 | #6 | #16 | Open |
+| 4.4 | Fundamentals look-ahead (also live path) | High | T5 | #6 | #16 | Open |
+| 4.5 | ML filter in-sample; no purge/embargo | Med | T5 | #6 | #16 | Open |
+| 4.6 | Divergence baseline optimistic | Med | T5 | #6 | #16 | Open |
+| 4.7 | Cost model understated; pop-std Sharpe | Low-Med | T5 | #6 | #16 | Open |
+| 5.1 | Redis/PG open in committed compose | High | T3 | #4 | #14 | Open |
+| 5.2 | No inter-service message authenticity | High | T3 | #4 | #14 | Open |
+| 5.3 | IB Gateway API exposure | High | T9 | #10 | #20 | Open |
+| 5.4 | `joblib.load` untrusted deserialization | Med-High | T9 | #10 | #20 | Open |
+| 5.5 | Live-mode guard drift (raw env var) | Med | T9 | #10 | #20 | Open |
+| 5.6 | `.env` perms; no dependency lockfile | Med-Low | T9 | #10 | #20 | Open |
+| 6.1 | No app-level healthchecks | High | T6 | #7 | #17 | Open |
+| 6.2 | Metrics not wired; no alert rules | High | T6 | #7 | #17 | Open |
+| 6.3 | Unbounded Redis streams (OOM risk) | High | T6 | #7 | #17 | Open |
+| 6.4 | No message `schema_version` | Med | T9 | #10 | #20 | Open |
+| 7.0 | Two parallel implementations + model-loader mismatch | Med | T8 | #9 | #19 | Open |
+
+**Priority rollup:** P0 = T1 (#2/#12), T2 (#3/#13), T3 (#4/#14) · P1 = T4 (#5/#15), T5 (#6/#16), T6 (#7/#17) · P2 = T7 (#8/#18), T8 (#9/#19), T9 (#10/#20).
+
+> The full-detail version of this review — including security exploitation paths and the local IB Gateway settings — is intentionally kept out of this public repo. It lives locally, gitignored, at `output/implementation-review-2026-08-06.FULL-PRIVATE.md`.

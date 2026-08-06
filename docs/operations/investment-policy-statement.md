@@ -156,8 +156,18 @@ auto-conversion or a manual `IDEALPRO` trade). Consequences for this policy:
 
 ## 6. Risk limits (authoritative source: `config/default.yaml` § `risk`)
 
-These are enforced in code. The IPS records them so the operator cannot quietly
-loosen them; **risk limits are never loosened during a drawdown** (§ 9).
+These limits are configured in `config/default.yaml` and are intended to be
+enforced in code. The IPS records them so the operator cannot quietly loosen
+them; **risk limits are never loosened during a drawdown** (§ 9).
+
+> **2026-08-06 review correction — several limits below are declared but not yet
+> enforced on the live path.** The [implementation review](implementation-review-2026-08-06.md)
+> found that the trailing **stop-loss**, the **passive hard-ceiling / margin auto-trim**,
+> and the drawdown **circuit-breaker _liquidation_** are implemented but never invoked by
+> the running risk service, and the drawdown gauge is measured on the deployment budget
+> rather than book equity — so the 10% pause / 20% breaker are effectively inert in the
+> capped regime. Until **T2 (#3)** and **T1 (#2)** land, the only live stop is the
+> once-daily EOD sleeve exit. See the review's § 12 findings register for enforcement status.
 
 | Limit | Value | Config key |
 |---|---:|---|
@@ -265,6 +275,7 @@ deployed system capital reaches −25%.**
 |---|---|---|
 | 2026-06-11 | Initial adoption | Phase-1 prerequisite. Capital: no fixed cap, drawdown-gated, $5K smoke test first. Retire at −25% deployed. Monthly review. |
 | 2026-06-30 | Currency reconciliation (§ 5, § 8, § 10) | Smoke test funded as 5,000 SGD (wired 2026-06-16), not USD; added funding-currency/FX section (NAV measured in USD, SGD/USD FX is unhedged and outside § 7); W-8BEN / SGD-residency tax notes; refreshed monitoring note now that the divergence + gateway-watchdog launchd jobs are deployed. |
+| 2026-08-06 | Implementation review adopted; § 6 enforcement caveat added | 6-agent read-only review found several § 6 limits declared but not wired on the live path (stop-loss, passive-scan, circuit-breaker liquidation; drawdown measured on budget not equity). **No limits changed** — this is a factual correction of the "enforced in code" claim. Tracked in **T1 (#2)** / **T2 (#3)**. Full review: [implementation-review-2026-08-06.md](implementation-review-2026-08-06.md). |
 
 ### Appendix A — revival conditions for dropped sleeves
 
