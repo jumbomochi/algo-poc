@@ -19,6 +19,7 @@ from shared.models.portfolio_config import PortfolioConfig
 from shared.models.research import ResearchCandidate
 from shared.models.sentiment import SentimentCursor, SentimentDaily, SentimentMessage
 from shared.models.signals import SignalRecord
+from shared.models.system_halt import SystemHaltState
 
 __all__ = [
     "AuditLog",
@@ -42,5 +43,6 @@ __all__ = [
     "SentimentDaily",
     "SentimentMessage",
     "SignalRecord",
+    "SystemHaltState",
     "Trade",
 ]
