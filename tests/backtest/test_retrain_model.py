@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import create_engine
@@ -27,7 +27,13 @@ def db_session():
 
 
 def _seed_trades(session: Session, n: int = 250) -> None:
-    """Seed DB with n trades across two portfolios."""
+    """Seed DB with n trades across two portfolios.
+
+    Entries are spread one per day with a five-day hold, so the purged
+    walk-forward has folds whose training labels close before the test window.
+    Bunching every trade into one month with a month-long hold would leave the
+    purge nothing to train on — correctly, but uninformatively.
+    """
     state = PaperTradingState.create_new(
         portfolio_capitals={"mr": 50_000, "mom": 50_000},
         session=session,
@@ -41,8 +47,8 @@ def _seed_trades(session: Session, n: int = 250) -> None:
         ticker = tickers[i % len(tickers)]
         entry_price = 100 + random.uniform(-20, 20)
         exit_price = entry_price + random.uniform(-10, 15)
-        entry_d = date(2023, 1, 1 + (i % 28))
-        exit_d = date(2023, 2, 1 + (i % 28))
+        entry_d = date(2023, 1, 1) + timedelta(days=i)
+        exit_d = entry_d + timedelta(days=5)
 
         state.record_fill(
             portfolio=portfolio, ticker=ticker, action="buy",

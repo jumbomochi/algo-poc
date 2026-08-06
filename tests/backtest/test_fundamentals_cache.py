@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import json
 import os
 import tempfile
 from datetime import date
+
+import pytest
 
 from scripts.fetch_fundamentals import load_fundamentals_cache, save_fundamentals_cache
 
@@ -54,7 +55,8 @@ def test_build_fundamentals_lookup():
         ],
     }
 
-    lookup = build_fundamentals_lookup(cache)
+    # No filing lag: availability keys straight off the period-end date.
+    lookup = build_fundamentals_lookup(cache, filing_lag_days=0)
 
     # Before first report: no data
     assert lookup("AAPL", date(2024, 1, 10)) is None
@@ -71,3 +73,75 @@ def test_build_fundamentals_lookup():
 
     # Unknown ticker
     assert lookup("MSFT", date(2024, 5, 1)) is None
+
+
+class TestFilingLag:
+    """A fiscal period ending on date D is not public knowledge on date D.
+
+    Finding 4.4 of the 2026-08-06 review: the lookup keyed availability off the
+    fiscal period-end, so both the backtest and live paper trading read figures
+    weeks before they were filed.
+    """
+
+    CACHE = {
+        "AAPL": [
+            {"report_date": "2024-03-31", "roe": 0.15},
+            {"report_date": "2024-06-30", "roe": 0.17},
+        ],
+    }
+
+    def test_period_end_is_not_an_availability_date(self):
+        from scripts.fetch_fundamentals import build_fundamentals_lookup
+
+        lookup = build_fundamentals_lookup(self.CACHE, filing_lag_days=45)
+
+        # The quarter ended 2024-03-31 but was not filed on 2024-03-31.
+        assert lookup("AAPL", date(2024, 3, 31)) is None
+        assert lookup("AAPL", date(2024, 5, 14)) is None
+        # 45 days after period end it is assumed filed and usable.
+        assert lookup("AAPL", date(2024, 5, 15))["roe"] == 0.15
+
+    def test_lag_defaults_to_the_10q_filing_deadline(self):
+        from scripts.fetch_fundamentals import (
+            DEFAULT_FILING_LAG_DAYS,
+            build_fundamentals_lookup,
+        )
+
+        assert DEFAULT_FILING_LAG_DAYS >= 40  # SEC 10-Q deadline, large filers
+        lookup = build_fundamentals_lookup(self.CACHE)
+        assert lookup("AAPL", date(2024, 3, 31)) is None
+
+    def test_explicit_filing_date_overrides_the_lag(self):
+        from scripts.fetch_fundamentals import build_fundamentals_lookup
+
+        cache = {
+            "AAPL": [
+                {"report_date": "2024-03-31", "filing_date": "2024-04-20", "roe": 0.15},
+            ],
+        }
+        lookup = build_fundamentals_lookup(cache, filing_lag_days=45)
+
+        assert lookup("AAPL", date(2024, 4, 19)) is None
+        assert lookup("AAPL", date(2024, 4, 20))["roe"] == 0.15
+
+    def test_reports_are_ordered_by_availability_not_period_end(self):
+        """A late-filed earlier period must not shadow an already-public one."""
+        from scripts.fetch_fundamentals import build_fundamentals_lookup
+
+        cache = {
+            "AAPL": [
+                # Restated Q1, filed months late.
+                {"report_date": "2024-03-31", "filing_date": "2024-09-30", "roe": 0.10},
+                {"report_date": "2024-06-30", "filing_date": "2024-07-31", "roe": 0.17},
+            ],
+        }
+        lookup = build_fundamentals_lookup(cache)
+
+        assert lookup("AAPL", date(2024, 8, 15))["roe"] == 0.17
+        assert lookup("AAPL", date(2024, 10, 1))["roe"] == 0.10
+
+    def test_negative_lag_rejected(self):
+        from scripts.fetch_fundamentals import build_fundamentals_lookup
+
+        with pytest.raises(ValueError, match="filing_lag_days"):
+            build_fundamentals_lookup(self.CACHE, filing_lag_days=-1)
