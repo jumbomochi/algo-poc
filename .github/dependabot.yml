@@ -1,0 +1,82 @@
+version: 2
+updates:
+  # pyproject.toml is the source of truth; requirements*.lock are derived
+  # (see docs/operations/dependency-lockfile.md). Dependabot bumps the
+  # version pins here — the lockfile refresh happens in CI/locally via
+  # `uv pip compile`, checked by the lockfile-freshness job in
+  # .github/workflows/security.yml.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - security
+
+  # One entry per Dockerfile location — Dependabot's docker ecosystem does
+  # not glob subdirectories.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, docker]
+  - package-ecosystem: docker
+    directory: /services/ml_model
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, docker]
+  - package-ecosystem: docker
+    directory: /services/signal_generation
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, docker]
+  - package-ecosystem: docker
+    directory: /services/risk_management
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, docker]
+  - package-ecosystem: docker
+    directory: /services/portfolio_accounting
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, docker]
+  - package-ecosystem: docker
+    directory: /services/execution
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, docker]
+  - package-ecosystem: docker
+    directory: /services/api
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, docker]
+  - package-ecosystem: docker
+    directory: /services/data_ingestion
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, docker]
+  - package-ecosystem: docker
+    directory: /services/notifications
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, docker]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - dependencies
+      - ci

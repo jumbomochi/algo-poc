@@ -1,0 +1,43 @@
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly scan for newly-disclosed CVEs in already-pinned dependencies.
+    - cron: "0 6 * * 1"
+
+jobs:
+  pip-audit:
+    name: pip-audit (dependency vulnerability scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install locked dependencies
+        run: pip install -r requirements-dev.lock
+      - name: Run pip-audit against the lockfile
+        run: pip-audit -r requirements-dev.lock
+
+  lockfile-freshness:
+    name: lockfile matches pyproject.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+      - name: Recompile and diff
+        run: |
+          uv pip compile pyproject.toml -o /tmp/requirements.lock
+          uv pip compile pyproject.toml --extra dev -o /tmp/requirements-dev.lock
+          diff -q requirements.lock /tmp/requirements.lock || {
+            echo "requirements.lock is stale — run: uv pip compile pyproject.toml -o requirements.lock" >&2
+            exit 1
+          }
+          diff -q requirements-dev.lock /tmp/requirements-dev.lock || {
+            echo "requirements-dev.lock is stale — run: uv pip compile pyproject.toml --extra dev -o requirements-dev.lock" >&2
+            exit 1
+          }

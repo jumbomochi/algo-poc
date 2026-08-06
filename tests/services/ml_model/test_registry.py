@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from services.ml_model.registry import ModelRegistry
+from services.ml_model.registry import ModelIntegrityError, ModelRegistry
 from services.ml_model.trainer import ModelTrainer
 from shared.models.ml_models import ModelVersion
 
@@ -198,3 +198,55 @@ class TestModelRegistry:
 
         with pytest.raises(ValueError, match="No previous"):
             registry.rollback()
+
+
+class TestModelIntegrity:
+    """joblib.load deserializes arbitrary objects — a tampered or corrupted
+    model file must never be loaded silently. save() records a content hash;
+    load_active() must verify it before deserializing.
+    """
+
+    def test_save_writes_integrity_hash_sidecar(self, trained_model, model_dir, mock_db):
+        registry = ModelRegistry(mock_db, model_dir)
+        window = (date(2024, 1, 1), date(2024, 6, 30))
+
+        model_path = registry.save(trained_model, "v1.0.0", {"accuracy": 0.85}, window)
+
+        assert os.path.exists(model_path + ".sha256")
+
+    def test_load_active_succeeds_when_hash_matches(self, trained_model, model_dir, mock_db):
+        registry = ModelRegistry(mock_db, model_dir)
+        window = (date(2024, 1, 1), date(2024, 6, 30))
+        registry.save(trained_model, "v1.0.0", {"accuracy": 0.85}, window)
+        mock_db._versions[0].is_active = True
+
+        model, version = registry.load_active()
+
+        assert model is not None
+        assert version == "v1.0.0"
+
+    def test_load_active_rejects_tampered_model_file(self, trained_model, model_dir, mock_db):
+        registry = ModelRegistry(mock_db, model_dir)
+        window = (date(2024, 1, 1), date(2024, 6, 30))
+        model_path = registry.save(trained_model, "v1.0.0", {"accuracy": 0.85}, window)
+        mock_db._versions[0].is_active = True
+
+        # Simulate tampering: append a byte after the hash was recorded.
+        with open(model_path, "ab") as f:
+            f.write(b"tampered")
+
+        with pytest.raises(ModelIntegrityError, match="integrity check failed"):
+            registry.load_active()
+
+    def test_load_active_rejects_model_missing_integrity_record(
+        self, trained_model, model_dir, mock_db
+    ):
+        registry = ModelRegistry(mock_db, model_dir)
+        window = (date(2024, 1, 1), date(2024, 6, 30))
+        model_path = registry.save(trained_model, "v1.0.0", {"accuracy": 0.85}, window)
+        mock_db._versions[0].is_active = True
+
+        os.remove(model_path + ".sha256")
+
+        with pytest.raises(ModelIntegrityError, match="no integrity record"):
+            registry.load_active()

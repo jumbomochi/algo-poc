@@ -93,11 +93,20 @@ def mock_redis():
 @pytest.fixture()
 def mock_db(trained_model, model_dir):
     """Set up a mock DB with a saved active model."""
+    import hashlib
+
     import joblib
 
     session = MagicMock()
     model_path = os.path.join(model_dir, "v1.0.0.joblib")
     joblib.dump(trained_model, model_path)
+    # ModelRegistry.load_active() verifies a content-hash sidecar before
+    # deserializing (untrusted-deserialization guard) — this fixture bypasses
+    # ModelRegistry.save() so it must write the sidecar itself.
+    with open(model_path, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    with open(model_path + ".sha256", "w") as f:
+        f.write(digest)
 
     active_record = MagicMock()
     active_record.version = "v1.0.0"

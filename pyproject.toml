@@ -39,6 +39,7 @@ dev = [
     "fakeredis>=2.21",
     "factory-boy>=3.3",
     "testcontainers[postgres,redis]>=3.7",
+    "pip-audit>=2.7,<3.0",
 ]
 
 [build-system]
