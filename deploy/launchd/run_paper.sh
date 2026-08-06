@@ -7,14 +7,23 @@ ALGO_DIR="/Users/huiliang/GitHub/algo-poc"
 VENV="$ALGO_DIR/.venv/bin/python"
 LOG_DIR="$HOME/ibc/logs"
 LOG_FILE="$LOG_DIR/paper_trading_$(date +%Y%m%d).log"
+ENV_FILE="$ALGO_DIR/.env"
+
+echo "$(date): Starting daily paper trading run" >> "$LOG_FILE"
 
 # The paper DB and redis are the dockerized instances, published on
 # machine-local ports (see docker-compose.override.yml). config/default.yaml's
-# localhost defaults point at nothing on this machine.
-export ALGO_DATABASE_URL="postgresql://algo:algo@localhost:55432/algo_poc"
-export ALGO_REDIS_URL="redis://localhost:56379/0"
-
-echo "$(date): Starting daily paper trading run" >> "$LOG_FILE"
+# localhost defaults point at nothing on this machine. Both now require auth
+# (T3 message-bus lockdown) — credentials live in the repo's gitignored
+# `.env`, same split as the Telegram credentials in gateway_watchdog.sh.
+DB_PASSWORD=$(grep '^POSTGRES_PASSWORD=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-)
+REDIS_PASSWORD=$(grep '^REDIS_PASSWORD=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-)
+if [ -z "$DB_PASSWORD" ] || [ -z "$REDIS_PASSWORD" ]; then
+    echo "$(date): ERROR - POSTGRES_PASSWORD/REDIS_PASSWORD not set in $ENV_FILE" >> "$LOG_FILE"
+    exit 1
+fi
+export ALGO_DATABASE_URL="postgresql://algo:${DB_PASSWORD}@localhost:55432/algo_poc"
+export ALGO_REDIS_URL="redis://:${REDIS_PASSWORD}@localhost:56379/0"
 
 # Check IB Gateway is running
 if ! nc -z 127.0.0.1 7497 2>/dev/null; then

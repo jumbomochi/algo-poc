@@ -8,6 +8,10 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 # Install project in editable mode with dev dependencies
 pip install -e ".[dev]"
 
+# First time only: Postgres/Redis require credentials (T3 message-bus
+# lockdown) — docker compose refuses to start without them.
+cp .env.example .env  # then fill in POSTGRES_PASSWORD / REDIS_PASSWORD
+
 # Build and start all services via Docker
 docker compose up
 

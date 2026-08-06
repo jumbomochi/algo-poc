@@ -53,6 +53,24 @@ def test_load_config_nested_env_override(tmp_path, monkeypatch):
     assert config.database.url == "postgresql://new:new@localhost/new"
 
 
+def test_load_config_nested_env_override_redis_url_preserves_auth(tmp_path, monkeypatch):
+    """ALGO_REDIS_URL must round-trip an auth-bearing URL untouched.
+
+    T3 message-bus lockdown: docker-compose.yml now injects
+    redis://:${REDIS_PASSWORD}@redis:6379/0 via this env var. Nothing in the
+    config layer should strip, re-encode, or otherwise mangle the embedded
+    password.
+    """
+    yaml_content = "mode: paper\nredis:\n  url: redis://localhost:6379/0\n"
+    config_file = tmp_path / "test_config.yaml"
+    config_file.write_text(yaml_content)
+    monkeypatch.setenv(
+        "ALGO_REDIS_URL", "redis://:s3cr3t-p@ss@redis:6379/0"
+    )
+    config = load_config(str(config_file))
+    assert config.redis.url == "redis://:s3cr3t-p@ss@redis:6379/0"
+
+
 def test_load_config_missing_file():
     with pytest.raises(FileNotFoundError):
         load_config("/nonexistent/path.yaml")
