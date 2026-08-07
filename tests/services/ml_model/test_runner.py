@@ -93,16 +93,24 @@ def mock_redis():
 @pytest.fixture()
 def mock_db(trained_model, model_dir):
     """Set up a mock DB with a saved active model."""
+    import hashlib
+
     import joblib
 
     session = MagicMock()
     model_path = os.path.join(model_dir, "v1.0.0.joblib")
     joblib.dump(trained_model, model_path)
+    # ModelRegistry.load_active() verifies a content hash recorded on the
+    # DB row (untrusted-deserialization guard) before deserializing — this
+    # fixture bypasses ModelRegistry.save() so it must set that field itself.
+    with open(model_path, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
 
     active_record = MagicMock()
     active_record.version = "v1.0.0"
     active_record.model_path = model_path
     active_record.is_active = True
+    active_record.content_hash = digest
 
     def query_side_effect(model_class):
         q = MagicMock()
