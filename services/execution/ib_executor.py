@@ -269,8 +269,10 @@ class IBExecutor:
 
             # A reconnect recreates the IB client, orphaning the fill/status
             # callbacks bound to the previous Trade objects. Re-register them for
-            # every still-open tracked order so a mid-session reconnect drops no
-            # fills. (First connect has no tracked trades → no-op.)
+            # every still-open tracked order so a mid-session reconnect keeps
+            # delivering their fills. (First connect has no tracked trades →
+            # no-op. Orders that completed during the outage are logged for
+            # reconciliation — see _reregister_open_trades.)
             self._reregister_open_trades()
 
             # A healthy session proves server connectivity: clear any stale
@@ -298,7 +300,15 @@ class IBExecutor:
 
     def _reregister_open_trades(self) -> None:
         """Re-bind fill/status callbacks onto the fresh Trade objects after a
-        reconnect, for every tracked order still open at IB."""
+        reconnect, for every tracked order still open at IB.
+
+        This recovers callbacks for orders that are STILL OPEN across the
+        reconnect. An order that reached a terminal state *during* the outage no
+        longer appears in ``openTrades()``, so its fill/status can't be replayed
+        here — that divergence is caught by the daily broker reconciliation
+        (``scripts/reconcile_paper.py``). Such orders are logged as a warning so
+        the gap is visible rather than silent.
+        """
         if self._ib is None or not self._trade_meta:
             return
         try:
@@ -306,6 +316,7 @@ class IBExecutor:
         except Exception:  # pragma: no cover - defensive
             self._logger.exception("Could not list open trades on reconnect")
             return
+        open_ids = set()
         reattached = 0
         for trade in open_trades:
             order = getattr(trade, "order", None)
@@ -313,12 +324,22 @@ class IBExecutor:
             meta = self._trade_meta.get(order_id)
             if meta is None:
                 continue
+            open_ids.add(order_id)
             ticker, side = meta
             self._register_trade(order_id, trade, ticker, side)
             reattached += 1
         if reattached:
             self._logger.info(
                 "Re-registered IB callbacks after reconnect", count=reattached
+            )
+        # Tracked orders that vanished across the reconnect may have completed
+        # during the outage; their fills cannot be replayed via callbacks.
+        missing = [oid for oid in self._trade_meta if oid not in open_ids]
+        if missing:
+            self._logger.warning(
+                "Tracked orders absent after reconnect — verify via broker "
+                "reconciliation (fills may have completed during the outage)",
+                order_ids=missing,
             )
 
     def _spawn(self, coro: Any) -> Any:

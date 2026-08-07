@@ -690,3 +690,21 @@ def test_partial_without_order_done_stays_partial(session, projector):
     intent = ledger.get("rec-1")
     session.rollback()
     assert intent.status == OrderStatus.PARTIALLY_FILLED.value
+
+
+def test_material_partial_then_done_stays_partial_not_filled(session, projector):
+    """order_done alone must NOT mark FILLED: a genuinely partial order that
+    the broker marks done (e.g. cancelled after 40/100) must stay
+    PARTIALLY_FILLED so the status path can terminalize it CANCELLED — only a
+    sub-one-share (whole-share-rounding) shortfall may terminalize on done."""
+    seed_intent(session, quantity=100, status=OrderStatus.SUBMITTED)
+    ledger = OrderLedger(session)
+
+    assert projector.apply(
+        make_fill(quantity=40, cumulative=40, order_done=True)
+    ) is True
+
+    intent = ledger.get("rec-1")
+    session.rollback()
+    assert intent.status == OrderStatus.PARTIALLY_FILLED.value
+    session.rollback()

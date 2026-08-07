@@ -399,15 +399,21 @@ class FillProjector:
             self.session.flush()
             return
         # FILLED when the fill reaches the requested quantity, OR when the broker
-        # reports the order done and something filled: the placed quantity can be
-        # below requested_quantity after whole-share rounding, and a full fill of
-        # that placed quantity must terminalize (FILLED is terminal, so the
-        # (requested-filled) reservation releases) instead of sticking at
-        # PARTIALLY_FILLED forever and blocking future buys.
+        # reports the order done and the only shortfall is sub-one-share — i.e.
+        # whole-share rounding placed floor(requested) and it fully filled. That
+        # terminal release (FILLED is terminal) frees the phantom
+        # (requested-filled) reservation instead of sticking PARTIALLY_FILLED.
+        #
+        # Crucially this must NOT fire for a *material* partial that the broker
+        # also marks done (isDone() is True for Cancelled too): a 40/100
+        # cancelled order must stay PARTIALLY_FILLED so the status path can
+        # terminalize it CANCELLED. Only a shortfall < 1 share is rounding.
+        shortfall = intent.requested_quantity - cumulative
         fully_filled = isclose(cumulative, intent.requested_quantity)
+        rounding_complete = order_done and 0 < shortfall < 1.0
         new_status = (
             OrderStatus.FILLED
-            if fully_filled or (order_done and cumulative > 0)
+            if fully_filled or rounding_complete
             else OrderStatus.PARTIALLY_FILLED
         )
         self._ledger.transition(intent.recommendation_id, new_status)

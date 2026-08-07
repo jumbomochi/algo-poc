@@ -251,3 +251,35 @@ async def test_reconnect_reregisters_callbacks_for_open_trades():
     assert len(new_trade.statusEvent.callbacks) == 1
     assert len(new_trade.commissionReportEvent.callbacks) == 1
     assert executor._trades["9"] is new_trade
+
+
+@pytest.mark.asyncio
+async def test_reconnect_warns_about_orders_absent_after_outage():
+    """An order that completed during the outage is no longer open at IB; its
+    callbacks can't be replayed, so the reconnect must surface it (warning) for
+    reconciliation instead of silently diverging."""
+    from unittest.mock import patch
+
+    executor = IBExecutor("h", 7497, 1)
+    executor.set_fill_handler(AsyncMock())
+    executor.set_order_status_handler(AsyncMock())
+    executor._logger = MagicMock()
+
+    old_trade = SimpleNamespace(
+        order=SimpleNamespace(orderId=9),
+        commissionReportEvent=Event(),
+        statusEvent=Event(),
+    )
+    executor._register_trade("9", old_trade, "AAPL", "buy")
+
+    fake_ib = MagicMock()
+    fake_ib.connectAsync = AsyncMock()
+    fake_ib.managedAccounts.return_value = ["DUN551088"]
+    fake_ib.openTrades.return_value = []  # order 9 completed during the outage
+
+    with patch("ib_insync.IB", return_value=fake_ib):
+        await executor.connect(expect_paper=True)
+
+    assert executor._logger.warning.called
+    warned_ids = executor._logger.warning.call_args.kwargs.get("order_ids")
+    assert warned_ids == ["9"]
