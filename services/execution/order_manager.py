@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
@@ -119,6 +119,7 @@ class OrderManager:
             "last_repriced_at": now,
             "reprice_count": 0,
             "recommendation_id": recommendation_id,
+            "order_type": "limit",
         }
 
         self._logger.info(
@@ -171,6 +172,22 @@ class OrderManager:
 
         # Track for idempotency
         self._submitted[recommendation_id] = order_id
+
+        # Track as an open order so cancel_all_orders can reach a stuck exit
+        # (a market exit normally fills at once, but a queued/rejected one must
+        # not be invisible to the kill path). Marked "market" so the unfilled
+        # sweep never tries to reprice it.
+        now = datetime.now(timezone.utc)
+        self.open_orders[order_id] = {
+            "ticker": ticker,
+            "quantity": quantity,
+            "limit_price": None,
+            "placed_at": now,
+            "last_repriced_at": now,
+            "reprice_count": 0,
+            "recommendation_id": recommendation_id,
+            "order_type": "market",
+        }
 
         self._logger.info(
             "Exit order submitted",
@@ -256,6 +273,10 @@ class OrderManager:
         actions: list[OrderAction] = []
 
         for order_id, info in self.open_orders.items():
+            # Market orders (e.g. exits/liquidations) fill at once and have no
+            # limit to reprice; the unfilled-limit sweep must leave them alone.
+            if info.get("order_type") == "market":
+                continue
             ticker = info["ticker"]
             next_close = market_calendar.get_next_market_close(now)
 
@@ -317,6 +338,46 @@ class OrderManager:
             # Rule 4: Recently placed — no action
 
         return actions
+
+    async def sweep_unfilled_orders(
+        self,
+        current_prices: dict[str, float],
+        market_calendar: Any,
+    ) -> int:
+        """Apply the unfilled-order decisions from :meth:`check_unfilled_orders`.
+
+        Cancels orders that are near close or past the reprice-attempt limit
+        (freeing their reservation once IB reports the cancellation). Repricing
+        needs a live quote — which the execution service has no feed for — so a
+        reprice decision only advances the order's bookkeeping, letting a
+        persistently-unfilled limit progress to the max-attempts cancel instead
+        of silently dying at IB session expiry. Returns the number of orders
+        cancelled.
+        """
+        cancelled = 0
+        for action in self.check_unfilled_orders(current_prices, market_calendar):
+            info = self.open_orders.get(action.order_id)
+            if info is None:
+                continue
+            if action.action_type == "cancel":
+                try:
+                    await self._executor.cancel_order(action.order_id)
+                    self.open_orders.pop(action.order_id, None)
+                    cancelled += 1
+                except Exception:
+                    self._logger.exception(
+                        "Failed to cancel unfilled order",
+                        order_id=action.order_id,
+                    )
+            else:  # reprice — no live quote feed, so only advance bookkeeping
+                info["reprice_count"] += 1
+                info["last_repriced_at"] = datetime.now(timezone.utc)
+                self._logger.info(
+                    "Unfilled limit aged (no quote feed to reprice)",
+                    order_id=action.order_id,
+                    reprice_count=info["reprice_count"],
+                )
+        return cancelled
 
     def handle_partial_fill(
         self,

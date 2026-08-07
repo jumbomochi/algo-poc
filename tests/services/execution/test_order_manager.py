@@ -42,6 +42,40 @@ class TestOrderManager:
         mock_executor.submit_market_order.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_submit_exit_tracked_in_open_orders(self):
+        """Exits must be tracked so cancel_all_orders can reach a stuck exit."""
+        mock_executor = AsyncMock()
+        mock_executor.find_order_by_ref = AsyncMock(return_value=None)
+        mock_executor.submit_market_order = AsyncMock(return_value="order-002")
+        mgr = OrderManager(
+            executor=mock_executor,
+            redis_client=AsyncMock(),
+            db_session=MagicMock(),
+        )
+        order_id = await mgr.submit_exit(
+            "AAPL", quantity=50, recommendation_id="rec-exit"
+        )
+        assert order_id in mgr.open_orders
+        assert mgr.open_orders[order_id]["order_type"] == "market"
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_reaches_exit_orders(self):
+        mock_executor = AsyncMock()
+        mock_executor.find_order_by_ref = AsyncMock(return_value=None)
+        mock_executor.submit_market_order = AsyncMock(return_value="order-002")
+        mock_executor.cancel_order = AsyncMock(return_value=True)
+        mgr = OrderManager(
+            executor=mock_executor,
+            redis_client=AsyncMock(),
+            db_session=MagicMock(),
+        )
+        await mgr.submit_exit("AAPL", quantity=50, recommendation_id="rec-exit")
+
+        cancelled = await mgr.cancel_all_orders()
+
+        assert "order-002" in cancelled
+
+    @pytest.mark.asyncio
     async def test_idempotency_prevents_duplicate(self):
         mock_executor = AsyncMock()
         mock_executor.submit_limit_order = AsyncMock(return_value="order-001")

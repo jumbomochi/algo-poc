@@ -102,6 +102,7 @@ def make_fill(
     ticker: str = "AAPL",
     exchange: str = "SMART",
     timestamp: datetime = NOW,
+    order_done: bool = False,
 ) -> FillMessage:
     if commission_trading is None and commission_currency == "USD":
         commission_trading = commission
@@ -124,6 +125,7 @@ def make_fill(
         con_id=265598,
         exchange=exchange,
         currency="USD",
+        order_done=order_done,
     )
 
 
@@ -657,3 +659,52 @@ def test_sell_cannot_exceed_position_and_buy_cannot_overdraw_cash(projector, ses
         ))
     assert get_position(session) is None
     assert get_cash(session) == 10_000
+
+
+def test_rounded_full_fill_terminalizes_and_releases_reservation(
+    session, projector
+):
+    """A whole-share-rounded order (requested 8.3243, placed 8) that fully fills
+    its placed quantity and is marked done by IB must terminalize FILLED — not
+    stick at PARTIALLY_FILLED and leak the (requested-filled) reservation."""
+    seed_intent(session, quantity=8.3243, status=OrderStatus.SUBMITTED)
+    ledger = OrderLedger(session)
+
+    assert projector.apply(make_fill(quantity=8, cumulative=8, order_done=True)) is True
+
+    intent = ledger.get("rec-1")
+    session.rollback()
+    assert intent.status == OrderStatus.FILLED.value
+    # FILLED is terminal, so no reservation remains to block future buys.
+    assert ledger.active_reservations("momentum") == 0
+    session.rollback()
+
+
+def test_partial_without_order_done_stays_partial(session, projector):
+    """A genuine partial (order still working, not done) is unchanged."""
+    seed_intent(session, quantity=10, status=OrderStatus.SUBMITTED)
+    ledger = OrderLedger(session)
+
+    assert projector.apply(make_fill(quantity=6, cumulative=6, order_done=False)) is True
+
+    intent = ledger.get("rec-1")
+    session.rollback()
+    assert intent.status == OrderStatus.PARTIALLY_FILLED.value
+
+
+def test_material_partial_then_done_stays_partial_not_filled(session, projector):
+    """order_done alone must NOT mark FILLED: a genuinely partial order that
+    the broker marks done (e.g. cancelled after 40/100) must stay
+    PARTIALLY_FILLED so the status path can terminalize it CANCELLED — only a
+    sub-one-share (whole-share-rounding) shortfall may terminalize on done."""
+    seed_intent(session, quantity=100, status=OrderStatus.SUBMITTED)
+    ledger = OrderLedger(session)
+
+    assert projector.apply(
+        make_fill(quantity=40, cumulative=40, order_done=True)
+    ) is True
+
+    intent = ledger.get("rec-1")
+    session.rollback()
+    assert intent.status == OrderStatus.PARTIALLY_FILLED.value
+    session.rollback()

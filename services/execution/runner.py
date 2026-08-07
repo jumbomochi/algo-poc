@@ -89,6 +89,15 @@ class ExecutionServiceRunner:
         else:
             self.ib_port = config.ib.paper_port
 
+        # Periodic unfilled-order sweep (cancel stale limits / free reservations).
+        # Driven on the reprice interval; needs a market calendar (set by the
+        # runner entrypoint) — without one the sweep is skipped.
+        self._reprice_interval_seconds = max(
+            1, int(config.execution.reprice_interval_minutes) * 60
+        )
+        self._last_sweep_at: float | None = None
+        self._market_calendar: Any = None
+
     async def setup(self) -> None:
         """Create consumer groups and replay pending messages.
 
@@ -427,6 +436,7 @@ class ExecutionServiceRunner:
             con_id=fill_info.get("con_id"),
             exchange=fill_info.get("exchange"),
             currency=fill_info.get("currency"),
+            order_done=bool(fill_info.get("order_done", False)),
         )
         local_effect = None
         if fill.account_id and fill.portfolio:
@@ -509,6 +519,24 @@ class ExecutionServiceRunner:
         finally:
             self._order_ledger.session.rollback()
 
+    async def _publish_alert(
+        self,
+        *,
+        event_type: str,
+        priority: str,
+        message: str,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        """Publish an alert to the alerts stream."""
+        alert = AlertMessage(
+            timestamp=datetime.now(timezone.utc),
+            event_type=event_type,
+            priority=priority,
+            message=message,
+            context=context or {},
+        )
+        await self._redis.publish(ALERTS_STREAM, alert.to_stream_dict())
+
     async def handle_ib_order_status(
         self, status_info: dict[str, Any]
     ) -> None:
@@ -523,6 +551,19 @@ class ExecutionServiceRunner:
             )
             if self._order_ledger is not None:
                 self._order_ledger.session.rollback()
+            return
+
+        # A late or duplicate broker status can arrive after the fill projector
+        # (or a prior status) already terminalized the intent. Transitioning out
+        # of a terminal state raises InvalidOrderTransition; ignore it instead.
+        if OrderStatus(intent.status) in TERMINAL_STATUSES:
+            self._logger.info(
+                "Ignoring IB status for already-terminal intent",
+                order_id=order_id,
+                status=status_info.get("status"),
+                current=intent.status,
+            )
+            self._order_ledger.session.rollback()
             return
 
         broker_status = str(status_info.get("status", ""))
@@ -566,10 +607,31 @@ class ExecutionServiceRunner:
         if target is None:
             self._order_ledger.session.rollback()
             return
-        self._order_ledger.transition(
-            intent.recommendation_id, target, reason=reason
-        )
-        self._commit_ledger()
+        try:
+            self._order_ledger.transition(
+                intent.recommendation_id, target, reason=reason
+            )
+            self._commit_ledger()
+        except Exception as exc:
+            # Never let a transition error escape into the fire-and-forget IB
+            # callback task (it would be swallowed and leave the shared session
+            # mid-transaction). Roll back and alert instead.
+            self._order_ledger.session.rollback()
+            self._logger.exception(
+                "Failed to persist IB order status",
+                order_id=order_id,
+                target=target.value,
+            )
+            await self._publish_alert(
+                event_type="order_status_persist_failed",
+                priority="high",
+                message=(
+                    f"Could not persist status {target.value} for order "
+                    f"{order_id}: {exc}"
+                ),
+                context={"order_id": order_id, "target": target.value},
+            )
+            return
         self._pending_orders.pop(order_id, None)
         self._order_manager.open_orders.pop(order_id, None)
 
@@ -662,6 +724,25 @@ class ExecutionServiceRunner:
             self._order_ledger.session.rollback()
         return in_flight
 
+    async def maybe_run_unfilled_sweep(self, now: float) -> bool:
+        """Run the unfilled-order sweep when the reprice interval has elapsed.
+
+        ``now`` is a monotonic timestamp (seconds). No-ops without a market
+        calendar. Execution has no live quote feed, so the sweep cancels stale
+        limits / frees reservations rather than repricing (see
+        OrderManager.sweep_unfilled_orders). Returns True when it ran.
+        """
+        if self._market_calendar is None:
+            return False
+        last = self._last_sweep_at
+        if last is not None and (now - last) < self._reprice_interval_seconds:
+            return False
+        self._last_sweep_at = now
+        await self._order_manager.sweep_unfilled_orders(
+            {}, self._market_calendar
+        )
+        return True
+
     async def shutdown(self) -> None:
         """Graceful shutdown: cancel all open orders to avoid orphans."""
         self._logger.info("Execution service shutting down")
@@ -686,6 +767,15 @@ class ExecutionServiceRunner:
 
         try:
             while self._running:
+                # Periodic unfilled-order sweep (best-effort — never tear down
+                # the loop on a sweep failure).
+                try:
+                    await self.maybe_run_unfilled_sweep(
+                        asyncio.get_running_loop().time()
+                    )
+                except Exception:
+                    self._logger.exception("Unfilled-order sweep failed; continuing")
+
                 # Read approved orders
                 messages = await self._redis.read_group(
                     APPROVED_ORDERS_STREAM,
@@ -778,7 +868,11 @@ if __name__ == "__main__":
         engine = create_engine(config.database.url)
         session = sessionmaker(bind=engine)()
         order_manager = OrderManager(
-            executor=executor, redis_client=redis_client, db_session=session
+            executor=executor,
+            redis_client=redis_client,
+            db_session=session,
+            reprice_interval_minutes=config.execution.reprice_interval_minutes,
+            max_reprice_attempts=config.execution.max_reprice_attempts,
         )
         runner = ExecutionServiceRunner(
             config=config,
@@ -786,6 +880,10 @@ if __name__ == "__main__":
             order_manager=order_manager,
             order_ledger=OrderLedger(session),
         )
+        # Wire the market calendar so the periodic unfilled-order sweep runs.
+        from shared.market_calendar import MarketCalendar
+
+        runner._market_calendar = MarketCalendar()
         try:
             positions = load_open_positions(session)
             runner._positions = {

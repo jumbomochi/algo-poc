@@ -124,7 +124,9 @@ class FillProjector:
                         strict_quantity=True,
                         exit_reason=intent.reason,
                     )
-                    self._advance_intent(intent, cumulative)
+                    self._advance_intent(
+                        intent, cumulative, order_done=fill.order_done
+                    )
                     execution.projection_applied = True
                     self.session.flush()
             except (FillProjectionError, ValueError) as exc:
@@ -385,7 +387,9 @@ class FillProjector:
             and row.side == intent.action.upper()
         )
 
-    def _advance_intent(self, intent: OrderIntent, cumulative: float) -> None:
+    def _advance_intent(
+        self, intent: OrderIntent, cumulative: float, *, order_done: bool = False
+    ) -> None:
         intent.filled_quantity = max(float(intent.filled_quantity), cumulative)
         if intent.status in {
             OrderStatus.FILLED.value,
@@ -394,9 +398,22 @@ class FillProjector:
         }:
             self.session.flush()
             return
+        # FILLED when the fill reaches the requested quantity, OR when the broker
+        # reports the order done and the only shortfall is sub-one-share — i.e.
+        # whole-share rounding placed floor(requested) and it fully filled. That
+        # terminal release (FILLED is terminal) frees the phantom
+        # (requested-filled) reservation instead of sticking PARTIALLY_FILLED.
+        #
+        # Crucially this must NOT fire for a *material* partial that the broker
+        # also marks done (isDone() is True for Cancelled too): a 40/100
+        # cancelled order must stay PARTIALLY_FILLED so the status path can
+        # terminalize it CANCELLED. Only a shortfall < 1 share is rounding.
+        shortfall = intent.requested_quantity - cumulative
+        fully_filled = isclose(cumulative, intent.requested_quantity)
+        rounding_complete = order_done and 0 < shortfall < 1.0
         new_status = (
             OrderStatus.FILLED
-            if isclose(cumulative, intent.requested_quantity)
+            if fully_filled or rounding_complete
             else OrderStatus.PARTIALLY_FILLED
         )
         self._ledger.transition(intent.recommendation_id, new_status)
