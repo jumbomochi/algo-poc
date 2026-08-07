@@ -250,6 +250,18 @@ class IBExecutor:
                         f"account(s) {non_paper} on port {self._port}. "
                         "Re-login the Gateway with the paper credentials."
                     )
+            elif expect_paper is False:
+                # Mirror guard for live: refuse a paper (DU) session on the live
+                # port so a mis-login can never trade the wrong book.
+                paper = [a for a in accounts if a.startswith("DU")]
+                if paper:
+                    self._ib.disconnect()
+                    self._ib = None
+                    raise WrongAccountTypeError(
+                        f"Live mode but the Gateway session holds PAPER "
+                        f"account(s) {paper} on port {self._port}. "
+                        "Re-login the Gateway with the live credentials."
+                    )
 
             # A healthy session proves server connectivity: clear any stale
             # lost-marker left by a socket that dropped without a 1102.

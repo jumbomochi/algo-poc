@@ -1385,6 +1385,45 @@ class TestPaperAccountGuard:
 
         assert executor._ib is fake_ib
 
+    @pytest.mark.asyncio
+    async def test_paper_account_on_live_port_refused(self):
+        """The mirror guard: live mode must refuse a paper (DU) Gateway session
+        so a mis-login never trades the wrong book."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from services.execution.ib_executor import (
+            IBExecutor,
+            WrongAccountTypeError,
+        )
+
+        executor = IBExecutor(host="h", port=7496, client_id=1)
+        fake_ib = MagicMock()
+        fake_ib.connectAsync = AsyncMock()
+        fake_ib.managedAccounts.return_value = ["DUN551088"]  # PAPER prefix
+
+        with patch("ib_insync.IB", return_value=fake_ib):
+            with pytest.raises(WrongAccountTypeError, match="PAPER"):
+                await executor.connect(expect_paper=False)
+
+        fake_ib.disconnect.assert_called_once()
+        assert executor._ib is None
+
+    @pytest.mark.asyncio
+    async def test_live_account_accepted_in_live_mode(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from services.execution.ib_executor import IBExecutor
+
+        executor = IBExecutor(host="h", port=7496, client_id=1)
+        fake_ib = MagicMock()
+        fake_ib.connectAsync = AsyncMock()
+        fake_ib.managedAccounts.return_value = ["U17723819"]  # live prefix
+
+        with patch("ib_insync.IB", return_value=fake_ib):
+            await executor.connect(expect_paper=False)
+
+        assert executor._ib is fake_ib
+
 
 class TestWholeShareFallback:
     """Accounts without fractional API support round down; sub-1-share skips."""

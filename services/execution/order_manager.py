@@ -119,6 +119,7 @@ class OrderManager:
             "last_repriced_at": now,
             "reprice_count": 0,
             "recommendation_id": recommendation_id,
+            "order_type": "limit",
         }
 
         self._logger.info(
@@ -171,6 +172,22 @@ class OrderManager:
 
         # Track for idempotency
         self._submitted[recommendation_id] = order_id
+
+        # Track as an open order so cancel_all_orders can reach a stuck exit
+        # (a market exit normally fills at once, but a queued/rejected one must
+        # not be invisible to the kill path). Marked "market" so the unfilled
+        # sweep never tries to reprice it.
+        now = datetime.now(timezone.utc)
+        self.open_orders[order_id] = {
+            "ticker": ticker,
+            "quantity": quantity,
+            "limit_price": None,
+            "placed_at": now,
+            "last_repriced_at": now,
+            "reprice_count": 0,
+            "recommendation_id": recommendation_id,
+            "order_type": "market",
+        }
 
         self._logger.info(
             "Exit order submitted",
