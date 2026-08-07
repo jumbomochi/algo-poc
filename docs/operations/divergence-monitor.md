@@ -6,7 +6,27 @@ drawdowns or operational issues compound.
 
 **Script:** `scripts/divergence_monitor.py`
 **Math layer:** `backtest/divergence.py` (pure functions, no I/O)
-**Tests:** `tests/backtest/test_divergence.py` (37 unit) + `tests/scripts/test_divergence_monitor.py` (8 integration)
+**Tests:** `tests/backtest/test_divergence.py` + `tests/scripts/test_divergence_monitor.py`
+
+---
+
+## The baseline has to be like-for-like
+
+The monitor only grades live against a backtest that live could actually have
+matched. It reads the baseline's declared execution model from the results
+JSON's `config` block and requires **next-open fills** plus a **per-order
+commission floor**.
+
+A backtest that filled same-bar (entries at the decision day's low, exits at
+that day's open) is unachievable, so live trails it by construction; grading
+against one either excuses real drift or invents drift that is only the
+baseline's optimism. When the baseline fails the check, every report comes back
+`NO_DATA` with a note, the header is tagged `[NOT LIKE-FOR-LIKE]`, and the
+arithmetic is still printed so the gap is visible.
+
+Fix: regenerate the baseline per
+[backtest-baseline.md](backtest-baseline.md). A results JSON with no
+`fill_model` key predates the 2026-08-06 rebaseline and is treated as same-bar.
 
 ---
 
@@ -14,11 +34,11 @@ drawdowns or operational issues compound.
 
 | Symptom | Manifests as | Action |
 |---|---|---|
-| Fills consistently worse than the 10 bps slippage assumed | `Slip bps` column much higher than 10 | Investigate IB routing, order timing, liquidity in thinly-traded ETFs |
+| Fills consistently worse than the baseline's slippage assumption | `Slip bps` column above 1.5× the baseline's rate | Investigate IB routing, order timing, liquidity in thinly-traded ETFs |
 | A signal not firing live the same way it fired in backtest | Live return diverges, daily correlation drops below ~0.7 | Diff the signal output between live and backtest for the same bars |
 | Order rejections or stuck positions | Trade count diverges, live equity flat while backtest moves | Check `services/execution` logs, order status in IB |
 | Universe drift (live trading a ticker no longer in the backtest universe) | Portfolio in DB but absent from backtest JSON | Re-run backtest, update CAPITAL_ALLOCATIONS, or accept and exclude |
-| Commission realization exceeding the $0.005/share assumed | Realized commission > 1.5× assumed | Review IB commission tier, check for high-frequency churn |
+| Commission realization exceeding the baseline's `max($1/order, $0.005/share)` | Realized commission > 1.5× assumed | Review IB commission tier, check for high-frequency churn |
 
 ## Usage
 
@@ -98,8 +118,9 @@ below ~0.7, signals are firing differently between live and backtest.
 Returns `None` (renders as `—`) when the series is constant or too short.
 
 **`Slip bps`** — average realized slippage per fill, weighted by notional
-(`|quantity × exit_price|`). The backtest assumes 10 bps; consistent values
-above ~15 bps warrant investigation.
+(`|quantity × exit_price|`). Compared against the baseline's own declared
+slippage (printed in the header); consistent values above 1.5× it warrant
+investigation.
 
 **`Trades`** — count of closed trades whose `exit_date` falls within the
 window. Compare to expected trade frequency per sleeve.

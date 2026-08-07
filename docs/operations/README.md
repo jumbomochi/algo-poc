@@ -7,6 +7,7 @@ Entry point for operational documentation.
 - `go-live-checklist.md` — Paper-to-live promotion gates
 - `rollback-playbook.md` — Time-bound rollback procedure
 - `divergence-monitor.md` — Daily live-vs-backtest divergence check (scripts/divergence_monitor.py)
+- `backtest-baseline.md` — Regenerating the headline backtest: point-in-time universe, next-open fills, real costs
 - Reconciliation procedures (TBD)
 - Incident response/escalation procedures (TBD)
 

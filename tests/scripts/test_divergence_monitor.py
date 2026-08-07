@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from scripts.divergence_monitor import (
     find_latest_backtest_json,
+    load_backtest_execution_model,
     load_backtest_equity_series,
     load_live_aggregate_series,
     load_live_equity_series,
@@ -259,3 +260,37 @@ def test_write_json_report_round_trip(tmp_path: Path):
     assert r["window_start"] == "2026-05-01"
     assert r["window_end"] == "2026-05-30"
     assert r["status"] == "OK"
+
+
+# ---------------------------------------------------------------------------
+# Baseline execution model
+# ---------------------------------------------------------------------------
+
+
+def test_load_execution_model_reads_the_declared_fill_model(tmp_path: Path):
+    path = _write_backtest_json(tmp_path)
+    data = json.loads(path.read_text())
+    data["config"].update({
+        "fill_model": "next_open",
+        "slippage_bps": 10,
+        "commission_per_share": 0.005,
+        "commission_minimum": 1.0,
+    })
+    path.write_text(json.dumps(data))
+
+    model = load_backtest_execution_model(str(path))
+
+    assert model.fill_model == "next_open"
+    assert model.is_like_for_like is True
+
+
+def test_load_execution_model_treats_a_pre_rebaseline_backtest_as_same_bar(
+    tmp_path: Path,
+):
+    """A backtest JSON with no fill_model predates the rebaseline."""
+    path = _write_backtest_json(tmp_path)
+
+    model = load_backtest_execution_model(str(path))
+
+    assert model.fill_model == "same_bar"
+    assert model.is_like_for_like is False

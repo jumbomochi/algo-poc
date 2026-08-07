@@ -104,6 +104,11 @@ class MembershipCalendar:
 
     ``always`` holds instruments that are tradable on every date but are not
     index constituents (the sector / thematic / inverse ETFs the sleeves use).
+
+    The ``snapshots`` mapping is deliberately the same shape that
+    ``research.factors.panel.build_factor_panel`` takes as
+    ``universe_membership_by_date``, so one membership file drives both the
+    backtest and the research factor panel without translation.
     """
 
     def __init__(

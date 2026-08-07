@@ -43,6 +43,13 @@ import numpy as np
 import pandas as pd
 
 from backtest.aggregate_risk import AggregateRiskMonitor
+from backtest.costs import (
+    DEFAULT_COMMISSION_MINIMUM,
+    DEFAULT_COMMISSION_PER_SHARE,
+    DEFAULT_SLIPPAGE_BPS,
+    CostModel,
+)
+from backtest.divergence import NEXT_OPEN_FILL_MODEL
 from backtest.feature_extractor import enrich_trades
 from backtest.metrics import BacktestMetrics
 from backtest.runner import BacktestResult, BacktestRunner
@@ -82,6 +89,7 @@ def _context_exit_quantity(
     return uncovered if uncovered > 0 else None
 from scripts.fetch_fundamentals import load_fundamentals_cache, build_fundamentals_lookup, SECTOR_MAP
 from scripts.fetch_earnings import load_earnings_cache, build_earnings_lookup
+from scripts.train_signal_model import assert_ml_filter_out_of_sample
 from services.signal_generation.technical import (
     SupportProximitySignal,
     SupportStrengthSignal,
@@ -95,6 +103,7 @@ from services.signal_generation.technical import (
 # also used by the data_ingestion service). Re-exported here so existing
 # imports (run_paper.py, tests) keep working.
 from shared.universe import (  # noqa: F401
+    ACTIVE_SLEEVES,
     BEAR_TICKERS,
     DEFENSIVE_TICKERS,
     SECTOR_ETFS,
@@ -102,8 +111,90 @@ from shared.universe import (  # noqa: F401
     SP500_TOP100,
     THEMATIC_ETFS,
     UNIVERSE_REGISTRY,
+    MembershipCalendar,
     get_union_universe,
 )
+
+# Instruments that are tradable on every date because they are not index
+# constituents at all: the sector, thematic, inverse and defensive ETFs the
+# non-equity sleeves are built on. Point-in-time S&P membership must not gate
+# these or those sleeves would never trade.
+ALWAYS_TRADABLE = (
+    frozenset(SECTOR_ETFS)
+    | frozenset(THEMATIC_ETFS)
+    | frozenset(DEFENSIVE_TICKERS)
+    | frozenset(BEAR_TICKERS)
+)
+
+
+def load_membership_calendar(path: str) -> MembershipCalendar:
+    """Load point-in-time index membership for the equity sleeves."""
+    return MembershipCalendar.from_json_file(path, always=ALWAYS_TRADABLE)
+
+
+def resolve_backtest_universe(
+    membership: MembershipCalendar | None,
+) -> list[str]:
+    """Tickers whose bars the backtest needs.
+
+    With a membership calendar this is every name that was *ever* a member —
+    including those later dropped or delisted — plus the ETF sleeves. Without
+    one it falls back to the static present-day sleeve union, which carries
+    survivorship bias (finding 4.1).
+    """
+    sleeve_union = get_union_universe(list(ACTIVE_SLEEVES))
+    if membership is None:
+        return sleeve_union
+    seen: set[str] = set()
+    universe: list[str] = []
+    for ticker in list(membership.all_tickers()) + sleeve_union:
+        if ticker not in seen:
+            seen.add(ticker)
+            universe.append(ticker)
+    return universe
+
+
+def build_cost_model(
+    slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
+    commission_per_share: float = DEFAULT_COMMISSION_PER_SHARE,
+    commission_minimum: float = DEFAULT_COMMISSION_MINIMUM,
+) -> CostModel:
+    """Cost model for the backtest: per-order floor + per-instrument slippage."""
+    return CostModel.with_liquidity_tiers(
+        slippage_bps=slippage_bps,
+        commission_per_share=commission_per_share,
+        commission_minimum=commission_minimum,
+    )
+
+
+def build_base_config(
+    *,
+    all_tickers: list[str],
+    years: int,
+    capital: float,
+    cost_model: CostModel,
+    replacement_policy: str,
+    replacement_score_margin: float,
+    portfolio_capitals: dict[str, float],
+    point_in_time_universe: bool,
+) -> dict:
+    """Provenance block saved with the results.
+
+    The execution model is declared explicitly so ``scripts/divergence_monitor``
+    can tell whether these numbers are a like-for-like baseline for live
+    trading, instead of assuming they are (finding 4.6).
+    """
+    return {
+        "tickers": all_tickers,
+        "years": years,
+        "initial_capital": capital,
+        "fill_model": NEXT_OPEN_FILL_MODEL,
+        "point_in_time_universe": point_in_time_universe,
+        "replacement_policy": replacement_policy,
+        "replacement_score_margin": replacement_score_margin,
+        "portfolios": portfolio_capitals,
+        **cost_model.to_dict(),
+    }
 
 
 def fetch_bars_from_ib(
@@ -1945,10 +2036,18 @@ def main():
                         help="Years of historical data (default: 10)")
     parser.add_argument("--capital", type=float, default=100_000,
                         help="Initial capital (default: 100000)")
-    parser.add_argument("--slippage-bps", type=int, default=10,
-                        help="Slippage in basis points (default: 10)")
-    parser.add_argument("--commission", type=float, default=0.005,
-                        help="Commission per share (default: 0.005)")
+    parser.add_argument("--slippage-bps", type=int, default=int(DEFAULT_SLIPPAGE_BPS),
+                        help="Base slippage in basis points, widened per "
+                             "liquidity tier for thin instruments "
+                             f"(default: {int(DEFAULT_SLIPPAGE_BPS)})")
+    parser.add_argument("--commission", type=float, default=DEFAULT_COMMISSION_PER_SHARE,
+                        help=f"Commission per share (default: {DEFAULT_COMMISSION_PER_SHARE})")
+    parser.add_argument("--commission-minimum", type=float,
+                        default=DEFAULT_COMMISSION_MINIMUM,
+                        help="Per-order commission floor in USD; IB charges "
+                             "max($1, $0.005/share) and at this account size "
+                             "the floor is usually what binds "
+                             f"(default: {DEFAULT_COMMISSION_MINIMUM})")
     parser.add_argument("--ib-host", default="127.0.0.1")
     parser.add_argument("--ib-port", type=int, default=7497)
     parser.add_argument("--output-dir", default="output",
@@ -1977,6 +2076,15 @@ def main():
         help="Minimum incoming score improvement for score_margin (default: 0.25)",
     )
     parser.add_argument(
+        "--universe-snapshots",
+        default=None,
+        help="Path to a point-in-time index membership JSON "
+             "({\"YYYY-MM-DD\": [tickers]}, effective forward from each "
+             "snapshot; see docs/operations/backtest-baseline.md). Without it "
+             "the backtest uses today's static ticker list and is "
+             "survivorship-biased.",
+    )
+    parser.add_argument(
         "--research-shadow",
         action="store_true",
         help="Record factor snapshots for every raw sleeve buy candidate",
@@ -1991,6 +2099,25 @@ def main():
     if args.start_date:
         trade_start_date = date.fromisoformat(args.start_date)
 
+    membership = None
+    if args.universe_snapshots:
+        membership = load_membership_calendar(args.universe_snapshots)
+
+    # Refuse an in-sample ML filter before spending time on data.
+    if args.ml_filter:
+        try:
+            ml_metadata = assert_ml_filter_out_of_sample(
+                args.ml_filter, trade_start_date
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+
+    cost_model = build_cost_model(
+        slippage_bps=args.slippage_bps,
+        commission_per_share=args.commission,
+        commission_minimum=args.commission_minimum,
+    )
+
     tickers = SP500_TOP50[:args.tickers]
     print(f"Backtest Configuration:")
     print(f"  Tickers: {len(tickers)} (top S&P 500)")
@@ -1998,19 +2125,29 @@ def main():
     print(f"  Capital:  ${args.capital:,.0f}")
     if trade_start_date:
         print(f"  Trade start: {trade_start_date}")
-    print(f"  Slippage: {args.slippage_bps} bps")
-    print(f"  Commission: ${args.commission}/share")
+    print(f"  Slippage: {args.slippage_bps} bps base, "
+          f"up to {max([args.slippage_bps, *cost_model.slippage_bps_by_ticker.values()]):.0f} bps for thin ETFs")
+    print(f"  Commission: max(${args.commission_minimum:.2f}/order, ${args.commission}/share)")
+    print(f"  Fills: {NEXT_OPEN_FILL_MODEL} (decision on close[t] fills at open[t+1])")
+    if membership is not None:
+        print(
+            f"  Universe: point-in-time, {len(membership.all_tickers())} tickers ever "
+            f"tradable from {membership.first_snapshot_date} "
+            f"(snapshots through {membership.last_snapshot_date})"
+        )
+    else:
+        print(
+            "  Universe: STATIC present-day ticker list — SURVIVORSHIP BIASED. "
+            "Every reported metric is inflated because the list is made of "
+            "names that survived. Pass --universe-snapshots for a baseline "
+            "you can act on (docs/operations/backtest-baseline.md)."
+        )
     print()
 
     # 1. Fetch data from IB
     # NOTE: mean_reversion and short_term_mr removed 2026-05-26 — see
     # docs/strategies/mean-reversion-failure-analysis.md
-    all_tickers = get_union_universe([
-        "momentum", "sector_rotation",
-        "thematic_momentum",
-        "quality_value", "earnings_drift",
-        "tail_risk_hedge",
-    ])
+    all_tickers = resolve_backtest_universe(membership)
     if args.bars_from_json:
         print(f"Step 1: Loading cached bars from {args.bars_from_json}...")
         with open(args.bars_from_json) as f:
@@ -2066,10 +2203,7 @@ def main():
 
     # 2. Set up backtest components
     print("\nStep 2: Initializing backtest engine...")
-    executor = SimulatedExecutor(
-        slippage_bps=args.slippage_bps,
-        commission_per_share=args.commission,
-    )
+    executor = SimulatedExecutor(cost_model)
 
     # Build portfolio configurations.
     # NOTE: mean_reversion and short_term_mr sleeves dropped 2026-05-26 after both posted
@@ -2106,11 +2240,21 @@ def main():
         replacement_policy=replacement_policy,
         replacement_score_margin=args.replacement_score_margin,
     )
+    # The equity sleeve's candidate list: every historical index member when a
+    # point-in-time calendar is available (the runner gates each date), else the
+    # static present-day top-100.
+    if membership is not None:
+        equity_eligible = [
+            ticker for ticker in membership.all_tickers()
+            if ticker not in ALWAYS_TRADABLE
+        ]
+    else:
+        equity_eligible = list(UNIVERSE_REGISTRY["quality_value"])
     qv_signals_fn = make_quality_value_signals_fn(
         fundamentals_lookup=fundamentals_lookup,
         sector_map=SECTOR_MAP,
         bars_by_ticker=bars_by_ticker,
-        eligible_tickers=UNIVERSE_REGISTRY["quality_value"],
+        eligible_tickers=equity_eligible,
         top_n=15,
         position_size_pct=0.06,
         initial_capital=args.capital * 0.1538,
@@ -2250,6 +2394,7 @@ def main():
             trade_start_date=trade_start_date,
             candidate_observer=shadow_recorders.get(name),
             portfolio_name=name,
+            membership=membership,
         )
     elapsed = time.time() - t0
 
@@ -2317,16 +2462,22 @@ def main():
 
     # 5. Save results to JSON
     print("\nStep 5: Saving results...")
-    base_config = {
-        "tickers": all_tickers,
-        "years": args.years,
-        "initial_capital": args.capital,
-        "slippage_bps": args.slippage_bps,
-        "commission_per_share": args.commission,
-        "replacement_policy": replacement_policy.value,
-        "replacement_score_margin": args.replacement_score_margin,
-        "portfolios": {name: pc.capital for name, pc in portfolios.items()},
-    }
+    base_config = build_base_config(
+        all_tickers=all_tickers,
+        years=args.years,
+        capital=args.capital,
+        cost_model=cost_model,
+        replacement_policy=replacement_policy.value,
+        replacement_score_margin=args.replacement_score_margin,
+        portfolio_capitals={name: pc.capital for name, pc in portfolios.items()},
+        point_in_time_universe=membership is not None,
+    )
+    if args.ml_filter:
+        base_config["ml_filter"] = {
+            "model": args.ml_filter,
+            "threshold": args.ml_threshold,
+            "training_window": ml_metadata,
+        }
     if len(portfolios) == 1:
         result = next(iter(results.values()))
         save_results(
