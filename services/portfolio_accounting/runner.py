@@ -76,10 +76,12 @@ async def main() -> None:
     from sqlalchemy.orm import Session
 
     from shared.config import load_config
+    from shared.heartbeat import register_heartbeat_collector
     from shared.observability import setup_metrics
 
     config = load_config("config/default.yaml")
     setup_metrics("portfolio-accounting", port=config.observability.prometheus_port)
+    register_heartbeat_collector()
     redis_connection = aioredis.from_url(config.redis.url)
     engine = create_engine(config.database.url)
     with Session(engine) as session:

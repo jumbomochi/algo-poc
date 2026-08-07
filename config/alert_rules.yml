@@ -38,6 +38,46 @@ groups:
             its logs — this is either a crashed/restarting container or a
             wedged event loop.
 
+      # CRITICAL fix: ServiceMetricsEndpointDown (above) does NOT catch a
+      # wedged main loop. setup_metrics()'s HTTP server runs on its own
+      # background thread, independent of the asyncio main loop — a hang on
+      # blocking I/O (the known IB stuck-modal class) releases the GIL, so
+      # that thread keeps answering scrapes (up stays 1) even while the loop
+      # that's supposed to be doing work never comes back around.
+      # algo_heartbeat_age_seconds (shared/heartbeat.py's
+      # HeartbeatAgeCollector) is recomputed from the heartbeat file's mtime
+      # fresh on every scrape, in that same surviving thread — so it climbs
+      # even while the main loop is stuck, which is exactly the signal
+      # ServiceMetricsEndpointDown can't provide. One rule per cadence class,
+      # matching the container healthcheck thresholds in docker-compose.yml.
+      - alert: HeartbeatStale
+        expr: algo_heartbeat_age_seconds{job!="data-ingestion"} > 120
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }}'s main loop has not iterated in over 2 minutes"
+          description: >-
+            algo_heartbeat_age_seconds is {{ $value }}s. The metrics
+            endpoint is still up (see ServiceMetricsEndpointDown), so this
+            is the wedged-but-alive case: a blocking call (IB, DB, a stuck
+            lock) that never returns. Check `docker compose logs
+            {{ $labels.job }}` for the last thing it was doing.
+
+      - alert: HeartbeatStaleDataIngestion
+        expr: algo_heartbeat_age_seconds{job="data-ingestion"} > 2700
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "data-ingestion's main loop has not iterated in over 45 minutes"
+          description: >-
+            algo_heartbeat_age_seconds is {{ $value }}s. data-ingestion's
+            outer loop sleeps polling_interval_minutes (15m default) between
+            cycles and heartbeats every cycle regardless of market-hours
+            gating, so 45m (3x cadence) is already a generous threshold —
+            matches the container healthcheck in docker-compose.yml.
+
   - name: algo-poc-stream-health
     rules:
       # "stream-idle": no new approved orders during what should be an
@@ -103,6 +143,29 @@ groups:
             A kill event was published in the last 5 minutes. Confirm
             whether this was an intentional operator action
             (docs/operations/rollback-playbook.md) or unexpected.
+
+  - name: algo-poc-risk-health
+    rules:
+      # IMPORTANT fix: the other half of "risk breaches" — algo_risk_breach_total
+      # (shared/observability.py) is incremented in
+      # RiskServiceRunner.run_passive_scan() for stop-loss/ceiling/margin
+      # breaches on already-held positions, distinct from
+      # algo_order_lifecycle_transitions_total{status="RISK_REJECTED"} (new
+      # orders rejected at entry). NOTE: run_passive_scan() is not yet
+      # invoked from RiskServiceRunner.run() on main — that's T2's thread —
+      # so this rule won't fire until T2 lands it; defined now so the signal
+      # exists the moment it does.
+      - alert: PassiveBreachDetected
+        expr: increase(algo_risk_breach_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Passive breach detected on a held position ({{ $labels.breach_type }})"
+          description: >-
+            algo_risk_breach_total incremented for breach_type={{ $labels.breach_type }}
+            in the last 15m. "trim" breaches are high-priority (see
+            services/risk_management/passive_monitor.py); "notify" are
+            informational.
 
   - name: algo-poc-redis-health
     rules:

@@ -45,6 +45,12 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
       - ./config/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      # T6 fix (IMPORTANT 2 — "dashboarded" acceptance criterion): provider
+      # config + the actual dashboard JSON it auto-loads. See
+      # config/grafana/dashboards.yml and
+      # config/grafana/dashboards/json/algo-poc-overview.json.
+      - ./config/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      - ./config/grafana/dashboards/json:/etc/grafana/provisioning/dashboards/json:ro
     depends_on:
       - prometheus
 

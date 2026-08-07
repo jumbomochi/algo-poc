@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 from dataclasses import dataclass
 
 from prometheus_client import (
@@ -28,11 +29,17 @@ def setup_metrics(service_name: str, port: int = 9090) -> None:
     something listening.
 
     Idempotent by design: a duplicate bind on *port* raises ``OSError``
-    ("address already in use") from the stdlib socket layer. That means
-    metrics are already being served in this process, which is the outcome
-    we want anyway — so it's logged and swallowed rather than propagated.
-    Crashing an entire trading service because its *metrics* endpoint was
-    already up would be exactly backwards.
+    with ``errno.EADDRINUSE`` ("address already in use") from the stdlib
+    socket layer. That specific case means metrics are already being served
+    in this process, which is the outcome we want anyway — so it's logged
+    and swallowed rather than propagated. Crashing an entire trading service
+    because its *metrics* endpoint was already up would be exactly backwards.
+
+    Narrowed deliberately to EADDRINUSE only (review feedback): any other
+    ``OSError`` — permission denied binding a privileged port, no free file
+    descriptors, a bad address — is a real, different problem and should
+    propagate and crash loudly rather than be silently treated the same as
+    "already started".
 
     Args:
         service_name: Human-readable name used for log messages.
@@ -40,9 +47,14 @@ def setup_metrics(service_name: str, port: int = 9090) -> None:
     """
     try:
         start_http_server(port)
-    except OSError:
+    except OSError as exc:
+        if exc.errno != errno.EADDRINUSE:
+            raise
         logger.warning(
-            "metrics_server_already_started", service=service_name, port=port
+            "metrics_server_already_started",
+            service=service_name,
+            port=port,
+            error=str(exc),
         )
         return
     logger.info("metrics_server_started", service=service_name, port=port)
@@ -88,6 +100,18 @@ class TradingMetrics:
     lifecycle_transitions: Counter
     lifecycle_state: Gauge
     reconciliation_entries_allowed: Gauge
+    # IMPORTANT fix (T6 review): lifecycle_transitions{status=RISK_REJECTED}
+    # only covers a *new order* being rejected at entry. It says nothing
+    # about a passive breach on an *already-held* position (stop-loss,
+    # soft/hard ceiling, margin) — that path is
+    # RiskServiceRunner.run_passive_scan() in
+    # services/risk_management/runner.py, which increments this with
+    # breach_type=<PassiveBreach.action_type> ("trim" | "notify"). Defined
+    # here even though that function isn't invoked from `run()` yet (T2's
+    # thread wires that) so the metric — and the PassiveBreachDetected
+    # alert rule in config/alert_rules.yml — already exist the moment T2
+    # lands it.
+    risk_breach_total: Counter
 
 
 def create_trading_metrics(
@@ -132,6 +156,12 @@ def create_trading_metrics(
         reconciliation_entries_allowed=Gauge(
             "algo_reconciliation_entries_allowed",
             "Whether broker/database reconciliation permits new entries",
+            registry=target_registry,
+        ),
+        risk_breach_total=Counter(
+            "algo_risk_breach_total",
+            "Passive breaches on held positions (stop-loss / ceiling / margin)",
+            ["breach_type"],
             registry=target_registry,
         ),
     )

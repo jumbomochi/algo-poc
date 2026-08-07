@@ -7,3 +7,8 @@ datasources:
     url: http://prometheus:9090
     isDefault: true
     editable: true
+    # Fixed (not auto-generated) so the provisioned dashboard JSON
+    # (config/grafana/dashboards/algo-poc-overview.json) can reference it
+    # deterministically via datasource.uid instead of guessing/hardcoding
+    # whatever Grafana would otherwise derive from the datasource name.
+    uid: prometheus

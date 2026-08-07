@@ -24,15 +24,37 @@ services:
     # loudly once at the ceiling instead of Redis silently evicting whatever
     # key LRU picks next — for a stream carrying stream:approved_orders /
     # stream:kill, silent eviction of unacked entries is worse than a loud
-    # write failure. shared/redis_client.py's XADD MAXLEN ~ capping (see
-    # DEFAULT_STREAM_MAXLEN) is the first line of defense and should keep
-    # usage well under this ceiling in normal operation.
+    # write failure.
+    #
+    # 512mb is sized together with shared/redis_client.py's
+    # DEFAULT_STREAM_MAXLEN (25_000), not picked independently — see the
+    # comment above that constant for the full arithmetic. Short version:
+    # worst case (9 primary streams simultaneously at cap, 1 KiB/entry) is
+    # ~220 MiB, ~43% of this ceiling, leaving headroom for Redis overhead,
+    # consumer-group PEL, and uncapped DLQ growth. RedisMemoryHigh
+    # (config/alert_rules.yml) fires at 80% (410 MiB) — above that
+    # provable worst case, so it only fires from genuinely abnormal growth,
+    # and still well before writes would start failing at 100%.
+    # tests/deploy/test_observability_healthchecks.py cross-checks this
+    # value against DEFAULT_STREAM_MAXLEN so the two can't silently drift
+    # apart again.
+    #
+    # PRE-MERGE OPERATOR CHECK (do not run this for me — see CLAUDE.md):
+    # before this config lands on the operator's live stack, run
+    # `redis-cli info memory` (used_memory_human) against the running
+    # container. If current usage is already near/above 512mb, either raise
+    # --maxmemory accordingly or let the new MAXLEN-capped publish() trim
+    # the existing unbounded streams down over one full publish cycle each
+    # BEFORE restarting Redis with this ceiling — `noeviction` means a
+    # restart straight into an already-over-ceiling dataset fails new
+    # writes immediately.
+    #
     # NOTE for merge: T3 (message-bus lockdown) also sets `command:` on this
     # service (--requirepass). Combine both into one redis-server invocation,
-    # e.g. ["redis-server", "--requirepass", "...", "--maxmemory", "256mb",
+    # e.g. ["redis-server", "--requirepass", "...", "--maxmemory", "512mb",
     # "--maxmemory-policy", "noeviction"] rather than keeping two `command:`
     # keys (compose only honors the last one).
-    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    command: ["redis-server", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
     ports:
       - "6379:6379"
     healthcheck:

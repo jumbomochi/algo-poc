@@ -712,11 +712,13 @@ if __name__ == "__main__":
 
         from services.execution.ib_executor import IBExecutor
         from services.execution.order_manager import OrderManager
+        from shared.heartbeat import register_heartbeat_collector
         from shared.observability import setup_metrics
         from shared.order_ledger import OrderLedger
         from shared.redis_client import RedisStreamClient
 
         setup_metrics("execution", port=config.observability.prometheus_port)
+        register_heartbeat_collector()
 
         redis_conn = aioredis.from_url(config.redis.url)
         redis_client = RedisStreamClient(redis_conn)

@@ -91,6 +91,41 @@ class TestSetupMetricsIdempotency:
         # Must not raise even though a server is already bound to `port`.
         setup_metrics("test-service", port=port)
 
+    def test_setup_metrics_swallows_only_address_in_use(self, monkeypatch) -> None:
+        """Narrowed per review: only EADDRINUSE means 'already started and
+        that's fine'. Any other OSError (permission denied binding a
+        privileged port, no free file descriptors, etc.) is a real problem
+        that should crash loudly, not be silently treated as success."""
+        import errno
+
+        import shared.observability as observability_module
+
+        def fake_start_http_server(port):
+            raise OSError(errno.EADDRINUSE, "Address already in use")
+
+        monkeypatch.setattr(
+            observability_module, "start_http_server", fake_start_http_server
+        )
+        setup_metrics("test-service", port=12345)  # must not raise
+
+    def test_setup_metrics_reraises_unrelated_os_errors(self, monkeypatch) -> None:
+        import errno
+
+        import shared.observability as observability_module
+
+        def fake_start_http_server(port):
+            raise OSError(errno.EACCES, "Permission denied")
+
+        monkeypatch.setattr(
+            observability_module, "start_http_server", fake_start_http_server
+        )
+        try:
+            setup_metrics("test-service", port=80)
+        except OSError as exc:
+            assert exc.errno == errno.EACCES
+        else:
+            raise AssertionError("expected a non-EADDRINUSE OSError to propagate")
+
 
 def test_trading_metrics_cover_capital_reservations_lifecycle_and_reconciliation():
     _reset_registry()
@@ -116,3 +151,20 @@ def test_trading_metrics_cover_capital_reservations_lifecycle_and_reconciliation
         == 3
     )
     assert metrics.reconciliation_entries_allowed._value.get() == 1
+
+
+def test_trading_metrics_covers_passive_risk_breaches():
+    """IMPORTANT fix: RISK_REJECTED (lifecycle_transitions) only covers
+    new-order rejections. Passive breaches on already-held positions
+    (stop-loss/soft-hard-ceiling/margin, run_passive_scan in
+    risk_management/runner.py) had no metric at all — this is the other
+    half of "risk breaches" from the acceptance criteria.
+    """
+    _reset_registry()
+    metrics = create_trading_metrics()
+
+    metrics.risk_breach_total.labels(breach_type="trim").inc()
+    metrics.risk_breach_total.labels(breach_type="notify").inc(2)
+
+    assert metrics.risk_breach_total.labels(breach_type="trim")._value.get() == 1
+    assert metrics.risk_breach_total.labels(breach_type="notify")._value.get() == 2
