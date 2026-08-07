@@ -195,3 +195,22 @@ async def test_duplicate_authoritative_commission_delivery_replays_same_fill():
     assert first == second
     assert first["execution_id"] == "exec-duplicate"
     assert first["timestamp"] == EXECUTED_AT
+
+
+@pytest.mark.asyncio
+async def test_spawn_routes_task_exception_to_logger():
+    """Fill/status callbacks are fire-and-forget; a failing one must be logged,
+    not silently swallowed by the event loop's default handler."""
+    executor = IBExecutor("h", 7497, 1)
+    executor._logger = MagicMock()
+
+    async def boom():
+        raise RuntimeError("callback blew up")
+
+    task = executor._spawn(boom())
+    try:
+        await task
+    except RuntimeError:
+        pass
+    # done-callback ran and logged the failure.
+    assert executor._logger.error.called or executor._logger.exception.called

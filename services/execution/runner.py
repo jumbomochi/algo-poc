@@ -510,6 +510,24 @@ class ExecutionServiceRunner:
         finally:
             self._order_ledger.session.rollback()
 
+    async def _publish_alert(
+        self,
+        *,
+        event_type: str,
+        priority: str,
+        message: str,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        """Publish an alert to the alerts stream."""
+        alert = AlertMessage(
+            timestamp=datetime.now(timezone.utc),
+            event_type=event_type,
+            priority=priority,
+            message=message,
+            context=context or {},
+        )
+        await self._redis.publish(ALERTS_STREAM, alert.to_stream_dict())
+
     async def handle_ib_order_status(
         self, status_info: dict[str, Any]
     ) -> None:
@@ -524,6 +542,19 @@ class ExecutionServiceRunner:
             )
             if self._order_ledger is not None:
                 self._order_ledger.session.rollback()
+            return
+
+        # A late or duplicate broker status can arrive after the fill projector
+        # (or a prior status) already terminalized the intent. Transitioning out
+        # of a terminal state raises InvalidOrderTransition; ignore it instead.
+        if OrderStatus(intent.status) in TERMINAL_STATUSES:
+            self._logger.info(
+                "Ignoring IB status for already-terminal intent",
+                order_id=order_id,
+                status=status_info.get("status"),
+                current=intent.status,
+            )
+            self._order_ledger.session.rollback()
             return
 
         broker_status = str(status_info.get("status", ""))
@@ -567,10 +598,31 @@ class ExecutionServiceRunner:
         if target is None:
             self._order_ledger.session.rollback()
             return
-        self._order_ledger.transition(
-            intent.recommendation_id, target, reason=reason
-        )
-        self._commit_ledger()
+        try:
+            self._order_ledger.transition(
+                intent.recommendation_id, target, reason=reason
+            )
+            self._commit_ledger()
+        except Exception as exc:
+            # Never let a transition error escape into the fire-and-forget IB
+            # callback task (it would be swallowed and leave the shared session
+            # mid-transaction). Roll back and alert instead.
+            self._order_ledger.session.rollback()
+            self._logger.exception(
+                "Failed to persist IB order status",
+                order_id=order_id,
+                target=target.value,
+            )
+            await self._publish_alert(
+                event_type="order_status_persist_failed",
+                priority="high",
+                message=(
+                    f"Could not persist status {target.value} for order "
+                    f"{order_id}: {exc}"
+                ),
+                context={"order_id": order_id, "target": target.value},
+            )
+            return
         self._pending_orders.pop(order_id, None)
         self._order_manager.open_orders.pop(order_id, None)
 

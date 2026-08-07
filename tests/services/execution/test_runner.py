@@ -1295,6 +1295,53 @@ class TestKillHandling:
         runner._order_manager.submit_exit.assert_not_awaited()
 
 
+class TestOrderStatusGuards:
+    """handle_ib_order_status must tolerate late/duplicate broker statuses on an
+    already-terminal intent and must never leak an open transaction (review)."""
+
+    @pytest.mark.asyncio
+    async def test_late_status_for_terminal_intent_is_ignored(self, durable_runner):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")  # -> SUBMITTED
+        ledger.transition("rec-1", OrderStatus.FILLED)
+        ledger.session.commit()
+
+        # A late Cancelled arrives after the fill already terminalized it.
+        await runner.handle_ib_order_status(
+            {"order_id": "9", "status": "Cancelled"}
+        )
+
+        assert ledger.get("rec-1").status == OrderStatus.FILLED.value
+        ledger.session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_transition_failure_is_caught_and_alerts(self, durable_runner):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")  # SUBMITTED
+        ledger.session.commit()
+
+        from shared.order_ledger import InvalidOrderTransition
+
+        with patch.object(
+            runner._order_ledger,
+            "transition",
+            side_effect=InvalidOrderTransition("boom"),
+        ):
+            # Must not propagate into the fire-and-forget IB callback task.
+            await runner.handle_ib_order_status(
+                {"order_id": "9", "status": "Cancelled"}
+            )
+
+        alerts = [
+            c for c in runner._redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert len(alerts) >= 1
+        # Session is usable afterwards (not left mid-transaction).
+        assert ledger.get("rec-1") is not None
+        ledger.session.rollback()
+
+
 class TestGracefulShutdown:
     @pytest.mark.asyncio
     async def test_graceful_shutdown_cleans_up(

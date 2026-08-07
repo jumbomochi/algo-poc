@@ -123,6 +123,9 @@ class IBExecutor:
         self._allow_fractional = allow_fractional
         self._ib = None  # Will hold ib_insync.IB instance
         self._trades: dict[str, Any] = {}  # order_id -> ib_insync.Trade
+        # Retain references to fire-and-forget callback tasks so they are not
+        # garbage-collected mid-flight and their exceptions are surfaced.
+        self._pending_tasks: set[Any] = set()
         self._fill_handler: FillHandler | None = None
         self._order_status_handler: OrderStatusHandler | None = None
         self._expect_paper: bool | None = None
@@ -286,6 +289,25 @@ class IBExecutor:
             self._ib.disconnect()
             self._logger.info("Disconnected from IB")
 
+    def _spawn(self, coro: Any) -> Any:
+        """Schedule a fire-and-forget callback coroutine with a done-callback so
+        its exception is logged instead of being swallowed by the event loop."""
+        task = asyncio.ensure_future(coro)
+        self._pending_tasks.add(task)
+
+        def _done(t: Any) -> None:
+            self._pending_tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                self._logger.error(
+                    "Async IB callback task failed", error=str(exc)
+                )
+
+        task.add_done_callback(_done)
+        return task
+
     async def _ensure_connected(self) -> None:
         """Reconnect on demand when the Gateway dropped the session.
 
@@ -374,7 +396,7 @@ class IBExecutor:
             if self._fill_handler is None:
                 self._logger.warning("IB fill received but no handler set", **payload)
                 return
-            asyncio.ensure_future(self._fill_handler(payload))
+            self._spawn(self._fill_handler(payload))
 
         trade.commissionReportEvent += _on_commission_report
 
@@ -383,7 +405,7 @@ class IBExecutor:
                 return
             status = str(trade.orderStatus.status)
             reason = self._status_reason(trade)
-            asyncio.ensure_future(
+            self._spawn(
                 self._emit_order_status(
                     order_id,
                     status,
