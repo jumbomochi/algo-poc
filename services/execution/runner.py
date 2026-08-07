@@ -427,6 +427,7 @@ class ExecutionServiceRunner:
             con_id=fill_info.get("con_id"),
             exchange=fill_info.get("exchange"),
             currency=fill_info.get("currency"),
+            order_done=bool(fill_info.get("order_done", False)),
         )
         local_effect = None
         if fill.account_id and fill.portfolio:

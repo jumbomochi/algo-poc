@@ -127,6 +127,9 @@ class FillMessage(StreamSerializable):
     con_id: int | None = None
     exchange: str | None = None
     currency: str | None = None
+    # True when IB reports the order terminal on this fill. Lets the projector
+    # terminalize a whole-share-rounded order (placed < requested) as FILLED.
+    order_done: bool = False
 
 
 class AlertMessage(StreamSerializable):
