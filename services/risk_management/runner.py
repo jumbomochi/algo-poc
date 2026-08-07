@@ -905,11 +905,23 @@ class RiskServiceRunner:
         Args:
             kill_msg: The kill message with reason and trigger info.
         """
+        # Latch: if already halted, this kill (or the breaker) is a distinct
+        # event for an incident whose positions may still be flattening. Re-affirm
+        # the halt but do NOT re-liquidate — a second liquidation with a different
+        # epoch would mint fresh exit ids and could oversell / flip short.
+        was_active = self._kill_switch.is_active
         self._kill_switch.activate(
             reason=kill_msg.reason,
             triggered_by=kill_msg.triggered_by,
             source="kill",
         )
+        if was_active:
+            self._logger.warning(
+                "Kill received while already halted — re-affirmed, not re-liquidating",
+                reason=kill_msg.reason,
+                triggered_by=kill_msg.triggered_by,
+            )
+            return
 
         self._logger.critical(
             "Kill switch activated — liquidating all positions",
@@ -1007,6 +1019,27 @@ class RiskServiceRunner:
         if quantity is None or quantity <= 0:
             return False
         exit_id = self._liquidation_exit_id(pos["ticker"], epoch)
+
+        # With a ledger, a missing con_id means we cannot create the backing
+        # intent, so execution would reject the exit — the position would go
+        # silently un-liquidated while the summary alert claimed success. Flag it
+        # for manual action instead of publishing a doomed order.
+        if self._order_ledger is not None and pos.get("con_id") is None:
+            self._logger.critical(
+                "Cannot auto-liquidate position: missing con_id",
+                ticker=pos["ticker"],
+                quantity=quantity,
+            )
+            await self._publish_alert(
+                event_type="liquidation_unroutable",
+                priority="critical",
+                message=(
+                    f"Cannot auto-liquidate {pos['ticker']} ({quantity}): missing "
+                    "con_id — manual action required"
+                ),
+                context={"ticker": pos["ticker"], "quantity": quantity},
+            )
+            return False
 
         if self._order_ledger is not None and pos.get("con_id") is not None:
             proposal = SimpleNamespace(
@@ -1303,6 +1336,19 @@ class RiskServiceRunner:
                     reason=decision.reason,
                     triggered_by="circuit_breaker",
                     event_type="circuit_breaker_liquidation",
+                )
+                # Also drive execution's kill path so it cancels resting orders
+                # (a liquidation that leaves working buys is not one). Same
+                # timestamp -> execution derives the same epoch/exit ids and
+                # dedups against the exits just published above. Risk re-consumes
+                # this but latches (was_active) instead of re-liquidating.
+                await self._redis.publish(
+                    KILL_STREAM,
+                    KillMessage(
+                        timestamp=activated,
+                        triggered_by="circuit_breaker",
+                        reason=decision.reason,
+                    ).to_stream_dict(),
                 )
             return
         await self._publish_alert(

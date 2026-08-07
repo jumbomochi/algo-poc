@@ -171,11 +171,41 @@ class KillSwitch:
                 triggered_by=halt.triggered_by,
             )
         elif halt is None and self._active:
-            self._active = False
-            self._activated_at = None
-            self._reason = None
-            self._triggered_by = None
-            self._logger.info("Halt cleared out-of-band; resuming on re-sync")
+            # No active halt in the DB. That means EITHER a human explicitly
+            # cleared it (a cleared row exists) OR our activation never persisted
+            # (a transient DB error). Only the former may resume trading —
+            # otherwise a persist failure would turn fail-closed into fail-open.
+            rows = self._halt_store.list_halts(mode=self._mode)
+            self._halt_store.session.rollback()
+            explicitly_cleared = bool(
+                rows and rows[0].active is False and rows[0].cleared_at is not None
+            )
+            if explicitly_cleared:
+                self._active = False
+                self._activated_at = None
+                self._reason = None
+                self._triggered_by = None
+                self._logger.info("Halt cleared out-of-band; resuming on re-sync")
+            else:
+                # Self-heal: re-persist so a restart stays halted.
+                self._logger.critical(
+                    "Active halt is not persisted; re-persisting and staying "
+                    "halted (fail-closed)",
+                    reason=self._reason,
+                )
+                try:
+                    self._halt_store.record_halt(
+                        mode=self._mode,
+                        source="kill",
+                        reason=self._reason or "resynced halt",
+                        triggered_by=self._triggered_by or "kill_switch",
+                        now=self._activated_at
+                        or datetime.now(timezone.utc),
+                    )
+                    self._halt_store.session.commit()
+                except Exception:
+                    self._halt_store.session.rollback()
+                    self._logger.exception("Failed to re-persist halt on re-sync")
 
     def check(self) -> RiskDecision:
         """Check whether the kill switch is active.

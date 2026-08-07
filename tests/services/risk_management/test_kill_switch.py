@@ -142,6 +142,25 @@ class TestKillSwitchPersistence:
         ks.sync_from_store()
         assert ks.is_active is False
 
+    def test_sync_stays_halted_when_persist_failed(self, mock_logger, store):
+        """If activation's DB persist failed, the in-memory halt has no backing
+        row. sync must NOT read that absence as a human clear and resume — that
+        would turn fail-closed into fail-open on exactly the failure it guards.
+        """
+        ks = KillSwitch(logger=mock_logger, halt_store=store, mode="paper")
+        # Simulate activate() whose commit failed: active in memory, no DB row.
+        ks._active = True
+        ks._reason = "margin call"
+        ks._triggered_by = "risk_engine"
+        ks._activated_at = datetime.now(timezone.utc)
+        assert store.load_active_halt(mode="paper") is None
+
+        ks.sync_from_store()
+
+        assert ks.is_active is True  # stays halted
+        # and self-heals: the halt is now persisted.
+        assert store.load_active_halt(mode="paper") is not None
+
     def test_sync_picks_up_external_halt(self, mock_logger, store):
         """A halt persisted by another actor is adopted on re-sync (fail-closed)."""
         ks = KillSwitch(logger=mock_logger, halt_store=store, mode="paper")

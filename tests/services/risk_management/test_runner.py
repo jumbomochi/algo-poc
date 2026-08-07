@@ -395,6 +395,77 @@ class TestKillLiquidation:
         session.rollback()
 
     @pytest.mark.asyncio
+    async def test_second_kill_while_halted_does_not_reliquidate(
+        self, db_runner, mock_redis
+    ):
+        """Once halted, a second (distinct-epoch) kill for the same incident must
+        latch, not re-liquidate a position that is still being flattened."""
+        runner, ledger, session = db_runner
+        await runner.process_kill(_kill_msg(reason="first"))
+        first = len(_approved_orders(mock_redis))
+
+        later = KillMessage(
+            timestamp=datetime(2026, 8, 7, 13, 0, 0, tzinfo=timezone.utc),
+            triggered_by="operator***",
+            reason="second while still halted",
+        )
+        await runner.process_kill(later)
+
+        assert len(_approved_orders(mock_redis)) == first  # no re-liquidation
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_position_without_con_id_is_flagged_not_silently_dropped(
+        self, mock_config, mock_redis
+    ):
+        """A position with no con_id cannot be routed to a ledger intent, so
+        execution would reject it. It must raise a critical alert (manual
+        action), not be published + reported as liquidated."""
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        session = Session(engine)
+        session.add(
+            Position(
+                account_id="DUTEST",
+                ticker="NOCID",
+                portfolio="momentum",
+                con_id=None,
+                exchange="SMART",
+                currency="USD",
+                quantity=5.0,
+                avg_entry_price=100,
+                current_price=100,
+                peak_price=100,
+                highest_price_since_entry=100,
+                opened_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+                status="open",
+            )
+        )
+        session.commit()
+        runner = RiskServiceRunner(
+            config=mock_config,
+            redis_client=mock_redis,
+            db_session=session,
+            order_ledger=OrderLedger(session),
+        )
+
+        await runner.process_kill(_kill_msg())
+
+        # No doomed exit published for the un-routable position ...
+        assert all(o.ticker != "NOCID" for o in _approved_orders(mock_redis))
+        # ... but the operator is warned to act.
+        alerts = [
+            str(c.args[1])
+            for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert any(
+            "NOCID" in a and ("manual" in a.lower() or "unroutable" in a.lower())
+            for a in alerts
+        )
+        session.rollback()
+
+    @pytest.mark.asyncio
     async def test_kill_always_alerts_even_with_no_positions(
         self, runner, mock_redis
     ):
@@ -498,6 +569,26 @@ class TestCircuitBreakerLiquidation:
         first = len(_approved_orders(mock_redis))
         await runner._emit_drawdown_gauge()  # still drawn down, already halted
         assert len(_approved_orders(mock_redis)) == first  # no re-liquidation
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_breaker_publishes_kill_so_execution_cancels_orders(
+        self, db_runner, mock_redis
+    ):
+        """The breaker must also reach execution's kill path (which cancels
+        resting orders) — a 'full liquidation' that leaves working buys is not
+        one. It does so by publishing a KillMessage to stream:kill."""
+        runner, session = db_runner
+        runner._portfolio.book_equity = 70_000
+        runner._portfolio.book_peak_equity = 100_000
+
+        await runner._emit_drawdown_gauge()
+
+        kills = [
+            c for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:kill"
+        ]
+        assert len(kills) == 1
         session.rollback()
 
     @pytest.mark.asyncio
