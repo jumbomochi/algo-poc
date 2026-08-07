@@ -89,6 +89,15 @@ class ExecutionServiceRunner:
         else:
             self.ib_port = config.ib.paper_port
 
+        # Periodic unfilled-order sweep (cancel stale limits / free reservations).
+        # Driven on the reprice interval; needs a market calendar (set by the
+        # runner entrypoint) — without one the sweep is skipped.
+        self._reprice_interval_seconds = max(
+            1, int(config.execution.reprice_interval_minutes) * 60
+        )
+        self._last_sweep_at: float | None = None
+        self._market_calendar: Any = None
+
     async def setup(self) -> None:
         """Create consumer groups and replay pending messages.
 
@@ -715,6 +724,25 @@ class ExecutionServiceRunner:
             self._order_ledger.session.rollback()
         return in_flight
 
+    async def maybe_run_unfilled_sweep(self, now: float) -> bool:
+        """Run the unfilled-order sweep when the reprice interval has elapsed.
+
+        ``now`` is a monotonic timestamp (seconds). No-ops without a market
+        calendar. Execution has no live quote feed, so the sweep cancels stale
+        limits / frees reservations rather than repricing (see
+        OrderManager.sweep_unfilled_orders). Returns True when it ran.
+        """
+        if self._market_calendar is None:
+            return False
+        last = self._last_sweep_at
+        if last is not None and (now - last) < self._reprice_interval_seconds:
+            return False
+        self._last_sweep_at = now
+        await self._order_manager.sweep_unfilled_orders(
+            {}, self._market_calendar
+        )
+        return True
+
     async def shutdown(self) -> None:
         """Graceful shutdown: cancel all open orders to avoid orphans."""
         self._logger.info("Execution service shutting down")
@@ -739,6 +767,15 @@ class ExecutionServiceRunner:
 
         try:
             while self._running:
+                # Periodic unfilled-order sweep (best-effort — never tear down
+                # the loop on a sweep failure).
+                try:
+                    await self.maybe_run_unfilled_sweep(
+                        asyncio.get_running_loop().time()
+                    )
+                except Exception:
+                    self._logger.exception("Unfilled-order sweep failed; continuing")
+
                 # Read approved orders
                 messages = await self._redis.read_group(
                     APPROVED_ORDERS_STREAM,
@@ -831,7 +868,11 @@ if __name__ == "__main__":
         engine = create_engine(config.database.url)
         session = sessionmaker(bind=engine)()
         order_manager = OrderManager(
-            executor=executor, redis_client=redis_client, db_session=session
+            executor=executor,
+            redis_client=redis_client,
+            db_session=session,
+            reprice_interval_minutes=config.execution.reprice_interval_minutes,
+            max_reprice_attempts=config.execution.max_reprice_attempts,
         )
         runner = ExecutionServiceRunner(
             config=config,
@@ -839,6 +880,10 @@ if __name__ == "__main__":
             order_manager=order_manager,
             order_ledger=OrderLedger(session),
         )
+        # Wire the market calendar so the periodic unfilled-order sweep runs.
+        from shared.market_calendar import MarketCalendar
+
+        runner._market_calendar = MarketCalendar()
         try:
             positions = load_open_positions(session)
             runner._positions = {

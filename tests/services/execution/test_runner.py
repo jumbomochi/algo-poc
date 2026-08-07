@@ -1295,6 +1295,29 @@ class TestKillHandling:
         runner._order_manager.submit_exit.assert_not_awaited()
 
 
+class TestUnfilledSweepDriver:
+    """A periodic driver must actually run the unfilled-order sweep (the logic
+    had no production caller before)."""
+
+    @pytest.mark.asyncio
+    async def test_maybe_run_unfilled_sweep_respects_interval(self, runner):
+        runner._market_calendar = MagicMock()
+        runner._order_manager.sweep_unfilled_orders = AsyncMock(return_value=0)
+        interval = runner._reprice_interval_seconds
+
+        assert await runner.maybe_run_unfilled_sweep(now=1000.0) is True
+        assert await runner.maybe_run_unfilled_sweep(now=1000.0 + interval - 1) is False
+        assert await runner.maybe_run_unfilled_sweep(now=1000.0 + interval + 1) is True
+        assert runner._order_manager.sweep_unfilled_orders.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_sweep_skipped_without_market_calendar(self, runner):
+        runner._market_calendar = None
+        runner._order_manager.sweep_unfilled_orders = AsyncMock()
+        assert await runner.maybe_run_unfilled_sweep(now=1000.0) is False
+        runner._order_manager.sweep_unfilled_orders.assert_not_awaited()
+
+
 class TestOrderStatusGuards:
     """handle_ib_order_status must tolerate late/duplicate broker statuses on an
     already-terminal intent and must never leak an open transaction (review)."""
