@@ -110,11 +110,12 @@ class _LockoutTracker:
     """Tracks auth failures per lockout bucket and locks out repeat offenders.
 
     Callers choose the bucket key (``client_id``) — see
-    ``get_current_user()``, which keys on ``(address, presented-key-prefix)``
-    rather than address alone, so one client guessing many different wrong
-    keys can't lock out every other client behind the same reverse proxy,
-    and so a bucket only ever accumulates failures for one specific wrong
-    guess.
+    ``get_current_user()``, which keys on the resolved client address alone.
+    All invalid-key attempts from one address share one failure budget,
+    regardless of which wrong key was presented each time; see
+    ``get_current_user()``'s docstring for why a per-key-prefix bucket was
+    tried and reverted (it let a tool that varies the guessed key evade
+    lockout entirely).
 
     In-memory and per-process: this is adequate for the single-process API
     deployment this repo documents (no multi-instance API scaling exists
@@ -187,9 +188,29 @@ class _LockoutTracker:
             elif client_id not in self._locked_until:
                 del self._failures[client_id]
 
+        self._evict_over_capacity()
+
+    def _evict_over_capacity(self) -> None:
+        """Drop the oldest *non-locked* bucket until back at capacity.
+
+        A currently-locked-out bucket is never evicted here: dropping it
+        would delete its ``_locked_until`` entry too, letting a genuinely
+        locked-out attacker regain access early just because the tracker
+        happened to be near capacity. If every tracked bucket is locked
+        out (an extreme, distributed-attack edge case), this temporarily
+        exceeds ``max_tracked_keys`` rather than lifting a lockout early —
+        ``_sweep`` reclaims the space once locks expire.
+        """
         while len(self._failures) > self._max_tracked_keys:
-            oldest_id, _ = self._failures.popitem(last=False)
-            self._locked_until.pop(oldest_id, None)
+            evicted = False
+            for client_id in self._failures:  # oldest-first iteration order
+                if client_id in self._locked_until:
+                    continue
+                del self._failures[client_id]
+                evicted = True
+                break
+            if not evicted:
+                break
 
     def reset(self) -> None:
         self._failures.clear()
@@ -217,10 +238,21 @@ def get_current_user(
     genuinely valid key always succeeds, full stop — the kill switch this
     guards must stay reachable for the operator no matter how many
     unrelated failures came from the same address. A missing header isn't
-    a guess and never touches lockout state either; only a *specific wrong
-    key* accumulates failures, bucketed by ``(address, key prefix)`` so one
-    attacker trying many different wrong keys can't lock out other clients
-    sharing that address (e.g. behind a reverse proxy).
+    a guess and never touches lockout state either.
+
+    Every *invalid*-key attempt from one resolved client address shares a
+    single lockout bucket, regardless of which wrong key was presented.
+    Bucketing on ``(address, key-prefix)`` instead was tried and reverted:
+    it let a credential-guessing tool that varies the guessed key on every
+    attempt (the normal case) get a fresh 5-failure budget per distinct
+    prefix and never actually lock out. The address-sharing hazard that
+    motivated a per-key bucket — everyone behind one reverse proxy sharing
+    a single ``request.client.host`` — is handled instead by only trusting
+    ``X-Forwarded-For`` from a configured, trusted proxy
+    (``API_FORWARDED_ALLOW_IPS`` in ``services/api/runner.py``; see
+    ``docs/operations/api-security.md``). An attacker rotating their own
+    source address defeats any address-keyed scheme and is an accepted
+    residual risk, not something this bucket key can solve.
     """
     if x_api_key is None:
         raise HTTPException(
@@ -232,11 +264,7 @@ def get_current_user(
     if role is not None:
         return APIUser(api_key=x_api_key, role=role)
 
-    address = request.client.host if request.client else "unknown"
-    # Bucketed by the wrong key's own prefix (not the full key — this
-    # value is logged) so distinct wrong guesses from one address don't
-    # share a lockout budget.
-    bucket = f"{address}:{x_api_key[:4]}"
+    bucket = request.client.host if request.client else "unknown"
 
     if _lockout.is_locked_out(bucket):
         raise HTTPException(

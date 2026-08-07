@@ -188,3 +188,33 @@ operation as the model file, since both live in the same trust domain
 separate Postgres credentials to forge, which is the actual security
 boundary this check needs. The migration is additive-only (one nullable
 column) and does not touch the loader-consolidation work planned for T8.
+
+### Model integrity — rollout sequence
+
+**This migration is not safe to deploy by itself.** After
+`alembic upgrade head`, every existing `ModelVersion` row — including
+whichever one is currently active — has `content_hash = NULL`.
+`ModelRegistry.load_active()` fails closed on a NULL `content_hash` by
+design (a missing integrity record is refused, not silently trusted), so
+the very next `load_active()` call after the migration lands raises
+`ModelIntegrityError` and the ml_model service cannot get a model until an
+operator backfills the column.
+
+Required sequence, in order:
+
+1. `alembic upgrade head` — adds the `content_hash` column (this migration,
+   `e7a1c4d92f3b`).
+2. `python -m scripts.ops.backfill_model_hashes` — **dry run first**, review
+   the report (it lists every row it would write a hash for, and separately
+   flags any row whose model file is no longer on disk — those are skipped,
+   not guessed at). Then:
+   `python -m scripts.ops.backfill_model_hashes --apply` to actually persist
+   the computed hashes. `--db-url` overrides the default
+   (`AppConfig.database.url` from `config/default.yaml`) if needed.
+3. **Verify** before considering the rollout complete: restart the
+   ml_model service (or call `ModelRegistry.load_active()` directly) and
+   confirm it loads the active model without raising `ModelIntegrityError`.
+
+This is an operator tool — nothing in this repo runs it automatically, and
+it must never be pointed at a real database by an agent. It is tested only
+against ephemeral sqlite files (`tests/ops/test_backfill_model_hashes.py`).
