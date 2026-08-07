@@ -13,6 +13,14 @@ from shared.universe import MembershipCalendar
 
 logger = logging.getLogger(__name__)
 
+# Consecutive trading sessions a held ticker may print no bar before the
+# position is written off as delisted. A name whose bars simply stop *is* what a
+# delisting looks like in daily data; leaving the position open would keep its
+# last close in NAV forever and keep the trade out of the win-rate/expectancy
+# statistics, which is survivorship bias moved from the universe into the trade
+# stats. Five sessions distinguishes a delisting from an ordinary data gap.
+DELISTING_STALE_SESSIONS = 5
+
 
 @dataclass
 class BacktestResult:
@@ -63,6 +71,7 @@ class BacktestRunner:
         candidate_observer: CandidateObserver | None = None,
         portfolio_name: str = "",
         membership: MembershipCalendar | None = None,
+        delisting_stale_sessions: int = DELISTING_STALE_SESSIONS,
     ) -> BacktestResult:
         """Run a backtest over the provided bar data.
 
@@ -86,6 +95,10 @@ class BacktestRunner:
                 ``bars_by_ticker`` is treated as tradable on every date, which
                 carries survivorship bias if those bars came from a
                 present-day ticker list.
+            delisting_stale_sessions: Consecutive sessions a held ticker may
+                print no bar before the position is written off at its last
+                close with ``exit_reason: "delisted"``. See
+                ``DELISTING_STALE_SESSIONS``.
 
         Returns:
             BacktestResult with trades, portfolio_values, and metrics.
@@ -109,56 +122,113 @@ class BacktestRunner:
         # Orders decided on the previous session, waiting for the next open.
         pending_entries: dict[str, _PendingEntry] = {}
         pending_exits: dict[str, str] = {}  # ticker -> exit_reason
-        # Last close seen per ticker, so a position in a name that stops
-        # printing bars (delisting, halt) is marked at its final price rather
-        # than frozen at cost.
+        # Last close seen per ticker, used to mark — and ultimately to write
+        # off — a position in a name that stops printing bars.
         last_close: dict[str, float] = {}
+        # Consecutive sessions since each ticker's last print. Only tracked once
+        # a ticker has printed at least one bar, so names that have not listed
+        # yet are not mistaken for delistings.
+        stale_sessions: dict[str, int] = {}
+
+        def close_position(ticker: str, fill: dict, exit_reason: str) -> float:
+            """Record trades for every lot of ``ticker`` and return the cash raised."""
+            proceeds = 0.0
+            for lot in positions.pop(ticker, []):
+                lot_fill = dict(fill)
+                lot_fill["quantity"] = lot.quantity
+                lot_fill["commission"] = self.executor.cost_model.commission_for(
+                    lot.quantity
+                )
+                exit_value = lot_fill["fill_price"] * lot.quantity
+                pnl = (
+                    exit_value
+                    - lot.entry_price * lot.quantity
+                    - lot.entry_commission
+                    - lot_fill["commission"]
+                )
+                proceeds += exit_value - lot_fill["commission"]
+                trades.append({
+                    "ticker": ticker,
+                    "entry_date": lot.entry_date,
+                    "exit_date": lot_fill["date"],
+                    "entry_price": lot.entry_price,
+                    "exit_price": lot_fill["fill_price"],
+                    "quantity": lot.quantity,
+                    "pnl": pnl,
+                    "entry_commission": lot.entry_commission,
+                    "exit_commission": lot_fill["commission"],
+                    "entry_signals": lot.entry_signals,
+                    "exit_reason": exit_reason,
+                })
+            return proceeds
 
         for current_date in all_dates:
-            # --- Phase 1: fill orders queued yesterday, at today's open. ---
+            traded_today = {
+                ticker for ticker in bars_by_ticker
+                if (ticker, current_date) in bars_by_date
+            }
+
+            # --- Phase 0: age every ticker that has printed before. ---
+            for ticker in stale_sessions:
+                stale_sessions[ticker] = (
+                    0 if ticker in traded_today else stale_sessions[ticker] + 1
+                )
+
+            # --- Phase 1a: write off holdings whose bars have stopped. ---
+            # There is no future bar to fill against, so the position is closed
+            # at its last observed close. Without this the position never
+            # closes: it stays out of the trade statistics while its stale mark
+            # props up NAV, and any queued order for it leaks reservations.
+            for ticker, stale in sorted(stale_sessions.items()):
+                if stale < delisting_stale_sessions:
+                    continue
+                if ticker not in positions and ticker not in pending_entries:
+                    continue
+                pending_entries.pop(ticker, None)
+                # A removal already decided is the real reason; the delisting is
+                # only why it had to fill at the last close instead of an open.
+                exit_reason = pending_exits.pop(ticker, None) or "delisted"
+                if ticker in positions:
+                    mark = last_close.get(ticker)
+                    if mark is None:
+                        continue
+                    cash += close_position(
+                        ticker,
+                        self.executor.fill_terminal_exit(
+                            quantity=0.0,
+                            price=mark,
+                            exit_date=current_date,
+                            ticker=ticker,
+                        ),
+                        exit_reason,
+                    )
+
+            # --- Phase 1b: fill exits queued yesterday, at today's open. ---
             # Exits settle before entries so freed cash is available the same
             # session, matching how the live sleeves sequence their orders.
             for ticker, exit_reason in list(pending_exits.items()):
                 bar = bars_by_date.get((ticker, current_date))
                 if bar is None:
                     # The ticker did not trade today; a market exit stays live
-                    # until it can actually be worked.
+                    # until it can actually be worked (or until Phase 1a writes
+                    # the position off as delisted).
                     continue
                 del pending_exits[ticker]
-                lots = positions.pop(ticker, None)
-                if not lots:
+                if ticker not in positions:
                     continue
-                for lot in lots:
-                    fill = self.executor.fill_market_exit(
-                        quantity=lot.quantity, bar=bar, ticker=ticker
-                    )
-                    exit_value = fill["fill_price"] * fill["quantity"]
-                    entry_value = lot.entry_price * lot.quantity
-                    pnl = exit_value - entry_value - lot.entry_commission - fill["commission"]
-                    cash += exit_value - fill["commission"]
+                cash += close_position(
+                    ticker,
+                    self.executor.fill_market_exit(
+                        quantity=0.0, bar=bar, ticker=ticker
+                    ),
+                    exit_reason,
+                )
 
-                    trades.append({
-                        "ticker": ticker,
-                        "entry_date": lot.entry_date,
-                        "exit_date": fill["date"],
-                        "entry_price": lot.entry_price,
-                        "exit_price": fill["fill_price"],
-                        "quantity": lot.quantity,
-                        "pnl": pnl,
-                        "entry_commission": lot.entry_commission,
-                        "exit_commission": fill["commission"],
-                        "entry_signals": lot.entry_signals,
-                        "exit_reason": exit_reason,
-                    })
-
-            for ticker, order in list(pending_entries.items()):
+            # --- Phase 1c: work yesterday's entries, then expire them. ---
+            for ticker, order in pending_entries.items():
                 bar = bars_by_date.get((ticker, current_date))
                 if bar is None:
-                    # No session for this ticker; the day order could not have
-                    # been working, so it carries to its next session.
                     continue
-                # Day-order semantics: this is the order's only session.
-                del pending_entries[ticker]
                 fill = self.executor.try_fill_limit_entry(
                     limit_price=order.limit_price,
                     quantity=order.quantity,
@@ -179,25 +249,41 @@ class BacktestRunner:
                         entry_signals=order.entry_signals,
                     )
                 )
+            # Day-order semantics: an entry gets exactly one session, whether or
+            # not its ticker printed a bar in it. Carrying it over would keep
+            # its notional reserved against cash indefinitely.
+            pending_entries.clear()
 
-            # --- Phase 2: decide, using bars up to and including today's close. ---
+            # --- Phase 2a: bookkeeping for everything that printed today. ---
             for ticker in bars_by_ticker:
                 bar = bars_by_date.get((ticker, current_date))
                 if bar is None:
                     continue
-
                 bars_history[ticker].append(bar)
                 last_close[ticker] = bar["close"]
+                stale_sessions.setdefault(ticker, 0)
 
-                if membership is not None and not membership.contains(ticker, current_date):
+            # --- Phase 2b: point-in-time universe gate. ---
+            # Driven by what we can act on rather than by what printed a bar, so
+            # a holding dropped from the index on a day it happens not to trade
+            # is still queued for exit.
+            non_members: set[str] = set()
+            if membership is not None:
+                gate_tickers = traded_today | set(positions) | set(pending_exits)
+                for ticker in sorted(gate_tickers):
+                    if membership.contains(ticker, current_date):
+                        continue
+                    non_members.add(ticker)
                     # Out of the point-in-time universe: not tradable, and any
                     # holding has to be liquidated (index removal / delisting).
                     if ticker in positions and ticker not in pending_exits:
                         pending_exits[ticker] = "universe_removal"
-                    pending_entries.pop(ticker, None)
+
+            # --- Phase 2c: decide, using bars up to and including today's close. ---
+            for ticker in bars_by_ticker:
+                if ticker not in traded_today or ticker in non_members:
                     continue
 
-                # Get signal for this ticker
                 signal = signals_fn(ticker, bars_history[ticker])
                 if signal is None:
                     continue

@@ -48,22 +48,55 @@ SAME_BAR_FILL_MODEL = "same_bar"
 
 @dataclass(frozen=True)
 class ExecutionModel:
-    """The execution assumptions a baseline backtest was run under."""
+    """The execution assumptions a baseline backtest was run under.
+
+    Every field that gates comparability defaults to the **unsafe** value, so a
+    model built from an incomplete config can never claim to be comparable by
+    omission.
+    """
 
     fill_model: str
     slippage_bps: float = ASSUMED_SLIPPAGE_BPS
     commission_per_share: float = ASSUMED_COMMISSION_PER_SHARE
     commission_minimum: float = DEFAULT_COMMISSION_MINIMUM
+    point_in_time_universe: bool = False
 
     @property
     def is_like_for_like(self) -> bool:
         """Whether live performance can be fairly compared to this baseline.
 
-        Requires next-open fills *and* a per-order commission floor — without
-        the floor the baseline understates cost by 10-20x on the small orders
-        the live account actually sends.
+        Requires all three:
+
+        - **next-open fills** — a same-bar backtest fills entries at the
+          decision day's low and exits at that day's open, which live cannot do;
+        - **a per-order commission floor** — without it the baseline understates
+          cost by 10-20x on the small orders the live account actually sends;
+        - **a point-in-time universe** — a backtest over today's ticker list
+          traded names *because* they went on to survive. Since
+          ``--universe-snapshots`` is opt-in, this is the assumption most likely
+          to be quietly missing from an otherwise-modernised re-run.
         """
-        return self.fill_model == NEXT_OPEN_FILL_MODEL and self.commission_minimum > 0
+        return (
+            self.fill_model == NEXT_OPEN_FILL_MODEL
+            and self.commission_minimum > 0
+            and self.point_in_time_universe
+        )
+
+    def unmet_requirements(self) -> list[str]:
+        """Human-readable reasons this baseline is not like-for-like."""
+        reasons: list[str] = []
+        if self.fill_model != NEXT_OPEN_FILL_MODEL:
+            reasons.append(
+                f"fills are '{self.fill_model}', not '{NEXT_OPEN_FILL_MODEL}'"
+            )
+        if self.commission_minimum <= 0:
+            reasons.append("no per-order commission floor")
+        if not self.point_in_time_universe:
+            reasons.append(
+                "static present-day universe (survivorship-biased); re-run with "
+                "--universe-snapshots"
+            )
+        return reasons
 
     def commission_for(self, quantity: float) -> float:
         """Commission this baseline assumed for one order of ``quantity``."""
@@ -76,15 +109,20 @@ class ExecutionModel:
 LEGACY_EXECUTION_MODEL = ExecutionModel(
     fill_model=SAME_BAR_FILL_MODEL, commission_minimum=0.0
 )
-DEFAULT_EXECUTION_MODEL = ExecutionModel(fill_model=NEXT_OPEN_FILL_MODEL)
+# What a fully-rebaselined run of this repo's backtest produces. Used only when
+# a caller supplies no model at all; anything parsed from a config fails safe.
+DEFAULT_EXECUTION_MODEL = ExecutionModel(
+    fill_model=NEXT_OPEN_FILL_MODEL, point_in_time_universe=True
+)
 
 
 def execution_model_from_backtest_config(config: Mapping | None) -> ExecutionModel:
     """Read the execution model a saved backtest declared in its ``config``.
 
-    A backtest that declares no ``fill_model`` predates the rebaseline and is
-    treated as same-bar (not comparable) rather than optimistically assumed
-    correct.
+    Anything a backtest does not declare is assumed to be the unsafe value: a
+    backtest with no ``fill_model`` predates the rebaseline and is treated as
+    same-bar, and one with no ``point_in_time_universe`` flag is treated as
+    survivorship-biased. Absence is never read as a pass.
     """
     if not config:
         return LEGACY_EXECUTION_MODEL
@@ -96,6 +134,7 @@ def execution_model_from_backtest_config(config: Mapping | None) -> ExecutionMod
             config.get("commission_per_share", ASSUMED_COMMISSION_PER_SHARE)
         ),
         commission_minimum=float(config.get("commission_minimum", 0.0)),
+        point_in_time_universe=bool(config.get("point_in_time_universe", False)),
     )
 
 
@@ -376,12 +415,10 @@ def build_report(
         # OK/WARNING/BREACH here would either excuse real drift or flag drift
         # that is purely the baseline's optimism.
         notes.append(
-            f"Baseline execution model is '{model.fill_model}' with a "
-            f"${model.commission_minimum:.2f} commission floor — not "
-            "like-for-like with live execution, so the divergence figures below "
-            "are not evidence of drift. Re-run the baseline backtest with "
-            "next-open fills and real costs "
-            "(see docs/operations/backtest-baseline.md)."
+            "Baseline is not like-for-like with live execution ("
+            + "; ".join(model.unmet_requirements())
+            + "), so the divergence figures below are not evidence of drift. "
+            "Re-run the baseline backtest per docs/operations/backtest-baseline.md."
         )
         status = "NO_DATA"
 

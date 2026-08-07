@@ -439,6 +439,7 @@ class TestExecutionModel:
             slippage_bps=10.0,
             commission_per_share=0.005,
             commission_minimum=1.0,
+            point_in_time_universe=True,
         )
         assert model.is_like_for_like is True
 
@@ -474,6 +475,7 @@ class TestExecutionModel:
             "slippage_bps": 15,
             "commission_per_share": 0.007,
             "commission_minimum": 1.0,
+            "point_in_time_universe": True,
         })
         assert model.fill_model == NEXT_OPEN_FILL_MODEL
         assert model.slippage_bps == pytest.approx(15.0)
@@ -527,6 +529,7 @@ class TestBuildReportBaselineComparability:
             slippage_bps=10.0,
             commission_per_share=0.005,
             commission_minimum=1.0,
+            point_in_time_universe=True,
         )
         report = build_report(
             "momentum",
@@ -558,7 +561,8 @@ class TestBuildReportBaselineComparability:
         )
         assert report.baseline_comparable is False
         assert report.status == "NO_DATA"
-        assert any("execution model" in note for note in report.notes)
+        assert any("not like-for-like" in note for note in report.notes)
+        assert any(SAME_BAR_FILL_MODEL in note for note in report.notes)
         # The arithmetic is still reported so the operator can see the gap.
         assert report.live_return is not None
         assert report.backtest_return is not None
@@ -594,3 +598,65 @@ class TestBuildReportBaselineComparability:
         )
         assert report.portfolio == "AGGREGATE"
         assert report.baseline_comparable is False
+
+
+class TestSurvivorshipBiasedBaselineIsNotComparable:
+    """A next-open backtest over a survivorship-biased universe is still unfair.
+
+    `--universe-snapshots` is opt-in, so the most likely re-run is one that
+    fixed the fills and the costs but kept the static present-day ticker list.
+    That baseline is inflated by winner pre-selection and live cannot match it,
+    so the gate has to fail it too.
+    """
+
+    def _model(self, **overrides):
+        kwargs = dict(
+            fill_model=NEXT_OPEN_FILL_MODEL,
+            slippage_bps=10.0,
+            commission_per_share=0.005,
+            commission_minimum=1.0,
+            point_in_time_universe=True,
+        )
+        kwargs.update(overrides)
+        return ExecutionModel(**kwargs)
+
+    def test_static_universe_is_not_comparable(self):
+        assert self._model(point_in_time_universe=False).is_like_for_like is False
+
+    def test_point_in_time_universe_is_required_alongside_fills_and_costs(self):
+        assert self._model().is_like_for_like is True
+
+    def test_config_missing_the_flag_fails_safe(self):
+        model = execution_model_from_backtest_config({
+            "fill_model": NEXT_OPEN_FILL_MODEL,
+            "commission_minimum": 1.0,
+        })
+        assert model.point_in_time_universe is False
+        assert model.is_like_for_like is False
+
+    def test_config_flag_is_read(self):
+        model = execution_model_from_backtest_config({
+            "fill_model": NEXT_OPEN_FILL_MODEL,
+            "commission_minimum": 1.0,
+            "point_in_time_universe": True,
+        })
+        assert model.is_like_for_like is True
+
+    def test_default_field_value_fails_safe(self):
+        """Constructing a model without opting in must not claim comparability."""
+        bare = ExecutionModel(fill_model=NEXT_OPEN_FILL_MODEL, commission_minimum=1.0)
+        assert bare.point_in_time_universe is False
+
+    def test_report_forces_no_data_for_a_static_universe_baseline(self):
+        start = date(2026, 5, 1)
+        report = build_report(
+            "momentum",
+            _equity_series(start, 10, 0.001),
+            _equity_series(start, 10, 0.001),
+            trades=[],
+            window_days=10,
+            execution_model=self._model(point_in_time_universe=False),
+        )
+        assert report.baseline_comparable is False
+        assert report.status == "NO_DATA"
+        assert any("survivorship" in note.lower() for note in report.notes)

@@ -15,6 +15,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from scripts.divergence_monitor import (
+    EXIT_BASELINE_NOT_COMPARABLE,
+    EXIT_BREACH,
+    EXIT_ERROR,
+    EXIT_OK,
+    exit_code_for,
     find_latest_backtest_json,
     load_backtest_execution_model,
     load_backtest_equity_series,
@@ -275,6 +280,7 @@ def test_load_execution_model_reads_the_declared_fill_model(tmp_path: Path):
         "slippage_bps": 10,
         "commission_per_share": 0.005,
         "commission_minimum": 1.0,
+        "point_in_time_universe": True,
     })
     path.write_text(json.dumps(data))
 
@@ -294,3 +300,81 @@ def test_load_execution_model_treats_a_pre_rebaseline_backtest_as_same_bar(
 
     assert model.fill_model == "same_bar"
     assert model.is_like_for_like is False
+
+
+# ---------------------------------------------------------------------------
+# Exit-code contract
+# ---------------------------------------------------------------------------
+
+
+def _report(status: str, comparable: bool = True) -> "PortfolioDivergenceReport":
+    from backtest.divergence import PortfolioDivergenceReport
+
+    return PortfolioDivergenceReport(
+        portfolio="momentum", window_start=None, window_end=None,
+        days_compared=0, live_return=None, backtest_return=None,
+        absolute_divergence_pp=None, relative_divergence=None,
+        daily_correlation=None, live_trades_in_window=0,
+        realized_slippage_total=0.0, realized_slippage_bps=None,
+        realized_commission_total=0.0, assumed_commission_total=0.0,
+        status=status, baseline_comparable=comparable,
+    )
+
+
+def _model(comparable: bool):
+    from backtest.divergence import ExecutionModel
+
+    return ExecutionModel(
+        fill_model="next_open" if comparable else "same_bar",
+        commission_minimum=1.0 if comparable else 0.0,
+        point_in_time_universe=comparable,
+    )
+
+
+class TestExitCode:
+    """A blind monitor must not look like a healthy one.
+
+    The deployed wrapper logs "Divergence monitor OK (exit 0)", so a forced
+    NO_DATA from a stale baseline previously read as a clean daily run.
+    """
+
+    def test_all_ok_exits_zero(self):
+        code = exit_code_for([_report("OK")], _model(comparable=True))
+        assert code == EXIT_OK == 0
+
+    def test_warning_exits_zero(self):
+        assert exit_code_for([_report("WARNING")], _model(comparable=True)) == EXIT_OK
+
+    def test_breach_exits_one(self):
+        code = exit_code_for([_report("BREACH")], _model(comparable=True))
+        assert code == EXIT_BREACH == 1
+
+    def test_non_comparable_baseline_gets_its_own_code(self):
+        code = exit_code_for(
+            [_report("NO_DATA", comparable=False)], _model(comparable=False)
+        )
+        assert code == EXIT_BASELINE_NOT_COMPARABLE
+        assert code not in (EXIT_OK, EXIT_BREACH, EXIT_ERROR)
+
+    def test_genuine_no_data_on_a_good_baseline_still_exits_zero(self):
+        """No overlapping live history yet is not a monitor fault."""
+        code = exit_code_for(
+            [_report("NO_DATA", comparable=True)], _model(comparable=True)
+        )
+        assert code == EXIT_OK
+
+    def test_breach_outranks_a_non_comparable_baseline(self):
+        code = exit_code_for(
+            [_report("BREACH"), _report("NO_DATA", comparable=False)],
+            _model(comparable=False),
+        )
+        assert code == EXIT_BREACH
+
+
+def test_wrapper_documents_and_branches_on_every_exit_code():
+    """deploy/launchd/run_divergence.sh must handle the code the script returns."""
+    from pathlib import Path as _Path
+
+    script = _Path("deploy/launchd/run_divergence.sh").read_text()
+    assert f"{EXIT_BASELINE_NOT_COMPARABLE} = " in script  # contract comment
+    assert f"    {EXIT_BASELINE_NOT_COMPARABLE})" in script  # case branch

@@ -29,7 +29,15 @@ results so downstream tools can check it:
 `config.slippage_bps_by_ticker` and `config.point_in_time_universe` are written
 into every results JSON. `scripts/divergence_monitor.py` reads them and reports
 `NO_DATA` rather than a misleading OK/BREACH if the baseline is not
-like-for-like.
+like-for-like. All three of next-open fills, a per-order commission floor **and**
+a point-in-time universe are required — a re-run that fixed the fills and the
+costs but kept the static ticker list is still inflated by winner
+pre-selection, so it does not pass. Anything the config does not declare is
+read as the unsafe value; absence is never a pass.
+
+When the baseline fails that check the monitor exits **3** (not 0), and
+`deploy/launchd/run_divergence.sh` logs it as `divergence monitor BLIND`. A
+blind monitor is an outage, not a clean run.
 
 ---
 
@@ -65,6 +73,17 @@ Rules the loader enforces:
   `scripts/run_backtest.py`): they are not index constituents, so membership
   must not gate them.
 
+**Delistings.** A held ticker whose bars simply stop is treated as a delisting:
+after `DELISTING_STALE_SESSIONS` (5) consecutive sessions with no print, the
+position is written off at its last observed close, charged the usual exit
+slippage and commission, and recorded as a closed trade with
+`exit_reason: "delisted"` (or the reason already queued, e.g.
+`universe_removal`). This matters for more than NAV: leaving the position open
+would keep it out of win rate, expectancy and `total_trades`, which is
+survivorship bias moved out of the universe and into the trade statistics. The
+write-off marks at the last close, which is neutral — optimistic for a
+bankruptcy, pessimistic for a cash acquisition at a premium.
+
 **Sourcing the data.** The membership history is not in this repo — it has to
 come from a data vendor or a reconstructed index-change list. Whatever the
 source, record it in the file's `source` field. Two things must accompany it
@@ -77,6 +96,16 @@ for the equity sleeves to work properly on delisted names:
    delisted names currently fall into the `Unknown` sector bucket and are
    grouped together by the sector-concentration limit. Extend `SECTOR_MAP`
    when the snapshot file lands.
+
+**Sleeve universes are scoped, and each equity sleeve ranks point-in-time.**
+`bars_by_ticker` is the union of every sleeve's instruments, so each ranking
+sleeve is given an explicit `eligible_tickers`: momentum gets the historical
+equity members plus the inverse ETFs, quality_value gets the historical equity
+members, and the ETF sleeves keep their fixed lists. Both equity sleeves also
+take the membership calendar and drop non-members from each date's ranking —
+otherwise top-N slots are filled by names the runner will refuse to buy and the
+sleeve silently trades nothing. If you add a ranking sleeve over equities, give
+it the same two arguments.
 
 ---
 

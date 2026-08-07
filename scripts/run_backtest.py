@@ -502,17 +502,32 @@ def make_momentum_signals_fn(
     regime_by_date: dict | None = None,
     bear_tickers: set[str] | None = None,
     portfolio_context: PortfolioContext | None = None,
+    eligible_tickers: list[str] | None = None,
+    membership: MembershipCalendar | None = None,
 ):
     """Create a momentum signal function based on 6-month relative strength.
 
-    Ranks all tickers by their return over the lookback period.
-    Buys the top N performers. Exits via trailing stop + max loss.
-    In bear markets, inverse ETFs (bear_tickers) naturally rank high and get selected.
-    When regime changes away from bear, inverse ETFs are force-exited.
+    Ranks the sleeve's own universe by return over the lookback period and buys
+    the top N. Exits via trailing stop + max loss. In bear markets, inverse ETFs
+    (bear_tickers) naturally rank high and get selected; when the regime turns
+    non-bear they are force-exited.
+
+    ``eligible_tickers`` scopes the ranking to the sleeve's universe. Without it
+    the ranking pool is every ticker in ``bars_by_ticker`` — which in a
+    multi-sleeve backtest is the union of *all* sleeves, letting momentum's top-N
+    fill up with thematic ETFs it was never meant to hold.
+
+    ``membership`` additionally restricts each date's ranking to names that were
+    index members on that date. This matters because the runner blocks entries in
+    non-members: without the per-date filter, top-N slots get taken by names the
+    sleeve is not allowed to buy and it silently trades nothing.
     """
     # Pre-compute date -> {ticker: close_price} for ranking
+    eligible = set(eligible_tickers or bars_by_ticker)
     price_by_date: dict[Any, dict[str, float]] = {}
     for ticker, bars in bars_by_ticker.items():
+        if ticker not in eligible:
+            continue
         for bar in bars:
             d = bar["date"]
             if d not in price_by_date:
@@ -532,6 +547,8 @@ def make_momentum_signals_fn(
 
         returns = []
         for ticker in current_prices:
+            if membership is not None and not membership.contains(ticker, d):
+                continue
             if ticker in past_prices and past_prices[ticker] > 0:
                 ret = (current_prices[ticker] - past_prices[ticker]) / past_prices[ticker]
                 returns.append((ticker, ret))
@@ -703,18 +720,26 @@ def make_sector_rotation_signals_fn(
     trailing_stop_pct: float = 0.08,
     regime_by_date: dict | None = None,
     portfolio_context: PortfolioContext | None = None,
+    eligible_tickers: list[str] | None = None,
 ):
     """Create a sector rotation signal function.
 
     Ranks sector ETFs by 3-month return and buys the top N.
     In bear regime, rotates to defensive sectors only (XLU, XLP, XLV).
     Exits via trailing stop or when sector drops out of top N.
+
+    ``eligible_tickers`` scopes the ranking to this sleeve's ETFs; without it the
+    pool is every ticker in ``bars_by_ticker`` (the union of all sleeves), which
+    lets the sector sleeve buy individual equities.
     """
     defensive_sectors = {"XLU", "XLP", "XLV"}
 
     # Pre-compute date -> {ticker: close_price} for ranking
+    eligible = set(eligible_tickers or bars_by_ticker)
     price_by_date: dict[Any, dict[str, float]] = {}
     for ticker, bars in bars_by_ticker.items():
+        if ticker not in eligible:
+            continue
         for bar in bars:
             d = bar["date"]
             if d not in price_by_date:
@@ -1143,12 +1168,16 @@ def make_quality_value_signals_fn(
     portfolio_context: PortfolioContext | None = None,
     replacement_policy: ReplacementPolicy = ReplacementPolicy.TECHNICAL_ONLY,
     replacement_score_margin: float = 0.25,
+    membership: MembershipCalendar | None = None,
 ):
     """Create a quality value signal function.
 
     Ranks stocks by a composite quality-value score (ROE, D/E, margin).
     Entry: composite score in top N.
     Exit: trailing stop.
+
+    ``membership`` restricts each date's ranking to index members on that date,
+    so top-N slots are not taken by names the runner will refuse to buy.
     """
     tracked: dict[str, list[dict]] = {}
 
@@ -1170,6 +1199,13 @@ def make_quality_value_signals_fn(
         if candidate not in eligible:
             continue
         for bar in candidate_bars:
+            # Point-in-time: a name only competes for a top-N slot on dates it
+            # was actually a member, otherwise non-members crowd out the names
+            # the runner would let this sleeve buy.
+            if membership is not None and not membership.contains(
+                candidate, bar["date"]
+            ):
+                continue
             tickers_by_date.setdefault(bar["date"], set()).add(candidate)
 
     scores_by_date: dict[date, dict[str, float]] = {}
@@ -2211,6 +2247,20 @@ def main():
     # (make_signals_fn, make_short_term_mr_signals_fn) remain in this file for future
     # revival. See docs/strategies/mean-reversion-failure-analysis.md for the failure
     # analysis and the conditions under which the sleeves should be re-enabled.
+    # Each equity sleeve's candidate list: every historical index member when a
+    # point-in-time calendar is available (the sleeve rankings and the runner
+    # both gate per date), else the static present-day list. Scoping this matters
+    # because bars_by_ticker is the union of *all* sleeves — an unscoped ranking
+    # lets one sleeve buy another's instruments.
+    if membership is not None:
+        equity_eligible = [
+            ticker for ticker in membership.all_tickers()
+            if ticker not in ALWAYS_TRADABLE
+        ]
+        momentum_eligible = equity_eligible + sorted(BEAR_TICKERS)
+    else:
+        equity_eligible = list(UNIVERSE_REGISTRY["quality_value"])
+        momentum_eligible = list(UNIVERSE_REGISTRY["momentum"])
     mom_signals_fn = make_momentum_signals_fn(
         bars_by_ticker=bars_by_ticker,
         top_n=5,
@@ -2219,9 +2269,12 @@ def main():
         initial_capital=args.capital * 0.2308,
         trailing_stop_pct=0.10,
         bear_tickers=BEAR_TICKERS,
+        eligible_tickers=momentum_eligible,
+        membership=membership,
     )
     sector_signals_fn = make_sector_rotation_signals_fn(
         bars_by_ticker=bars_by_ticker,
+        eligible_tickers=list(UNIVERSE_REGISTRY["sector_rotation"]),
         top_n=3,
         lookback_days=63,
         position_size_pct=0.20,
@@ -2240,16 +2293,6 @@ def main():
         replacement_policy=replacement_policy,
         replacement_score_margin=args.replacement_score_margin,
     )
-    # The equity sleeve's candidate list: every historical index member when a
-    # point-in-time calendar is available (the runner gates each date), else the
-    # static present-day top-100.
-    if membership is not None:
-        equity_eligible = [
-            ticker for ticker in membership.all_tickers()
-            if ticker not in ALWAYS_TRADABLE
-        ]
-    else:
-        equity_eligible = list(UNIVERSE_REGISTRY["quality_value"])
     qv_signals_fn = make_quality_value_signals_fn(
         fundamentals_lookup=fundamentals_lookup,
         sector_map=SECTOR_MAP,
@@ -2262,6 +2305,7 @@ def main():
         regime_by_date=regime_by_date,
         replacement_policy=replacement_policy,
         replacement_score_margin=args.replacement_score_margin,
+        membership=membership,
     )
     ed_signals_fn = make_earnings_drift_signals_fn(
         earnings_lookup=earnings_lookup,

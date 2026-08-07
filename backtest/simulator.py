@@ -59,6 +59,30 @@ class SimulatedExecutor:
             "date": bar["date"],
         }
 
+    def fill_terminal_exit(
+        self,
+        quantity: float,
+        price: float,
+        exit_date,
+        ticker: str | None = None,
+    ) -> dict:
+        """Write a position off at ``price`` when no future bar will ever come.
+
+        Used for delistings: there is no next open to fill against, so the
+        position is closed at its last observed close. Slippage and commission
+        are charged exactly as for a market exit, because pretending the
+        write-off is free would understate the cost of holding a name to its
+        delisting.
+        """
+        slippage_multiplier = 1 - self.cost_model.slippage_bps_for(ticker) / 10_000
+        return {
+            "filled": True,
+            "fill_price": price * slippage_multiplier,
+            "quantity": quantity,
+            "commission": self.cost_model.commission_for(quantity),
+            "date": exit_date,
+        }
+
     def fill_market_exit(
         self,
         quantity: float,

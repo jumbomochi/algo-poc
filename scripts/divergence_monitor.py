@@ -11,8 +11,9 @@ For each paper-trading portfolio (and the aggregate), this script:
    slippage/commission from the ``trades`` table.
 4. Prints a console table, writes a JSON report, and optionally emits a
    Prometheus textfile for ``node_exporter`` to scrape.
-5. Exits non-zero if any portfolio's divergence breaches the threshold —
-   so cron/launchd jobs can alert.
+5. Exits non-zero if any portfolio's divergence breaches the threshold, or if
+   the baseline backtest is not comparable to live at all — so cron/launchd
+   jobs can alert. See ``exit_code_for`` for the contract.
 
 This is **not** a kill switch. It surfaces divergence so a human can decide
 whether to investigate, disable a sleeve, or carry on. Automated sleeve
@@ -53,6 +54,40 @@ from backtest.divergence import (
 )
 from scripts.paper_state import PaperTradingState
 from shared.config import load_config
+
+
+# ---------------------------------------------------------------------------
+# Exit-code contract (mirrored in deploy/launchd/run_divergence.sh)
+# ---------------------------------------------------------------------------
+
+EXIT_OK = 0
+EXIT_BREACH = 1
+EXIT_ERROR = 2
+# The monitor ran but could not judge anything: the baseline backtest is not
+# like-for-like with live execution, so every report was forced to NO_DATA.
+# This needs its own code — folding it into EXIT_OK made a blind monitor
+# indistinguishable from a healthy one in the daily log.
+EXIT_BASELINE_NOT_COMPARABLE = 3
+
+
+def exit_code_for(
+    reports: list[PortfolioDivergenceReport],
+    execution_model: ExecutionModel | None = None,
+) -> int:
+    """Map the run's outcome onto the process exit code.
+
+    A breach outranks a stale baseline: it is the louder signal, and in practice
+    the two cannot co-occur (a non-comparable baseline forces every status to
+    NO_DATA). A genuine NO_DATA on a good baseline — no overlapping live history
+    yet — is not a fault and stays at EXIT_OK.
+    """
+    if any_breach(reports):
+        return EXIT_BREACH
+    if execution_model is not None and not execution_model.is_like_for_like:
+        return EXIT_BASELINE_NOT_COMPARABLE
+    if any(not r.baseline_comparable for r in reports):
+        return EXIT_BASELINE_NOT_COMPARABLE
+    return EXIT_OK
 
 
 # ---------------------------------------------------------------------------
@@ -374,10 +409,10 @@ def main() -> int:
     backtest_path = args.backtest or find_latest_backtest_json()
     if backtest_path is None:
         print("ERROR: No backtest JSON found. Pass --backtest or run scripts/run_backtest.py first.")
-        return 2
+        return EXIT_ERROR
     if not Path(backtest_path).is_file():
         print(f"ERROR: Backtest file not found: {backtest_path}")
-        return 2
+        return EXIT_ERROR
     print(f"  Backtest source: {backtest_path}")
 
     bt_per_portfolio, bt_aggregate = load_backtest_equity_series(backtest_path)
@@ -398,13 +433,13 @@ def main() -> int:
         session: Session = session_factory()
     except Exception as e:
         print(f"ERROR: Failed to construct DB engine ({args.db_url}): {e}")
-        return 2
+        return EXIT_ERROR
 
     try:
         state = PaperTradingState.load(session)
     except ValueError:
         print("ERROR: No paper trading state in DB. Run scripts/run_paper.py --init first.")
-        return 2
+        return EXIT_ERROR
     except Exception as e:
         # Auth failure, network unreachable, missing tables, etc.
         print(f"ERROR: Could not load paper state from DB ({args.db_url}):")
@@ -413,7 +448,7 @@ def main() -> int:
             "       Check that the DB is running, credentials are correct, "
             "and migrations have run (`alembic upgrade head`)."
         )
-        return 2
+        return EXIT_ERROR
 
     portfolios = state.get_portfolio_names()
     if args.portfolio:
@@ -422,7 +457,7 @@ def main() -> int:
                 f"ERROR: Portfolio '{args.portfolio}' not in DB. "
                 f"Available: {', '.join(portfolios)}"
             )
-            return 2
+            return EXIT_ERROR
         portfolios = [args.portfolio]
 
     # --- Build per-portfolio reports ---
@@ -493,7 +528,7 @@ def main() -> int:
     if args.prometheus_textfile:
         write_prometheus_textfile(reports, args.prometheus_textfile)
 
-    return 1 if any_breach(reports) else 0
+    return exit_code_for(reports, execution_model)
 
 
 if __name__ == "__main__":
