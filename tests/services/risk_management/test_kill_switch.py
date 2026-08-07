@@ -80,3 +80,98 @@ class TestKillSwitch:
         assert ks.is_active is True
         assert ks.reason == "second reason"
         assert ks.triggered_by == "system_b"
+
+
+class TestKillSwitchPersistence:
+    """The kill switch must survive a restart (fail-closed) by persisting to the
+    durable halt table (review finding 1.1)."""
+
+    @pytest.fixture()
+    def store(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session
+
+        from shared.halt_state import HaltStateRepository
+        from shared.models import Base
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        return HaltStateRepository(Session(engine))
+
+    def test_activate_persists_halt(self, mock_logger, store):
+        ks = KillSwitch(logger=mock_logger, halt_store=store, mode="paper")
+        ks.activate(reason="margin call", triggered_by="risk_engine")
+
+        halt = store.load_active_halt(mode="paper")
+        assert halt is not None
+        assert halt.active is True
+        assert halt.reason == "margin call"
+        assert halt.source == "kill"
+
+    def test_reload_from_store_stays_halted_after_restart(self, mock_logger, store):
+        # First process activates and persists.
+        KillSwitch(logger=mock_logger, halt_store=store, mode="paper").activate(
+            reason="breaker", triggered_by="risk_engine"
+        )
+        # A fresh process (new in-memory switch) reloads the persisted halt.
+        restarted = KillSwitch(logger=mock_logger, halt_store=store, mode="paper")
+        assert restarted.is_active is False  # not yet reloaded
+        restarted.reload_from_store()
+        assert restarted.is_active is True
+        assert restarted.check().approved is False
+
+    def test_deactivate_clears_persisted_halt(self, mock_logger, store):
+        ks = KillSwitch(logger=mock_logger, halt_store=store, mode="paper")
+        ks.activate(reason="r", triggered_by="t")
+        ks.deactivate(cleared_by="admin***")
+
+        assert ks.is_active is False
+        assert store.load_active_halt(mode="paper") is None
+
+    def test_sync_picks_up_external_clear(self, mock_logger, store):
+        """The clear API endpoint writes the DB; the running risk process must
+        pick that up on its periodic re-sync and resume."""
+        ks = KillSwitch(logger=mock_logger, halt_store=store, mode="paper")
+        ks.activate(reason="r", triggered_by="t")
+        assert ks.is_active is True
+
+        # Simulate the admin endpoint clearing the halt out-of-band.
+        store.clear_halt(mode="paper", cleared_by="admin***", now=datetime.now(timezone.utc))
+        store.session.commit()
+
+        ks.sync_from_store()
+        assert ks.is_active is False
+
+    def test_sync_stays_halted_when_persist_failed(self, mock_logger, store):
+        """If activation's DB persist failed, the in-memory halt has no backing
+        row. sync must NOT read that absence as a human clear and resume — that
+        would turn fail-closed into fail-open on exactly the failure it guards.
+        """
+        ks = KillSwitch(logger=mock_logger, halt_store=store, mode="paper")
+        # Simulate activate() whose commit failed: active in memory, no DB row.
+        ks._active = True
+        ks._reason = "margin call"
+        ks._triggered_by = "risk_engine"
+        ks._activated_at = datetime.now(timezone.utc)
+        assert store.load_active_halt(mode="paper") is None
+
+        ks.sync_from_store()
+
+        assert ks.is_active is True  # stays halted
+        # and self-heals: the halt is now persisted.
+        assert store.load_active_halt(mode="paper") is not None
+
+    def test_sync_picks_up_external_halt(self, mock_logger, store):
+        """A halt persisted by another actor is adopted on re-sync (fail-closed)."""
+        ks = KillSwitch(logger=mock_logger, halt_store=store, mode="paper")
+        store.record_halt(
+            mode="paper",
+            source="kill",
+            reason="external",
+            triggered_by="other",
+            now=datetime.now(timezone.utc),
+        )
+        store.session.commit()
+
+        ks.sync_from_store()
+        assert ks.is_active is True

@@ -309,6 +309,332 @@ class TestKillSwitchIntegration:
         assert len(order_calls) == 2
 
 
+def _kill_msg(reason="emergency", triggered_by="admin***"):
+    return KillMessage(
+        timestamp=datetime(2026, 8, 7, 12, 0, 0, tzinfo=timezone.utc),
+        triggered_by=triggered_by,
+        reason=reason,
+    )
+
+
+class TestKillLiquidation:
+    """Kill liquidation must reload authoritative DB positions, route exits
+    through the ledger with deterministic ids (idempotent on replay), always
+    alert, and not abort on a single-position failure (review 1.3–1.5)."""
+
+    @pytest.fixture
+    def db_runner(self, mock_config, mock_redis):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        session = Session(engine)
+        now = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        for ticker, con_id, qty in [("AAPL", 111, 10.0), ("MSFT", 222, 5.0)]:
+            session.add(
+                Position(
+                    account_id="DUTEST",
+                    ticker=ticker,
+                    portfolio="momentum",
+                    con_id=con_id,
+                    exchange="SMART",
+                    currency="USD",
+                    quantity=qty,
+                    avg_entry_price=100,
+                    current_price=100,
+                    peak_price=100,
+                    highest_price_since_entry=100,
+                    opened_at=now,
+                    status="open",
+                )
+            )
+        session.commit()
+        ledger = OrderLedger(session)
+        runner = RiskServiceRunner(
+            config=mock_config,
+            redis_client=mock_redis,
+            db_session=session,
+            order_ledger=ledger,
+        )
+        # Stale/empty in-memory book: the kill MUST reload from the DB, not this.
+        runner._portfolio.positions = {}
+        return runner, ledger, session
+
+    @pytest.mark.asyncio
+    async def test_kill_liquidates_authoritative_db_positions(
+        self, db_runner, mock_redis
+    ):
+        runner, ledger, session = db_runner
+        await runner.process_kill(_kill_msg())
+
+        orders = _approved_orders(mock_redis)
+        sells = {o.ticker: o for o in orders if o.action == "sell"}
+        assert set(sells) == {"AAPL", "MSFT"}
+        assert sells["AAPL"].quantity == pytest.approx(10.0)
+        # Each exit is backed by a deterministic ledger intent so execution can
+        # actually place it (not a synthetic id it would reject).
+        intent = ledger.get(sells["AAPL"].recommendation_id)
+        assert intent.action == "SELL"
+        assert intent.con_id == 111
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_replayed_kill_does_not_double_submit(self, db_runner, mock_redis):
+        runner, ledger, session = db_runner
+        await runner.process_kill(_kill_msg())
+        first_ids = {o.recommendation_id for o in _approved_orders(mock_redis)}
+
+        # Same kill message redelivered (crash-replay): must reuse the same
+        # deterministic intents, not mint new ones.
+        await runner.process_kill(_kill_msg())
+        all_ids = {o.recommendation_id for o in _approved_orders(mock_redis)}
+        assert all_ids == first_ids  # no new exit ids
+
+        from shared.models import OrderIntent
+
+        intent_count = session.query(OrderIntent).count()
+        assert intent_count == 2  # two positions, not four
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_second_kill_while_halted_does_not_reliquidate(
+        self, db_runner, mock_redis
+    ):
+        """Once halted, a second (distinct-epoch) kill for the same incident must
+        latch, not re-liquidate a position that is still being flattened."""
+        runner, ledger, session = db_runner
+        await runner.process_kill(_kill_msg(reason="first"))
+        first = len(_approved_orders(mock_redis))
+
+        later = KillMessage(
+            timestamp=datetime(2026, 8, 7, 13, 0, 0, tzinfo=timezone.utc),
+            triggered_by="operator***",
+            reason="second while still halted",
+        )
+        await runner.process_kill(later)
+
+        assert len(_approved_orders(mock_redis)) == first  # no re-liquidation
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_position_without_con_id_is_flagged_not_silently_dropped(
+        self, mock_config, mock_redis
+    ):
+        """A position with no con_id cannot be routed to a ledger intent, so
+        execution would reject it. It must raise a critical alert (manual
+        action), not be published + reported as liquidated."""
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        session = Session(engine)
+        session.add(
+            Position(
+                account_id="DUTEST",
+                ticker="NOCID",
+                portfolio="momentum",
+                con_id=None,
+                exchange="SMART",
+                currency="USD",
+                quantity=5.0,
+                avg_entry_price=100,
+                current_price=100,
+                peak_price=100,
+                highest_price_since_entry=100,
+                opened_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+                status="open",
+            )
+        )
+        session.commit()
+        runner = RiskServiceRunner(
+            config=mock_config,
+            redis_client=mock_redis,
+            db_session=session,
+            order_ledger=OrderLedger(session),
+        )
+
+        await runner.process_kill(_kill_msg())
+
+        # No doomed exit published for the un-routable position ...
+        assert all(o.ticker != "NOCID" for o in _approved_orders(mock_redis))
+        # ... but the operator is warned to act.
+        alerts = [
+            str(c.args[1])
+            for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert any(
+            "NOCID" in a and ("manual" in a.lower() or "unroutable" in a.lower())
+            for a in alerts
+        )
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_kill_always_alerts_even_with_no_positions(
+        self, runner, mock_redis
+    ):
+        runner._portfolio.positions = {}
+        await runner.process_kill(_kill_msg())
+
+        alerts = [
+            c.args[1]
+            for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert any("kill" in str(a).lower() for a in alerts)
+
+    @pytest.mark.asyncio
+    async def test_kill_per_position_failure_does_not_abort_rest(
+        self, db_runner, mock_redis
+    ):
+        runner, ledger, session = db_runner
+        original = runner._emit_liquidation_exit
+
+        async def flaky(pos, **kwargs):
+            if pos["ticker"] == "AAPL":
+                raise RuntimeError("IB disconnected for AAPL")
+            return await original(pos, **kwargs)
+
+        runner._emit_liquidation_exit = flaky
+        await runner.process_kill(_kill_msg())
+
+        orders = _approved_orders(mock_redis)
+        assert any(o.ticker == "MSFT" for o in orders)  # MSFT still liquidated
+        alerts = [
+            c.args[1]
+            for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert any("kill" in str(a).lower() for a in alerts)  # alert still fired
+        session.rollback()
+
+
+class TestCircuitBreakerLiquidation:
+    """The 20% circuit breaker must liquidate, not merely pause buys (1.2)."""
+
+    @pytest.fixture
+    def db_runner(self, mock_config, mock_redis):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        session = Session(engine)
+        now = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        session.add(
+            Position(
+                account_id="DUTEST",
+                ticker="AAPL",
+                portfolio="momentum",
+                con_id=111,
+                exchange="SMART",
+                currency="USD",
+                quantity=10.0,
+                avg_entry_price=100,
+                current_price=100,
+                peak_price=100,
+                highest_price_since_entry=100,
+                opened_at=now,
+                status="open",
+            )
+        )
+        session.commit()
+        runner = RiskServiceRunner(
+            config=mock_config,
+            redis_client=mock_redis,
+            db_session=session,
+            order_ledger=OrderLedger(session),
+        )
+        return runner, session
+
+    @pytest.mark.asyncio
+    async def test_breaker_liquidates_and_halts(self, db_runner, mock_redis):
+        from shared.halt_state import HaltStateRepository
+
+        runner, session = db_runner
+        runner._portfolio.book_equity = 70_000  # 30% drawdown
+        runner._portfolio.book_peak_equity = 100_000
+
+        await runner._emit_drawdown_gauge()
+
+        assert runner._kill_switch.is_active is True
+        orders = _approved_orders(mock_redis)
+        assert any(o.ticker == "AAPL" and o.action == "sell" for o in orders)
+        halt = HaltStateRepository(session).load_active_halt(mode="paper")
+        assert halt is not None and halt.source == "circuit_breaker"
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_breaker_does_not_reliquidate_when_already_halted(
+        self, db_runner, mock_redis
+    ):
+        runner, session = db_runner
+        runner._portfolio.book_equity = 70_000
+        runner._portfolio.book_peak_equity = 100_000
+
+        await runner._emit_drawdown_gauge()
+        first = len(_approved_orders(mock_redis))
+        await runner._emit_drawdown_gauge()  # still drawn down, already halted
+        assert len(_approved_orders(mock_redis)) == first  # no re-liquidation
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_breaker_publishes_kill_so_execution_cancels_orders(
+        self, db_runner, mock_redis
+    ):
+        """The breaker must also reach execution's kill path (which cancels
+        resting orders) — a 'full liquidation' that leaves working buys is not
+        one. It does so by publishing a KillMessage to stream:kill."""
+        runner, session = db_runner
+        runner._portfolio.book_equity = 70_000
+        runner._portfolio.book_peak_equity = 100_000
+
+        await runner._emit_drawdown_gauge()
+
+        kills = [
+            c for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:kill"
+        ]
+        assert len(kills) == 1
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_pause_only_alerts_no_liquidation(self, db_runner, mock_redis):
+        runner, session = db_runner
+        runner._portfolio.book_equity = 88_000  # 12% -> pause, not breaker
+        runner._portfolio.book_peak_equity = 100_000
+
+        await runner._emit_drawdown_gauge()
+
+        assert runner._kill_switch.is_active is False
+        assert _approved_orders(mock_redis) == []
+        session.rollback()
+
+
+class TestKillFailsClosedOnRestart:
+    """A restart after a kill must stay halted (review 1.1)."""
+
+    def test_runner_reloads_persisted_halt_on_construction(
+        self, mock_config, mock_redis
+    ):
+        from shared.halt_state import HaltStateRepository
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        session = Session(engine)
+        # A prior process persisted an active halt for this mode.
+        HaltStateRepository(session).record_halt(
+            mode="paper",
+            source="kill",
+            reason="prior emergency",
+            triggered_by="admin***",
+            now=datetime.now(timezone.utc),
+        )
+        session.commit()
+
+        # A fresh runner (simulating a restart) must come up already halted.
+        runner = RiskServiceRunner(
+            config=mock_config, redis_client=mock_redis, db_session=session
+        )
+
+        assert runner._kill_switch.is_active is True
+        assert runner._kill_switch.check().approved is False
+        session.close()
+
+
 class TestDrawdownCheck:
     @pytest.mark.asyncio
     async def test_drawdown_rejects_new_buy(self, runner, mock_redis):

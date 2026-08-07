@@ -582,7 +582,11 @@ class TestDurableExecutionIdentity:
         finally:
             event.remove(engine, "before_cursor_execute", record_select)
 
-        assert len(selects) == 1
+        # The reconciliation must be a single atomic read (projection + positions
+        # in one UNION query). The per-position exit-dedup reads that follow are a
+        # separate, legitimate concern and are not counted here.
+        reconciliation_selects = [s for s in selects if "row_kind" in s]
+        assert len(reconciliation_selects) == 1
 
     @pytest.mark.asyncio
     async def test_inactive_before_fill_is_submission_failed(
@@ -1209,6 +1213,86 @@ class TestKillHandling:
         mock_order_manager.cancel_all_orders.assert_called_once()
         # Should have submitted market exits for all positions
         assert mock_order_manager.submit_exit.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_kill_uses_deterministic_exit_id(
+        self, runner, mock_order_manager
+    ):
+        """Kill exits must carry a deterministic per-event id so a replay is a
+        no-op instead of re-selling (review 1.3)."""
+        runner._positions = {"AAPL": 10}
+        msg = KillMessage(
+            timestamp=datetime(2026, 8, 7, 12, 0, 0, tzinfo=timezone.utc),
+            triggered_by="admin",
+            reason="e",
+        )
+        await runner.process_kill(msg)
+
+        epoch = int(msg.timestamp.timestamp())
+        assert mock_order_manager.submit_exit.await_args.kwargs[
+            "recommendation_id"
+        ] == f"liq-paper-AAPL-{epoch}"
+
+    @pytest.mark.asyncio
+    async def test_kill_per_ticker_failure_continues_and_alerts(
+        self, runner, mock_redis, mock_order_manager
+    ):
+        """One ticker failing (e.g. IB disconnect) must not abort the rest, and
+        the critical alert must always fire (review 1.5)."""
+        runner._positions = {"AAPL": 10, "MSFT": 5}
+
+        async def flaky(*, ticker, quantity, recommendation_id):
+            if ticker == "AAPL":
+                raise RuntimeError("IB disconnected")
+            return "order-x"
+
+        mock_order_manager.submit_exit.side_effect = flaky
+
+        await runner.process_kill(kill_message())
+
+        # Both tickers attempted despite AAPL failing.
+        assert mock_order_manager.submit_exit.await_count == 2
+        alerts = [
+            c for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert len(alerts) >= 1
+
+    @pytest.mark.asyncio
+    async def test_kill_skips_ticker_already_liquidated_via_ledger(
+        self, durable_runner
+    ):
+        """If the authoritative (risk) path already submitted the exit for this
+        kill, execution's defense-in-depth net must skip it — no double-sell."""
+        runner, ledger = durable_runner
+        msg = kill_message()
+        epoch = int(msg.timestamp.timestamp())
+        exit_id = f"liq-paper-AAPL-{epoch}"
+        # A real open AAPL position exists (so reconcile keeps it) ...
+        ledger.session.add(
+            Position(
+                account_id="DUN551088",
+                ticker="AAPL",
+                portfolio="momentum",
+                con_id=265598,
+                exchange="SMART",
+                currency="USD",
+                quantity=10,
+                avg_entry_price=100,
+                current_price=100,
+                peak_price=100,
+                highest_price_since_entry=100,
+                opened_at=BROKER_TIME,
+                status="open",
+            )
+        )
+        ledger.session.commit()
+        # ... but risk already created + submitted this deterministic exit.
+        seed_approved_intent(ledger, recommendation_id=exit_id, ib_order_id="77")
+
+        await runner.process_kill(msg)
+
+        runner._order_manager.submit_exit.assert_not_awaited()
 
 
 class TestGracefulShutdown:
