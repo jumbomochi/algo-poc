@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from services.api.app import create_app
-from services.api.auth import _load_api_keys
+from services.api.auth import _LockoutTracker, _load_api_keys
 
 
 @pytest.fixture()
@@ -108,11 +108,14 @@ class TestLiveModeGuard:
 
 class TestRateLimitLockout:
     """An internet-reachable API guarding a kill switch must not allow an
-    unbounded key-guessing loop. Repeated X-API-Key failures from the same
-    client are locked out for a cooldown window.
+    unbounded key-guessing loop against one specific wrong key — but for a
+    real-money system, availability of the kill endpoint outranks
+    brute-force resistance. A VALID key must never be blocked by lockout
+    state, no matter how many prior failures came from the same address;
+    only repeated failures with the *same* invalid key accumulate.
     """
 
-    def test_repeated_failures_are_locked_out(self, client):
+    def test_repeated_failures_with_the_same_wrong_key_are_locked_out(self, client):
         from services.api.auth import LOCKOUT_MAX_FAILURES
 
         for _ in range(LOCKOUT_MAX_FAILURES):
@@ -124,32 +127,140 @@ class TestRateLimitLockout:
         locked = client.get("/api/v1/auth-check", headers={"X-API-Key": "bad-key"})
         assert locked.status_code == 429
 
-    def test_lockout_blocks_even_a_subsequently_valid_key(self, client):
+    def test_valid_key_never_locked_out_even_after_other_failures_from_same_ip(
+        self, client
+    ):
+        """Regression: lockout must gate only failures, never a request that
+        presents a genuinely valid key — the kill switch (admin-gated by
+        this same key) must stay reachable for the operator.
+        """
         from services.api.auth import LOCKOUT_MAX_FAILURES
 
-        for _ in range(LOCKOUT_MAX_FAILURES):
+        for _ in range(LOCKOUT_MAX_FAILURES * 3):
             client.get("/api/v1/auth-check", headers={"X-API-Key": "bad-key"})
 
         response = client.get(
             "/api/v1/auth-check", headers={"X-API-Key": "test-key"}
         )
-        assert response.status_code == 429
+        assert response.status_code == 200
 
-    def test_successful_auth_resets_the_failure_count(self, client):
+    def test_missing_header_requests_do_not_count_toward_lockout(self, client):
+        """A request with no X-API-Key at all isn't a guessing attempt —
+        it must not consume the failure budget for a real key guess.
+        """
         from services.api.auth import LOCKOUT_MAX_FAILURES
 
-        for _ in range(LOCKOUT_MAX_FAILURES - 1):
-            client.get("/api/v1/auth-check", headers={"X-API-Key": "bad-key"})
+        for _ in range(LOCKOUT_MAX_FAILURES * 3):
+            response = client.get("/api/v1/auth-check")
+            assert response.status_code == 401
 
-        ok = client.get("/api/v1/auth-check", headers={"X-API-Key": "test-key"})
-        assert ok.status_code == 200
-
-        # The prior success cleared the failure count, so a single further
-        # failure must not be enough to lock out.
-        still_not_locked = client.get(
+        # A genuine wrong-key guess right after must still get a plain 401,
+        # not an immediate 429 from budget the header-less requests used up.
+        first_guess = client.get(
             "/api/v1/auth-check", headers={"X-API-Key": "bad-key"}
         )
-        assert still_not_locked.status_code == 401
+        assert first_guess.status_code == 401
+
+    def test_different_wrong_keys_from_same_address_do_not_share_a_bucket(
+        self, client
+    ):
+        """Lockout is keyed on (address, presented-key-prefix), not the
+        address alone — otherwise one client guessing many different wrong
+        keys would lock out everyone else behind the same reverse proxy.
+        """
+        from services.api.auth import LOCKOUT_MAX_FAILURES
+
+        # Distinct 4-char prefixes ("keyA"/"keyB") — the bucket keys on the
+        # presented key's prefix, so this exercises the actual bucketing
+        # boundary rather than relying on two keys happening to differ.
+        for _ in range(LOCKOUT_MAX_FAILURES):
+            client.get("/api/v1/auth-check", headers={"X-API-Key": "keyA-wrong-one"})
+
+        # "keyA-wrong-one" is now locked out...
+        locked = client.get(
+            "/api/v1/auth-check", headers={"X-API-Key": "keyA-wrong-one"}
+        )
+        assert locked.status_code == 429
+
+        # ...but a different wrong key (different prefix) from the same
+        # TestClient address is a separate bucket and gets a plain 401.
+        different_key = client.get(
+            "/api/v1/auth-check", headers={"X-API-Key": "keyB-wrong-two"}
+        )
+        assert different_key.status_code == 401
+
+
+class TestLockoutTrackerBounded:
+    """_LockoutTracker is keyed by attacker-controlled strings (address +
+    key prefix) with no natural expiry from the caller — it must not grow
+    without bound, or a slow/wide attack becomes its own memory-exhaustion
+    vector. Tested directly against the class (with an injected fake clock,
+    so no real sleeping) rather than through HTTP: the property under test
+    is the tracker's internal size, which isn't observable through a
+    response status code.
+    """
+
+    def test_stale_buckets_are_swept_after_the_window_expires(self):
+        now = [0.0]
+        tracker = _LockoutTracker(
+            max_failures=5, window_seconds=10.0, lockout_seconds=30.0,
+            now_fn=lambda: now[0],
+        )
+
+        tracker.record_failure("bucket-a")
+        assert len(tracker._failures) == 1
+
+        # Long past the window, never enough failures to lock out: the next
+        # record_failure for an unrelated bucket must sweep the stale one.
+        now[0] = 100.0
+        tracker.record_failure("bucket-b")
+
+        assert "bucket-a" not in tracker._failures
+        assert "bucket-b" in tracker._failures
+
+    def test_active_lockout_is_not_swept_before_it_expires(self):
+        now = [0.0]
+        tracker = _LockoutTracker(
+            max_failures=2, window_seconds=10.0, lockout_seconds=30.0,
+            now_fn=lambda: now[0],
+        )
+
+        tracker.record_failure("bucket-a")
+        tracker.record_failure("bucket-a")  # crosses max_failures -> locked
+        assert tracker.is_locked_out("bucket-a") is True
+
+        now[0] = 15.0  # past the failure window, still inside the lockout
+        tracker.record_failure("bucket-b")
+
+        assert tracker.is_locked_out("bucket-a") is True
+
+    def test_tracked_bucket_count_is_capped(self):
+        tracker = _LockoutTracker(
+            max_failures=5, window_seconds=60.0, lockout_seconds=300.0,
+            max_tracked_keys=10,
+        )
+
+        for i in range(1000):
+            tracker.record_failure(f"attacker-{i}")
+
+        assert len(tracker._failures) <= 10
+
+    def test_capacity_eviction_drops_oldest_bucket_first(self):
+        now = [0.0]
+        tracker = _LockoutTracker(
+            max_failures=5, window_seconds=60.0, lockout_seconds=300.0,
+            max_tracked_keys=2, now_fn=lambda: now[0],
+        )
+
+        tracker.record_failure("first")
+        now[0] += 1.0
+        tracker.record_failure("second")
+        now[0] += 1.0
+        tracker.record_failure("third")  # over capacity -> evicts "first"
+
+        assert "first" not in tracker._failures
+        assert "second" in tracker._failures
+        assert "third" in tracker._failures
 
 
 class TestRoleBasedAccess:

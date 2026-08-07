@@ -44,14 +44,46 @@ guard — not a separate, driftable env-var check.
 
 ## Auth: X-API-Key lockout
 
-`services/api/auth.py` tracks failed `X-API-Key` attempts per client
-address (`_LockoutTracker`) and returns `429` after
-`LOCKOUT_MAX_FAILURES` (5) failures within `LOCKOUT_WINDOW_SECONDS` (60s),
-for `LOCKOUT_DURATION_SECONDS` (300s). This is in-process, per-instance
-state — fine for the single-process deployment this repo documents. If the
-API is ever scaled to multiple instances, this needs to move to a shared
-store (Redis) or it stops being effective (each instance gets its own
-budget of 5 failures).
+`services/api/auth.py` tracks failed `X-API-Key` attempts and returns `429`
+after `LOCKOUT_MAX_FAILURES` (5) failures within `LOCKOUT_WINDOW_SECONDS`
+(60s), for `LOCKOUT_DURATION_SECONDS` (300s). Availability of the kill
+switch (admin-gated by this same key) outranks brute-force resistance for a
+real-money system, which shapes three deliberate choices in
+`get_current_user()`:
+
+- **Validity is checked before lockout state.** A request presenting a
+  genuinely valid key always succeeds, regardless of how many unrelated
+  failures came from the same address — a valid key can never be 429'd.
+- **A missing `X-API-Key` header is never counted as a failure.** It isn't
+  a guess; only a request presenting a specific *wrong* key accumulates
+  toward lockout.
+- **The lockout bucket is `(client address, wrong-key prefix)`, not address
+  alone.** One attacker guessing many different wrong keys from one address
+  only ever fills the bucket for each specific wrong guess — it can't lock
+  out a different client sharing that address (e.g. behind the reverse
+  proxy above) who happens to present a different key.
+
+`_LockoutTracker` is bounded (`LOCKOUT_MAX_TRACKED_KEYS`, default 10,000):
+stale buckets (no failures left in the window, not currently locked) are
+swept on every failure, and the tracker evicts the least-recently-active
+bucket if the cap is exceeded — an attacker can't grow this structure
+without bound by hitting many distinct addresses/keys.
+
+This is in-process, per-instance state — fine for the single-process
+deployment this repo documents. If the API is ever scaled to multiple
+instances, this needs to move to a shared store (Redis) or it stops being
+effective (each instance gets its own budget).
+
+**Proxy IPs**: `request.client.host` (used to build the lockout bucket) is
+the *direct* TCP peer — behind the reverse proxy this doc recommends for
+TLS, that's the proxy's own address, so every real client would share one
+bucket unless uvicorn is told to trust the proxy's `X-Forwarded-For`
+header. `services/api/runner.py` reads `API_FORWARDED_ALLOW_IPS` from the
+environment and passes it to uvicorn's `forwarded_allow_ips` /
+`proxy_headers`; set it to the proxy's actual address once one is in front
+of the API. Leaving it unset (the default) means uvicorn does not trust
+forwarded headers at all — safe but means every client behind a proxy
+shares one lockout bucket until this is configured.
 
 ## Secrets: `.env` today, a real secrets manager later
 
@@ -94,13 +126,25 @@ compose. Two hardening steps, in order of effort:
   uv pip compile pyproject.toml --extra dev -o requirements-dev.lock
   ```
 
-- `.github/workflows/security.yml` runs `pip-audit` against
-  `requirements-dev.lock` on every push/PR and weekly on a schedule, and a
-  `lockfile-freshness` job that fails CI if either lockfile has drifted
-  from `pyproject.toml`.
+- `.github/workflows/security.yml` runs `pip-audit` against **both**
+  `requirements.lock` (what every service container actually installs —
+  see below) and `requirements-dev.lock` (what CI/local dev installs) on
+  every push/PR and weekly on a schedule, plus a `lockfile-freshness` job
+  that fails CI if either lockfile has drifted from `pyproject.toml`.
 - `.github/dependabot.yml` opens weekly PRs bumping pinned versions in
   `pyproject.toml` (pip ecosystem), the per-service Dockerfiles (docker
   ecosystem), and the GitHub Actions workflow itself.
+- **All 9 Dockerfiles (root `Dockerfile` + one per service) install from
+  `requirements.lock`, not floating `pyproject.toml` ranges:**
+  `COPY pyproject.toml requirements.lock ./` followed by
+  `pip install --no-deps -r requirements.lock && pip install --no-deps .`
+  — every dependency comes from the pinned lockfile (no resolver-driven
+  version drift between builds), and the final `pip install --no-deps .`
+  only registers the local `algo-poc` package/entry points without
+  re-resolving anything. Without this, `pip-audit` could certify
+  `requirements.lock` clean while the containers that actually run in
+  production still float on whatever `pyproject.toml`'s `>=` ranges
+  resolve to at build time — auditing a file nothing installs from.
 
 Note: these are the first GitHub Actions workflows in this repo — there was
 no prior CI. `security.yml` covers T9's supply-chain scope only; a general
@@ -126,12 +170,21 @@ to `stream:<name>:dlq` (see `services/execution/runner.py`,
 
 ## Model integrity
 
-`services/ml_model/registry.py` writes a `sha256` sidecar
-(`<version>.joblib.sha256`) next to every saved model and verifies it
-before `joblib.load` in `load_active()` — `joblib.load` deserializes
-arbitrary Python objects, so a modified model file is a code-execution
-risk, not just a "wrong predictions" risk. A missing or mismatched hash
-raises `ModelIntegrityError` and the load is refused. This is intentionally
-a plain sidecar file, not a new `ModelVersion` database column — no schema
-migration needed, and it stays out of the way of the loader-consolidation
-work planned for T8.
+`services/ml_model/registry.py` records a `sha256` of every saved model on
+its `ModelVersion.content_hash` DB column (migration
+`e7a1c4d92f3b_add_model_version_content_hash`) and verifies it before
+`joblib.load` in `load_active()` — `joblib.load` deserializes arbitrary
+Python objects, so a modified model file is a code-execution risk, not
+just a "wrong predictions" risk. A missing or mismatched hash raises
+`ModelIntegrityError` and the load is refused.
+
+The reference hash deliberately lives in Postgres, **not** a filesystem
+sidecar next to the model file. An earlier version of this check stored
+the hash as `<version>.joblib.sha256` in the same directory as the model —
+that fails against the threat it names: an attacker (or process) with
+filesystem write access to `model_dir` can rewrite the sidecar in the same
+operation as the model file, since both live in the same trust domain
+(same directory, same process, same permissions). The DB row requires
+separate Postgres credentials to forge, which is the actual security
+boundary this check needs. The migration is additive-only (one nullable
+column) and does not touch the loader-consolidation work planned for T8.

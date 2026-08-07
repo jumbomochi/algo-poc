@@ -17,9 +17,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install locked dependencies
+      - name: Install locked dependencies (includes pip-audit itself)
         run: pip install -r requirements-dev.lock
-      - name: Run pip-audit against the lockfile
+      # Audit both: requirements.lock is what every service Dockerfile
+      # actually installs (see COPY requirements.lock + pip install --no-deps
+      # -r requirements.lock in each Dockerfile) — that's the one that
+      # matters for the deployed system. requirements-dev.lock is audited
+      # too since it's what CI/local dev installs.
+      - name: Audit the deployed (production) lockfile
+        run: pip-audit -r requirements.lock
+      - name: Audit the dev/CI lockfile
         run: pip-audit -r requirements-dev.lock
 
   lockfile-freshness:

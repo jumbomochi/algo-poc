@@ -202,17 +202,29 @@ class TestModelRegistry:
 
 class TestModelIntegrity:
     """joblib.load deserializes arbitrary objects — a tampered or corrupted
-    model file must never be loaded silently. save() records a content hash;
-    load_active() must verify it before deserializing.
+    model file must never be loaded silently. save() records a content hash
+    on the ModelVersion DB row (not a filesystem sidecar); load_active()
+    must verify it before deserializing.
+
+    The reference hash deliberately lives in Postgres, not next to the
+    model file: an attacker who can rewrite the model file on disk (a
+    filesystem-write compromise) cannot also forge a database row without
+    separate DB credentials. A same-directory sidecar file would be
+    rewritable in the same operation as the tampered model, defeating the
+    whole point of the check.
     """
 
-    def test_save_writes_integrity_hash_sidecar(self, trained_model, model_dir, mock_db):
+    def test_save_records_content_hash_on_db_row(self, trained_model, model_dir, mock_db):
         registry = ModelRegistry(mock_db, model_dir)
         window = (date(2024, 1, 1), date(2024, 6, 30))
 
         model_path = registry.save(trained_model, "v1.0.0", {"accuracy": 0.85}, window)
 
-        assert os.path.exists(model_path + ".sha256")
+        saved = mock_db._versions[0]
+        assert saved.content_hash is not None
+        assert len(saved.content_hash) == 64  # sha256 hex digest
+        # No filesystem sidecar — that's the point of the fix.
+        assert not os.path.exists(model_path + ".sha256")
 
     def test_load_active_succeeds_when_hash_matches(self, trained_model, model_dir, mock_db):
         registry = ModelRegistry(mock_db, model_dir)
@@ -232,6 +244,7 @@ class TestModelIntegrity:
         mock_db._versions[0].is_active = True
 
         # Simulate tampering: append a byte after the hash was recorded.
+        # The recorded hash lives on the DB row, untouched by this write.
         with open(model_path, "ab") as f:
             f.write(b"tampered")
 
@@ -241,12 +254,39 @@ class TestModelIntegrity:
     def test_load_active_rejects_model_missing_integrity_record(
         self, trained_model, model_dir, mock_db
     ):
+        """A row saved before this feature existed (content_hash is NULL)
+        must be refused, not silently trusted."""
+        registry = ModelRegistry(mock_db, model_dir)
+        window = (date(2024, 1, 1), date(2024, 6, 30))
+        registry.save(trained_model, "v1.0.0", {"accuracy": 0.85}, window)
+        mock_db._versions[0].is_active = True
+        mock_db._versions[0].content_hash = None
+
+        with pytest.raises(ModelIntegrityError, match="no integrity record"):
+            registry.load_active()
+
+    def test_rewriting_model_file_and_a_stale_sidecar_is_still_caught(
+        self, trained_model, model_dir, mock_db
+    ):
+        """Regression for the co-location flaw: even if a leftover sidecar
+        file exists (e.g. from an old deploy) and is rewritten alongside a
+        tampered model, the DB-stored hash — a separate trust domain — must
+        still catch the tamper.
+        """
         registry = ModelRegistry(mock_db, model_dir)
         window = (date(2024, 1, 1), date(2024, 6, 30))
         model_path = registry.save(trained_model, "v1.0.0", {"accuracy": 0.85}, window)
         mock_db._versions[0].is_active = True
 
-        os.remove(model_path + ".sha256")
+        with open(model_path, "ab") as f:
+            f.write(b"tampered")
+        # An attacker with filesystem access can write a sidecar that
+        # matches the tampered file — this must not matter.
+        import hashlib
+        with open(model_path, "rb") as f:
+            forged_hash = hashlib.sha256(f.read()).hexdigest()
+        with open(model_path + ".sha256", "w") as f:
+            f.write(forged_hash)
 
-        with pytest.raises(ModelIntegrityError, match="no integrity record"):
+        with pytest.raises(ModelIntegrityError, match="integrity check failed"):
             registry.load_active()

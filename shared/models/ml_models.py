@@ -19,3 +19,7 @@ class ModelVersion(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+    # sha256 of the model file at save() time, recorded here rather than a
+    # filesystem sidecar: a Postgres row requires DB credentials to forge,
+    # not just filesystem write access to model_dir (see ModelRegistry).
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
