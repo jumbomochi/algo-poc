@@ -1,0 +1,17 @@
+apiVersion: 1
+
+# T6 fix (IMPORTANT 2): "dashboarded" acceptance criterion — config/grafana/
+# previously had only datasources.yml, so Grafana came up with no
+# dashboards provisioned at all. This provider auto-loads every dashboard
+# JSON file under the mounted path (see docker-compose.observability.yml's
+# grafana volumes) on container start and polls for changes.
+providers:
+  - name: algo-poc
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/json

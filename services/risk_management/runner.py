@@ -17,6 +17,7 @@ from services.risk_management.funding import (
 from services.risk_management.kill_switch import KillSwitch
 from services.risk_management.passive_monitor import PassiveBreachMonitor
 from shared.config import AppConfig
+from shared.heartbeat import register_heartbeat_collector, write_heartbeat
 from shared.logging import get_logger
 from shared.models import CapitalSnapshot, OrderIntent, OrderStatus, Position
 from shared.order_ledger import OrderIntentNotFound, OrderLedger
@@ -909,6 +910,11 @@ class RiskServiceRunner:
         )
 
         for breach in breaches:
+            # IMPORTANT fix (T6 review): the other half of "risk breaches" —
+            # lifecycle_transitions{status=RISK_REJECTED} only covers new
+            # orders rejected at entry, not a breach on an already-held
+            # position. Single line, smallest footprint on this file.
+            self._metrics.risk_breach_total.labels(breach_type=breach.action_type).inc()
             priority = "high" if breach.action_type == "trim" else "medium"
             await self._publish_alert(
                 event_type=f"passive_breach_{breach.action_type}",
@@ -1020,6 +1026,8 @@ class RiskServiceRunner:
 
         try:
             while True:
+                # T6: heartbeat for the container healthcheck — see docker-compose.yml.
+                write_heartbeat()
                 # Read recommendations
                 messages = await self._redis.read_group(
                     RECOMMENDATIONS_STREAM,
@@ -1087,7 +1095,11 @@ if __name__ == "__main__":
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
 
+        from shared.observability import setup_metrics
         from shared.redis_client import RedisStreamClient
+
+        setup_metrics("risk-management", port=config.observability.prometheus_port)
+        register_heartbeat_collector()
 
         redis_conn = aioredis.from_url(config.redis.url)
         redis_client = RedisStreamClient(redis_conn)

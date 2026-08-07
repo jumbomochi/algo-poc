@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock
 
-from shared.redis_client import RedisStreamClient, StreamMessage
+from shared.redis_client import DEFAULT_STREAM_MAXLEN, RedisStreamClient, StreamMessage
 
 
 class TestRedisStreamClient:
@@ -23,6 +23,8 @@ class TestRedisStreamClient:
         mock_redis.xadd.assert_called_once_with(
             "stream:test",
             {"ticker": "AAPL", "price": "150.0"},
+            maxlen=DEFAULT_STREAM_MAXLEN,
+            approximate=True,
         )
         assert msg_id == "1234-0"
 
@@ -120,3 +122,65 @@ class TestPendingReplay:
 
         again = await fake_client.read_group("s", "g", "c1", block_ms=1)
         assert again == []
+
+
+class TestStreamBounding:
+    """T6: unbounded streams are how a quiet Redis OOMs the whole bus (review
+    Theme 6.3). publish() now caps every stream it writes to with XADD
+    MAXLEN ~ so old, already-consumed entries get trimmed automatically
+    instead of growing forever."""
+
+    @pytest.mark.asyncio
+    async def test_publish_bounds_stream_length_via_maxlen(self):
+        import fakeredis.aioredis
+
+        client = RedisStreamClient(fakeredis.aioredis.FakeRedis(), stream_maxlen=5)
+        for i in range(50):
+            await client.publish("s", {"n": str(i)})
+
+        length = await client._redis.xlen("s")
+        assert length <= 5
+
+    @pytest.mark.asyncio
+    async def test_publish_with_maxlen_none_leaves_stream_unbounded(self):
+        import fakeredis.aioredis
+
+        client = RedisStreamClient(fakeredis.aioredis.FakeRedis(), stream_maxlen=None)
+        for i in range(20):
+            await client.publish("s", {"n": str(i)})
+
+        assert await client._redis.xlen("s") == 20
+
+    @pytest.mark.asyncio
+    async def test_default_maxlen_is_a_large_generous_bound(self):
+        # Sanity check on the constant itself: large enough that no normal
+        # trading-day volume is ever truncated mid-processing, small enough
+        # to actually bound memory.
+        assert 10_000 <= DEFAULT_STREAM_MAXLEN <= 1_000_000
+
+    def test_default_maxlen_fits_the_maxmemory_ceiling_with_headroom(self):
+        """IMPORTANT fix: DEFAULT_STREAM_MAXLEN and docker-compose.yml's
+        redis --maxmemory were previously picked independently. This proves
+        the arithmetic documented next to DEFAULT_STREAM_MAXLEN in
+        shared/redis_client.py: worst case (all primary streams
+        simultaneously at cap) must fit well inside the ceiling, leaving
+        headroom for Redis overhead, PEL, and uncapped DLQ growth.
+        See tests/deploy/test_observability_healthchecks.py for the
+        companion test that reads the actual --maxmemory value out of
+        docker-compose.yml and checks it against this same constant.
+        """
+        assumed_worst_case_entry_bytes = 1024  # 1 KiB, see the constant's docstring
+        primary_stream_count = 9  # market_data, fundamentals, events, signals,
+        # recommendations, approved_orders, fills, alerts, kill
+
+        worst_case_bytes = (
+            primary_stream_count * DEFAULT_STREAM_MAXLEN * assumed_worst_case_entry_bytes
+        )
+        maxmemory_bytes = 512 * 1024 * 1024  # matches docker-compose.yml's --maxmemory 512mb
+
+        assert worst_case_bytes < maxmemory_bytes * 0.5, (
+            "DEFAULT_STREAM_MAXLEN no longer leaves >=50% headroom under the "
+            "512mb maxmemory ceiling — reconcile both numbers together (see "
+            "the comment above DEFAULT_STREAM_MAXLEN) rather than changing "
+            "one in isolation"
+        )

@@ -29,6 +29,21 @@ def client(redis_client):
 # Portfolio
 # ---------------------------------------------------------------------------
 
+class TestHealthzEndpoint:
+    """T6: unauthenticated liveness probe for the container healthcheck."""
+
+    def test_healthz_returns_200_without_auth(self, client):
+        response = client.get("/healthz")
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+
+    def test_healthz_works_even_with_no_redis_client(self):
+        app = create_app(redis_client=None)
+        no_redis_client = TestClient(app)
+        response = no_redis_client.get("/healthz")
+        assert response.status_code == 200
+
+
 class TestPortfolioEndpoint:
     def test_portfolio_returns_200_with_auth(self, client):
         response = client.get("/api/v1/portfolio", headers=ADMIN_HEADERS)

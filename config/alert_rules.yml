@@ -1,0 +1,184 @@
+# T6 — observability & unattended healthchecks.
+#
+# These rules are visible/evaluated in Prometheus's own UI
+# (http://localhost:9091/alerts) as soon as the observability compose
+# overlay is up. Wiring an actual notification channel (Alertmanager ->
+# Telegram/Slack/email) is a separate follow-up: the checklist item this
+# thread implements is "alert rules" (the PromQL + thresholds), not a full
+# paging pipeline.
+#
+# IMPORTANT CADENCE CAVEAT: this system trades once/day via a scheduled
+# paper run (deploy/launchd/run_paper.sh, ~04:15 SGT), not continuously
+# intraday. "Idle" is completely normal outside that window and on
+# weekends. The windows below are picked to avoid flapping on a normal day
+# rather than to page within minutes of a real intraday system — retune (or
+# gate these by business-hours) before wiring any of this to a pager, and
+# definitely before/if this ever runs a continuous intraday strategy.
+groups:
+  - name: algo-poc-service-health
+    rules:
+      # This is the single highest-value alert in this file: it fires
+      # whenever a service's /metrics endpoint stops answering at all,
+      # whether because the container died (restart: unless-stopped should
+      # already be handling that) or because its event loop is wedged badly
+      # enough that even the lightweight background metrics HTTP server
+      # (shared/observability.py's setup_metrics(), started separately from
+      # the service's own main loop) stops responding.
+      - alert: ServiceMetricsEndpointDown
+        expr: |
+          up{job=~"data-ingestion|signal-generation|ml-model|risk-management|execution|api|notifications|portfolio-accounting"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} metrics endpoint unreachable"
+          description: >-
+            Prometheus has failed to scrape {{ $labels.job }}:9090/metrics
+            for 2+ minutes. Check `docker compose ps {{ $labels.job }}` and
+            its logs — this is either a crashed/restarting container or a
+            wedged event loop.
+
+      # CRITICAL fix: ServiceMetricsEndpointDown (above) does NOT catch a
+      # wedged main loop. setup_metrics()'s HTTP server runs on its own
+      # background thread, independent of the asyncio main loop — a hang on
+      # blocking I/O (the known IB stuck-modal class) releases the GIL, so
+      # that thread keeps answering scrapes (up stays 1) even while the loop
+      # that's supposed to be doing work never comes back around.
+      # algo_heartbeat_age_seconds (shared/heartbeat.py's
+      # HeartbeatAgeCollector) is recomputed from the heartbeat file's mtime
+      # fresh on every scrape, in that same surviving thread — so it climbs
+      # even while the main loop is stuck, which is exactly the signal
+      # ServiceMetricsEndpointDown can't provide. One rule per cadence class,
+      # matching the container healthcheck thresholds in docker-compose.yml.
+      - alert: HeartbeatStale
+        expr: algo_heartbeat_age_seconds{job!="data-ingestion"} > 120
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }}'s main loop has not iterated in over 2 minutes"
+          description: >-
+            algo_heartbeat_age_seconds is {{ $value }}s. The metrics
+            endpoint is still up (see ServiceMetricsEndpointDown), so this
+            is the wedged-but-alive case: a blocking call (IB, DB, a stuck
+            lock) that never returns. Check `docker compose logs
+            {{ $labels.job }}` for the last thing it was doing.
+
+      - alert: HeartbeatStaleDataIngestion
+        expr: algo_heartbeat_age_seconds{job="data-ingestion"} > 2700
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "data-ingestion's main loop has not iterated in over 45 minutes"
+          description: >-
+            algo_heartbeat_age_seconds is {{ $value }}s. data-ingestion's
+            outer loop sleeps polling_interval_minutes (15m default) between
+            cycles and heartbeats every cycle regardless of market-hours
+            gating, so 45m (3x cadence) is already a generous threshold —
+            matches the container healthcheck in docker-compose.yml.
+
+  - name: algo-poc-stream-health
+    rules:
+      # "stream-idle": no new approved orders during what should be an
+      # active window. Tune/gate by business-hours before paging on this —
+      # see the cadence caveat above.
+      - alert: ApprovedOrdersStreamIdle
+        expr: increase(redis_stream_entries_added{key="stream:approved_orders"}[60m]) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No new approved orders in the last 60 minutes"
+          description: >-
+            stream:approved_orders has not grown in 60m
+            (redis_stream_entries_added, via redis_exporter
+            --check-streams-pattern). Expected during off-hours/weekends.
+
+      # "no-fills-in-N-min": using a 24h window rather than literal minutes
+      # because fills only happen once/day, shortly after the 04:15 SGT
+      # paper run — see the cadence caveat above.
+      - alert: NoFillsRecently
+        expr: increase(redis_stream_entries_added{key="stream:fills"}[24h]) == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No fills recorded in the last 24 hours"
+          description: >-
+            stream:fills has not grown in 24h. Investigate execution / IB
+            Gateway connectivity if this fires on a day the paper run was
+            expected to trade.
+
+      # "dlq-depth": shared with T4 (idempotent fills & stream hygiene).
+      # Sourced from redis_exporter's generic per-key stream introspection
+      # (--check-streams-pattern 'stream:*' in docker-compose.observability.yml)
+      # rather than a custom app metric — every DEAD_LETTER_SUFFIX (":dlq")
+      # stream gets one `redis_stream_length` series for free, no app code
+      # needed on T4's side unless a differently-shaped metric (e.g. broken
+      # out by failure reason) is wanted later.
+      - alert: DeadLetterQueueBacklog
+        expr: redis_stream_length{key=~".*:dlq"} > 10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Dead-letter queue {{ $labels.key }} has {{ $value }} unprocessed messages"
+          description: >-
+            Messages are failing validation/processing and landing in a DLQ
+            instead of being handled/acked. See shared/redis_client.py's
+            send_to_dead_letter().
+
+      # Free bonus from the same redis_exporter data: any new entry on
+      # stream:kill is inherently notable (this system's kill switch should
+      # almost never fire), so alert at severity=info on any activity at
+      # all rather than needing a rate/idle threshold.
+      - alert: KillStreamActivity
+        expr: increase(redis_stream_entries_added{key="stream:kill"}[5m]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "stream:kill received a new message"
+          description: >-
+            A kill event was published in the last 5 minutes. Confirm
+            whether this was an intentional operator action
+            (docs/operations/rollback-playbook.md) or unexpected.
+
+  - name: algo-poc-risk-health
+    rules:
+      # IMPORTANT fix: the other half of "risk breaches" — algo_risk_breach_total
+      # (shared/observability.py) is incremented in
+      # RiskServiceRunner.run_passive_scan() for stop-loss/ceiling/margin
+      # breaches on already-held positions, distinct from
+      # algo_order_lifecycle_transitions_total{status="RISK_REJECTED"} (new
+      # orders rejected at entry). NOTE: run_passive_scan() is not yet
+      # invoked from RiskServiceRunner.run() on main — that's T2's thread —
+      # so this rule won't fire until T2 lands it; defined now so the signal
+      # exists the moment it does.
+      - alert: PassiveBreachDetected
+        expr: increase(algo_risk_breach_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Passive breach detected on a held position ({{ $labels.breach_type }})"
+          description: >-
+            algo_risk_breach_total incremented for breach_type={{ $labels.breach_type }}
+            in the last 15m. "trim" breaches are high-priority (see
+            services/risk_management/passive_monitor.py); "notify" are
+            informational.
+
+  - name: algo-poc-redis-health
+    rules:
+      - alert: RedisMemoryHigh
+        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis memory usage above 80% of configured maxmemory"
+          description: >-
+            redis_memory_max_bytes reflects the `maxmemory` set on the redis
+            service's command in docker-compose.yml. Policy is `noeviction`,
+            so crossing 100% means writes start failing loudly rather than
+            silently evicting stream data (review Theme 6.3) — this alert
+            should fire well before that.

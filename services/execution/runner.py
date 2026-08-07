@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from shared.config import AppConfig
+from shared.heartbeat import write_heartbeat
 from shared.logging import get_logger
 from shared.models import OrderStatus
 from shared.order_ledger import TERMINAL_STATUSES, OrderLedger
@@ -643,6 +644,8 @@ class ExecutionServiceRunner:
 
         try:
             while self._running:
+                # T6: heartbeat for the container healthcheck — see docker-compose.yml.
+                write_heartbeat()
                 # Read approved orders
                 messages = await self._redis.read_group(
                     APPROVED_ORDERS_STREAM,
@@ -709,8 +712,13 @@ if __name__ == "__main__":
 
         from services.execution.ib_executor import IBExecutor
         from services.execution.order_manager import OrderManager
+        from shared.heartbeat import register_heartbeat_collector
+        from shared.observability import setup_metrics
         from shared.order_ledger import OrderLedger
         from shared.redis_client import RedisStreamClient
+
+        setup_metrics("execution", port=config.observability.prometheus_port)
+        register_heartbeat_collector()
 
         redis_conn = aioredis.from_url(config.redis.url)
         redis_client = RedisStreamClient(redis_conn)
