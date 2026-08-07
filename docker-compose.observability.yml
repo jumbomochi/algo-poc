@@ -2,9 +2,14 @@ services:
   prometheus:
     image: prom/prometheus:v2.51.0
     ports:
-      - "9091:9090"
+      # Loopback-only, consistent with the T3 message-bus lockdown pattern
+      # applied to docker-compose.yml (that thread lands on a separate
+      # branch; applying the same rule here directly since this file is
+      # entirely T6-owned per the 2026-08-06 review's work-thread split).
+      - "127.0.0.1:9091:9090"
     volumes:
       - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./config/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
       - prometheus_data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
@@ -17,20 +22,49 @@ services:
       - execution
       - api
       - notifications
+      - portfolio-accounting
+      - redis-exporter
 
   grafana:
     image: grafana/grafana:10.4.0
     ports:
-      - "3000:3000"
+      # Loopback-only — see the prometheus ports comment above.
+      - "127.0.0.1:3000:3000"
     environment:
       - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_AUTH_ANONYMOUS_ENABLED=true
+      # Required, no default: this file previously shipped a committed
+      # admin/admin password with anonymous auth enabled — the same class of
+      # finding as T3's Redis/Postgres lockdown (review Theme 5.1), just not
+      # in that thread's file list. Generate one (e.g. `openssl rand -hex
+      # 24`) and put it in the repo's gitignored `.env` alongside
+      # POSTGRES_PASSWORD/REDIS_PASSWORD (see .env.example on the T3
+      # message-bus-lockdown branch — merge GRAFANA_ADMIN_PASSWORD into that
+      # file once both branches land).
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env before starting the observability stack}
+      - GF_AUTH_ANONYMOUS_ENABLED=false
     volumes:
       - grafana_data:/var/lib/grafana
       - ./config/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
     depends_on:
       - prometheus
+
+  # T6: exposes Redis's own memory + per-stream metrics to Prometheus with no
+  # app-code polling needed. redis_memory_used_bytes/redis_memory_max_bytes
+  # back the RedisMemoryHigh alert; --check-streams-pattern gives every
+  # `stream:*` key (including every `:dlq` suffix) a redis_stream_length /
+  # redis_stream_entries_added series, which back the dlq-depth and
+  # stream-idle/no-fills alerts in config/alert_rules.yml.
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    environment:
+      - REDIS_ADDR=redis://redis:6379
+      # NOTE for merge with T3 (message-bus lockdown): once Redis requires
+      # auth, this also needs REDIS_PASSWORD (oliver006/redis_exporter reads
+      # it natively as REDIS_PASSWORD) sourced from the same `.env`.
+    command:
+      - "--check-streams-pattern=stream:*"
+    depends_on:
+      - redis
 
 volumes:
   prometheus_data:

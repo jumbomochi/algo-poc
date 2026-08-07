@@ -8,6 +8,23 @@ import redis.asyncio as aioredis
 
 DEAD_LETTER_SUFFIX = ":dlq"
 
+# T6 (observability & unattended healthchecks): an unbounded stream is how a
+# quiet Redis eventually OOMs and takes the whole message bus down silently
+# (review Theme 6.3) — every publish() call caps its stream with
+# `XADD ... MAXLEN ~ <n>` so already-consumed history gets trimmed instead of
+# growing forever. `~` (approximate=True) lets Redis trim lazily in whole
+# macro-nodes rather than exactly-per-entry, which is materially cheaper and
+# is the documented/recommended mode for this. The bound is generous relative
+# to real trading-day volume (see tests/shared/test_redis_client.py) — this
+# is memory insurance, not a working-set limit anything should ever bump
+# into in normal operation.
+#
+# NOTE: this intentionally does not touch send_to_dead_letter()'s XADD below
+# (DLQ region owned by T4 in a parallel thread) — DLQ volume should stay low
+# by construction (only failures land there), so it's lower priority to
+# bound and left for T4 to cap the same way if/when useful.
+DEFAULT_STREAM_MAXLEN = 100_000
+
 
 @dataclass
 class StreamMessage:
@@ -17,8 +34,14 @@ class StreamMessage:
 
 
 class RedisStreamClient:
-    def __init__(self, redis: aioredis.Redis):
+    def __init__(
+        self,
+        redis: aioredis.Redis,
+        *,
+        stream_maxlen: int | None = DEFAULT_STREAM_MAXLEN,
+    ):
         self._redis = redis
+        self._stream_maxlen = stream_maxlen
 
     async def publish(
         self,
@@ -28,6 +51,10 @@ class RedisStreamClient:
     ) -> str:
         if idempotency_key:
             data = {**data, "_idempotency_key": idempotency_key}
+        if self._stream_maxlen is not None:
+            return await self._redis.xadd(
+                stream, data, maxlen=self._stream_maxlen, approximate=True
+            )
         return await self._redis.xadd(stream, data)
 
     async def create_consumer_group(

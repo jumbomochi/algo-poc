@@ -18,6 +18,21 @@ services:
   redis:
     restart: unless-stopped
     image: redis:7
+    # T6 (bound Redis): without a maxmemory ceiling, unbounded streams
+    # eventually OOM the Redis process itself and take the whole message bus
+    # down silently (review Theme 6.3). `noeviction` means a write errors out
+    # loudly once at the ceiling instead of Redis silently evicting whatever
+    # key LRU picks next — for a stream carrying stream:approved_orders /
+    # stream:kill, silent eviction of unacked entries is worse than a loud
+    # write failure. shared/redis_client.py's XADD MAXLEN ~ capping (see
+    # DEFAULT_STREAM_MAXLEN) is the first line of defense and should keep
+    # usage well under this ceiling in normal operation.
+    # NOTE for merge: T3 (message-bus lockdown) also sets `command:` on this
+    # service (--requirepass). Combine both into one redis-server invocation,
+    # e.g. ["redis-server", "--requirepass", "...", "--maxmemory", "256mb",
+    # "--maxmemory-policy", "noeviction"] rather than keeping two `command:`
+    # keys (compose only honors the last one).
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
     ports:
       - "6379:6379"
     healthcheck:
@@ -57,6 +72,21 @@ services:
       - ALGO_REDIS_URL=redis://redis:6379/0
       # IB Gateway runs on the host, not in a container; reach it via the host alias.
       - ALGO_IB_HOST=host.docker.internal
+    # T6: container healthcheck via heartbeat-file freshness (see
+    # shared/heartbeat.py) — catches a wedged-but-alive process (e.g. a
+    # stuck IB call) that `restart: unless-stopped` alone misses, since that
+    # only restarts on process exit. NOTE: plain `docker compose` does NOT
+    # itself restart a container just because its healthcheck reports
+    # unhealthy — this makes the wedge visible in `docker compose ps` /
+    # `docker inspect` (and to any future watchdog reading container health,
+    # same pattern as deploy/launchd/gateway_watchdog.sh), it does not by
+    # itself cause a restart.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat('/var/algo/heartbeat').st_mtime<2700 else 1)"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 3m
 
   signal-generation:
     restart: unless-stopped
@@ -72,6 +102,15 @@ services:
       - ALGO_MODE=paper
       - ALGO_DATABASE_URL=postgresql://algo:algo@postgres:5432/algo_poc
       - ALGO_REDIS_URL=redis://redis:6379/0
+    # T6: heartbeat-file healthcheck — see the data-ingestion comment above
+    # for the full rationale. This service's Redis-consumer loop iterates
+    # every 1-2s, so a much tighter freshness window than the poller above.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat('/var/algo/heartbeat').st_mtime<120 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   ml-model:
     restart: unless-stopped
@@ -87,6 +126,13 @@ services:
       - ALGO_MODE=paper
       - ALGO_DATABASE_URL=postgresql://algo:algo@postgres:5432/algo_poc
       - ALGO_REDIS_URL=redis://redis:6379/0
+    # T6: heartbeat-file healthcheck — see the data-ingestion comment above.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat('/var/algo/heartbeat').st_mtime<120 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   risk-management:
     restart: unless-stopped
@@ -102,6 +148,15 @@ services:
       - ALGO_MODE=paper
       - ALGO_DATABASE_URL=postgresql://algo:algo@postgres:5432/algo_poc
       - ALGO_REDIS_URL=redis://redis:6379/0
+    # T6: heartbeat-file healthcheck — see the data-ingestion comment above.
+    # Particularly load-bearing here: this is the kill-switch consumer, and
+    # the exact process most likely to matter if it silently wedges.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat('/var/algo/heartbeat').st_mtime<120 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   execution:
     restart: unless-stopped
@@ -130,6 +185,16 @@ services:
       - ALGO_IB_HOST=host.docker.internal
       # Where execution writes the Error-1100 marker for the host watchdog.
       - ALGO_GATEWAY_STATE_DIR=/var/algo/state
+    # T6: heartbeat-file healthcheck — see the data-ingestion comment above.
+    # execution shares /var/algo/state with the host Gateway watchdog for a
+    # different purpose (the IB Error-1100 marker); the heartbeat file below
+    # lives in a separate, unmounted path so the two mechanisms can't collide.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat('/var/algo/heartbeat').st_mtime<120 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   api:
     restart: unless-stopped
@@ -152,6 +217,17 @@ services:
       # Real key:role pairs from the (gitignored) .env file; without this the
       # API falls back to dev keys (refused in live mode).
       - API_KEYS=${API_KEYS:-}
+    # T6: liveness probe via the unauthenticated /healthz route (see
+    # services/api/app.py) rather than a heartbeat file — the API already
+    # runs an HTTP server, so this reuses it instead of adding a second
+    # liveness mechanism. Uses python (already in the image) instead of
+    # curl, which python:3.12-slim does not include.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u,sys; sys.exit(0 if u.urlopen('http://localhost:8000/healthz', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
   notifications:
     restart: unless-stopped
@@ -170,6 +246,13 @@ services:
       # Telegram credentials from the (gitignored) .env file in the project root
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+    # T6: heartbeat-file healthcheck — see the data-ingestion comment above.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat('/var/algo/heartbeat').st_mtime<120 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   # Consumes stream:fills and projects fills into the durable ledger
   # (execution_fills, positions, order-intent FILLED status). Without this
@@ -189,6 +272,13 @@ services:
       - ALGO_MODE=paper
       - ALGO_DATABASE_URL=postgresql://algo:algo@postgres:5432/algo_poc
       - ALGO_REDIS_URL=redis://redis:6379/0
+    # T6: heartbeat-file healthcheck — see the data-ingestion comment above.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat('/var/algo/heartbeat').st_mtime<120 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
 volumes:
   pgdata:

@@ -128,7 +128,11 @@ if __name__ == "__main__":
         import redis.asyncio as aioredis
 
         from services.data_ingestion.ib_client import IBClient
+        from shared.heartbeat import write_heartbeat
+        from shared.observability import setup_metrics
         from shared.redis_client import RedisStreamClient
+
+        setup_metrics("data-ingestion", port=config.observability.prometheus_port)
 
         redis_conn = aioredis.from_url(config.redis.url)
         redis_client = RedisStreamClient(redis_conn)
@@ -157,6 +161,11 @@ if __name__ == "__main__":
         while True:
             if runner.is_market_active() or config.mode == "backtest":
                 await runner.run_cycle(tickers)
+            # T6: heartbeat file for the container healthcheck (see
+            # docker-compose.yml) — proves this loop is still iterating, not
+            # wedged. Written once per poll cycle since this loop's own
+            # cadence is minutes, not seconds.
+            write_heartbeat()
             await asyncio.sleep(config.data_ingestion.polling_interval_minutes * 60)
 
     asyncio.run(main())

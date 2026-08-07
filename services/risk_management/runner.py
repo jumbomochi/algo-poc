@@ -17,6 +17,7 @@ from services.risk_management.funding import (
 from services.risk_management.kill_switch import KillSwitch
 from services.risk_management.passive_monitor import PassiveBreachMonitor
 from shared.config import AppConfig
+from shared.heartbeat import write_heartbeat
 from shared.logging import get_logger
 from shared.models import CapitalSnapshot, OrderIntent, OrderStatus, Position
 from shared.order_ledger import OrderIntentNotFound, OrderLedger
@@ -1020,6 +1021,8 @@ class RiskServiceRunner:
 
         try:
             while True:
+                # T6: heartbeat for the container healthcheck — see docker-compose.yml.
+                write_heartbeat()
                 # Read recommendations
                 messages = await self._redis.read_group(
                     RECOMMENDATIONS_STREAM,
@@ -1087,7 +1090,10 @@ if __name__ == "__main__":
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
 
+        from shared.observability import setup_metrics
         from shared.redis_client import RedisStreamClient
+
+        setup_metrics("risk-management", port=config.observability.prometheus_port)
 
         redis_conn = aioredis.from_url(config.redis.url)
         redis_client = RedisStreamClient(redis_conn)

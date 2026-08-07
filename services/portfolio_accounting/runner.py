@@ -5,6 +5,7 @@ import asyncio
 from pydantic import ValidationError
 
 from services.portfolio_accounting.projector import FillProjectionError, FillProjector
+from shared.heartbeat import write_heartbeat
 from shared.logging import get_logger
 from shared.redis_client import RedisStreamClient, StreamMessage
 from shared.schemas.messages import FillMessage
@@ -65,6 +66,8 @@ class PortfolioAccountingRunner:
             )
             for message in messages:
                 await self.process_message(message)
+            # T6: heartbeat for the container healthcheck — see docker-compose.yml.
+            write_heartbeat()
 
 
 async def main() -> None:
@@ -73,8 +76,10 @@ async def main() -> None:
     from sqlalchemy.orm import Session
 
     from shared.config import load_config
+    from shared.observability import setup_metrics
 
     config = load_config("config/default.yaml")
+    setup_metrics("portfolio-accounting", port=config.observability.prometheus_port)
     redis_connection = aioredis.from_url(config.redis.url)
     engine = create_engine(config.database.url)
     with Session(engine) as session:

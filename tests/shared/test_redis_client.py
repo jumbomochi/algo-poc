@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock
 
-from shared.redis_client import RedisStreamClient, StreamMessage
+from shared.redis_client import DEFAULT_STREAM_MAXLEN, RedisStreamClient, StreamMessage
 
 
 class TestRedisStreamClient:
@@ -23,6 +23,8 @@ class TestRedisStreamClient:
         mock_redis.xadd.assert_called_once_with(
             "stream:test",
             {"ticker": "AAPL", "price": "150.0"},
+            maxlen=DEFAULT_STREAM_MAXLEN,
+            approximate=True,
         )
         assert msg_id == "1234-0"
 
@@ -120,3 +122,38 @@ class TestPendingReplay:
 
         again = await fake_client.read_group("s", "g", "c1", block_ms=1)
         assert again == []
+
+
+class TestStreamBounding:
+    """T6: unbounded streams are how a quiet Redis OOMs the whole bus (review
+    Theme 6.3). publish() now caps every stream it writes to with XADD
+    MAXLEN ~ so old, already-consumed entries get trimmed automatically
+    instead of growing forever."""
+
+    @pytest.mark.asyncio
+    async def test_publish_bounds_stream_length_via_maxlen(self):
+        import fakeredis.aioredis
+
+        client = RedisStreamClient(fakeredis.aioredis.FakeRedis(), stream_maxlen=5)
+        for i in range(50):
+            await client.publish("s", {"n": str(i)})
+
+        length = await client._redis.xlen("s")
+        assert length <= 5
+
+    @pytest.mark.asyncio
+    async def test_publish_with_maxlen_none_leaves_stream_unbounded(self):
+        import fakeredis.aioredis
+
+        client = RedisStreamClient(fakeredis.aioredis.FakeRedis(), stream_maxlen=None)
+        for i in range(20):
+            await client.publish("s", {"n": str(i)})
+
+        assert await client._redis.xlen("s") == 20
+
+    @pytest.mark.asyncio
+    async def test_default_maxlen_is_a_large_generous_bound(self):
+        # Sanity check on the constant itself: large enough that no normal
+        # trading-day volume is ever truncated mid-processing, small enough
+        # to actually bound memory.
+        assert 10_000 <= DEFAULT_STREAM_MAXLEN <= 1_000_000

@@ -22,13 +22,29 @@ def setup_metrics(service_name: str, port: int = 9090) -> None:
     """Start a Prometheus metrics HTTP endpoint.
 
     Launches a background HTTP server that exposes ``/metrics`` on the
-    given *port*.  Call this once at service startup.
+    given *port*.  Call this once at service startup — every service `main`
+    now does (T6 observability wiring), so Prometheus's static
+    ``<service>:9090`` scrape targets in config/prometheus.yml actually have
+    something listening.
+
+    Idempotent by design: a duplicate bind on *port* raises ``OSError``
+    ("address already in use") from the stdlib socket layer. That means
+    metrics are already being served in this process, which is the outcome
+    we want anyway — so it's logged and swallowed rather than propagated.
+    Crashing an entire trading service because its *metrics* endpoint was
+    already up would be exactly backwards.
 
     Args:
         service_name: Human-readable name used for log messages.
         port: TCP port to bind the metrics server to.
     """
-    start_http_server(port)
+    try:
+        start_http_server(port)
+    except OSError:
+        logger.warning(
+            "metrics_server_already_started", service=service_name, port=port
+        )
+        return
     logger.info("metrics_server_started", service=service_name, port=port)
 
 

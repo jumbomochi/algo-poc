@@ -8,6 +8,7 @@ from shared.observability import (
     create_gauge,
     create_histogram,
     create_trading_metrics,
+    setup_metrics,
 )
 
 
@@ -69,6 +70,26 @@ class TestGauge:
 
         gauge.dec(3)
         assert gauge._value.get() == 40.0
+
+
+class TestSetupMetricsIdempotency:
+    """A service's main() should never crash because metrics already started.
+
+    T6: every service now calls setup_metrics() once at startup. Binding the
+    same port twice raises OSError ("address already in use") from the
+    stdlib socket layer; setup_metrics must absorb that rather than crash
+    the whole service over a duplicate bind.
+    """
+
+    def test_setup_metrics_can_be_called_twice_on_the_same_port(self) -> None:
+        # A high, obscure fixed port to make a real collision with another
+        # process on the test host unlikely, while still exercising the
+        # actual duplicate-bind path (unlike port=0, which the OS reassigns
+        # fresh on every call and would never collide).
+        port = 19_237
+        setup_metrics("test-service", port=port)
+        # Must not raise even though a server is already bound to `port`.
+        setup_metrics("test-service", port=port)
 
 
 def test_trading_metrics_cover_capital_reservations_lifecycle_and_reconciliation():

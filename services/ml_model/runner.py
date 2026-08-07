@@ -121,8 +121,12 @@ if __name__ == "__main__":
     async def main() -> None:
         import redis.asyncio as aioredis
 
+        from shared.heartbeat import write_heartbeat
+        from shared.observability import setup_metrics
         from shared.redis_client import RedisStreamClient
         from shared.schemas.messages import SignalMessage
+
+        setup_metrics("ml-model", port=config.observability.prometheus_port)
 
         redis_conn = aioredis.from_url(config.redis.url)
         redis_client = RedisStreamClient(redis_conn)
@@ -159,5 +163,7 @@ if __name__ == "__main__":
                     await redis_client.ack(STREAM, GROUP, msg.message_id)
                 except Exception:
                     logger.exception("ml_processing_error")
+            # T6: heartbeat for the container healthcheck — see docker-compose.yml.
+            write_heartbeat()
 
     asyncio.run(main())
