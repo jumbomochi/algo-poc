@@ -123,6 +123,7 @@ class IBExecutor:
         self._allow_fractional = allow_fractional
         self._ib = None  # Will hold ib_insync.IB instance
         self._trades: dict[str, Any] = {}  # order_id -> ib_insync.Trade
+        self._trade_meta: dict[str, tuple[str, str]] = {}  # order_id -> (ticker, side)
         # Retain references to fire-and-forget callback tasks so they are not
         # garbage-collected mid-flight and their exceptions are surfaced.
         self._pending_tasks: set[Any] = set()
@@ -266,6 +267,12 @@ class IBExecutor:
                         "Re-login the Gateway with the live credentials."
                     )
 
+            # A reconnect recreates the IB client, orphaning the fill/status
+            # callbacks bound to the previous Trade objects. Re-register them for
+            # every still-open tracked order so a mid-session reconnect drops no
+            # fills. (First connect has no tracked trades → no-op.)
+            self._reregister_open_trades()
+
             # A healthy session proves server connectivity: clear any stale
             # lost-marker left by a socket that dropped without a 1102.
             self._clear_connectivity_marker()
@@ -288,6 +295,31 @@ class IBExecutor:
         if self._ib is not None:
             self._ib.disconnect()
             self._logger.info("Disconnected from IB")
+
+    def _reregister_open_trades(self) -> None:
+        """Re-bind fill/status callbacks onto the fresh Trade objects after a
+        reconnect, for every tracked order still open at IB."""
+        if self._ib is None or not self._trade_meta:
+            return
+        try:
+            open_trades = list(self._ib.openTrades())
+        except Exception:  # pragma: no cover - defensive
+            self._logger.exception("Could not list open trades on reconnect")
+            return
+        reattached = 0
+        for trade in open_trades:
+            order = getattr(trade, "order", None)
+            order_id = str(getattr(order, "orderId", "") or "")
+            meta = self._trade_meta.get(order_id)
+            if meta is None:
+                continue
+            ticker, side = meta
+            self._register_trade(order_id, trade, ticker, side)
+            reattached += 1
+        if reattached:
+            self._logger.info(
+                "Re-registered IB callbacks after reconnect", count=reattached
+            )
 
     def _spawn(self, coro: Any) -> Any:
         """Schedule a fire-and-forget callback coroutine with a done-callback so
@@ -339,6 +371,9 @@ class IBExecutor:
     def _register_trade(self, order_id: str, trade: Any, ticker: str, side: str) -> None:
         """Track the trade and publish fills after IB reports commission."""
         self._trades[order_id] = trade
+        # Remember (ticker, side) so callbacks can be re-registered onto a fresh
+        # Trade object after a reconnect recreates the IB client.
+        self._trade_meta[order_id] = (ticker, side)
 
         def _on_commission_report(
             trade: Any, fill: Any, commission_report: Any

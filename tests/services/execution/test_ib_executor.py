@@ -214,3 +214,40 @@ async def test_spawn_routes_task_exception_to_logger():
         pass
     # done-callback ran and logged the failure.
     assert executor._logger.error.called or executor._logger.exception.called
+
+
+@pytest.mark.asyncio
+async def test_reconnect_reregisters_callbacks_for_open_trades():
+    """A mid-session reconnect recreates the IB client; callbacks bound to the
+    old Trade objects must be re-registered onto the fresh ones or fills/status
+    for in-flight orders are silently lost."""
+    from unittest.mock import patch
+
+    executor = IBExecutor("h", 7497, 1)
+    executor.set_fill_handler(AsyncMock())
+    executor.set_order_status_handler(AsyncMock())
+
+    old_trade = SimpleNamespace(
+        order=SimpleNamespace(orderId=9),
+        commissionReportEvent=Event(),
+        statusEvent=Event(),
+    )
+    executor._register_trade("9", old_trade, "AAPL", "buy")
+
+    new_trade = SimpleNamespace(
+        order=SimpleNamespace(orderId=9),
+        orderStatus=SimpleNamespace(status="Submitted", filled=0),
+        commissionReportEvent=Event(),
+        statusEvent=Event(),
+    )
+    fake_ib = MagicMock()
+    fake_ib.connectAsync = AsyncMock()
+    fake_ib.managedAccounts.return_value = ["DUN551088"]
+    fake_ib.openTrades.return_value = [new_trade]
+
+    with patch("ib_insync.IB", return_value=fake_ib):
+        await executor.connect(expect_paper=True)  # simulates the reconnect
+
+    assert len(new_trade.statusEvent.callbacks) == 1
+    assert len(new_trade.commissionReportEvent.callbacks) == 1
+    assert executor._trades["9"] is new_trade
