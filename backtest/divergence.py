@@ -16,7 +16,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Iterable
+from typing import Iterable, Mapping
+
+from backtest.costs import (
+    DEFAULT_COMMISSION_MINIMUM,
+    DEFAULT_COMMISSION_PER_SHARE,
+    DEFAULT_SLIPPAGE_BPS,
+    CostModel,
+)
 
 # Thresholds tuned to be quiet during normal operation but loud when something
 # real is breaking. Tuned for a 30-day rolling window; tighten for shorter windows.
@@ -27,8 +34,108 @@ DEFAULT_ABSOLUTE_BREACH_PP = 0.05  # 5 pp absolute breach
 
 # The backtest assumes these per-trade frictions. The monitor flags when live
 # fills consistently exceed them.
-ASSUMED_SLIPPAGE_BPS = 10.0
-ASSUMED_COMMISSION_PER_SHARE = 0.005
+ASSUMED_SLIPPAGE_BPS = DEFAULT_SLIPPAGE_BPS
+ASSUMED_COMMISSION_PER_SHARE = DEFAULT_COMMISSION_PER_SHARE
+
+# How a backtest filled its orders. Only a ``next_open`` baseline is a
+# like-for-like comparison for live trading: a ``same_bar`` backtest filled
+# entries at the decision day's low and exits at that day's open, which live
+# cannot do, so live trails it by construction (finding 4.6 of the 2026-08-06
+# review — the monitor was baselining against exactly that).
+NEXT_OPEN_FILL_MODEL = "next_open"
+SAME_BAR_FILL_MODEL = "same_bar"
+
+
+@dataclass(frozen=True)
+class ExecutionModel:
+    """The execution assumptions a baseline backtest was run under.
+
+    Every field that gates comparability defaults to the **unsafe** value, so a
+    model built from an incomplete config can never claim to be comparable by
+    omission.
+    """
+
+    fill_model: str
+    slippage_bps: float = ASSUMED_SLIPPAGE_BPS
+    commission_per_share: float = ASSUMED_COMMISSION_PER_SHARE
+    commission_minimum: float = DEFAULT_COMMISSION_MINIMUM
+    point_in_time_universe: bool = False
+
+    @property
+    def is_like_for_like(self) -> bool:
+        """Whether live performance can be fairly compared to this baseline.
+
+        Requires all three:
+
+        - **next-open fills** — a same-bar backtest fills entries at the
+          decision day's low and exits at that day's open, which live cannot do;
+        - **a per-order commission floor** — without it the baseline understates
+          cost by 10-20x on the small orders the live account actually sends;
+        - **a point-in-time universe** — a backtest over today's ticker list
+          traded names *because* they went on to survive. Since
+          ``--universe-snapshots`` is opt-in, this is the assumption most likely
+          to be quietly missing from an otherwise-modernised re-run.
+        """
+        return (
+            self.fill_model == NEXT_OPEN_FILL_MODEL
+            and self.commission_minimum > 0
+            and self.point_in_time_universe
+        )
+
+    def unmet_requirements(self) -> list[str]:
+        """Human-readable reasons this baseline is not like-for-like."""
+        reasons: list[str] = []
+        if self.fill_model != NEXT_OPEN_FILL_MODEL:
+            reasons.append(
+                f"fills are '{self.fill_model}', not '{NEXT_OPEN_FILL_MODEL}'"
+            )
+        if self.commission_minimum <= 0:
+            reasons.append("no per-order commission floor")
+        if not self.point_in_time_universe:
+            reasons.append(
+                "static present-day universe (survivorship-biased); re-run with "
+                "--universe-snapshots"
+            )
+        return reasons
+
+    def commission_for(self, quantity: float) -> float:
+        """Commission this baseline assumed for one order of ``quantity``."""
+        return CostModel(
+            commission_per_share=self.commission_per_share,
+            commission_minimum=self.commission_minimum,
+        ).commission_for(quantity)
+
+
+LEGACY_EXECUTION_MODEL = ExecutionModel(
+    fill_model=SAME_BAR_FILL_MODEL, commission_minimum=0.0
+)
+# What a fully-rebaselined run of this repo's backtest produces. Used only when
+# a caller supplies no model at all; anything parsed from a config fails safe.
+DEFAULT_EXECUTION_MODEL = ExecutionModel(
+    fill_model=NEXT_OPEN_FILL_MODEL, point_in_time_universe=True
+)
+
+
+def execution_model_from_backtest_config(config: Mapping | None) -> ExecutionModel:
+    """Read the execution model a saved backtest declared in its ``config``.
+
+    Anything a backtest does not declare is assumed to be the unsafe value: a
+    backtest with no ``fill_model`` predates the rebaseline and is treated as
+    same-bar, and one with no ``point_in_time_universe`` flag is treated as
+    survivorship-biased. Absence is never read as a pass.
+    """
+    if not config:
+        return LEGACY_EXECUTION_MODEL
+    fill_model = str(config.get("fill_model") or SAME_BAR_FILL_MODEL)
+    return ExecutionModel(
+        fill_model=fill_model,
+        slippage_bps=float(config.get("slippage_bps", ASSUMED_SLIPPAGE_BPS)),
+        commission_per_share=float(
+            config.get("commission_per_share", ASSUMED_COMMISSION_PER_SHARE)
+        ),
+        commission_minimum=float(config.get("commission_minimum", 0.0)),
+        point_in_time_universe=bool(config.get("point_in_time_universe", False)),
+    )
 
 
 @dataclass
@@ -56,6 +163,10 @@ class PortfolioDivergenceReport:
     assumed_commission_total: float
     status: str  # "OK" | "WARNING" | "BREACH" | "NO_DATA"
     notes: list[str] = field(default_factory=list)
+    # Which execution model the baseline backtest used, and whether comparing
+    # live against it is meaningful at all.
+    baseline_fill_model: str = NEXT_OPEN_FILL_MODEL
+    baseline_comparable: bool = True
 
 
 def align_and_window(
@@ -207,21 +318,27 @@ def slippage_bps(trades: list[dict]) -> float | None:
     return (total_slippage_dollars / total_notional) * 10000
 
 
-def commission_totals(trades: list[dict]) -> tuple[float, float]:
+def commission_totals(
+    trades: list[dict],
+    execution_model: ExecutionModel | None = None,
+) -> tuple[float, float]:
     """Return ``(realized, assumed)`` commission dollars for a list of trades.
 
-    Realized comes from ``trade['commission']``; assumed is
-    ``shares * ASSUMED_COMMISSION_PER_SHARE`` per fill. Each Trade row is one
-    exit, but a round trip is two fills (entry + exit) — the assumed figure
-    multiplies by 2 to match.
+    Realized comes from ``trade['commission']``. Assumed is what the baseline
+    backtest's cost model charges for the same orders — including its per-order
+    floor, so a handful of small live orders is not compared against a
+    per-share figure of a few cents. Each Trade row is one exit, but a round
+    trip is two orders (entry + exit), so the assumed figure counts both.
     """
+    model = execution_model or DEFAULT_EXECUTION_MODEL
     realized = 0.0
-    assumed_shares = 0.0
+    assumed = 0.0
     for t in trades:
         realized += t.get("commission", 0.0) or 0.0
-        assumed_shares += abs(t.get("quantity", 0.0) or 0.0)
-    # Two fills per round trip (entry + exit) at $0.005/share.
-    assumed = assumed_shares * ASSUMED_COMMISSION_PER_SHARE * 2
+        quantity = abs(t.get("quantity", 0.0) or 0.0)
+        if quantity <= 0:
+            continue
+        assumed += 2 * model.commission_for(quantity)
     return realized, assumed
 
 
@@ -232,13 +349,20 @@ def build_report(
     trades: list[dict],
     window_days: int = DEFAULT_WINDOW_DAYS,
     threshold: float = DEFAULT_THRESHOLD,
+    execution_model: ExecutionModel | None = None,
 ) -> PortfolioDivergenceReport:
     """Top-level helper that runs the full divergence computation for one portfolio.
 
     The script feeds this with data it pulled from the DB and the backtest
     JSON. The function is pure so the same inputs always produce the same
     report — tests construct synthetic series directly.
+
+    ``execution_model`` describes how the baseline backtest filled its orders.
+    If that baseline is not like-for-like with live execution, the status is
+    ``NO_DATA``: the numbers are still computed and shown, but they are not
+    evidence of drift, because live trails such a baseline by construction.
     """
+    model = execution_model or DEFAULT_EXECUTION_MODEL
     dates, lvals, btvals = align_and_window(live, backtest, window_days)
     notes: list[str] = []
 
@@ -260,6 +384,8 @@ def build_report(
             assumed_commission_total=0.0,
             status="NO_DATA",
             notes=["No overlapping dates between live and backtest series."],
+            baseline_fill_model=model.fill_model,
+            baseline_comparable=model.is_like_for_like,
         )
 
     if len(dates) < window_days:
@@ -274,13 +400,27 @@ def build_report(
     corr = correlation(daily_returns(lvals), daily_returns(btvals))
     window_trades = filter_trades_to_window(trades, dates[0], dates[-1])
     slip_total = sum((t.get("slippage", 0.0) or 0.0) for t in window_trades)
-    realized_comm, assumed_comm = commission_totals(window_trades)
+    realized_comm, assumed_comm = commission_totals(
+        window_trades, execution_model=model
+    )
     status = classify_status(rel_div, abs_div, threshold=threshold)
 
     if status == "BREACH":
         notes.append("Divergence exceeds breach threshold — investigate before next entry.")
     elif status == "WARNING":
         notes.append("Divergence exceeds warning threshold — review at next checkpoint.")
+
+    if not model.is_like_for_like:
+        # Refuse to grade live against a baseline it cannot match. Reporting
+        # OK/WARNING/BREACH here would either excuse real drift or flag drift
+        # that is purely the baseline's optimism.
+        notes.append(
+            "Baseline is not like-for-like with live execution ("
+            + "; ".join(model.unmet_requirements())
+            + "), so the divergence figures below are not evidence of drift. "
+            "Re-run the baseline backtest per docs/operations/backtest-baseline.md."
+        )
+        status = "NO_DATA"
 
     return PortfolioDivergenceReport(
         portfolio=portfolio,
@@ -299,6 +439,8 @@ def build_report(
         assumed_commission_total=assumed_comm,
         status=status,
         notes=notes,
+        baseline_fill_model=model.fill_model,
+        baseline_comparable=model.is_like_for_like,
     )
 
 
@@ -309,6 +451,7 @@ def aggregate_reports(
     all_trades: list[dict],
     window_days: int = DEFAULT_WINDOW_DAYS,
     threshold: float = DEFAULT_THRESHOLD,
+    execution_model: ExecutionModel | None = None,
 ) -> PortfolioDivergenceReport:
     """Build an aggregate ("portfolio of portfolios") report.
 
@@ -324,6 +467,7 @@ def aggregate_reports(
         trades=all_trades,
         window_days=window_days,
         threshold=threshold,
+        execution_model=execution_model,
     )
 
 

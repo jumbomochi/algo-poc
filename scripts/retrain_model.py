@@ -23,9 +23,12 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from backtest.feature_extractor import extract_features
 from scripts.train_signal_model import (
+    DEFAULT_EMBARGO_DAYS,
     _prepare_for_lgb,
+    build_model_metadata,
     train_final_model,
     walk_forward_evaluate,
+    write_model_metadata,
 )
 from shared.models.ml_models import ModelVersion
 from shared.models.portfolio import Trade
@@ -95,6 +98,7 @@ def run_retraining_pipeline(
     min_samples: int = 200,
     output_dir: str = "data/models",
     n_splits: int = 3,
+    embargo_days: int = DEFAULT_EMBARGO_DAYS,
     dry_run: bool = False,
     force: bool = False,
 ) -> dict:
@@ -123,12 +127,22 @@ def run_retraining_pipeline(
     # 3. Extract features
     features, labels = extract_features(trades)
 
-    # 4. Parse dates for walk-forward splitting
-    dates = pd.Series([t.get("entry_date", "2020-01-01") for t in trades])
-    dates = pd.to_datetime(dates)
+    # 4. Parse dates for walk-forward splitting. Exit dates are what the purge
+    #    keys off: a trade's label is only knowable once the trade closes.
+    dates = pd.to_datetime(
+        pd.Series([t.get("entry_date", "2020-01-01") for t in trades])
+    )
+    exit_dates = pd.to_datetime(
+        pd.Series([
+            t.get("exit_date") or t.get("entry_date", "2020-01-01") for t in trades
+        ])
+    )
 
-    # 5. Walk-forward evaluation
-    fold_results = walk_forward_evaluate(features, labels, dates, n_splits)
+    # 5. Purged, embargoed walk-forward evaluation
+    fold_results = walk_forward_evaluate(
+        features, labels, dates, n_splits,
+        exit_dates=exit_dates, embargo_days=embargo_days,
+    )
 
     if not fold_results:
         return {
@@ -171,11 +185,19 @@ def run_retraining_pipeline(
 
     versioned_path = os.path.join(output_dir, f"signal_quality_{version}.txt")
     model.save_model(versioned_path)
+    training_window = build_model_metadata(
+        dates=dates,
+        exit_dates=exit_dates,
+        embargo_days=embargo_days,
+        n_trades=len(trades),
+    )
+    write_model_metadata(versioned_path, training_window)
 
     # Also save as the canonical path if promoted (for paper trader)
     if should_promote:
         canonical_path = os.path.join(output_dir, "signal_quality_model.txt")
         model.save_model(canonical_path)
+        write_model_metadata(canonical_path, training_window)
 
     # 11. Deactivate current model if promoting
     if should_promote:
@@ -241,6 +263,15 @@ def main() -> None:
         help="Number of walk-forward splits (default: 3)",
     )
     parser.add_argument(
+        "--embargo-days",
+        type=int,
+        default=DEFAULT_EMBARGO_DAYS,
+        help=(
+            "Calendar days of embargo between each fold's training data and its "
+            f"test window (default: {DEFAULT_EMBARGO_DAYS})"
+        ),
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Force promotion even if new model isn't strictly better",
@@ -269,6 +300,7 @@ def main() -> None:
             min_samples=args.min_samples,
             output_dir=args.output_dir,
             n_splits=args.n_splits,
+            embargo_days=args.embargo_days,
             dry_run=args.dry_run,
             force=args.force,
         )

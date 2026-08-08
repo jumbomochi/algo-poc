@@ -61,6 +61,9 @@ def _sharpe_ratio(
     """Compute annualized Sharpe ratio from daily portfolio values.
 
     Uses daily returns, subtracts daily risk-free rate, then annualizes.
+    Dispersion is the *sample* standard deviation (ddof=1): the population
+    form divides by ``n`` instead of ``n - 1`` and so understates dispersion,
+    which inflates the reported Sharpe (2026-08-06 review, finding 4.7).
     """
     if len(portfolio_values) < 2:
         return 0.0
@@ -79,8 +82,11 @@ def _sharpe_ratio(
     excess_returns = [r - daily_rf for r in daily_returns]
 
     n = len(excess_returns)
+    if n < 2:
+        return 0.0
+
     mean = sum(excess_returns) / n
-    variance = sum((r - mean) ** 2 for r in excess_returns) / n
+    variance = sum((r - mean) ** 2 for r in excess_returns) / (n - 1)
     std = math.sqrt(variance)
 
     if std == 0.0:

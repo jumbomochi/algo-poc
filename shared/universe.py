@@ -10,7 +10,21 @@ watchlist.)
 
 from __future__ import annotations
 
-# Top 50 S&P 500 by market cap (as of early 2025)
+import bisect
+import json
+from collections.abc import Collection, Iterable, Mapping
+from datetime import date
+
+# Top 50 S&P 500 by market cap **as of early 2025**.
+#
+# SURVIVORSHIP BIAS: this is a snapshot of today's winners, so using it over a
+# multi-year backtest lets the strategy trade names *because* they went on to
+# become mega-caps, and never sees the names that were dropped or delisted.
+# The 2026-08-06 implementation review (finding 4.1) called it out as inflating
+# every reported metric. Prefer a point-in-time ``MembershipCalendar`` for any
+# backtest whose numbers are used to justify capital; these static lists remain
+# as the live watchlist source (where "today's members" is exactly right) and as
+# a clearly-labelled fallback.
 SP500_TOP50 = [
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "BRK B", "LLY",
     "AVGO", "JPM", "TSLA", "UNH", "XOM", "V", "MA", "PG", "COST",
@@ -72,6 +86,111 @@ ACTIVE_SLEEVES = [
     "earnings_drift",
     "tail_risk_hedge",
 ]
+
+
+class MembershipCalendar:
+    """Point-in-time index membership: which tickers were in the universe when.
+
+    Built from *sparse snapshots* — each snapshot date lists the constituents
+    effective from that date until the next snapshot. This is what removes
+    survivorship bias from a backtest: a name is only tradable on dates when it
+    was actually a member, and names that were later dropped or delisted are
+    still present in the history via :meth:`all_tickers`.
+
+    Dates before the first snapshot have **no** members. Back-filling the
+    earliest snapshot backwards would silently reintroduce the bias, so a
+    backtest that starts before the membership history simply cannot trade —
+    which is loud and obvious rather than quietly optimistic.
+
+    ``always`` holds instruments that are tradable on every date but are not
+    index constituents (the sector / thematic / inverse ETFs the sleeves use).
+
+    The ``snapshots`` mapping is deliberately the same shape that
+    ``research.factors.panel.build_factor_panel`` takes as
+    ``universe_membership_by_date``, so one membership file drives both the
+    backtest and the research factor panel without translation.
+    """
+
+    def __init__(
+        self,
+        snapshots: Mapping[date | str, Collection[str]],
+        always: Iterable[str] | None = None,
+    ) -> None:
+        if not snapshots:
+            raise ValueError(
+                "MembershipCalendar requires at least one snapshot; "
+                "pass point-in-time membership or omit the calendar entirely"
+            )
+        parsed = sorted(
+            (_as_date(day), frozenset(members)) for day, members in snapshots.items()
+        )
+        self._dates: list[date] = [day for day, _ in parsed]
+        self._members: list[frozenset[str]] = [members for _, members in parsed]
+        self.always: frozenset[str] = frozenset(always or ())
+
+    @property
+    def first_snapshot_date(self) -> date:
+        return self._dates[0]
+
+    @property
+    def last_snapshot_date(self) -> date:
+        return self._dates[-1]
+
+    def members_as_of(self, day: date) -> frozenset[str]:
+        """Constituents effective on ``day`` (excluding ``always`` members)."""
+        index = bisect.bisect_right(self._dates, day) - 1
+        if index < 0:
+            return frozenset()
+        return self._members[index]
+
+    def contains(self, ticker: str, day: date) -> bool:
+        """Whether ``ticker`` was tradable on ``day``."""
+        if ticker in self.always:
+            return True
+        return ticker in self.members_as_of(day)
+
+    def all_tickers(self) -> list[str]:
+        """Every ticker that was ever a member, plus the ``always`` set.
+
+        Includes names that were later dropped or delisted — the whole point of
+        a point-in-time universe is that those bars have to be fetched too.
+        """
+        seen: set[str] = set(self.always)
+        for members in self._members:
+            seen |= members
+        return sorted(seen)
+
+    @classmethod
+    def from_mapping(
+        cls,
+        payload: Mapping,
+        always: Iterable[str] | None = None,
+    ) -> MembershipCalendar:
+        """Build from a loaded JSON object.
+
+        Accepts either a bare ``{date: [tickers]}`` mapping or an envelope with
+        a ``snapshots`` key alongside provenance metadata.
+        """
+        snapshots = payload.get("snapshots", payload) if "snapshots" in payload else payload
+        return cls(snapshots, always=always)
+
+    @classmethod
+    def from_json_file(
+        cls,
+        path: str,
+        always: Iterable[str] | None = None,
+    ) -> MembershipCalendar:
+        """Load membership snapshots from a JSON file.
+
+        See ``docs/operations/backtest-baseline.md`` for the file format and how
+        to generate one.
+        """
+        with open(path) as handle:
+            return cls.from_mapping(json.load(handle), always=always)
+
+
+def _as_date(value: date | str) -> date:
+    return value if isinstance(value, date) else date.fromisoformat(str(value))
 
 
 def get_union_universe(strategy_names: list[str]) -> list[str]:
