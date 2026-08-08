@@ -110,7 +110,6 @@ class SignalGenerationRunner:
         of leaving them parked in the PEL."""
         try:
             await handler(msg.data)
-            await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
         except Exception as exc:
             logger.exception(
                 "Poison signal-input message; sending to DLQ",
@@ -124,6 +123,17 @@ class SignalGenerationRunner:
                 logger.exception(
                     "Failed to dead-letter poison message", stream=stream
                 )
+            return
+        # A transient ack failure after a successful handler must not
+        # dead-letter an already-processed message.
+        try:
+            await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
+        except Exception:
+            logger.exception(
+                "Ack failed after processing; relying on redelivery",
+                stream=stream,
+                message_id=msg.message_id,
+            )
 
     async def process_market_data(self, data: dict[str, Any]) -> list[SignalMessage]:
         """Run all technical signals on market data and publish results.

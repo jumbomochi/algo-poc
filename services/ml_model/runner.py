@@ -5,12 +5,15 @@ from datetime import datetime, timezone
 from typing import Any
 
 from shared.config import AppConfig
+from shared.logging import get_logger
 from shared.schemas.messages import RecommendationMessage, SignalMessage
 
 from services.ml_model.feature_assembly import FeatureAssembler
 from services.ml_model.predictor import ModelPredictor
 from services.ml_model.regime import RegimeDetector
 from services.ml_model.registry import ModelRegistry
+
+logger = get_logger("ml_model")
 
 RECOMMENDATIONS_STREAM = "stream:recommendations"
 SIGNALS_STREAM = "stream:signals"
@@ -86,11 +89,16 @@ class MLServiceRunner:
         self._buffered_message_ids.setdefault(ticker, []).append(msg.message_id)
         try:
             result = await self.process_signals(ticker, self._signal_buffer[ticker])
-        except Exception as exc:
-            # Roll this signal out of the buffer and dead-letter it.
-            self._signal_buffer[ticker].pop()
-            self._buffered_message_ids[ticker].pop()
-            await self._dead_letter(msg, exc)
+        except Exception:
+            # A processing failure (e.g. no active model yet) is transient, not
+            # poison — keep the signal buffered and leave it pending so a later
+            # signal (or a restart's drain) retries the whole buffer rather than
+            # dead-lettering a perfectly valid signal.
+            logger.warning(
+                "process_signals failed; leaving signal buffered + pending",
+                ticker=ticker,
+                message_id=msg.message_id,
+            )
             return
 
         if result is not None:

@@ -813,7 +813,6 @@ class ExecutionServiceRunner:
         for msg in messages:
             try:
                 await handler(parser(msg.data))
-                await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
             except Exception as exc:
                 self._logger.exception(
                     "Poison message; sending to DLQ",
@@ -834,6 +833,17 @@ class ExecutionServiceRunner:
                     priority="high",
                     message=f"Poison message on {stream} dead-lettered: {exc}",
                     context={"stream": stream, "message_id": str(msg.message_id)},
+                )
+                continue
+            # A transient ack failure after a successful handler must not
+            # dead-letter an already-processed message.
+            try:
+                await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
+            except Exception:
+                self._logger.exception(
+                    "Ack failed after processing; relying on redelivery",
+                    stream=stream,
+                    message_id=msg.message_id,
                 )
 
 

@@ -468,6 +468,28 @@ class TestKillLiquidation:
         session.rollback()
 
     @pytest.mark.asyncio
+    async def test_kill_survives_position_load_failure_with_critical_alert(
+        self, db_runner, mock_redis
+    ):
+        """A transient failure enumerating positions must not drop the kill — it
+        must still halt and raise a critical alert (not vanish into the DLQ)."""
+        runner, ledger, session = db_runner
+        runner._authoritative_open_positions = MagicMock(
+            side_effect=RuntimeError("DB unavailable")
+        )
+
+        await runner.process_kill(_kill_msg())  # must not raise
+
+        assert runner._kill_switch.is_active is True
+        alerts = [
+            str(c.args[1])
+            for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert any("critical" in a.lower() or "manual" in a.lower() for a in alerts)
+        session.rollback()
+
+    @pytest.mark.asyncio
     async def test_kill_always_alerts_even_with_no_positions(
         self, runner, mock_redis
     ):
@@ -971,6 +993,25 @@ class TestSteadyStatePoisonHandling:
         mock_redis.send_to_dead_letter.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_ack_failure_after_success_does_not_dead_letter(
+        self, runner, mock_redis
+    ):
+        """A transient ack failure AFTER the handler succeeded must not label a
+        processed message poison — redelivery + idempotency handles it."""
+        mock_redis.read_group = AsyncMock(return_value=[self._msg("5-0")])
+        mock_redis.send_to_dead_letter = AsyncMock()
+        mock_redis.ack = AsyncMock(side_effect=ConnectionError("redis blip"))
+
+        async def ok(_):
+            return None
+
+        await runner._consume_and_process(
+            "stream:fills", lambda d: d, ok, count=1, block_ms=0
+        )
+
+        mock_redis.send_to_dead_letter.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_successful_message_is_acked(self, runner, mock_redis):
         mock_redis.read_group = AsyncMock(return_value=[self._msg("9-0")])
         mock_redis.send_to_dead_letter = AsyncMock()
@@ -1136,6 +1177,22 @@ class TestFillProcessing:
         await runner.process_fill(fill)
         # 10_000 - 1_000 notional - 10.0 USD commission (NOT 13.5)
         assert runner._cash == pytest.approx(10_000 - 1_000 - 10.0)
+
+    @pytest.mark.asyncio
+    async def test_non_usd_commission_without_conversion_is_excluded(self, runner):
+        """If a native (SGD) commission has no USD conversion, it must NOT be
+        subtracted as USD units — exclude it rather than corrupt USD cash."""
+        runner._cash = 10_000.0
+        fill = self._fill_with(
+            execution_id="exec-3",
+            quantity=10,
+            price=100,
+            commission=13.5,  # SGD, no conversion provided
+            commission_trading=None,
+            commission_currency="SGD",
+        )
+        await runner.process_fill(fill)
+        assert runner._cash == pytest.approx(10_000 - 1_000)  # no commission applied
 
 
 class TestSleeveBridgeRecommendations:

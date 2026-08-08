@@ -204,6 +204,10 @@ class RiskServiceRunner:
         self._processed_execution_ids: set[str] = set()
         self._processed_execution_order: deque[str] = deque(maxlen=10_000)
 
+        # Last-alerted depth per dlq, so a persistent backlog doesn't re-alert
+        # every scan — only a fresh backlog or a growing one does.
+        self._dlq_alerted_depth: dict[str, int] = {}
+
     async def setup(self) -> None:
         """Create consumer groups and replay pending messages.
 
@@ -279,12 +283,21 @@ class RiskServiceRunner:
         self._current_prices[fill.ticker] = fill.fill_price
 
         # Cash is denominated in the trading currency (USD). Use the USD-converted
-        # commission, not the raw (possibly native, e.g. SGD) fill.commission.
-        commission_usd = (
-            fill.commission_trading
-            if fill.commission_trading is not None
-            else fill.commission
-        )
+        # commission; only fall back to the raw amount when it is already USD.
+        # A native (e.g. SGD) commission with no conversion is excluded rather
+        # than subtracted as if it were USD (the projector rejects that case).
+        if fill.commission_trading is not None:
+            commission_usd = fill.commission_trading
+        elif fill.commission_currency in (None, "USD"):
+            commission_usd = fill.commission
+        else:
+            commission_usd = 0.0
+            self._logger.warning(
+                "Non-USD commission without USD conversion; excluded from the "
+                "in-memory book",
+                ticker=fill.ticker,
+                currency=fill.commission_currency,
+            )
 
         if fill.side == "buy":
             pos = positions.get(fill.ticker)
@@ -990,7 +1003,25 @@ class RiskServiceRunner:
         exit through the ledger with a deterministic id, guards each position so
         one failure never aborts the rest, and always publishes a critical alert.
         """
-        positions = self._authoritative_open_positions()
+        try:
+            positions = self._authoritative_open_positions()
+        except Exception:
+            # Never drop a kill/breaker on a transient DB error: the halt is
+            # already persisted (fail-closed), so alert critically for manual
+            # liquidation rather than letting process_kill raise into the DLQ.
+            self._logger.exception(
+                "Could not load positions for liquidation", event_type=event_type
+            )
+            await self._publish_alert(
+                event_type="liquidation_failed",
+                priority="critical",
+                message=(
+                    f"{event_type}: could not load positions to liquidate — "
+                    "MANUAL ACTION REQUIRED"
+                ),
+                context={"reason": reason, "triggered_by": triggered_by},
+            )
+            return
         liquidated = 0
         for pos in positions:
             try:
@@ -1499,7 +1530,6 @@ class RiskServiceRunner:
         for msg in messages:
             try:
                 await handler(parser(msg.data))
-                await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
             except retryable_exc as exc:
                 self._logger.warning(
                     "Retryable error; leaving message pending",
@@ -1507,8 +1537,23 @@ class RiskServiceRunner:
                     message_id=msg.message_id,
                     reason=str(exc),
                 )
+                continue
             except Exception as exc:
                 await self._dead_letter(stream, msg, exc)
+                continue
+            # Ack is separate from the poison path: a transient ack failure after
+            # a successful handler must NOT dead-letter an already-processed
+            # message — redelivery + idempotency (execution_id dedup, ledger)
+            # handles the reprocess safely.
+            try:
+                await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
+            except Exception:
+                self._logger.exception(
+                    "Ack failed after processing; relying on redelivery + "
+                    "idempotency",
+                    stream=stream,
+                    message_id=msg.message_id,
+                )
 
     async def _check_dlq_depths(self) -> None:
         """Alert when any consumed stream's dead-letter queue has a backlog, so
@@ -1521,13 +1566,19 @@ class RiskServiceRunner:
                 depth = await self._redis.stream_length(dlq)
             except Exception:  # pragma: no cover - defensive (dlq may not exist)
                 continue
-            if depth and depth > 0:
+            # Alert only on a new or growing backlog; reset once it clears so the
+            # next backlog re-alerts. Avoids re-alerting every scan on a static
+            # backlog.
+            if depth and depth > self._dlq_alerted_depth.get(dlq, 0):
                 await self._publish_alert(
                     event_type="dlq_backlog",
                     priority="high",
                     message=f"Dead-letter backlog on {dlq}: {depth} message(s)",
                     context={"stream": dlq, "depth": depth},
                 )
+                self._dlq_alerted_depth[dlq] = depth
+            elif not depth:
+                self._dlq_alerted_depth[dlq] = 0
 
     async def _dead_letter(self, stream: str, msg: Any, exc: Exception) -> None:
         """DLQ + ack + alert a poison message (matches setup()'s replay path)."""
