@@ -132,6 +132,8 @@ def mock_redis():
     redis.create_consumer_group = AsyncMock()
     redis.read_group = AsyncMock(return_value=[])
     redis.ack = AsyncMock()
+    redis.send_to_dead_letter = AsyncMock()
+    redis.stream_length = AsyncMock(return_value=0)  # empty dlq by default
     return redis
 
 
@@ -984,6 +986,39 @@ class TestSteadyStatePoisonHandling:
         assert handled == [{"bad": "payload"}]
         mock_redis.ack.assert_awaited_once()
         mock_redis.send_to_dead_letter.assert_not_awaited()
+
+
+class TestDlqDepthMonitor:
+    """A non-empty :dlq must raise an alert so parked poison never goes
+    unnoticed (review 3.5)."""
+
+    @pytest.mark.asyncio
+    async def test_alerts_when_dlq_has_backlog(self, runner, mock_redis):
+        mock_redis.stream_length = AsyncMock(return_value=2)
+
+        await runner._check_dlq_depths()
+
+        alerts = [
+            c.args[1]
+            for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert any(
+            "dlq" in str(a).lower() or "dead-letter" in str(a).lower()
+            for a in alerts
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_alert_when_dlq_empty(self, runner, mock_redis):
+        mock_redis.stream_length = AsyncMock(return_value=0)
+
+        await runner._check_dlq_depths()
+
+        alerts = [
+            c for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert alerts == []
 
 
 class TestFillProcessing:

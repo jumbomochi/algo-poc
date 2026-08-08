@@ -1260,6 +1260,7 @@ class RiskServiceRunner:
         await self.run_stop_loss_check()
         await self.run_passive_scan()
         await self._emit_drawdown_gauge()
+        await self._check_dlq_depths()
 
     async def maybe_run_periodic_checks(self, now: float) -> bool:
         """Run the periodic checks if the scan interval has elapsed.
@@ -1508,6 +1509,25 @@ class RiskServiceRunner:
                 )
             except Exception as exc:
                 await self._dead_letter(stream, msg, exc)
+
+    async def _check_dlq_depths(self) -> None:
+        """Alert when any consumed stream's dead-letter queue has a backlog, so
+        parked poison messages are noticed rather than accumulating silently."""
+        from shared.redis_client import DEAD_LETTER_SUFFIX
+
+        for stream in (RECOMMENDATIONS_STREAM, KILL_STREAM, FILLS_STREAM):
+            dlq = stream + DEAD_LETTER_SUFFIX
+            try:
+                depth = await self._redis.stream_length(dlq)
+            except Exception:  # pragma: no cover - defensive (dlq may not exist)
+                continue
+            if depth and depth > 0:
+                await self._publish_alert(
+                    event_type="dlq_backlog",
+                    priority="high",
+                    message=f"Dead-letter backlog on {dlq}: {depth} message(s)",
+                    context={"stream": dlq, "depth": depth},
+                )
 
     async def _dead_letter(self, stream: str, msg: Any, exc: Exception) -> None:
         """DLQ + ack + alert a poison message (matches setup()'s replay path)."""
