@@ -132,6 +132,8 @@ def mock_redis():
     redis.create_consumer_group = AsyncMock()
     redis.read_group = AsyncMock(return_value=[])
     redis.ack = AsyncMock()
+    redis.send_to_dead_letter = AsyncMock()
+    redis.stream_length = AsyncMock(return_value=0)  # empty dlq by default
     return redis
 
 
@@ -463,6 +465,28 @@ class TestKillLiquidation:
             "NOCID" in a and ("manual" in a.lower() or "unroutable" in a.lower())
             for a in alerts
         )
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_kill_survives_position_load_failure_with_critical_alert(
+        self, db_runner, mock_redis
+    ):
+        """A transient failure enumerating positions must not drop the kill — it
+        must still halt and raise a critical alert (not vanish into the DLQ)."""
+        runner, ledger, session = db_runner
+        runner._authoritative_open_positions = MagicMock(
+            side_effect=RuntimeError("DB unavailable")
+        )
+
+        await runner.process_kill(_kill_msg())  # must not raise
+
+        assert runner._kill_switch.is_active is True
+        alerts = [
+            str(c.args[1])
+            for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert any("critical" in a.lower() or "manual" in a.lower() for a in alerts)
         session.rollback()
 
     @pytest.mark.asyncio
@@ -917,6 +941,127 @@ class TestAuditLogging:
         assert mock_logger.info.call_count >= 1
 
 
+class TestSteadyStatePoisonHandling:
+    """A non-retryable error in the steady-state loop must DLQ + ack + alert —
+    not silently leave the message parked in the PEL (review 3.3)."""
+
+    def _msg(self, mid="1-0"):
+        return SimpleNamespace(message_id=mid, data={"bad": "payload"})
+
+    @pytest.mark.asyncio
+    async def test_poison_message_is_dead_lettered_acked_and_alerted(
+        self, runner, mock_redis
+    ):
+        mock_redis.read_group = AsyncMock(return_value=[self._msg("7-0")])
+        mock_redis.send_to_dead_letter = AsyncMock()
+
+        async def boom(_):
+            raise ValueError("unparseable")
+
+        await runner._consume_and_process(
+            "stream:fills", lambda d: d, boom, count=1, block_ms=0
+        )
+
+        mock_redis.send_to_dead_letter.assert_awaited_once()
+        mock_redis.ack.assert_awaited_once()
+        alerts = [
+            c for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert len(alerts) >= 1
+
+    @pytest.mark.asyncio
+    async def test_retryable_error_leaves_message_pending(self, runner, mock_redis):
+        from services.risk_management.runner import RetryableRiskStateError
+
+        mock_redis.read_group = AsyncMock(return_value=[self._msg("8-0")])
+        mock_redis.send_to_dead_letter = AsyncMock()
+
+        async def retry(_):
+            raise RetryableRiskStateError("state not ready")
+
+        await runner._consume_and_process(
+            "stream:recommendations",
+            lambda d: d,
+            retry,
+            count=1,
+            block_ms=0,
+            retryable_exc=(RetryableRiskStateError,),
+        )
+
+        mock_redis.ack.assert_not_awaited()
+        mock_redis.send_to_dead_letter.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ack_failure_after_success_does_not_dead_letter(
+        self, runner, mock_redis
+    ):
+        """A transient ack failure AFTER the handler succeeded must not label a
+        processed message poison — redelivery + idempotency handles it."""
+        mock_redis.read_group = AsyncMock(return_value=[self._msg("5-0")])
+        mock_redis.send_to_dead_letter = AsyncMock()
+        mock_redis.ack = AsyncMock(side_effect=ConnectionError("redis blip"))
+
+        async def ok(_):
+            return None
+
+        await runner._consume_and_process(
+            "stream:fills", lambda d: d, ok, count=1, block_ms=0
+        )
+
+        mock_redis.send_to_dead_letter.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_successful_message_is_acked(self, runner, mock_redis):
+        mock_redis.read_group = AsyncMock(return_value=[self._msg("9-0")])
+        mock_redis.send_to_dead_letter = AsyncMock()
+        handled = []
+
+        async def ok(d):
+            handled.append(d)
+
+        await runner._consume_and_process(
+            "stream:fills", lambda d: d, ok, count=1, block_ms=0
+        )
+
+        assert handled == [{"bad": "payload"}]
+        mock_redis.ack.assert_awaited_once()
+        mock_redis.send_to_dead_letter.assert_not_awaited()
+
+
+class TestDlqDepthMonitor:
+    """A non-empty :dlq must raise an alert so parked poison never goes
+    unnoticed (review 3.5)."""
+
+    @pytest.mark.asyncio
+    async def test_alerts_when_dlq_has_backlog(self, runner, mock_redis):
+        mock_redis.stream_length = AsyncMock(return_value=2)
+
+        await runner._check_dlq_depths()
+
+        alerts = [
+            c.args[1]
+            for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert any(
+            "dlq" in str(a).lower() or "dead-letter" in str(a).lower()
+            for a in alerts
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_alert_when_dlq_empty(self, runner, mock_redis):
+        mock_redis.stream_length = AsyncMock(return_value=0)
+
+        await runner._check_dlq_depths()
+
+        alerts = [
+            c for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert alerts == []
+
+
 class TestFillProcessing:
     """process_fill keeps the in-memory portfolio synced with executions."""
 
@@ -977,6 +1122,77 @@ class TestFillProcessing:
         pos = runner._portfolio.positions["AAPL"]
         assert pos["quantity"] == 20
         assert pos["avg_entry_price"] == pytest.approx(110.0)
+
+    def _fill_with(self, **kw):
+        from shared.schemas.messages import FillMessage
+
+        base = dict(
+            ticker="AAPL",
+            timestamp=datetime.now(timezone.utc),
+            side="buy",
+            quantity=10.0,
+            fill_price=100.0,
+            commission=0.5,
+            recommendation_id=str(uuid.uuid4()),
+            order_id="order-1",
+        )
+        base.update(kw)
+        return FillMessage(**base)
+
+    @pytest.mark.asyncio
+    async def test_replayed_fill_does_not_move_book(self, runner):
+        """At-least-once delivery: the same execution replayed must not
+        double-count NAV/cash/positions (review 3.1)."""
+        runner._cash = 10_000.0
+        fill = self._fill_with(execution_id="exec-1", quantity=10, price=100)
+
+        await runner.process_fill(fill)
+        cash_after_first = runner._cash
+        qty_after_first = runner._portfolio.positions["AAPL"]["quantity"]
+
+        await runner.process_fill(fill)  # replay
+
+        assert runner._cash == cash_after_first
+        assert runner._portfolio.positions["AAPL"]["quantity"] == qty_after_first
+
+    @pytest.mark.asyncio
+    async def test_fill_without_execution_id_still_processes(self, runner):
+        runner._cash = 10_000.0
+        await runner.process_fill(self._fill_with(execution_id=None, quantity=5))
+        assert runner._portfolio.positions["AAPL"]["quantity"] == 5
+
+    @pytest.mark.asyncio
+    async def test_process_fill_uses_commission_trading_usd(self, runner):
+        """Cash is USD; a native (e.g. SGD) commission must be applied via the
+        USD-converted commission_trading, not the raw fill.commission (3.2)."""
+        runner._cash = 10_000.0
+        fill = self._fill_with(
+            execution_id="exec-2",
+            quantity=10,
+            price=100,
+            commission=13.5,  # native (e.g. SGD)
+            commission_trading=10.0,  # USD-converted
+            commission_currency="SGD",
+        )
+        await runner.process_fill(fill)
+        # 10_000 - 1_000 notional - 10.0 USD commission (NOT 13.5)
+        assert runner._cash == pytest.approx(10_000 - 1_000 - 10.0)
+
+    @pytest.mark.asyncio
+    async def test_non_usd_commission_without_conversion_is_excluded(self, runner):
+        """If a native (SGD) commission has no USD conversion, it must NOT be
+        subtracted as USD units — exclude it rather than corrupt USD cash."""
+        runner._cash = 10_000.0
+        fill = self._fill_with(
+            execution_id="exec-3",
+            quantity=10,
+            price=100,
+            commission=13.5,  # SGD, no conversion provided
+            commission_trading=None,
+            commission_currency="SGD",
+        )
+        await runner.process_fill(fill)
+        assert runner._cash == pytest.approx(10_000 - 1_000)  # no commission applied
 
 
 class TestSleeveBridgeRecommendations:

@@ -84,6 +84,11 @@ class NotificationsServiceRunner:
             await self._redis.send_to_dead_letter(
                 ALERTS_STREAM, message, str(exc)
             )
+            # Ack after dead-lettering, or the original leaks in the PEL and is
+            # re-drained + re-DLQ'd on every restart (finding 3.4).
+            await self._redis.ack(
+                ALERTS_STREAM, CONSUMER_GROUP, message.message_id
+            )
 
     async def health_check(self) -> dict[str, Any]:
         """Return health status for the notifications service.

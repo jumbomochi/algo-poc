@@ -252,3 +252,74 @@ class TestMLServiceRunner:
 
         assert result is not None
         assert 0.0 <= result.confidence <= 1.0
+
+
+class TestMLConsumerLoop:
+    def _runner(self, mock_config):
+        redis = AsyncMock()
+        redis.create_consumer_group = AsyncMock()
+        redis.drain_pending = AsyncMock(return_value=[])
+        redis.read_group = AsyncMock(return_value=[])
+        redis.ack = AsyncMock()
+        redis.send_to_dead_letter = AsyncMock()
+        runner = MLServiceRunner(
+            config=mock_config, redis_client=redis, db_session=None
+        )
+        return runner, redis
+
+    def _sig(self, mid, ticker="AAPL"):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            message_id=mid,
+            data=_make_signal(ticker, "support_proximity").to_stream_dict(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_incomplete_signal_is_not_acked(self, mock_config):
+        """A signal that only lands in the buffer (incomplete vector) must not be
+        acked — a crash would lose it (finding 3.5)."""
+        runner, redis = self._runner(mock_config)
+        runner.process_signals = AsyncMock(return_value=None)
+        redis.read_group = AsyncMock(return_value=[self._sig("1-0")])
+
+        await runner.consume_once()
+
+        redis.ack.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_completed_aggregation_acks_all_buffered(self, mock_config):
+        runner, redis = self._runner(mock_config)
+        runner.process_signals = AsyncMock(side_effect=[None, None, MagicMock()])
+        redis.read_group = AsyncMock(
+            side_effect=[[self._sig("1-0")], [self._sig("2-0")], [self._sig("3-0")]]
+        )
+
+        await runner.consume_once()
+        await runner.consume_once()
+        assert redis.ack.await_count == 0  # both buffered, none acked yet
+        await runner.consume_once()  # completes the aggregation
+
+        acked = {c.args[2] for c in redis.ack.call_args_list}
+        assert acked == {"1-0", "2-0", "3-0"}
+
+    @pytest.mark.asyncio
+    async def test_poison_signal_dead_lettered_and_acked(self, mock_config):
+        from types import SimpleNamespace
+
+        runner, redis = self._runner(mock_config)
+        redis.read_group = AsyncMock(
+            return_value=[SimpleNamespace(message_id="9-0", data={"bad": "x"})]
+        )
+
+        await runner.consume_once()
+
+        redis.send_to_dead_letter.assert_awaited_once()
+        redis.ack.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_setup_drains_pending(self, mock_config):
+        runner, redis = self._runner(mock_config)
+        await runner.setup()
+        redis.create_consumer_group.assert_awaited()
+        redis.drain_pending.assert_awaited_once()

@@ -776,58 +776,75 @@ class ExecutionServiceRunner:
                 except Exception:
                     self._logger.exception("Unfilled-order sweep failed; continuing")
 
-                # Read approved orders
-                messages = await self._redis.read_group(
+                await self._consume_and_process(
                     APPROVED_ORDERS_STREAM,
-                    CONSUMER_GROUP,
-                    CONSUMER_NAME,
+                    ApprovedOrderMessage.from_stream_dict,
+                    self.process_approved_order,
                     count=10,
                     block_ms=2000,
                 )
-
-                for msg in messages:
-                    try:
-                        order = ApprovedOrderMessage.from_stream_dict(msg.data)
-                        await self.process_approved_order(order)
-                        await self._redis.ack(
-                            APPROVED_ORDERS_STREAM,
-                            CONSUMER_GROUP,
-                            msg.message_id,
-                        )
-                    except Exception:
-                        self._logger.exception(
-                            "Error processing approved order",
-                            message_id=msg.message_id,
-                        )
-
-                # Read kill stream
-                kill_messages = await self._redis.read_group(
+                await self._consume_and_process(
                     KILLS_STREAM,
-                    CONSUMER_GROUP,
-                    CONSUMER_NAME,
+                    KillMessage.from_stream_dict,
+                    self.process_kill,
                     count=1,
                     block_ms=500,
                 )
-
-                for msg in kill_messages:
-                    try:
-                        kill_msg = KillMessage.from_stream_dict(msg.data)
-                        await self.process_kill(kill_msg)
-                        await self._redis.ack(
-                            KILLS_STREAM,
-                            CONSUMER_GROUP,
-                            msg.message_id,
-                        )
-                    except Exception:
-                        self._logger.exception(
-                            "Error processing kill message",
-                            message_id=msg.message_id,
-                        )
 
         except (KeyboardInterrupt, Exception):
             self._logger.info("Execution service interrupted")
         finally:
             await self.shutdown()
+
+    async def _consume_and_process(
+        self,
+        stream: str,
+        parser: Any,
+        handler: Any,
+        *,
+        count: int,
+        block_ms: int,
+    ) -> None:
+        """Read a batch and process each message, dead-lettering poison messages
+        (DLQ + ack + alert) instead of leaving them parked in the PEL."""
+        messages = await self._redis.read_group(
+            stream, CONSUMER_GROUP, CONSUMER_NAME, count=count, block_ms=block_ms
+        )
+        for msg in messages:
+            try:
+                await handler(parser(msg.data))
+            except Exception as exc:
+                self._logger.exception(
+                    "Poison message; sending to DLQ",
+                    stream=stream,
+                    message_id=msg.message_id,
+                )
+                try:
+                    await self._redis.send_to_dead_letter(stream, msg, str(exc))
+                    await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
+                except Exception:
+                    self._logger.exception(
+                        "Failed to dead-letter poison message",
+                        stream=stream,
+                        message_id=msg.message_id,
+                    )
+                await self._publish_alert(
+                    event_type="poison_message",
+                    priority="high",
+                    message=f"Poison message on {stream} dead-lettered: {exc}",
+                    context={"stream": stream, "message_id": str(msg.message_id)},
+                )
+                continue
+            # A transient ack failure after a successful handler must not
+            # dead-letter an already-processed message.
+            try:
+                await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
+            except Exception:
+                self._logger.exception(
+                    "Ack failed after processing; relying on redelivery",
+                    stream=stream,
+                    message_id=msg.message_id,
+                )
 
 
 if __name__ == "__main__":

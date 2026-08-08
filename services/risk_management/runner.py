@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 import uuid
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -196,6 +197,17 @@ class RiskServiceRunner:
         )
         self._last_periodic_scan_at: float | None = None
 
+        # Dedup fills by execution_id so a redelivered fill never double-counts
+        # the in-memory book. Bounded (FIFO eviction) so it can't grow without
+        # limit over a long-running process; the DB projector is the durable
+        # dedup, this only needs to cover the redelivery window.
+        self._processed_execution_ids: set[str] = set()
+        self._processed_execution_order: deque[str] = deque(maxlen=10_000)
+
+        # Last-alerted depth per dlq, so a persistent backlog doesn't re-alert
+        # every scan — only a fresh backlog or a growing one does.
+        self._dlq_alerted_depth: dict[str, int] = {}
+
     async def setup(self) -> None:
         """Create consumer groups and replay pending messages.
 
@@ -253,8 +265,39 @@ class RiskServiceRunner:
         Keeps positions, cash, nav, and peak_nav current between DB reloads
         so risk checks act on what the account actually holds.
         """
+        # At-least-once delivery: the same execution can be redelivered (crash
+        # replay via drain_pending, or a steady-state retry). The DB projector
+        # dedups durably by execution_id; the in-memory book must too, or a
+        # replay double-counts NAV/cash/positions.
+        if fill.execution_id is not None:
+            if fill.execution_id in self._processed_execution_ids:
+                self._logger.info(
+                    "Ignoring already-processed fill (replay)",
+                    execution_id=fill.execution_id,
+                    ticker=fill.ticker,
+                )
+                return
+            self._remember_execution_id(fill.execution_id)
+
         positions = self._portfolio.positions
         self._current_prices[fill.ticker] = fill.fill_price
+
+        # Cash is denominated in the trading currency (USD). Use the USD-converted
+        # commission; only fall back to the raw amount when it is already USD.
+        # A native (e.g. SGD) commission with no conversion is excluded rather
+        # than subtracted as if it were USD (the projector rejects that case).
+        if fill.commission_trading is not None:
+            commission_usd = fill.commission_trading
+        elif fill.commission_currency in (None, "USD"):
+            commission_usd = fill.commission
+        else:
+            commission_usd = 0.0
+            self._logger.warning(
+                "Non-USD commission without USD conversion; excluded from the "
+                "in-memory book",
+                ticker=fill.ticker,
+                currency=fill.commission_currency,
+            )
 
         if fill.side == "buy":
             pos = positions.get(fill.ticker)
@@ -275,7 +318,7 @@ class RiskServiceRunner:
                     ) / total
                 pos["quantity"] = total
                 pos["current_price"] = fill.fill_price
-            self._cash -= fill.fill_price * fill.quantity + fill.commission
+            self._cash -= fill.fill_price * fill.quantity + commission_usd
         else:
             pos = positions.get(fill.ticker)
             if pos is not None:
@@ -283,7 +326,7 @@ class RiskServiceRunner:
                 pos["current_price"] = fill.fill_price
                 if pos["quantity"] <= 0:
                     del positions[fill.ticker]
-            self._cash += fill.fill_price * fill.quantity - fill.commission
+            self._cash += fill.fill_price * fill.quantity - commission_usd
 
         market_value = sum(
             p["quantity"] * self._current_prices.get(t, p["current_price"])
@@ -300,6 +343,14 @@ class RiskServiceRunner:
             nav=self._portfolio.nav,
             open_positions=len(positions),
         )
+
+    def _remember_execution_id(self, execution_id: str) -> None:
+        """Record a processed execution_id, evicting the oldest past the cap."""
+        if len(self._processed_execution_order) == self._processed_execution_order.maxlen:
+            oldest = self._processed_execution_order[0]
+            self._processed_execution_ids.discard(oldest)
+        self._processed_execution_order.append(execution_id)
+        self._processed_execution_ids.add(execution_id)
 
     async def process_recommendation(self, rec: RecommendationMessage) -> None:
         """Process a single recommendation through the risk gate.
@@ -952,7 +1003,25 @@ class RiskServiceRunner:
         exit through the ledger with a deterministic id, guards each position so
         one failure never aborts the rest, and always publishes a critical alert.
         """
-        positions = self._authoritative_open_positions()
+        try:
+            positions = self._authoritative_open_positions()
+        except Exception:
+            # Never drop a kill/breaker on a transient DB error: the halt is
+            # already persisted (fail-closed), so alert critically for manual
+            # liquidation rather than letting process_kill raise into the DLQ.
+            self._logger.exception(
+                "Could not load positions for liquidation", event_type=event_type
+            )
+            await self._publish_alert(
+                event_type="liquidation_failed",
+                priority="critical",
+                message=(
+                    f"{event_type}: could not load positions to liquidate — "
+                    "MANUAL ACTION REQUIRED"
+                ),
+                context={"reason": reason, "triggered_by": triggered_by},
+            )
+            return
         liquidated = 0
         for pos in positions:
             try:
@@ -1222,6 +1291,7 @@ class RiskServiceRunner:
         await self.run_stop_loss_check()
         await self.run_passive_scan()
         await self._emit_drawdown_gauge()
+        await self._check_dlq_depths()
 
     async def maybe_run_periodic_checks(self, now: float) -> bool:
         """Run the periodic checks if the scan interval has elapsed.
@@ -1413,59 +1483,125 @@ class RiskServiceRunner:
                     asyncio.get_running_loop().time()
                 )
 
-                # Read recommendations
-                messages = await self._redis.read_group(
+                # A retryable state error on a durable sell must stay pending;
+                # any other error is a poison message → DLQ + ack + alert.
+                await self._consume_and_process(
                     RECOMMENDATIONS_STREAM,
-                    CONSUMER_GROUP,
-                    CONSUMER_NAME,
+                    RecommendationMessage.from_stream_dict,
+                    self.process_recommendation,
                     count=10,
                     block_ms=2000,
+                    retryable_exc=(RetryableRiskStateError,),
                 )
-                for msg in messages:
-                    try:
-                        rec = RecommendationMessage.from_stream_dict(msg.data)
-                        await self.process_recommendation(rec)
-                        await self._redis.ack(
-                            RECOMMENDATIONS_STREAM, CONSUMER_GROUP, msg.message_id
-                        )
-                    except Exception:
-                        self._logger.exception(
-                            "Error processing recommendation", message_id=msg.message_id
-                        )
-
-                # Read kill stream
-                kill_messages = await self._redis.read_group(
-                    KILL_STREAM, CONSUMER_GROUP, CONSUMER_NAME, count=1, block_ms=500
+                await self._consume_and_process(
+                    KILL_STREAM,
+                    KillMessage.from_stream_dict,
+                    self.process_kill,
+                    count=1,
+                    block_ms=500,
                 )
-                for msg in kill_messages:
-                    try:
-                        kill_msg = KillMessage.from_stream_dict(msg.data)
-                        await self.process_kill(kill_msg)
-                        await self._redis.ack(
-                            KILL_STREAM, CONSUMER_GROUP, msg.message_id
-                        )
-                    except Exception:
-                        self._logger.exception(
-                            "Error processing kill message", message_id=msg.message_id
-                        )
-
-                # Read fills to keep the in-memory portfolio current
-                fill_messages = await self._redis.read_group(
-                    FILLS_STREAM, CONSUMER_GROUP, CONSUMER_NAME, count=10, block_ms=500
+                await self._consume_and_process(
+                    FILLS_STREAM,
+                    FillMessage.from_stream_dict,
+                    self.process_fill,
+                    count=10,
+                    block_ms=500,
                 )
-                for msg in fill_messages:
-                    try:
-                        fill = FillMessage.from_stream_dict(msg.data)
-                        await self.process_fill(fill)
-                        await self._redis.ack(
-                            FILLS_STREAM, CONSUMER_GROUP, msg.message_id
-                        )
-                    except Exception:
-                        self._logger.exception(
-                            "Error processing fill message", message_id=msg.message_id
-                        )
         except (KeyboardInterrupt, Exception):
             self._logger.info("Risk management service interrupted")
+
+    async def _consume_and_process(
+        self,
+        stream: str,
+        parser: Any,
+        handler: Any,
+        *,
+        count: int,
+        block_ms: int,
+        retryable_exc: tuple[type[BaseException], ...] = (),
+    ) -> None:
+        """Read a batch and process each message with steady-state poison
+        discipline: ack on success, leave pending on a retryable error, and
+        DLQ + ack + alert on any other (poison) error — so a non-retryable
+        message is never silently parked in the PEL."""
+        messages = await self._redis.read_group(
+            stream, CONSUMER_GROUP, CONSUMER_NAME, count=count, block_ms=block_ms
+        )
+        for msg in messages:
+            try:
+                await handler(parser(msg.data))
+            except retryable_exc as exc:
+                self._logger.warning(
+                    "Retryable error; leaving message pending",
+                    stream=stream,
+                    message_id=msg.message_id,
+                    reason=str(exc),
+                )
+                continue
+            except Exception as exc:
+                await self._dead_letter(stream, msg, exc)
+                continue
+            # Ack is separate from the poison path: a transient ack failure after
+            # a successful handler must NOT dead-letter an already-processed
+            # message — redelivery + idempotency (execution_id dedup, ledger)
+            # handles the reprocess safely.
+            try:
+                await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
+            except Exception:
+                self._logger.exception(
+                    "Ack failed after processing; relying on redelivery + "
+                    "idempotency",
+                    stream=stream,
+                    message_id=msg.message_id,
+                )
+
+    async def _check_dlq_depths(self) -> None:
+        """Alert when any consumed stream's dead-letter queue has a backlog, so
+        parked poison messages are noticed rather than accumulating silently."""
+        from shared.redis_client import DEAD_LETTER_SUFFIX
+
+        for stream in (RECOMMENDATIONS_STREAM, KILL_STREAM, FILLS_STREAM):
+            dlq = stream + DEAD_LETTER_SUFFIX
+            try:
+                depth = await self._redis.stream_length(dlq)
+            except Exception:  # pragma: no cover - defensive (dlq may not exist)
+                continue
+            # Alert only on a new or growing backlog; reset once it clears so the
+            # next backlog re-alerts. Avoids re-alerting every scan on a static
+            # backlog.
+            if depth and depth > self._dlq_alerted_depth.get(dlq, 0):
+                await self._publish_alert(
+                    event_type="dlq_backlog",
+                    priority="high",
+                    message=f"Dead-letter backlog on {dlq}: {depth} message(s)",
+                    context={"stream": dlq, "depth": depth},
+                )
+                self._dlq_alerted_depth[dlq] = depth
+            elif not depth:
+                self._dlq_alerted_depth[dlq] = 0
+
+    async def _dead_letter(self, stream: str, msg: Any, exc: Exception) -> None:
+        """DLQ + ack + alert a poison message (matches setup()'s replay path)."""
+        self._logger.exception(
+            "Poison message; sending to DLQ",
+            stream=stream,
+            message_id=msg.message_id,
+        )
+        try:
+            await self._redis.send_to_dead_letter(stream, msg, str(exc))
+            await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
+        except Exception:
+            self._logger.exception(
+                "Failed to dead-letter poison message",
+                stream=stream,
+                message_id=msg.message_id,
+            )
+        await self._publish_alert(
+            event_type="poison_message",
+            priority="high",
+            message=f"Poison message on {stream} dead-lettered: {exc}",
+            context={"stream": stream, "message_id": str(msg.message_id)},
+        )
 
 
 if __name__ == "__main__":

@@ -238,3 +238,39 @@ class TestRunnerInit:
         """Runner should have a StalenessChecker configured from config."""
         runner = _make_runner()
         assert runner._staleness is not None
+
+
+class TestSignalConsumerLoop:
+    @pytest.mark.asyncio
+    async def test_poison_input_dead_lettered_and_acked(self):
+        from types import SimpleNamespace
+
+        redis = AsyncMock()
+        redis.read_group = AsyncMock(
+            side_effect=lambda stream, *a, **k: (
+                [SimpleNamespace(message_id="1-0", data={"bad": "x"})]
+                if stream == "stream:market_data"
+                else []
+            )
+        )
+        redis.ack = AsyncMock()
+        redis.send_to_dead_letter = AsyncMock()
+        runner = _make_runner(redis_client=redis)
+
+        await runner.consume_once()
+
+        redis.send_to_dead_letter.assert_awaited_once()
+        redis.ack.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_setup_creates_groups_and_drains_pending(self):
+        redis = AsyncMock()
+        redis.create_consumer_group = AsyncMock()
+        redis.drain_pending = AsyncMock(return_value=[])
+        runner = _make_runner(redis_client=redis)
+
+        await runner.setup()
+
+        # one group + one drain per input stream (3)
+        assert redis.create_consumer_group.await_count == 3
+        assert redis.drain_pending.await_count == 3

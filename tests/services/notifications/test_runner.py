@@ -122,6 +122,22 @@ class TestNotificationsServiceRunner:
         assert call_args[0][0] == "stream:alerts"
 
     @pytest.mark.asyncio
+    async def test_dlq_path_acks_after_send(
+        self, runner, mock_redis, mock_dispatcher
+    ):
+        """The failure path must ack after dead-lettering, or the original leaks
+        in the PEL and is re-drained + re-DLQ'd on every restart (3.4)."""
+        mock_dispatcher.dispatch.side_effect = RuntimeError("dispatch failed")
+        stream_msg = make_alert_stream_message(message_id="77-0")
+
+        await runner.process_message(stream_msg)
+
+        mock_redis.send_to_dead_letter.assert_called_once()
+        mock_redis.ack.assert_called_once_with(
+            "stream:alerts", "notifications_service", "77-0"
+        )
+
+    @pytest.mark.asyncio
     async def test_health_check_returns_ok(self, runner):
         """Health check should return a dict with status ok."""
         result = await runner.health_check()

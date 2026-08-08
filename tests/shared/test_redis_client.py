@@ -120,3 +120,12 @@ class TestPendingReplay:
 
         again = await fake_client.read_group("s", "g", "c1", block_ms=1)
         assert again == []
+
+
+@pytest.mark.asyncio
+async def test_stream_length_wraps_xlen():
+    mock_redis = AsyncMock()
+    mock_redis.xlen = AsyncMock(return_value=3)
+    client = RedisStreamClient(mock_redis)
+    assert await client.stream_length("stream:fills:dlq") == 3
+    mock_redis.xlen.assert_awaited_once_with("stream:fills:dlq")
