@@ -917,6 +917,75 @@ class TestAuditLogging:
         assert mock_logger.info.call_count >= 1
 
 
+class TestSteadyStatePoisonHandling:
+    """A non-retryable error in the steady-state loop must DLQ + ack + alert —
+    not silently leave the message parked in the PEL (review 3.3)."""
+
+    def _msg(self, mid="1-0"):
+        return SimpleNamespace(message_id=mid, data={"bad": "payload"})
+
+    @pytest.mark.asyncio
+    async def test_poison_message_is_dead_lettered_acked_and_alerted(
+        self, runner, mock_redis
+    ):
+        mock_redis.read_group = AsyncMock(return_value=[self._msg("7-0")])
+        mock_redis.send_to_dead_letter = AsyncMock()
+
+        async def boom(_):
+            raise ValueError("unparseable")
+
+        await runner._consume_and_process(
+            "stream:fills", lambda d: d, boom, count=1, block_ms=0
+        )
+
+        mock_redis.send_to_dead_letter.assert_awaited_once()
+        mock_redis.ack.assert_awaited_once()
+        alerts = [
+            c for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert len(alerts) >= 1
+
+    @pytest.mark.asyncio
+    async def test_retryable_error_leaves_message_pending(self, runner, mock_redis):
+        from services.risk_management.runner import RetryableRiskStateError
+
+        mock_redis.read_group = AsyncMock(return_value=[self._msg("8-0")])
+        mock_redis.send_to_dead_letter = AsyncMock()
+
+        async def retry(_):
+            raise RetryableRiskStateError("state not ready")
+
+        await runner._consume_and_process(
+            "stream:recommendations",
+            lambda d: d,
+            retry,
+            count=1,
+            block_ms=0,
+            retryable_exc=(RetryableRiskStateError,),
+        )
+
+        mock_redis.ack.assert_not_awaited()
+        mock_redis.send_to_dead_letter.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_successful_message_is_acked(self, runner, mock_redis):
+        mock_redis.read_group = AsyncMock(return_value=[self._msg("9-0")])
+        mock_redis.send_to_dead_letter = AsyncMock()
+        handled = []
+
+        async def ok(d):
+            handled.append(d)
+
+        await runner._consume_and_process(
+            "stream:fills", lambda d: d, ok, count=1, block_ms=0
+        )
+
+        assert handled == [{"bad": "payload"}]
+        mock_redis.ack.assert_awaited_once()
+        mock_redis.send_to_dead_letter.assert_not_awaited()
+
+
 class TestFillProcessing:
     """process_fill keeps the in-memory portfolio synced with executions."""
 

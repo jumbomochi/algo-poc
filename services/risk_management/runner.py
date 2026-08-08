@@ -1451,59 +1451,86 @@ class RiskServiceRunner:
                     asyncio.get_running_loop().time()
                 )
 
-                # Read recommendations
-                messages = await self._redis.read_group(
+                # A retryable state error on a durable sell must stay pending;
+                # any other error is a poison message → DLQ + ack + alert.
+                await self._consume_and_process(
                     RECOMMENDATIONS_STREAM,
-                    CONSUMER_GROUP,
-                    CONSUMER_NAME,
+                    RecommendationMessage.from_stream_dict,
+                    self.process_recommendation,
                     count=10,
                     block_ms=2000,
+                    retryable_exc=(RetryableRiskStateError,),
                 )
-                for msg in messages:
-                    try:
-                        rec = RecommendationMessage.from_stream_dict(msg.data)
-                        await self.process_recommendation(rec)
-                        await self._redis.ack(
-                            RECOMMENDATIONS_STREAM, CONSUMER_GROUP, msg.message_id
-                        )
-                    except Exception:
-                        self._logger.exception(
-                            "Error processing recommendation", message_id=msg.message_id
-                        )
-
-                # Read kill stream
-                kill_messages = await self._redis.read_group(
-                    KILL_STREAM, CONSUMER_GROUP, CONSUMER_NAME, count=1, block_ms=500
+                await self._consume_and_process(
+                    KILL_STREAM,
+                    KillMessage.from_stream_dict,
+                    self.process_kill,
+                    count=1,
+                    block_ms=500,
                 )
-                for msg in kill_messages:
-                    try:
-                        kill_msg = KillMessage.from_stream_dict(msg.data)
-                        await self.process_kill(kill_msg)
-                        await self._redis.ack(
-                            KILL_STREAM, CONSUMER_GROUP, msg.message_id
-                        )
-                    except Exception:
-                        self._logger.exception(
-                            "Error processing kill message", message_id=msg.message_id
-                        )
-
-                # Read fills to keep the in-memory portfolio current
-                fill_messages = await self._redis.read_group(
-                    FILLS_STREAM, CONSUMER_GROUP, CONSUMER_NAME, count=10, block_ms=500
+                await self._consume_and_process(
+                    FILLS_STREAM,
+                    FillMessage.from_stream_dict,
+                    self.process_fill,
+                    count=10,
+                    block_ms=500,
                 )
-                for msg in fill_messages:
-                    try:
-                        fill = FillMessage.from_stream_dict(msg.data)
-                        await self.process_fill(fill)
-                        await self._redis.ack(
-                            FILLS_STREAM, CONSUMER_GROUP, msg.message_id
-                        )
-                    except Exception:
-                        self._logger.exception(
-                            "Error processing fill message", message_id=msg.message_id
-                        )
         except (KeyboardInterrupt, Exception):
             self._logger.info("Risk management service interrupted")
+
+    async def _consume_and_process(
+        self,
+        stream: str,
+        parser: Any,
+        handler: Any,
+        *,
+        count: int,
+        block_ms: int,
+        retryable_exc: tuple[type[BaseException], ...] = (),
+    ) -> None:
+        """Read a batch and process each message with steady-state poison
+        discipline: ack on success, leave pending on a retryable error, and
+        DLQ + ack + alert on any other (poison) error — so a non-retryable
+        message is never silently parked in the PEL."""
+        messages = await self._redis.read_group(
+            stream, CONSUMER_GROUP, CONSUMER_NAME, count=count, block_ms=block_ms
+        )
+        for msg in messages:
+            try:
+                await handler(parser(msg.data))
+                await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
+            except retryable_exc as exc:
+                self._logger.warning(
+                    "Retryable error; leaving message pending",
+                    stream=stream,
+                    message_id=msg.message_id,
+                    reason=str(exc),
+                )
+            except Exception as exc:
+                await self._dead_letter(stream, msg, exc)
+
+    async def _dead_letter(self, stream: str, msg: Any, exc: Exception) -> None:
+        """DLQ + ack + alert a poison message (matches setup()'s replay path)."""
+        self._logger.exception(
+            "Poison message; sending to DLQ",
+            stream=stream,
+            message_id=msg.message_id,
+        )
+        try:
+            await self._redis.send_to_dead_letter(stream, msg, str(exc))
+            await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
+        except Exception:
+            self._logger.exception(
+                "Failed to dead-letter poison message",
+                stream=stream,
+                message_id=msg.message_id,
+            )
+        await self._publish_alert(
+            event_type="poison_message",
+            priority="high",
+            message=f"Poison message on {stream} dead-lettered: {exc}",
+            context={"stream": stream, "message_id": str(msg.message_id)},
+        )
 
 
 if __name__ == "__main__":

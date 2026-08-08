@@ -1365,6 +1365,36 @@ class TestOrderStatusGuards:
         ledger.session.rollback()
 
 
+class TestExecutionPoisonHandling:
+    """A poison message in the execution loop must DLQ + ack + alert (3.3)."""
+
+    @pytest.mark.asyncio
+    async def test_poison_message_dead_lettered_acked_alerted(
+        self, runner, mock_redis
+    ):
+        from types import SimpleNamespace
+
+        mock_redis.read_group = AsyncMock(
+            return_value=[SimpleNamespace(message_id="1-0", data={"x": "y"})]
+        )
+        mock_redis.send_to_dead_letter = AsyncMock()
+
+        async def boom(_):
+            raise ValueError("unparseable")
+
+        await runner._consume_and_process(
+            "stream:approved_orders", lambda d: d, boom, count=1, block_ms=0
+        )
+
+        mock_redis.send_to_dead_letter.assert_awaited_once()
+        mock_redis.ack.assert_awaited_once()
+        alerts = [
+            c for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert len(alerts) >= 1
+
+
 class TestGracefulShutdown:
     @pytest.mark.asyncio
     async def test_graceful_shutdown_cleans_up(
