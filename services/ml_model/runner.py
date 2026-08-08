@@ -13,6 +13,9 @@ from services.ml_model.regime import RegimeDetector
 from services.ml_model.registry import ModelRegistry
 
 RECOMMENDATIONS_STREAM = "stream:recommendations"
+SIGNALS_STREAM = "stream:signals"
+CONSUMER_GROUP = "ml_model"
+CONSUMER_NAME = "ml_worker_1"
 
 
 class MLServiceRunner:
@@ -39,6 +42,69 @@ class MLServiceRunner:
         self._registry = ModelRegistry(db_session, model_dir)
         self._regime = RegimeDetector()
         self._predictor: ModelPredictor | None = None
+        # Signals buffer per ticker until a full feature vector is assembled.
+        # Their message ids are held so they can be acked ONLY once the buffer
+        # is durably consumed (a recommendation published) — not on arrival.
+        self._signal_buffer: dict[str, list[SignalMessage]] = {}
+        self._buffered_message_ids: dict[str, list[str]] = {}
+
+    async def setup(self) -> None:
+        """Create the consumer group and replay delivered-but-unacked signals.
+
+        Without the replay, signals in flight (or buffered but not yet
+        aggregated) at a crash are lost — the normal ``">"`` read never
+        re-delivers them.
+        """
+        await self._redis.create_consumer_group(SIGNALS_STREAM, CONSUMER_GROUP)
+        pending = await self._redis.drain_pending(
+            SIGNALS_STREAM, CONSUMER_GROUP, CONSUMER_NAME
+        )
+        for msg in pending:
+            await self._handle_signal(msg)
+
+    async def consume_once(self, *, count: int = 10, block_ms: int = 2000) -> None:
+        """Read one batch of signals and process each."""
+        messages = await self._redis.read_group(
+            SIGNALS_STREAM, CONSUMER_GROUP, CONSUMER_NAME, count=count, block_ms=block_ms
+        )
+        for msg in messages:
+            await self._handle_signal(msg)
+
+    async def _handle_signal(self, msg: Any) -> None:
+        """Buffer a signal and, when it completes a feature vector, publish the
+        recommendation and ack the whole buffer. Incomplete signals are left
+        pending (un-acked) so a restart's drain rebuilds the buffer. Poison
+        messages are dead-lettered + acked."""
+        try:
+            signal = SignalMessage.from_stream_dict(msg.data)
+        except Exception as exc:
+            await self._dead_letter(msg, exc)
+            return
+
+        ticker = signal.ticker
+        self._signal_buffer.setdefault(ticker, []).append(signal)
+        self._buffered_message_ids.setdefault(ticker, []).append(msg.message_id)
+        try:
+            result = await self.process_signals(ticker, self._signal_buffer[ticker])
+        except Exception as exc:
+            # Roll this signal out of the buffer and dead-letter it.
+            self._signal_buffer[ticker].pop()
+            self._buffered_message_ids[ticker].pop()
+            await self._dead_letter(msg, exc)
+            return
+
+        if result is not None:
+            # The buffer was durably consumed (recommendation published) — only
+            # now is it safe to ack every message that contributed to it.
+            for mid in self._buffered_message_ids[ticker]:
+                await self._redis.ack(SIGNALS_STREAM, CONSUMER_GROUP, mid)
+            self._signal_buffer[ticker] = []
+            self._buffered_message_ids[ticker] = []
+        # else: incomplete — leave pending so a restart replays it.
+
+    async def _dead_letter(self, msg: Any, exc: Exception) -> None:
+        await self._redis.send_to_dead_letter(SIGNALS_STREAM, msg, str(exc))
+        await self._redis.ack(SIGNALS_STREAM, CONSUMER_GROUP, msg.message_id)
 
     def _ensure_predictor_loaded(self) -> ModelPredictor:
         """Lazily load the active model and create a predictor."""
@@ -122,7 +188,6 @@ if __name__ == "__main__":
         import redis.asyncio as aioredis
 
         from shared.redis_client import RedisStreamClient
-        from shared.schemas.messages import SignalMessage
 
         redis_conn = aioredis.from_url(config.redis.url)
         redis_client = RedisStreamClient(redis_conn)
@@ -130,34 +195,11 @@ if __name__ == "__main__":
             config=config, redis_client=redis_client, db_session=None
         )
 
-        STREAM = "stream:signals"
-        GROUP = "ml_model"
-        CONSUMER = "ml_worker_1"
-        await redis_client.create_consumer_group(STREAM, GROUP)
+        await runner.setup()  # create group + replay pending signals
 
         logger.info("ML model service started", mode=config.mode)
 
-        # Buffer signals per ticker
-        signal_buffer: dict[str, list[SignalMessage]] = {}
-
         while True:
-            messages = await redis_client.read_group(
-                STREAM, GROUP, CONSUMER, count=10, block_ms=2000
-            )
-            for msg in messages:
-                try:
-                    signal = SignalMessage.from_stream_dict(msg.data)
-                    signal_buffer.setdefault(signal.ticker, []).append(signal)
-
-                    # Try to process when we have enough signals
-                    result = await runner.process_signals(
-                        signal.ticker, signal_buffer[signal.ticker]
-                    )
-                    if result is not None:
-                        signal_buffer[signal.ticker] = []
-
-                    await redis_client.ack(STREAM, GROUP, msg.message_id)
-                except Exception:
-                    logger.exception("ml_processing_error")
+            await runner.consume_once(count=10, block_ms=2000)
 
     asyncio.run(main())

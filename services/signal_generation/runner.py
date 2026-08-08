@@ -30,6 +30,8 @@ from services.signal_generation.staleness import StalenessChecker
 logger = get_logger("signal_generation_runner")
 
 SIGNALS_STREAM = "stream:signals"
+CONSUMER_GROUP = "signal_generation"
+CONSUMER_NAME = "signal_worker_1"
 
 
 class SignalGenerationRunner:
@@ -75,6 +77,53 @@ class SignalGenerationRunner:
             NewsSentimentSignal(),
             InsiderActivitySignal(),
         ]
+
+    def _stream_handlers(self) -> dict[str, Any]:
+        return {
+            "stream:market_data": self.process_market_data,
+            "stream:fundamentals": self.process_fundamentals,
+            "stream:events": self.process_events,
+        }
+
+    async def setup(self) -> None:
+        """Create consumer groups and replay delivered-but-unacked inputs so a
+        restart does not silently drop signal-input messages in flight."""
+        for stream, handler in self._stream_handlers().items():
+            await self._redis.create_consumer_group(stream, CONSUMER_GROUP)
+            pending = await self._redis.drain_pending(
+                stream, CONSUMER_GROUP, CONSUMER_NAME
+            )
+            for msg in pending:
+                await self._handle(stream, handler, msg)
+
+    async def consume_once(self, *, count: int = 10, block_ms: int = 1000) -> None:
+        """Read one batch from each input stream and process it."""
+        for stream, handler in self._stream_handlers().items():
+            messages = await self._redis.read_group(
+                stream, CONSUMER_GROUP, CONSUMER_NAME, count=count, block_ms=block_ms
+            )
+            for msg in messages:
+                await self._handle(stream, handler, msg)
+
+    async def _handle(self, stream: str, handler: Any, msg: Any) -> None:
+        """Process one input, dead-lettering poison messages (DLQ + ack) instead
+        of leaving them parked in the PEL."""
+        try:
+            await handler(msg.data)
+            await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
+        except Exception as exc:
+            logger.exception(
+                "Poison signal-input message; sending to DLQ",
+                stream=stream,
+                message_id=msg.message_id,
+            )
+            try:
+                await self._redis.send_to_dead_letter(stream, msg, str(exc))
+                await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
+            except Exception:
+                logger.exception(
+                    "Failed to dead-letter poison message", stream=stream
+                )
 
     async def process_market_data(self, data: dict[str, Any]) -> list[SignalMessage]:
         """Run all technical signals on market data and publish results.
@@ -247,29 +296,11 @@ if __name__ == "__main__":
             config=config, redis_client=redis_client, db_session=None
         )
 
+        await runner.setup()  # create groups + replay pending inputs
+
         logger.info("Signal generation service started", mode=config.mode)
 
-        STREAMS = {
-            "stream:market_data": runner.process_market_data,
-            "stream:fundamentals": runner.process_fundamentals,
-            "stream:events": runner.process_events,
-        }
-        GROUP = "signal_generation"
-        CONSUMER = "signal_worker_1"
-
-        for stream in STREAMS:
-            await redis_client.create_consumer_group(stream, GROUP)
-
         while True:
-            for stream, handler in STREAMS.items():
-                messages = await redis_client.read_group(
-                    stream, GROUP, CONSUMER, count=10, block_ms=1000
-                )
-                for msg in messages:
-                    try:
-                        await handler(msg.data)
-                        await redis_client.ack(stream, GROUP, msg.message_id)
-                    except Exception:
-                        logger.exception("signal_processing_error", stream=stream)
+            await runner.consume_once(count=10, block_ms=1000)
 
     asyncio.run(main())
