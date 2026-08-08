@@ -978,6 +978,61 @@ class TestFillProcessing:
         assert pos["quantity"] == 20
         assert pos["avg_entry_price"] == pytest.approx(110.0)
 
+    def _fill_with(self, **kw):
+        from shared.schemas.messages import FillMessage
+
+        base = dict(
+            ticker="AAPL",
+            timestamp=datetime.now(timezone.utc),
+            side="buy",
+            quantity=10.0,
+            fill_price=100.0,
+            commission=0.5,
+            recommendation_id=str(uuid.uuid4()),
+            order_id="order-1",
+        )
+        base.update(kw)
+        return FillMessage(**base)
+
+    @pytest.mark.asyncio
+    async def test_replayed_fill_does_not_move_book(self, runner):
+        """At-least-once delivery: the same execution replayed must not
+        double-count NAV/cash/positions (review 3.1)."""
+        runner._cash = 10_000.0
+        fill = self._fill_with(execution_id="exec-1", quantity=10, price=100)
+
+        await runner.process_fill(fill)
+        cash_after_first = runner._cash
+        qty_after_first = runner._portfolio.positions["AAPL"]["quantity"]
+
+        await runner.process_fill(fill)  # replay
+
+        assert runner._cash == cash_after_first
+        assert runner._portfolio.positions["AAPL"]["quantity"] == qty_after_first
+
+    @pytest.mark.asyncio
+    async def test_fill_without_execution_id_still_processes(self, runner):
+        runner._cash = 10_000.0
+        await runner.process_fill(self._fill_with(execution_id=None, quantity=5))
+        assert runner._portfolio.positions["AAPL"]["quantity"] == 5
+
+    @pytest.mark.asyncio
+    async def test_process_fill_uses_commission_trading_usd(self, runner):
+        """Cash is USD; a native (e.g. SGD) commission must be applied via the
+        USD-converted commission_trading, not the raw fill.commission (3.2)."""
+        runner._cash = 10_000.0
+        fill = self._fill_with(
+            execution_id="exec-2",
+            quantity=10,
+            price=100,
+            commission=13.5,  # native (e.g. SGD)
+            commission_trading=10.0,  # USD-converted
+            commission_currency="SGD",
+        )
+        await runner.process_fill(fill)
+        # 10_000 - 1_000 notional - 10.0 USD commission (NOT 13.5)
+        assert runner._cash == pytest.approx(10_000 - 1_000 - 10.0)
+
 
 class TestSleeveBridgeRecommendations:
     """Sleeve recommendations (run_paper --publish) carry price + sizing."""

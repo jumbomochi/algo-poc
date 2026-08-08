@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 import uuid
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -196,6 +197,13 @@ class RiskServiceRunner:
         )
         self._last_periodic_scan_at: float | None = None
 
+        # Dedup fills by execution_id so a redelivered fill never double-counts
+        # the in-memory book. Bounded (FIFO eviction) so it can't grow without
+        # limit over a long-running process; the DB projector is the durable
+        # dedup, this only needs to cover the redelivery window.
+        self._processed_execution_ids: set[str] = set()
+        self._processed_execution_order: deque[str] = deque(maxlen=10_000)
+
     async def setup(self) -> None:
         """Create consumer groups and replay pending messages.
 
@@ -253,8 +261,30 @@ class RiskServiceRunner:
         Keeps positions, cash, nav, and peak_nav current between DB reloads
         so risk checks act on what the account actually holds.
         """
+        # At-least-once delivery: the same execution can be redelivered (crash
+        # replay via drain_pending, or a steady-state retry). The DB projector
+        # dedups durably by execution_id; the in-memory book must too, or a
+        # replay double-counts NAV/cash/positions.
+        if fill.execution_id is not None:
+            if fill.execution_id in self._processed_execution_ids:
+                self._logger.info(
+                    "Ignoring already-processed fill (replay)",
+                    execution_id=fill.execution_id,
+                    ticker=fill.ticker,
+                )
+                return
+            self._remember_execution_id(fill.execution_id)
+
         positions = self._portfolio.positions
         self._current_prices[fill.ticker] = fill.fill_price
+
+        # Cash is denominated in the trading currency (USD). Use the USD-converted
+        # commission, not the raw (possibly native, e.g. SGD) fill.commission.
+        commission_usd = (
+            fill.commission_trading
+            if fill.commission_trading is not None
+            else fill.commission
+        )
 
         if fill.side == "buy":
             pos = positions.get(fill.ticker)
@@ -275,7 +305,7 @@ class RiskServiceRunner:
                     ) / total
                 pos["quantity"] = total
                 pos["current_price"] = fill.fill_price
-            self._cash -= fill.fill_price * fill.quantity + fill.commission
+            self._cash -= fill.fill_price * fill.quantity + commission_usd
         else:
             pos = positions.get(fill.ticker)
             if pos is not None:
@@ -283,7 +313,7 @@ class RiskServiceRunner:
                 pos["current_price"] = fill.fill_price
                 if pos["quantity"] <= 0:
                     del positions[fill.ticker]
-            self._cash += fill.fill_price * fill.quantity - fill.commission
+            self._cash += fill.fill_price * fill.quantity - commission_usd
 
         market_value = sum(
             p["quantity"] * self._current_prices.get(t, p["current_price"])
@@ -300,6 +330,14 @@ class RiskServiceRunner:
             nav=self._portfolio.nav,
             open_positions=len(positions),
         )
+
+    def _remember_execution_id(self, execution_id: str) -> None:
+        """Record a processed execution_id, evicting the oldest past the cap."""
+        if len(self._processed_execution_order) == self._processed_execution_order.maxlen:
+            oldest = self._processed_execution_order[0]
+            self._processed_execution_ids.discard(oldest)
+        self._processed_execution_order.append(execution_id)
+        self._processed_execution_ids.add(execution_id)
 
     async def process_recommendation(self, rec: RecommendationMessage) -> None:
         """Process a single recommendation through the risk gate.
