@@ -5,6 +5,7 @@ from typing import Any
 
 from services.notifications.dispatcher import NotificationDispatcher
 from shared.config import AppConfig
+from shared.heartbeat import write_heartbeat
 from shared.logging import get_logger
 from shared.redis_client import RedisStreamClient, StreamMessage
 from shared.schemas.messages import AlertMessage
@@ -125,6 +126,8 @@ class NotificationsServiceRunner:
 
                 for msg in messages:
                     await self.process_message(msg)
+                # T6: heartbeat for the container healthcheck — see docker-compose.yml.
+                write_heartbeat()
         except (KeyboardInterrupt, Exception):
             self._logger.info("Notifications service interrupted")
         finally:
@@ -149,7 +152,12 @@ if __name__ == "__main__":
             TelegramChannel,
         )
         from services.notifications.dispatcher import NotificationDispatcher
+        from shared.heartbeat import register_heartbeat_collector
+        from shared.observability import setup_metrics
         from shared.redis_client import RedisStreamClient
+
+        setup_metrics("notifications", port=config.observability.prometheus_port)
+        register_heartbeat_collector()
 
         redis_conn = aioredis.from_url(config.redis.url)
         redis_client = RedisStreamClient(redis_conn)

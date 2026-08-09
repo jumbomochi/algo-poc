@@ -8,6 +8,49 @@ import redis.asyncio as aioredis
 
 DEAD_LETTER_SUFFIX = ":dlq"
 
+# T6 (observability & unattended healthchecks): an unbounded stream is how a
+# quiet Redis eventually OOMs and takes the whole message bus down silently
+# (review Theme 6.3) — every publish() call caps its stream with
+# `XADD ... MAXLEN ~ <n>` so already-consumed history gets trimmed instead of
+# growing forever. `~` (approximate=True) lets Redis trim lazily in whole
+# macro-nodes rather than exactly-per-entry, which is materially cheaper and
+# is the documented/recommended mode for this.
+#
+# SIZING ARITHMETIC (reconciled against docker-compose.yml's redis
+# `--maxmemory 512mb` — see tests/deploy/test_observability_healthchecks.py
+# for the cross-file check that keeps these two numbers from drifting apart):
+#   - 1 KiB assumed worst-case average entry size. The largest schema is
+#     FillMessage (~16 fields, shared/schemas/messages.py) at maybe 400-600
+#     bytes serialized as stream field/value strings; 1 KiB is a deliberately
+#     generous round number covering that plus Redis's own per-entry stream
+#     overhead (listpack node headers, the entry ID).
+#   - 9 primary (non-DLQ) streams get capped: market_data, fundamentals,
+#     events, signals, recommendations, approved_orders, fills, alerts, kill.
+#   - Worst case, ALL 9 simultaneously at cap: 9 * 25_000 * 1 KiB ≈ 220 MiB —
+#     about 43% of the 512 MiB ceiling, leaving ~290 MiB of headroom for
+#     Redis's own process overhead, consumer-group PEL, and the (deliberately
+#     uncapped, see below) DLQ streams. RedisMemoryHigh in
+#     config/alert_rules.yml fires at 80% of maxmemory (410 MiB) — well
+#     above this provable cap-worst-case, so under normal operation it only
+#     fires from genuinely abnormal growth, and still comfortably before the
+#     `noeviction` rejection point at 100%.
+#   - 25_000 per stream also covers ~1.9 days of market_data's own full-rate
+#     volume (~500 tickers x ~26 polls/day at the default 15-min interval)
+#     before the oldest ticks get trimmed — a reasonable "consumer down over
+#     a weekend" buffer; unlike orders/fills/kill, lost market_data ticks
+#     are re-fetchable from source on the next ingestion cycle, so this is
+#     an acceptable trade-off, not silent data loss of anything money-critical.
+#
+# NOTE: this intentionally does not touch send_to_dead_letter()'s XADD below
+# (DLQ region owned by T4 in a parallel thread) — DLQ volume should stay low
+# by construction (only failures land there), so it's lower priority to
+# bound and left for T4 to cap the same way if/when useful. It also means
+# DLQ growth is NOT included in the 220 MiB worst-case above — the ~290 MiB
+# headroom is what absorbs that until T4 adds capping there, and
+# DeadLetterQueueBacklog (config/alert_rules.yml) pages well before DLQ
+# growth could meaningfully eat into it.
+DEFAULT_STREAM_MAXLEN = 25_000
+
 
 @dataclass
 class StreamMessage:
@@ -17,8 +60,14 @@ class StreamMessage:
 
 
 class RedisStreamClient:
-    def __init__(self, redis: aioredis.Redis):
+    def __init__(
+        self,
+        redis: aioredis.Redis,
+        *,
+        stream_maxlen: int | None = DEFAULT_STREAM_MAXLEN,
+    ):
         self._redis = redis
+        self._stream_maxlen = stream_maxlen
 
     async def publish(
         self,
@@ -28,6 +77,10 @@ class RedisStreamClient:
     ) -> str:
         if idempotency_key:
             data = {**data, "_idempotency_key": idempotency_key}
+        if self._stream_maxlen is not None:
+            return await self._redis.xadd(
+                stream, data, maxlen=self._stream_maxlen, approximate=True
+            )
         return await self._redis.xadd(stream, data)
 
     async def create_consumer_group(

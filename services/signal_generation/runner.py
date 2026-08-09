@@ -298,7 +298,12 @@ if __name__ == "__main__":
     async def main() -> None:
         import redis.asyncio as aioredis
 
+        from shared.heartbeat import register_heartbeat_collector, write_heartbeat
+        from shared.observability import setup_metrics
         from shared.redis_client import RedisStreamClient
+
+        setup_metrics("signal-generation", port=config.observability.prometheus_port)
+        register_heartbeat_collector()
 
         redis_conn = aioredis.from_url(config.redis.url)
         redis_client = RedisStreamClient(redis_conn)
@@ -312,5 +317,7 @@ if __name__ == "__main__":
 
         while True:
             await runner.consume_once(count=10, block_ms=1000)
+            # T6: heartbeat for the container healthcheck — see docker-compose.yml.
+            write_heartbeat()
 
     asyncio.run(main())

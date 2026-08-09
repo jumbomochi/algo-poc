@@ -35,8 +35,14 @@ def create_app(
         owned_conn = None
         if app.state.redis is None or app.state.db_sessionmaker is None:
             from shared.config import load_config
+            from shared.observability import setup_metrics
 
             config = load_config("config/default.yaml")
+            # T6: wire the /metrics endpoint (see shared/observability.py).
+            # Skipped whenever a test injects a redis_client double (this
+            # branch never runs then), so it only binds a real port for a
+            # real container start.
+            setup_metrics("api", port=config.observability.prometheus_port)
             if app.state.redis is None:
                 import redis.asyncio as aioredis
 
@@ -75,6 +81,18 @@ def create_app(
     app.include_router(kill.router)
     app.include_router(ml.router)
     app.include_router(backtest.router)
+
+    # T6: unauthenticated liveness probe for the container healthcheck (see
+    # docker-compose.yml). Deliberately does not touch app.state.redis or any
+    # other dependency — this answers "is the process/event loop responsive",
+    # not "are our dependencies up"; conflating the two would make a Redis
+    # outage look identical to a wedged API process and trigger the wrong
+    # response. No auth by design (a healthcheck can't be handed an API key
+    # without putting it in the compose file in cleartext) and it returns no
+    # information beyond "the server answered".
+    @app.get("/healthz")
+    def healthz() -> dict:
+        return {"status": "ok"}
 
     # Auth-check smoke endpoint.
     @app.get("/api/v1/auth-check")

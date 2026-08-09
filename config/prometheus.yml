@@ -2,6 +2,14 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# T6: alert rules live in alert_rules.yml (mounted alongside this file in
+# docker-compose.observability.yml). Evaluated and visible at
+# http://localhost:9091/alerts even without Alertmanager configured — wiring
+# actual paging/notification routing is a separate follow-up beyond this
+# thread's checklist ("Alert rules"), not done here.
+rule_files:
+  - "alert_rules.yml"
+
 scrape_configs:
   - job_name: "data-ingestion"
     static_configs:
@@ -30,3 +38,19 @@ scrape_configs:
   - job_name: "notifications"
     static_configs:
       - targets: ["notifications:9090"]
+
+  # T6: was missing entirely — portfolio-accounting projects stream:fills
+  # into the durable ledger; without this job its metrics endpoint (wired in
+  # services/portfolio_accounting/runner.py) was never scraped.
+  - job_name: "portfolio-accounting"
+    static_configs:
+      - targets: ["portfolio-accounting:9090"]
+
+  # T6: redis_exporter sidecar (docker-compose.observability.yml) — gives us
+  # redis_memory_used_bytes/redis_memory_max_bytes (the "redis-memory" alert)
+  # and, via --check-streams-pattern, per-stream redis_stream_length /
+  # redis_stream_entries_added (the "dlq-depth" and "stream-idle" alerts)
+  # with zero app-side polling code.
+  - job_name: "redis-exporter"
+    static_configs:
+      - targets: ["redis-exporter:9121"]

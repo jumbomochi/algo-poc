@@ -1,0 +1,128 @@
+{
+  "uid": "algo-poc-overview",
+  "title": "algo-poc — money-critical overview",
+  "description": "T6 first-draft dashboard: orders, fills, kill events, risk breaches, DLQ depth, Redis memory, and per-service heartbeat age. Panels are intentionally simple (rate/increase over a window) — refine thresholds/visuals once this has run against real data.",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "timezone": "browser",
+  "time": { "from": "now-24h", "to": "now" },
+  "refresh": "30s",
+  "tags": ["algo-poc", "t6"],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Orders approved / rejected (per 5m)",
+      "description": "algo_order_lifecycle_transitions_total by status. RISK_REJECTED here is entry-time rejections only — see the separate Risk breaches panel for breaches on already-held positions.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (status) (increase(algo_order_lifecycle_transitions_total[5m]))",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Fills (stream:fills entries added, per 5m)",
+      "description": "redis_stream_entries_added via redis_exporter --check-streams-pattern.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "increase(redis_stream_entries_added{key=\"stream:fills\"}[5m])",
+          "legendFormat": "fills"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Kill events (stream:kill entries added, per 5m)",
+      "description": "Should be flat at 0 almost always — any nonzero value is notable. Mirrors the KillStreamActivity alert.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "increase(redis_stream_entries_added{key=\"stream:kill\"}[5m])",
+          "legendFormat": "kill events"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Risk breaches — passive scan (per 15m, by type)",
+      "description": "algo_risk_breach_total, incremented in RiskServiceRunner.run_passive_scan() for stop-loss/ceiling/margin breaches on held positions. Empty until T2 wires run_passive_scan() into run() on main.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (breach_type) (increase(algo_risk_breach_total[15m]))",
+          "legendFormat": "{{breach_type}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Dead-letter queue depth, by stream",
+      "description": "redis_stream_length for every *:dlq stream. Alert threshold (DeadLetterQueueBacklog) fires at 10.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "redis_stream_length{key=~\".*:dlq\"}",
+          "legendFormat": "{{key}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Redis memory usage vs maxmemory",
+      "description": "redis_memory_used_bytes / redis_memory_max_bytes. RedisMemoryHigh alerts at 0.8; noeviction rejects writes at 1.0.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "min": 0 } },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "redis_memory_used_bytes / redis_memory_max_bytes",
+          "legendFormat": "used / maxmemory"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Heartbeat age, by service",
+      "description": "algo_heartbeat_age_seconds, recomputed fresh on every scrape (independent of a wedged main loop — see shared/heartbeat.py). A climbing line for one job means that service's loop stopped iterating; compare against the HeartbeatStale / HeartbeatStaleDataIngestion alert thresholds (120s / 2700s).",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "algo_heartbeat_age_seconds",
+          "legendFormat": "{{job}}"
+        }
+      ]
+    }
+  ]
+}
