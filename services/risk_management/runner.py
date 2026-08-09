@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import math
 import uuid
+from collections import deque
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import func, or_, select
@@ -17,9 +20,15 @@ from services.risk_management.funding import (
 from services.risk_management.kill_switch import KillSwitch
 from services.risk_management.passive_monitor import PassiveBreachMonitor
 from shared.config import AppConfig
+from shared.halt_state import HaltStateRepository
+from shared.liquidation import liquidation_exit_id, load_liquidation_targets
 from shared.logging import get_logger
 from shared.models import CapitalSnapshot, OrderIntent, OrderStatus, Position
-from shared.order_ledger import OrderIntentNotFound, OrderLedger
+from shared.order_ledger import (
+    ConflictingOrderIntent,
+    OrderIntentNotFound,
+    OrderLedger,
+)
 from shared.universe import lookup_sector
 from shared.observability import DEFAULT_TRADING_METRICS
 from shared.schemas.messages import (
@@ -89,7 +98,15 @@ class RiskServiceRunner:
             drawdown_pause_pct=risk_cfg.drawdown_pause_pct,
             drawdown_circuit_breaker_pct=risk_cfg.drawdown_circuit_breaker_pct,
         )
-        self._kill_switch = KillSwitch(logger=self._logger)
+        # Durable kill switch: persist halts so a restart stays halted
+        # (fail-closed) instead of silently resuming trading (review 1.1).
+        halt_store = (
+            HaltStateRepository(db_session) if db_session is not None else None
+        )
+        self._kill_switch = KillSwitch(
+            logger=self._logger, halt_store=halt_store, mode=config.mode
+        )
+        self._kill_switch.reload_from_store()
         self._passive_monitor = PassiveBreachMonitor(config=risk_cfg)
         self._correlation_monitor = CorrelationMonitor()
 
@@ -137,6 +154,12 @@ class RiskServiceRunner:
                     market_value / risk_nav * 100.0 if risk_nav > 0 else 0.0
                 ),
                 margin_utilization_pct=0.0,
+                # Drawdown is judged on the real marked book (cash + MTM), not
+                # the capped deployment budget in nav. load_portfolio_state
+                # already computes both from PortfolioConfig.cash + positions
+                # and the EquitySnapshot high-water mark.
+                book_equity=state["nav"],
+                book_peak_equity=state["peak_nav"],
             )
             self._logger.info(
                 "Portfolio state loaded from DB",
@@ -165,6 +188,26 @@ class RiskServiceRunner:
             for account_id, mode in pairs:
                 self._refresh_lifecycle_metrics(account_id, mode)
             self._order_ledger.session.rollback()
+
+        # Periodic risk driver: reuse the passive-scan cadence to run the
+        # intraday stop-loss, hard-ceiling auto-trim, and drawdown gauge. Track
+        # the last run on a monotonic clock so the interval survives wall-clock
+        # jumps. ``None`` means "run on the first loop iteration".
+        self._passive_scan_interval_seconds = max(
+            1, int(risk_cfg.passive_scan_interval_minutes) * 60
+        )
+        self._last_periodic_scan_at: float | None = None
+
+        # Dedup fills by execution_id so a redelivered fill never double-counts
+        # the in-memory book. Bounded (FIFO eviction) so it can't grow without
+        # limit over a long-running process; the DB projector is the durable
+        # dedup, this only needs to cover the redelivery window.
+        self._processed_execution_ids: set[str] = set()
+        self._processed_execution_order: deque[str] = deque(maxlen=10_000)
+
+        # Last-alerted depth per dlq, so a persistent backlog doesn't re-alert
+        # every scan — only a fresh backlog or a growing one does.
+        self._dlq_alerted_depth: dict[str, int] = {}
 
     async def setup(self) -> None:
         """Create consumer groups and replay pending messages.
@@ -223,8 +266,39 @@ class RiskServiceRunner:
         Keeps positions, cash, nav, and peak_nav current between DB reloads
         so risk checks act on what the account actually holds.
         """
+        # At-least-once delivery: the same execution can be redelivered (crash
+        # replay via drain_pending, or a steady-state retry). The DB projector
+        # dedups durably by execution_id; the in-memory book must too, or a
+        # replay double-counts NAV/cash/positions.
+        if fill.execution_id is not None:
+            if fill.execution_id in self._processed_execution_ids:
+                self._logger.info(
+                    "Ignoring already-processed fill (replay)",
+                    execution_id=fill.execution_id,
+                    ticker=fill.ticker,
+                )
+                return
+            self._remember_execution_id(fill.execution_id)
+
         positions = self._portfolio.positions
         self._current_prices[fill.ticker] = fill.fill_price
+
+        # Cash is denominated in the trading currency (USD). Use the USD-converted
+        # commission; only fall back to the raw amount when it is already USD.
+        # A native (e.g. SGD) commission with no conversion is excluded rather
+        # than subtracted as if it were USD (the projector rejects that case).
+        if fill.commission_trading is not None:
+            commission_usd = fill.commission_trading
+        elif fill.commission_currency in (None, "USD"):
+            commission_usd = fill.commission
+        else:
+            commission_usd = 0.0
+            self._logger.warning(
+                "Non-USD commission without USD conversion; excluded from the "
+                "in-memory book",
+                ticker=fill.ticker,
+                currency=fill.commission_currency,
+            )
 
         if fill.side == "buy":
             pos = positions.get(fill.ticker)
@@ -245,7 +319,7 @@ class RiskServiceRunner:
                     ) / total
                 pos["quantity"] = total
                 pos["current_price"] = fill.fill_price
-            self._cash -= fill.fill_price * fill.quantity + fill.commission
+            self._cash -= fill.fill_price * fill.quantity + commission_usd
         else:
             pos = positions.get(fill.ticker)
             if pos is not None:
@@ -253,7 +327,7 @@ class RiskServiceRunner:
                 pos["current_price"] = fill.fill_price
                 if pos["quantity"] <= 0:
                     del positions[fill.ticker]
-            self._cash += fill.fill_price * fill.quantity - fill.commission
+            self._cash += fill.fill_price * fill.quantity - commission_usd
 
         market_value = sum(
             p["quantity"] * self._current_prices.get(t, p["current_price"])
@@ -270,6 +344,14 @@ class RiskServiceRunner:
             nav=self._portfolio.nav,
             open_positions=len(positions),
         )
+
+    def _remember_execution_id(self, execution_id: str) -> None:
+        """Record a processed execution_id, evicting the oldest past the cap."""
+        if len(self._processed_execution_order) == self._processed_execution_order.maxlen:
+            oldest = self._processed_execution_order[0]
+            self._processed_execution_ids.discard(oldest)
+        self._processed_execution_order.append(execution_id)
+        self._processed_execution_ids.add(execution_id)
 
     async def process_recommendation(self, rec: RecommendationMessage) -> None:
         """Process a single recommendation through the risk gate.
@@ -700,6 +782,9 @@ class RiskServiceRunner:
                     position["quantity"] * position["current_price"] / nav * 100.0
                 )
         self._cash = nav - market_value
+        # Drawdown is judged on real marked book equity, not the capped
+        # deployment budget (nav). Position sizing still uses nav below.
+        book_equity, book_peak_equity = self._book_equity_from_db(session)
         self._portfolio = PortfolioState(
             nav=nav,
             peak_nav=max(nav, peak_nav),
@@ -707,12 +792,31 @@ class RiskServiceRunner:
             sector_exposure=sector_exposure,
             total_exposure_pct=(market_value / nav * 100.0 if nav > 0 else 0.0),
             margin_utilization_pct=0.0,
+            book_equity=book_equity,
+            book_peak_equity=book_peak_equity,
         )
         self._current_prices = {
             ticker: position["current_price"] for ticker, position in positions.items()
         }
         session.rollback()
         return None
+
+    def _book_equity_from_db(self, session: Any) -> tuple[float | None, float | None]:
+        """Return (book_equity, book_peak_equity) from the DB, or (None, None).
+
+        Book equity is real cash across sleeves plus mark-to-market positions;
+        the peak is the highest daily aggregate equity ever snapshotted. This is
+        the denominator the drawdown check needs — unlike ``deployable_capital``,
+        it actually falls when the book loses money.
+        """
+        from shared.position_loader import load_portfolio_state
+
+        try:
+            state = load_portfolio_state(session)
+        except Exception:  # pragma: no cover - defensive; never block the gate
+            self._logger.exception("Book-equity load failed; drawdown falls back to nav")
+            return None, None
+        return state["nav"], state["peak_nav"]
 
     def _active_reservations(self, rec: RecommendationMessage) -> float:
         if self._order_ledger is None or not rec.portfolio:
@@ -853,10 +957,23 @@ class RiskServiceRunner:
         Args:
             kill_msg: The kill message with reason and trigger info.
         """
+        # Latch: if already halted, this kill (or the breaker) is a distinct
+        # event for an incident whose positions may still be flattening. Re-affirm
+        # the halt but do NOT re-liquidate — a second liquidation with a different
+        # epoch would mint fresh exit ids and could oversell / flip short.
+        was_active = self._kill_switch.is_active
         self._kill_switch.activate(
             reason=kill_msg.reason,
             triggered_by=kill_msg.triggered_by,
+            source="kill",
         )
+        if was_active:
+            self._logger.warning(
+                "Kill received while already halted — re-affirmed, not re-liquidating",
+                reason=kill_msg.reason,
+                triggered_by=kill_msg.triggered_by,
+            )
+            return
 
         self._logger.critical(
             "Kill switch activated — liquidating all positions",
@@ -864,40 +981,181 @@ class RiskServiceRunner:
             triggered_by=kill_msg.triggered_by,
         )
 
-        # Emit market sell orders for all open positions
-        for ticker, pos_data in self._portfolio.positions.items():
-            quantity = pos_data.get("quantity", 0) if isinstance(pos_data, dict) else 0
-            if quantity <= 0:
-                continue
-
-            order = ApprovedOrderMessage(
-                ticker=ticker,
-                timestamp=datetime.now(timezone.utc),
-                action="sell",
-                quantity=quantity,
-                order_type="market",
-                limit_price=None,
-                recommendation_id=f"kill-{uuid.uuid4()}",
-                risk_adjustments={"kill_switch": True, "reason": kill_msg.reason},
-            )
-
-            await self._redis.publish(
-                APPROVED_ORDERS_STREAM,
-                order.to_stream_dict(),
-            )
-
-            self._logger.info(
-                "Kill liquidation order published",
-                ticker=ticker,
-                quantity=quantity,
-            )
-
-        await self._publish_alert(
+        # Deterministic per-kill epoch: both risk and execution receive the same
+        # KillMessage, so exits for one kill converge on the same ledger ids
+        # (replay is idempotent) while a later kill re-liquidates.
+        epoch = int(kill_msg.timestamp.timestamp())
+        await self._liquidate_all(
+            epoch=epoch,
+            reason=kill_msg.reason,
+            triggered_by=kill_msg.triggered_by,
             event_type="kill_switch_activated",
-            priority="critical",
-            message=f"Kill switch activated by {kill_msg.triggered_by}: {kill_msg.reason}",
-            context={"triggered_by": kill_msg.triggered_by},
         )
+
+    async def _liquidate_all(
+        self,
+        *,
+        epoch: int,
+        reason: str,
+        triggered_by: str,
+        event_type: str,
+    ) -> None:
+        """Flatten the whole book. Reloads authoritative positions, routes each
+        exit through the ledger with a deterministic id, guards each position so
+        one failure never aborts the rest, and always publishes a critical alert.
+        """
+        try:
+            positions = self._authoritative_open_positions()
+        except Exception:
+            # Never drop a kill/breaker on a transient DB error: the halt is
+            # already persisted (fail-closed), so alert critically for manual
+            # liquidation rather than letting process_kill raise into the DLQ.
+            self._logger.exception(
+                "Could not load positions for liquidation", event_type=event_type
+            )
+            await self._publish_alert(
+                event_type="liquidation_failed",
+                priority="critical",
+                message=(
+                    f"{event_type}: could not load positions to liquidate — "
+                    "MANUAL ACTION REQUIRED"
+                ),
+                context={"reason": reason, "triggered_by": triggered_by},
+            )
+            return
+        liquidated = 0
+        for pos in positions:
+            try:
+                if await self._emit_liquidation_exit(pos, epoch=epoch, reason=reason):
+                    liquidated += 1
+            except Exception:
+                self._logger.exception(
+                    "Liquidation emit failed for a position; continuing",
+                    ticker=pos.get("ticker"),
+                )
+
+        # Always alert, even on zero positions or partial failure — the operator
+        # must always learn a kill/breaker fired.
+        await self._publish_alert(
+            event_type=event_type,
+            priority="critical",
+            message=f"{event_type} by {triggered_by}: {reason}",
+            context={
+                "triggered_by": triggered_by,
+                "reason": reason,
+                "positions_seen": len(positions),
+                "positions_liquidated": liquidated,
+            },
+        )
+
+    def _authoritative_open_positions(self) -> list[dict[str, Any]]:
+        """Reload open positions from the DB (broker truth), aggregated by
+        ticker, so liquidation acts on real holdings — not a stale or empty
+        in-memory book (review 1.4). Falls back to the in-memory book when no DB
+        session is wired (unit paths)."""
+        if self._order_ledger is None:
+            return [
+                {
+                    "ticker": ticker,
+                    "quantity": (
+                        pos.get("quantity", 0) if isinstance(pos, dict) else 0
+                    ),
+                    "con_id": None,
+                    "account_id": None,
+                    "exchange": None,
+                    "currency": None,
+                    "portfolio": None,
+                }
+                for ticker, pos in self._portfolio.positions.items()
+            ]
+
+        targets = load_liquidation_targets(self._order_ledger.session)
+        self._order_ledger.session.rollback()
+        return targets
+
+    def _liquidation_exit_id(self, ticker: str, epoch: int) -> str:
+        return liquidation_exit_id(self._config.mode, ticker, epoch)
+
+    async def _emit_liquidation_exit(
+        self, pos: dict[str, Any], *, epoch: int, reason: str
+    ) -> bool:
+        """Create the deterministic exit intent (idempotent) and publish it.
+
+        Returns True when an exit was published. The ledger intent is what lets
+        execution actually place the sell (a synthetic id with no intent is
+        rejected), and the deterministic id makes a replay a no-op.
+        """
+        quantity = pos["quantity"]
+        if quantity is None or quantity <= 0:
+            return False
+        exit_id = self._liquidation_exit_id(pos["ticker"], epoch)
+
+        # With a ledger, a missing con_id means we cannot create the backing
+        # intent, so execution would reject the exit — the position would go
+        # silently un-liquidated while the summary alert claimed success. Flag it
+        # for manual action instead of publishing a doomed order.
+        if self._order_ledger is not None and pos.get("con_id") is None:
+            self._logger.critical(
+                "Cannot auto-liquidate position: missing con_id",
+                ticker=pos["ticker"],
+                quantity=quantity,
+            )
+            await self._publish_alert(
+                event_type="liquidation_unroutable",
+                priority="critical",
+                message=(
+                    f"Cannot auto-liquidate {pos['ticker']} ({quantity}): missing "
+                    "con_id — manual action required"
+                ),
+                context={"ticker": pos["ticker"], "quantity": quantity},
+            )
+            return False
+
+        if self._order_ledger is not None and pos.get("con_id") is not None:
+            proposal = SimpleNamespace(
+                recommendation_id=exit_id,
+                account_id=pos["account_id"] or "",
+                mode=self._config.mode,
+                portfolio=pos["portfolio"] or "__liquidation__",
+                con_id=pos["con_id"],
+                symbol=pos["ticker"],
+                exchange=pos["exchange"] or "SMART",
+                currency=pos["currency"] or "USD",
+                action="SELL",
+                quantity=quantity,
+                limit_price=None,
+                order_type="MKT",
+            )
+            try:
+                self._order_ledger.create_intent(proposal)
+                self._order_ledger.session.commit()
+            except ConflictingOrderIntent:
+                # An intent for this deterministic id already exists (a replay or
+                # the concurrent execution-side net). Keep it — that is exactly
+                # the idempotency guarantee.
+                self._order_ledger.session.rollback()
+            except Exception:
+                self._order_ledger.session.rollback()
+                raise
+
+        order = ApprovedOrderMessage(
+            ticker=pos["ticker"],
+            timestamp=datetime.now(timezone.utc),
+            action="sell",
+            quantity=quantity,
+            order_type="market",
+            limit_price=None,
+            recommendation_id=exit_id,
+            risk_adjustments={"kill_switch": True, "reason": reason},
+        )
+        await self._redis.publish(APPROVED_ORDERS_STREAM, order.to_stream_dict())
+        self._logger.info(
+            "Liquidation order published",
+            ticker=pos["ticker"],
+            quantity=quantity,
+            recommendation_id=exit_id,
+        )
+        return True
 
     async def run_passive_scan(self) -> None:
         """Run passive breach monitoring scan.
@@ -922,12 +1180,56 @@ class RiskServiceRunner:
                     "target_pct": breach.target_pct,
                 },
             )
+            # A hard-ceiling breach on a real position is auto-trimmed back to
+            # the soft ceiling; a soft breach is advisory only. The margin
+            # sentinel ("__margin__") has no single position to sell, so it
+            # stays alert-only until margin trimming is designed.
+            if breach.action_type == "trim" and breach.ticker != "__margin__":
+                await self._trim_position_to_target(breach)
 
         if breaches:
             self._logger.info(
                 "Passive scan completed",
                 breach_count=len(breaches),
             )
+
+    async def _trim_position_to_target(self, breach: Any) -> None:
+        """Emit a market sell that reduces a position to its target ceiling."""
+        pos = self._portfolio.positions.get(breach.ticker)
+        price = self._current_prices.get(breach.ticker, 0.0)
+        nav = self._portfolio.nav
+        if pos is None or price <= 0 or nav <= 0:
+            return
+        quantity = pos.get("quantity", 0) if isinstance(pos, dict) else 0
+        if quantity <= 0:
+            return
+        target_value = nav * breach.target_pct / 100.0
+        sell_quantity = round((quantity * price - target_value) / price, 4)
+        if sell_quantity <= 0:
+            return
+
+        order = ApprovedOrderMessage(
+            ticker=breach.ticker,
+            timestamp=datetime.now(timezone.utc),
+            action="sell",
+            quantity=sell_quantity,
+            order_type="market",
+            limit_price=None,
+            recommendation_id=f"passive-trim-{uuid.uuid4()}",
+            risk_adjustments={
+                "passive_trim": True,
+                "target_pct": breach.target_pct,
+                "current_pct": breach.current_pct,
+            },
+        )
+        await self._redis.publish(APPROVED_ORDERS_STREAM, order.to_stream_dict())
+        self._logger.warning(
+            "Hard-ceiling auto-trim order published",
+            ticker=breach.ticker,
+            sell_quantity=sell_quantity,
+            current_pct=breach.current_pct,
+            target_pct=breach.target_pct,
+        )
 
     async def run_stop_loss_check(self) -> None:
         """Check all positions for trailing stop-loss triggers.
@@ -974,6 +1276,161 @@ class RiskServiceRunner:
                     message=decision.reason,
                     context={"ticker": ticker, "quantity": quantity},
                 )
+
+    async def run_periodic_risk_checks(self) -> None:
+        """Drive the intraday safety controls the daily sleeve run does not.
+
+        Refresh marks from the DB, fire trailing stop-losses, auto-trim
+        hard-ceiling breaches, and raise a drawdown gauge measured on real book
+        equity. These mechanisms exist and are tested but had zero live callers
+        before this driver (review findings 2.1–2.3).
+        """
+        # Reconcile the durable halt first: adopt an out-of-band halt, or resume
+        # after the admin clear endpoint has cleared it in the DB.
+        self._kill_switch.sync_from_store()
+        self._refresh_portfolio_from_db()
+        await self.run_stop_loss_check()
+        await self.run_passive_scan()
+        await self._emit_drawdown_gauge()
+        await self._check_dlq_depths()
+
+    async def maybe_run_periodic_checks(self, now: float) -> bool:
+        """Run the periodic checks if the scan interval has elapsed.
+
+        ``now`` is a monotonic timestamp (seconds). Returns True when the checks
+        ran. The first call always runs.
+        """
+        last = self._last_periodic_scan_at
+        if (
+            last is not None
+            and (now - last) < self._passive_scan_interval_seconds
+        ):
+            return False
+        self._last_periodic_scan_at = now
+        # The sweep is best-effort: a failure here must never propagate and tear
+        # down the main run() loop, which would halt recommendation, kill, and
+        # fill processing for the whole service.
+        try:
+            await self.run_periodic_risk_checks()
+        except Exception:
+            self._logger.exception("Periodic risk checks failed; continuing")
+        return True
+
+    def _refresh_portfolio_from_db(self) -> None:
+        """Reload positions, marks, cash and book equity from the DB.
+
+        The risk service has no market-data feed, so the freshest available
+        marks are the ones the data pipeline has written to ``positions``. This
+        refresh lets the periodic stop-loss and ceiling scan act on them. It
+        no-ops without a DB session (unit tests drive the in-memory book
+        directly).
+        """
+        if self._db_session is None:
+            return
+        from shared.position_loader import load_portfolio_state
+
+        try:
+            state = load_portfolio_state(self._db_session)
+            positions = state["positions"]
+            book_equity = float(state["nav"])
+            book_peak = float(state["peak_nav"])
+            # The ceiling / sizing denominator stays on the deployment budget,
+            # consistent with the entry path (_refresh_risk_state). Only the
+            # drawdown gauge (book_equity/book_peak) moves to real book equity.
+            snapshot = self._db_session.scalar(
+                select(CapitalSnapshot)
+                .where(CapitalSnapshot.mode == self._config.mode)
+                .order_by(
+                    CapitalSnapshot.captured_at.desc(), CapitalSnapshot.id.desc()
+                )
+                .limit(1)
+            )
+            nav = (
+                float(snapshot.deployable_capital)
+                if snapshot is not None
+                else book_equity
+            )
+            market_value = sum(
+                p["quantity"] * p["current_price"] for p in positions.values()
+            )
+            self._cash = nav - market_value
+            self._current_prices = {
+                ticker: p["current_price"] for ticker, p in positions.items()
+            }
+            self._portfolio = PortfolioState(
+                nav=nav,
+                peak_nav=nav,
+                positions=positions,
+                sector_exposure=state["sector_exposure"],
+                total_exposure_pct=(
+                    market_value / nav * 100.0 if nav > 0 else 0.0
+                ),
+                margin_utilization_pct=0.0,
+                book_equity=book_equity,
+                book_peak_equity=book_peak,
+            )
+        except Exception:  # pragma: no cover - defensive
+            self._logger.exception(
+                "Periodic portfolio refresh failed; using last in-memory state"
+            )
+        finally:
+            try:
+                self._db_session.rollback()
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+    async def _emit_drawdown_gauge(self) -> None:
+        """Act on a real book-equity drawdown breach.
+
+        The pause already rejects new buys inside ``process_recommendation``; here
+        it raises a high alert. The 20% circuit breaker **liquidates** — it halts
+        (fail-closed, persisted) and flattens the book, once per incident.
+        """
+        decision = self._engine.check_portfolio_drawdown(self._portfolio)
+        if decision.approved:
+            return
+        breaker = "circuit breaker" in decision.reason.lower()
+        if breaker:
+            # Fire once per halt incident: an already-active (persisted) halt
+            # means we have already liquidated — don't re-sell every scan.
+            if not self._kill_switch.is_active:
+                self._kill_switch.activate(
+                    reason=decision.reason,
+                    triggered_by="circuit_breaker",
+                    source="circuit_breaker",
+                )
+                activated = self._kill_switch.activated_at or datetime.now(
+                    timezone.utc
+                )
+                await self._liquidate_all(
+                    epoch=int(activated.timestamp()),
+                    reason=decision.reason,
+                    triggered_by="circuit_breaker",
+                    event_type="circuit_breaker_liquidation",
+                )
+                # Also drive execution's kill path so it cancels resting orders
+                # (a liquidation that leaves working buys is not one). Same
+                # timestamp -> execution derives the same epoch/exit ids and
+                # dedups against the exits just published above. Risk re-consumes
+                # this but latches (was_active) instead of re-liquidating.
+                await self._redis.publish(
+                    KILL_STREAM,
+                    KillMessage(
+                        timestamp=activated,
+                        triggered_by="circuit_breaker",
+                        reason=decision.reason,
+                    ).to_stream_dict(),
+                )
+            return
+        await self._publish_alert(
+            event_type="drawdown_pause",
+            priority="high",
+            message=decision.reason,
+            context={
+                "book_equity": self._portfolio.book_equity,
+                "book_peak_equity": self._portfolio.book_peak_equity,
+            },
+        )
 
     def _estimate_buy_quantity(self, ticker: str, price: float) -> int:
         """Estimate the number of shares to buy based on position limit.
@@ -1026,59 +1483,131 @@ class RiskServiceRunner:
 
         try:
             while True:
-                # Read recommendations
-                messages = await self._redis.read_group(
+                # Intraday safety sweep: stop-loss, hard-ceiling trim, drawdown
+                # gauge — gated to the passive-scan interval on a monotonic clock.
+                await self.maybe_run_periodic_checks(
+                    asyncio.get_running_loop().time()
+                )
+
+                # A retryable state error on a durable sell must stay pending;
+                # any other error is a poison message → DLQ + ack + alert.
+                await self._consume_and_process(
                     RECOMMENDATIONS_STREAM,
-                    CONSUMER_GROUP,
-                    CONSUMER_NAME,
+                    RecommendationMessage.from_stream_dict,
+                    self.process_recommendation,
                     count=10,
                     block_ms=2000,
+                    retryable_exc=(RetryableRiskStateError,),
                 )
-                for msg in messages:
-                    try:
-                        rec = RecommendationMessage.from_stream_dict(msg.data)
-                        await self.process_recommendation(rec)
-                        await self._redis.ack(
-                            RECOMMENDATIONS_STREAM, CONSUMER_GROUP, msg.message_id
-                        )
-                    except Exception:
-                        self._logger.exception(
-                            "Error processing recommendation", message_id=msg.message_id
-                        )
-
-                # Read kill stream
-                kill_messages = await self._redis.read_group(
-                    KILL_STREAM, CONSUMER_GROUP, CONSUMER_NAME, count=1, block_ms=500
+                await self._consume_and_process(
+                    KILL_STREAM,
+                    KillMessage.from_stream_dict,
+                    self.process_kill,
+                    count=1,
+                    block_ms=500,
                 )
-                for msg in kill_messages:
-                    try:
-                        kill_msg = KillMessage.from_stream_dict(msg.data)
-                        await self.process_kill(kill_msg)
-                        await self._redis.ack(
-                            KILL_STREAM, CONSUMER_GROUP, msg.message_id
-                        )
-                    except Exception:
-                        self._logger.exception(
-                            "Error processing kill message", message_id=msg.message_id
-                        )
-
-                # Read fills to keep the in-memory portfolio current
-                fill_messages = await self._redis.read_group(
-                    FILLS_STREAM, CONSUMER_GROUP, CONSUMER_NAME, count=10, block_ms=500
+                await self._consume_and_process(
+                    FILLS_STREAM,
+                    FillMessage.from_stream_dict,
+                    self.process_fill,
+                    count=10,
+                    block_ms=500,
                 )
-                for msg in fill_messages:
-                    try:
-                        fill = FillMessage.from_stream_dict(msg.data)
-                        await self.process_fill(fill)
-                        await self._redis.ack(
-                            FILLS_STREAM, CONSUMER_GROUP, msg.message_id
-                        )
-                    except Exception:
-                        self._logger.exception(
-                            "Error processing fill message", message_id=msg.message_id
-                        )
         except (KeyboardInterrupt, Exception):
             self._logger.info("Risk management service interrupted")
+
+    async def _consume_and_process(
+        self,
+        stream: str,
+        parser: Any,
+        handler: Any,
+        *,
+        count: int,
+        block_ms: int,
+        retryable_exc: tuple[type[BaseException], ...] = (),
+    ) -> None:
+        """Read a batch and process each message with steady-state poison
+        discipline: ack on success, leave pending on a retryable error, and
+        DLQ + ack + alert on any other (poison) error — so a non-retryable
+        message is never silently parked in the PEL."""
+        messages = await self._redis.read_group(
+            stream, CONSUMER_GROUP, CONSUMER_NAME, count=count, block_ms=block_ms
+        )
+        for msg in messages:
+            try:
+                await handler(parser(msg.data))
+            except retryable_exc as exc:
+                self._logger.warning(
+                    "Retryable error; leaving message pending",
+                    stream=stream,
+                    message_id=msg.message_id,
+                    reason=str(exc),
+                )
+                continue
+            except Exception as exc:
+                await self._dead_letter(stream, msg, exc)
+                continue
+            # Ack is separate from the poison path: a transient ack failure after
+            # a successful handler must NOT dead-letter an already-processed
+            # message — redelivery + idempotency (execution_id dedup, ledger)
+            # handles the reprocess safely.
+            try:
+                await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
+            except Exception:
+                self._logger.exception(
+                    "Ack failed after processing; relying on redelivery + "
+                    "idempotency",
+                    stream=stream,
+                    message_id=msg.message_id,
+                )
+
+    async def _check_dlq_depths(self) -> None:
+        """Alert when any consumed stream's dead-letter queue has a backlog, so
+        parked poison messages are noticed rather than accumulating silently."""
+        from shared.redis_client import DEAD_LETTER_SUFFIX
+
+        for stream in (RECOMMENDATIONS_STREAM, KILL_STREAM, FILLS_STREAM):
+            dlq = stream + DEAD_LETTER_SUFFIX
+            try:
+                depth = await self._redis.stream_length(dlq)
+            except Exception:  # pragma: no cover - defensive (dlq may not exist)
+                continue
+            # Alert only on a new or growing backlog; reset once it clears so the
+            # next backlog re-alerts. Avoids re-alerting every scan on a static
+            # backlog.
+            if depth and depth > self._dlq_alerted_depth.get(dlq, 0):
+                await self._publish_alert(
+                    event_type="dlq_backlog",
+                    priority="high",
+                    message=f"Dead-letter backlog on {dlq}: {depth} message(s)",
+                    context={"stream": dlq, "depth": depth},
+                )
+                self._dlq_alerted_depth[dlq] = depth
+            elif not depth:
+                self._dlq_alerted_depth[dlq] = 0
+
+    async def _dead_letter(self, stream: str, msg: Any, exc: Exception) -> None:
+        """DLQ + ack + alert a poison message (matches setup()'s replay path)."""
+        self._logger.exception(
+            "Poison message; sending to DLQ",
+            stream=stream,
+            message_id=msg.message_id,
+        )
+        try:
+            await self._redis.send_to_dead_letter(stream, msg, str(exc))
+            await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
+        except Exception:
+            self._logger.exception(
+                "Failed to dead-letter poison message",
+                stream=stream,
+                message_id=msg.message_id,
+            )
+        await self._publish_alert(
+            event_type="poison_message",
+            priority="high",
+            message=f"Poison message on {stream} dead-lettered: {exc}",
+            context={"stream": stream, "message_id": str(msg.message_id)},
+        )
 
 
 if __name__ == "__main__":

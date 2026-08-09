@@ -113,6 +113,54 @@ class TestPortfolioDrawdown:
         assert "circuit breaker" in decision.reason.lower()
 
 
+class TestDrawdownOnBookEquity:
+    """Drawdown must measure real marked book equity, not the deployment
+    budget. When book_equity/book_peak_equity are populated they take
+    precedence over nav/peak_nav (which, on the live path, is the capped
+    deployable_capital and reads a phantom ~0% drawdown)."""
+
+    def test_book_equity_takes_precedence_over_nav(self):
+        """nav pinned at the cap reads no drawdown, but a real 15% book-equity
+        drop must engage the pause."""
+        engine = RiskEngine(drawdown_pause_pct=10.0, drawdown_circuit_breaker_pct=20.0)
+        # nav == peak_nav (deployable_capital pinned at cap -> phantom 0%)
+        portfolio = make_portfolio(nav=100_000, peak_nav=100_000)
+        portfolio.book_equity = 85_000
+        portfolio.book_peak_equity = 100_000
+        decision = engine.check_portfolio_drawdown(portfolio)
+        assert decision.approved is False
+        assert "drawdown" in decision.reason.lower()
+
+    def test_book_equity_engages_circuit_breaker(self):
+        """A real 20% book-equity drawdown engages the breaker even when nav
+        shows none."""
+        engine = RiskEngine(drawdown_pause_pct=10.0, drawdown_circuit_breaker_pct=20.0)
+        portfolio = make_portfolio(nav=100_000, peak_nav=100_000)
+        portfolio.book_equity = 80_000
+        portfolio.book_peak_equity = 100_000
+        decision = engine.check_portfolio_drawdown(portfolio)
+        assert decision.approved is False
+        assert "circuit breaker" in decision.reason.lower()
+
+    def test_book_equity_within_limits_approves(self):
+        """Real book equity only 5% below peak -> approved, regardless of nav."""
+        engine = RiskEngine(drawdown_pause_pct=10.0, drawdown_circuit_breaker_pct=20.0)
+        portfolio = make_portfolio(nav=100_000, peak_nav=100_000)
+        portfolio.book_equity = 95_000
+        portfolio.book_peak_equity = 100_000
+        decision = engine.check_portfolio_drawdown(portfolio)
+        assert decision.approved is True
+
+    def test_falls_back_to_nav_when_book_equity_absent(self):
+        """With no book_equity populated, behavior is unchanged (nav/peak_nav)."""
+        engine = RiskEngine(drawdown_pause_pct=10.0, drawdown_circuit_breaker_pct=20.0)
+        portfolio = make_portfolio(nav=85_000, peak_nav=100_000)
+        assert portfolio.book_equity is None
+        decision = engine.check_portfolio_drawdown(portfolio)
+        assert decision.approved is False
+        assert "drawdown" in decision.reason.lower()
+
+
 class TestDecisionPrecedence:
     """Verify the documented precedence order:
     1. Kill switch / circuit breaker

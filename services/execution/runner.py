@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from shared.config import AppConfig
+from shared.liquidation import liquidation_exit_id
 from shared.logging import get_logger
 from shared.models import OrderStatus
-from shared.order_ledger import TERMINAL_STATUSES, OrderLedger
+from shared.order_ledger import (
+    TERMINAL_STATUSES,
+    OrderIntentNotFound,
+    OrderLedger,
+)
 from shared.schemas.messages import (
     AlertMessage,
     ApprovedOrderMessage,
@@ -84,6 +88,15 @@ class ExecutionServiceRunner:
             self.ib_port = config.ib.live_port
         else:
             self.ib_port = config.ib.paper_port
+
+        # Periodic unfilled-order sweep (cancel stale limits / free reservations).
+        # Driven on the reprice interval; needs a market calendar (set by the
+        # runner entrypoint) — without one the sweep is skipped.
+        self._reprice_interval_seconds = max(
+            1, int(config.execution.reprice_interval_minutes) * 60
+        )
+        self._last_sweep_at: float | None = None
+        self._market_calendar: Any = None
 
     async def setup(self) -> None:
         """Create consumer groups and replay pending messages.
@@ -423,6 +436,7 @@ class ExecutionServiceRunner:
             con_id=fill_info.get("con_id"),
             exchange=fill_info.get("exchange"),
             currency=fill_info.get("currency"),
+            order_done=bool(fill_info.get("order_done", False)),
         )
         local_effect = None
         if fill.account_id and fill.portfolio:
@@ -505,6 +519,24 @@ class ExecutionServiceRunner:
         finally:
             self._order_ledger.session.rollback()
 
+    async def _publish_alert(
+        self,
+        *,
+        event_type: str,
+        priority: str,
+        message: str,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        """Publish an alert to the alerts stream."""
+        alert = AlertMessage(
+            timestamp=datetime.now(timezone.utc),
+            event_type=event_type,
+            priority=priority,
+            message=message,
+            context=context or {},
+        )
+        await self._redis.publish(ALERTS_STREAM, alert.to_stream_dict())
+
     async def handle_ib_order_status(
         self, status_info: dict[str, Any]
     ) -> None:
@@ -519,6 +551,19 @@ class ExecutionServiceRunner:
             )
             if self._order_ledger is not None:
                 self._order_ledger.session.rollback()
+            return
+
+        # A late or duplicate broker status can arrive after the fill projector
+        # (or a prior status) already terminalized the intent. Transitioning out
+        # of a terminal state raises InvalidOrderTransition; ignore it instead.
+        if OrderStatus(intent.status) in TERMINAL_STATUSES:
+            self._logger.info(
+                "Ignoring IB status for already-terminal intent",
+                order_id=order_id,
+                status=status_info.get("status"),
+                current=intent.status,
+            )
+            self._order_ledger.session.rollback()
             return
 
         broker_status = str(status_info.get("status", ""))
@@ -562,10 +607,31 @@ class ExecutionServiceRunner:
         if target is None:
             self._order_ledger.session.rollback()
             return
-        self._order_ledger.transition(
-            intent.recommendation_id, target, reason=reason
-        )
-        self._commit_ledger()
+        try:
+            self._order_ledger.transition(
+                intent.recommendation_id, target, reason=reason
+            )
+            self._commit_ledger()
+        except Exception as exc:
+            # Never let a transition error escape into the fire-and-forget IB
+            # callback task (it would be swallowed and leave the shared session
+            # mid-transaction). Roll back and alert instead.
+            self._order_ledger.session.rollback()
+            self._logger.exception(
+                "Failed to persist IB order status",
+                order_id=order_id,
+                target=target.value,
+            )
+            await self._publish_alert(
+                event_type="order_status_persist_failed",
+                priority="high",
+                message=(
+                    f"Could not persist status {target.value} for order "
+                    f"{order_id}: {exc}"
+                ),
+                context={"order_id": order_id, "target": target.value},
+            )
+            return
         self._pending_orders.pop(order_id, None)
         self._order_manager.open_orders.pop(order_id, None)
 
@@ -588,25 +654,45 @@ class ExecutionServiceRunner:
         # Cancel all open orders
         await self._order_manager.cancel_all_orders()
 
-        # Emit market sell orders for all positions
+        # Deterministic per-kill epoch: exits for one kill converge on the same
+        # ids across a replay and across the risk-side authoritative path, so we
+        # never double-sell.
+        epoch = int(kill_msg.timestamp.timestamp())
+        liquidated = 0
         for ticker, quantity in positions_to_liquidate.items():
             if quantity <= 0:
                 continue
+            exit_id = liquidation_exit_id(self._config.mode, ticker, epoch)
+            try:
+                if self._exit_already_in_flight(exit_id):
+                    self._logger.info(
+                        "Kill exit already in flight; skipping",
+                        ticker=ticker,
+                        recommendation_id=exit_id,
+                    )
+                    continue
+                await self._order_manager.submit_exit(
+                    ticker=ticker,
+                    quantity=quantity,
+                    recommendation_id=exit_id,
+                )
+                liquidated += 1
+                self._logger.info(
+                    "Kill liquidation order submitted",
+                    ticker=ticker,
+                    quantity=quantity,
+                    recommendation_id=exit_id,
+                )
+            except Exception:
+                # One position failing (e.g. IB disconnected mid-loop) must not
+                # abort the rest, and the critical alert below must still fire.
+                self._logger.exception(
+                    "Kill liquidation failed for a position; continuing",
+                    ticker=ticker,
+                )
 
-            kill_rec_id = f"kill-{uuid.uuid4()}"
-            await self._order_manager.submit_exit(
-                ticker=ticker,
-                quantity=quantity,
-                recommendation_id=kill_rec_id,
-            )
-
-            self._logger.info(
-                "Kill liquidation order submitted",
-                ticker=ticker,
-                quantity=quantity,
-            )
-
-        # Publish alert
+        # Always publish the critical alert — even on zero positions or partial
+        # failure, the operator must learn the kill fired.
         alert = AlertMessage(
             timestamp=datetime.now(timezone.utc),
             event_type="kill_switch_liquidation",
@@ -614,10 +700,48 @@ class ExecutionServiceRunner:
             message=f"Kill switch activated by {kill_msg.triggered_by}: {kill_msg.reason}",
             context={
                 "triggered_by": kill_msg.triggered_by,
-                "positions_liquidated": len(positions_to_liquidate),
+                "positions_seen": len(positions_to_liquidate),
+                "positions_liquidated": liquidated,
             },
         )
         await self._redis.publish(ALERTS_STREAM, alert.to_stream_dict())
+
+    def _exit_already_in_flight(self, exit_id: str) -> bool:
+        """True if an intent for this deterministic exit id is already submitted
+        or terminal — the risk-side authoritative path (or a prior pass/replay)
+        has it, so this defense-in-depth net defers to avoid a double-sell."""
+        if self._order_ledger is None:
+            return False
+        try:
+            intent = self._order_ledger.get(exit_id)
+            in_flight = OrderStatus(intent.status) in TERMINAL_STATUSES or intent.status in {
+                OrderStatus.SUBMITTED.value,
+                OrderStatus.PARTIALLY_FILLED.value,
+            }
+        except OrderIntentNotFound:
+            in_flight = False
+        finally:
+            self._order_ledger.session.rollback()
+        return in_flight
+
+    async def maybe_run_unfilled_sweep(self, now: float) -> bool:
+        """Run the unfilled-order sweep when the reprice interval has elapsed.
+
+        ``now`` is a monotonic timestamp (seconds). No-ops without a market
+        calendar. Execution has no live quote feed, so the sweep cancels stale
+        limits / frees reservations rather than repricing (see
+        OrderManager.sweep_unfilled_orders). Returns True when it ran.
+        """
+        if self._market_calendar is None:
+            return False
+        last = self._last_sweep_at
+        if last is not None and (now - last) < self._reprice_interval_seconds:
+            return False
+        self._last_sweep_at = now
+        await self._order_manager.sweep_unfilled_orders(
+            {}, self._market_calendar
+        )
+        return True
 
     async def shutdown(self) -> None:
         """Graceful shutdown: cancel all open orders to avoid orphans."""
@@ -643,58 +767,84 @@ class ExecutionServiceRunner:
 
         try:
             while self._running:
-                # Read approved orders
-                messages = await self._redis.read_group(
+                # Periodic unfilled-order sweep (best-effort — never tear down
+                # the loop on a sweep failure).
+                try:
+                    await self.maybe_run_unfilled_sweep(
+                        asyncio.get_running_loop().time()
+                    )
+                except Exception:
+                    self._logger.exception("Unfilled-order sweep failed; continuing")
+
+                await self._consume_and_process(
                     APPROVED_ORDERS_STREAM,
-                    CONSUMER_GROUP,
-                    CONSUMER_NAME,
+                    ApprovedOrderMessage.from_stream_dict,
+                    self.process_approved_order,
                     count=10,
                     block_ms=2000,
                 )
-
-                for msg in messages:
-                    try:
-                        order = ApprovedOrderMessage.from_stream_dict(msg.data)
-                        await self.process_approved_order(order)
-                        await self._redis.ack(
-                            APPROVED_ORDERS_STREAM,
-                            CONSUMER_GROUP,
-                            msg.message_id,
-                        )
-                    except Exception:
-                        self._logger.exception(
-                            "Error processing approved order",
-                            message_id=msg.message_id,
-                        )
-
-                # Read kill stream
-                kill_messages = await self._redis.read_group(
+                await self._consume_and_process(
                     KILLS_STREAM,
-                    CONSUMER_GROUP,
-                    CONSUMER_NAME,
+                    KillMessage.from_stream_dict,
+                    self.process_kill,
                     count=1,
                     block_ms=500,
                 )
-
-                for msg in kill_messages:
-                    try:
-                        kill_msg = KillMessage.from_stream_dict(msg.data)
-                        await self.process_kill(kill_msg)
-                        await self._redis.ack(
-                            KILLS_STREAM,
-                            CONSUMER_GROUP,
-                            msg.message_id,
-                        )
-                    except Exception:
-                        self._logger.exception(
-                            "Error processing kill message",
-                            message_id=msg.message_id,
-                        )
 
         except (KeyboardInterrupt, Exception):
             self._logger.info("Execution service interrupted")
         finally:
             await self.shutdown()
+
+    async def _consume_and_process(
+        self,
+        stream: str,
+        parser: Any,
+        handler: Any,
+        *,
+        count: int,
+        block_ms: int,
+    ) -> None:
+        """Read a batch and process each message, dead-lettering poison messages
+        (DLQ + ack + alert) instead of leaving them parked in the PEL."""
+        messages = await self._redis.read_group(
+            stream, CONSUMER_GROUP, CONSUMER_NAME, count=count, block_ms=block_ms
+        )
+        for msg in messages:
+            try:
+                await handler(parser(msg.data))
+            except Exception as exc:
+                self._logger.exception(
+                    "Poison message; sending to DLQ",
+                    stream=stream,
+                    message_id=msg.message_id,
+                )
+                try:
+                    await self._redis.send_to_dead_letter(stream, msg, str(exc))
+                    await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
+                except Exception:
+                    self._logger.exception(
+                        "Failed to dead-letter poison message",
+                        stream=stream,
+                        message_id=msg.message_id,
+                    )
+                await self._publish_alert(
+                    event_type="poison_message",
+                    priority="high",
+                    message=f"Poison message on {stream} dead-lettered: {exc}",
+                    context={"stream": stream, "message_id": str(msg.message_id)},
+                )
+                continue
+            # A transient ack failure after a successful handler must not
+            # dead-letter an already-processed message.
+            try:
+                await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
+            except Exception:
+                self._logger.exception(
+                    "Ack failed after processing; relying on redelivery",
+                    stream=stream,
+                    message_id=msg.message_id,
+                )
 
 
 if __name__ == "__main__":
@@ -735,7 +885,11 @@ if __name__ == "__main__":
         engine = create_engine(config.database.url)
         session = sessionmaker(bind=engine)()
         order_manager = OrderManager(
-            executor=executor, redis_client=redis_client, db_session=session
+            executor=executor,
+            redis_client=redis_client,
+            db_session=session,
+            reprice_interval_minutes=config.execution.reprice_interval_minutes,
+            max_reprice_attempts=config.execution.max_reprice_attempts,
         )
         runner = ExecutionServiceRunner(
             config=config,
@@ -743,6 +897,10 @@ if __name__ == "__main__":
             order_manager=order_manager,
             order_ledger=OrderLedger(session),
         )
+        # Wire the market calendar so the periodic unfilled-order sweep runs.
+        from shared.market_calendar import MarketCalendar
+
+        runner._market_calendar = MarketCalendar()
         try:
             positions = load_open_positions(session)
             runner._positions = {

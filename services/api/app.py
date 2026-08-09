@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import Depends, FastAPI
 
@@ -12,27 +13,44 @@ from shared.redis_client import RedisStreamClient
 logger = get_logger("api.app")
 
 
-def create_app(redis_client: RedisStreamClient | None = None) -> FastAPI:
+def create_app(
+    redis_client: RedisStreamClient | None = None,
+    db_sessionmaker: Any = None,
+    mode: str = "paper",
+) -> FastAPI:
     """Create and configure the FastAPI application.
 
     Args:
         redis_client: Injected Redis Streams client (used by tests). When
             omitted, a client is created from config during app lifespan —
             the kill endpoint needs it to publish to ``stream:kill``.
+        db_sessionmaker: Injected SQLAlchemy sessionmaker (used by tests). When
+            omitted, one is created from config during app lifespan — the kill
+            *clear* endpoint needs it to clear the durable halt.
+        mode: trading mode the halt table is scoped by (``paper``/``live``).
     """
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         owned_conn = None
-        if app.state.redis is None:
-            import redis.asyncio as aioredis
-
+        if app.state.redis is None or app.state.db_sessionmaker is None:
             from shared.config import load_config
 
             config = load_config("config/default.yaml")
-            owned_conn = aioredis.from_url(config.redis.url)
-            app.state.redis = RedisStreamClient(owned_conn)
-            logger.info("api_redis_connected", url_scheme="redis")
+            if app.state.redis is None:
+                import redis.asyncio as aioredis
+
+                owned_conn = aioredis.from_url(config.redis.url)
+                app.state.redis = RedisStreamClient(owned_conn)
+                logger.info("api_redis_connected", url_scheme="redis")
+            if app.state.db_sessionmaker is None:
+                from sqlalchemy import create_engine
+                from sqlalchemy.orm import sessionmaker
+
+                engine = create_engine(config.database.url)
+                app.state.db_sessionmaker = sessionmaker(bind=engine)
+                app.state.mode = config.mode
+                logger.info("api_db_connected")
         yield
         if owned_conn is not None:
             await owned_conn.aclose()
@@ -46,6 +64,8 @@ def create_app(redis_client: RedisStreamClient | None = None) -> FastAPI:
     # Set immediately (not just in lifespan) so injected clients work even
     # when a TestClient is used without a `with` block (no lifespan events).
     app.state.redis = redis_client
+    app.state.db_sessionmaker = db_sessionmaker
+    app.state.mode = mode
 
     # Register route modules.
     app.include_router(portfolio.router)

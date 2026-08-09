@@ -138,3 +138,78 @@ class TestUnfilledOrders:
             new_price=None,
         )
         assert action.new_price is None
+
+
+class TestUnfilledSweep:
+    def _mgr(self):
+        executor = AsyncMock()
+        executor.cancel_order = AsyncMock(return_value=True)
+        return OrderManager(
+            executor=executor,
+            redis_client=AsyncMock(),
+            db_session=MagicMock(),
+            reprice_interval_minutes=60,
+            max_reprice_attempts=3,
+        )
+
+    def _calendar(self, close_in_hours=3):
+        now = datetime.now(timezone.utc)
+        cal = MagicMock()
+        cal.get_next_market_close.return_value = now + timedelta(hours=close_in_hours)
+        return cal
+
+    def test_check_unfilled_skips_market_orders(self):
+        """A market exit tracked in open_orders must never be repriced/cancelled
+        by the unfilled sweep (it is not an unfilled limit)."""
+        mgr = self._mgr()
+        now = datetime.now(timezone.utc)
+        mgr.open_orders["exit-1"] = {
+            "ticker": "AAPL",
+            "quantity": 5,
+            "limit_price": None,
+            "placed_at": now - timedelta(hours=5),
+            "last_repriced_at": now - timedelta(hours=5),
+            "reprice_count": 0,
+            "recommendation_id": "rec-exit",
+            "order_type": "market",
+        }
+        actions = mgr.check_unfilled_orders({}, self._calendar(close_in_hours=0.1))
+        assert actions == []
+
+    @pytest.mark.asyncio
+    async def test_sweep_applies_cancel_and_frees_open_order(self):
+        mgr = self._mgr()
+        now = datetime.now(timezone.utc)
+        mgr.open_orders["order-1"] = {
+            "ticker": "AAPL",
+            "quantity": 50,
+            "limit_price": 150.0,
+            "placed_at": now - timedelta(minutes=5),
+            "last_repriced_at": now - timedelta(minutes=5),
+            "reprice_count": 3,  # at max -> cancel
+            "recommendation_id": "rec-1",
+            "order_type": "limit",
+        }
+        applied = await mgr.sweep_unfilled_orders({}, self._calendar())
+        assert applied == 1
+        mgr._executor.cancel_order.assert_awaited_once_with("order-1")
+        assert "order-1" not in mgr.open_orders
+
+    @pytest.mark.asyncio
+    async def test_sweep_advances_reprice_bookkeeping_without_feed(self):
+        """With no live quote feed, a stale limit can't be repriced to a better
+        price, but its bookkeeping must advance so it eventually cancels."""
+        mgr = self._mgr()
+        now = datetime.now(timezone.utc)
+        mgr.open_orders["order-1"] = {
+            "ticker": "AAPL",
+            "quantity": 50,
+            "limit_price": 150.0,
+            "placed_at": now - timedelta(minutes=61),
+            "last_repriced_at": now - timedelta(minutes=61),
+            "reprice_count": 0,
+            "recommendation_id": "rec-1",
+            "order_type": "limit",
+        }
+        await mgr.sweep_unfilled_orders({}, self._calendar())
+        assert mgr.open_orders["order-1"]["reprice_count"] == 1

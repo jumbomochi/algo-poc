@@ -160,26 +160,51 @@ These limits are configured in `config/default.yaml` and are intended to be
 enforced in code. The IPS records them so the operator cannot quietly loosen
 them; **risk limits are never loosened during a drawdown** (§ 9).
 
-> **2026-08-06 review correction — several limits below are declared but not yet
-> enforced on the live path.** The [implementation review](implementation-review-2026-08-06.md)
-> found that the trailing **stop-loss**, the **passive hard-ceiling / margin auto-trim**,
-> and the drawdown **circuit-breaker _liquidation_** are implemented but never invoked by
-> the running risk service, and the drawdown gauge is measured on the deployment budget
-> rather than book equity — so the 10% pause / 20% breaker are effectively inert in the
-> capped regime. Until **T2 (#3)** and **T1 (#2)** land, the only live stop is the
-> once-daily EOD sleeve exit. See the review's § 12 findings register for enforcement status.
+> **2026-08-06 review correction / enforcement status.** The
+> [implementation review](implementation-review-2026-08-06.md) found the trailing
+> **stop-loss**, the **passive hard-ceiling / margin auto-trim**, the drawdown
+> **circuit-breaker _liquidation_**, and the drawdown **gauge** were implemented
+> but never invoked by the running risk service (the gauge measured the deployment
+> budget rather than book equity, so the 10% pause / 20% breaker read a phantom
+> ~0% in the capped regime).
+>
+> **T2 (#3) — landed.** A periodic driver on the passive-scan interval runs the
+> trailing stop-loss and hard-ceiling auto-trim on the live path, and the drawdown
+> gauge is measured on **real marked book equity** (cash + MTM), so the 10% pause
+> engages on a real drawdown.
+>
+> **T1 (#2) — landed.** The kill switch is now **durable and fail-closed**: a kill
+> is persisted (`system_halt` table) and reloaded on restart, so a restart after a
+> kill stays halted until an explicit human clear via `DELETE /api/v1/kill`
+> (admin-only). The **20% circuit breaker now liquidates** (activates the halt and
+> flattens the book), not merely pauses buys. Kill/breaker liquidation reloads
+> authoritative DB positions and routes each exit through the OrderLedger with a
+> deterministic per-event id, so a replayed kill does not double-sell and exits
+> actually reach IB; each position is guarded and the critical alert always fires.
+>
+> **Still pending:** the stop-loss / hard-ceiling auto-trim exits are *emitted* by
+> the risk service but are not yet routed through the ledger the way the kill path
+> is, so their end-to-end execution + a re-fire guard is tracked with **T4/T7**;
+> execution's intent-less direct liquidation in the risk-down case depends on
+> **T7**'s broker tracking for cross-restart idempotency. **Margin-critical
+> auto-trim** stays alert-only (no margin-utilization data is plumbed).
+> See § 12 of the review for the findings register.
 
-| Limit | Value | Config key |
-|---|---:|---|
-| Position entry limit | 5% of NAV | `position_entry_limit_pct` |
-| Sector concentration | 20% of NAV | `sector_concentration_pct` |
-| Trailing stop-loss | 15% | `stop_loss_trailing_pct` |
-| Drawdown — pause new buys | 10% | `drawdown_pause_pct` |
-| Drawdown — circuit breaker (liquidate all) | 20% | `drawdown_circuit_breaker_pct` |
-| Position soft ceiling (notify) | 7% | `soft_ceiling_pct` |
-| Position hard ceiling (auto-trim to soft) | 15% | `hard_ceiling_pct` |
-| Margin warning / critical | 70% / 85% | `margin_warning_pct` / `margin_critical_pct` |
-| Correlation alert | 0.70 | `correlation_alert_threshold` |
+Enforcement column: **auto** = system acts (buy paused) without a human;
+**emit** = risk service emits the order but end-to-end execution lands with T1;
+**alert** = operator is notified but must act; **pending** = declared, not yet wired.
+
+| Limit | Value | Config key | Enforced |
+|---|---:|---|---|
+| Position entry limit | 5% of NAV | `position_entry_limit_pct` | auto |
+| Sector concentration | 20% of NAV | `sector_concentration_pct` | auto |
+| Trailing stop-loss | 15% | `stop_loss_trailing_pct` | emit (T2); executes with T1 |
+| Drawdown — pause new buys | 10% | `drawdown_pause_pct` | auto (T2: on book equity) |
+| Drawdown — circuit breaker (liquidate all) | 20% | `drawdown_circuit_breaker_pct` | auto (T1: halts + liquidates) |
+| Position soft ceiling (notify) | 7% | `soft_ceiling_pct` | alert |
+| Position hard ceiling (auto-trim to soft) | 15% | `hard_ceiling_pct` | emit (T2); executes with T1 |
+| Margin warning / critical | 70% / 85% | `margin_warning_pct` / `margin_critical_pct` | pending (no margin data) |
+| Correlation alert | 0.70 | `correlation_alert_threshold` | alert |
 
 The 10% drawdown pause and 20% circuit breaker are **system-level automated**
 responses. The retirement trigger in § 7 is a **human, account-level** decision that

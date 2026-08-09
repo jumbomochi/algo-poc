@@ -123,6 +123,10 @@ class IBExecutor:
         self._allow_fractional = allow_fractional
         self._ib = None  # Will hold ib_insync.IB instance
         self._trades: dict[str, Any] = {}  # order_id -> ib_insync.Trade
+        self._trade_meta: dict[str, tuple[str, str]] = {}  # order_id -> (ticker, side)
+        # Retain references to fire-and-forget callback tasks so they are not
+        # garbage-collected mid-flight and their exceptions are surfaced.
+        self._pending_tasks: set[Any] = set()
         self._fill_handler: FillHandler | None = None
         self._order_status_handler: OrderStatusHandler | None = None
         self._expect_paper: bool | None = None
@@ -250,6 +254,26 @@ class IBExecutor:
                         f"account(s) {non_paper} on port {self._port}. "
                         "Re-login the Gateway with the paper credentials."
                     )
+            elif expect_paper is False:
+                # Mirror guard for live: refuse a paper (DU) session on the live
+                # port so a mis-login can never trade the wrong book.
+                paper = [a for a in accounts if a.startswith("DU")]
+                if paper:
+                    self._ib.disconnect()
+                    self._ib = None
+                    raise WrongAccountTypeError(
+                        f"Live mode but the Gateway session holds PAPER "
+                        f"account(s) {paper} on port {self._port}. "
+                        "Re-login the Gateway with the live credentials."
+                    )
+
+            # A reconnect recreates the IB client, orphaning the fill/status
+            # callbacks bound to the previous Trade objects. Re-register them for
+            # every still-open tracked order so a mid-session reconnect keeps
+            # delivering their fills. (First connect has no tracked trades →
+            # no-op. Orders that completed during the outage are logged for
+            # reconciliation — see _reregister_open_trades.)
+            self._reregister_open_trades()
 
             # A healthy session proves server connectivity: clear any stale
             # lost-marker left by a socket that dropped without a 1102.
@@ -273,6 +297,69 @@ class IBExecutor:
         if self._ib is not None:
             self._ib.disconnect()
             self._logger.info("Disconnected from IB")
+
+    def _reregister_open_trades(self) -> None:
+        """Re-bind fill/status callbacks onto the fresh Trade objects after a
+        reconnect, for every tracked order still open at IB.
+
+        This recovers callbacks for orders that are STILL OPEN across the
+        reconnect. An order that reached a terminal state *during* the outage no
+        longer appears in ``openTrades()``, so its fill/status can't be replayed
+        here — that divergence is caught by the daily broker reconciliation
+        (``scripts/reconcile_paper.py``). Such orders are logged as a warning so
+        the gap is visible rather than silent.
+        """
+        if self._ib is None or not self._trade_meta:
+            return
+        try:
+            open_trades = list(self._ib.openTrades())
+        except Exception:  # pragma: no cover - defensive
+            self._logger.exception("Could not list open trades on reconnect")
+            return
+        open_ids = set()
+        reattached = 0
+        for trade in open_trades:
+            order = getattr(trade, "order", None)
+            order_id = str(getattr(order, "orderId", "") or "")
+            meta = self._trade_meta.get(order_id)
+            if meta is None:
+                continue
+            open_ids.add(order_id)
+            ticker, side = meta
+            self._register_trade(order_id, trade, ticker, side)
+            reattached += 1
+        if reattached:
+            self._logger.info(
+                "Re-registered IB callbacks after reconnect", count=reattached
+            )
+        # Tracked orders that vanished across the reconnect may have completed
+        # during the outage; their fills cannot be replayed via callbacks.
+        missing = [oid for oid in self._trade_meta if oid not in open_ids]
+        if missing:
+            self._logger.warning(
+                "Tracked orders absent after reconnect — verify via broker "
+                "reconciliation (fills may have completed during the outage)",
+                order_ids=missing,
+            )
+
+    def _spawn(self, coro: Any) -> Any:
+        """Schedule a fire-and-forget callback coroutine with a done-callback so
+        its exception is logged instead of being swallowed by the event loop."""
+        task = asyncio.ensure_future(coro)
+        self._pending_tasks.add(task)
+
+        def _done(t: Any) -> None:
+            self._pending_tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                self._logger.error(
+                    "Async IB callback task failed", error=str(exc)
+                )
+
+        task.add_done_callback(_done)
+        return task
 
     async def _ensure_connected(self) -> None:
         """Reconnect on demand when the Gateway dropped the session.
@@ -305,6 +392,9 @@ class IBExecutor:
     def _register_trade(self, order_id: str, trade: Any, ticker: str, side: str) -> None:
         """Track the trade and publish fills after IB reports commission."""
         self._trades[order_id] = trade
+        # Remember (ticker, side) so callbacks can be re-registered onto a fresh
+        # Trade object after a reconnect recreates the IB client.
+        self._trade_meta[order_id] = (ticker, side)
 
         def _on_commission_report(
             trade: Any, fill: Any, commission_report: Any
@@ -362,7 +452,7 @@ class IBExecutor:
             if self._fill_handler is None:
                 self._logger.warning("IB fill received but no handler set", **payload)
                 return
-            asyncio.ensure_future(self._fill_handler(payload))
+            self._spawn(self._fill_handler(payload))
 
         trade.commissionReportEvent += _on_commission_report
 
@@ -371,7 +461,7 @@ class IBExecutor:
                 return
             status = str(trade.orderStatus.status)
             reason = self._status_reason(trade)
-            asyncio.ensure_future(
+            self._spawn(
                 self._emit_order_status(
                     order_id,
                     status,

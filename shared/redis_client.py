@@ -115,6 +115,10 @@ class RedisStreamClient:
     async def ack(self, stream: str, group: str, message_id: str) -> int:
         return await self._redis.xack(stream, group, message_id)
 
+    async def stream_length(self, stream: str) -> int:
+        """Return the number of entries in a stream (XLEN); 0 if it is absent."""
+        return int(await self._redis.xlen(stream))
+
     async def send_to_dead_letter(
         self,
         stream: str,

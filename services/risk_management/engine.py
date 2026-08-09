@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
@@ -16,7 +16,15 @@ class RiskDecision:
 
 @dataclass
 class PortfolioState:
-    """Snapshot of current portfolio metrics used by risk checks."""
+    """Snapshot of current portfolio metrics used by risk checks.
+
+    ``nav``/``peak_nav`` size entries against the deployment budget. Drawdown,
+    however, must be judged on the real marked book — cash plus mark-to-market
+    positions — because on the live path ``nav`` is ``deployable_capital``
+    pinned at the USD cap, which reads a phantom ~0% drawdown. When
+    ``book_equity``/``book_peak_equity`` are populated they drive the drawdown
+    check; when absent it falls back to ``nav``/``peak_nav``.
+    """
 
     nav: float
     peak_nav: float
@@ -24,6 +32,8 @@ class PortfolioState:
     sector_exposure: dict[str, float]
     total_exposure_pct: float
     margin_utilization_pct: float
+    book_equity: float | None = None
+    book_peak_equity: float | None = None
 
 
 class RiskEngine:
@@ -267,14 +277,26 @@ class RiskEngine:
         Returns:
             RiskDecision with approved=False and appropriate reason.
         """
-        if portfolio.peak_nav <= 0:
+        # Judge drawdown on the real marked book when available; only fall back
+        # to nav/peak_nav (the deployment budget) when the book is not wired.
+        equity = (
+            portfolio.book_equity
+            if portfolio.book_equity is not None
+            else portfolio.nav
+        )
+        peak = (
+            portfolio.book_peak_equity
+            if portfolio.book_peak_equity is not None
+            else portfolio.peak_nav
+        )
+        if peak <= 0:
             return RiskDecision(
                 approved=True,
                 reason="No peak NAV recorded",
                 adjusted_quantity=0,
             )
 
-        drawdown_pct = ((portfolio.peak_nav - portfolio.nav) / portfolio.peak_nav) * 100.0
+        drawdown_pct = ((peak - equity) / peak) * 100.0
 
         # Circuit breaker is highest precedence (20% default)
         if drawdown_pct >= self.drawdown_circuit_breaker_pct:

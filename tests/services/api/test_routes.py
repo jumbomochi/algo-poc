@@ -186,6 +186,82 @@ class TestKillEndpoint:
         assert response.status_code == 503
 
 
+class TestKillClearEndpoint:
+    """DELETE clears a persisted halt so the operator can resume (the explicit
+    human clear the fail-closed kill switch requires)."""
+
+    def _app_with_db(self, redis_client):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        from shared.models import Base
+
+        # StaticPool + shared connection so the seed thread and the TestClient's
+        # request thread see the same in-memory DB.
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(engine)
+        sm = sessionmaker(bind=engine)
+        app = create_app(redis_client=redis_client, db_sessionmaker=sm, mode="paper")
+        return app, sm
+
+    def _seed_halt(self, sm):
+        from datetime import datetime, timezone
+
+        from shared.halt_state import HaltStateRepository
+
+        with sm() as s:
+            HaltStateRepository(s).record_halt(
+                mode="paper",
+                source="kill",
+                reason="prior",
+                triggered_by="admin***",
+                now=datetime.now(timezone.utc),
+            )
+            s.commit()
+
+    def test_clear_requires_admin(self, redis_client):
+        app, _ = self._app_with_db(redis_client)
+        client = TestClient(app)
+        assert client.delete("/api/v1/kill", headers=VIEWER_HEADERS).status_code == 403
+
+    def test_clear_requires_auth(self, redis_client):
+        app, _ = self._app_with_db(redis_client)
+        client = TestClient(app)
+        assert client.delete("/api/v1/kill").status_code == 401
+
+    def test_clear_clears_active_halt(self, redis_client):
+        from shared.halt_state import HaltStateRepository
+
+        app, sm = self._app_with_db(redis_client)
+        self._seed_halt(sm)
+        client = TestClient(app)
+
+        response = client.delete("/api/v1/kill", headers=ADMIN_HEADERS)
+
+        assert response.status_code == 200
+        assert response.json()["cleared"] is True
+        with sm() as s:
+            assert HaltStateRepository(s).load_active_halt(mode="paper") is None
+
+    def test_clear_with_no_active_halt_returns_false(self, redis_client):
+        app, _ = self._app_with_db(redis_client)
+        client = TestClient(app)
+        response = client.delete("/api/v1/kill", headers=ADMIN_HEADERS)
+        assert response.status_code == 200
+        assert response.json()["cleared"] is False
+
+    def test_clear_returns_503_without_db(self, redis_client):
+        app = create_app(redis_client=redis_client)  # no db wired
+        client = TestClient(app)
+        response = client.delete("/api/v1/kill", headers=ADMIN_HEADERS)
+        assert response.status_code == 503
+
+
 # ---------------------------------------------------------------------------
 # ML
 # ---------------------------------------------------------------------------

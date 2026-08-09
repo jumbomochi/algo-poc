@@ -582,7 +582,11 @@ class TestDurableExecutionIdentity:
         finally:
             event.remove(engine, "before_cursor_execute", record_select)
 
-        assert len(selects) == 1
+        # The reconciliation must be a single atomic read (projection + positions
+        # in one UNION query). The per-position exit-dedup reads that follow are a
+        # separate, legitimate concern and are not counted here.
+        reconciliation_selects = [s for s in selects if "row_kind" in s]
+        assert len(reconciliation_selects) == 1
 
     @pytest.mark.asyncio
     async def test_inactive_before_fill_is_submission_failed(
@@ -1210,6 +1214,186 @@ class TestKillHandling:
         # Should have submitted market exits for all positions
         assert mock_order_manager.submit_exit.call_count == 2
 
+    @pytest.mark.asyncio
+    async def test_kill_uses_deterministic_exit_id(
+        self, runner, mock_order_manager
+    ):
+        """Kill exits must carry a deterministic per-event id so a replay is a
+        no-op instead of re-selling (review 1.3)."""
+        runner._positions = {"AAPL": 10}
+        msg = KillMessage(
+            timestamp=datetime(2026, 8, 7, 12, 0, 0, tzinfo=timezone.utc),
+            triggered_by="admin",
+            reason="e",
+        )
+        await runner.process_kill(msg)
+
+        epoch = int(msg.timestamp.timestamp())
+        assert mock_order_manager.submit_exit.await_args.kwargs[
+            "recommendation_id"
+        ] == f"liq-paper-AAPL-{epoch}"
+
+    @pytest.mark.asyncio
+    async def test_kill_per_ticker_failure_continues_and_alerts(
+        self, runner, mock_redis, mock_order_manager
+    ):
+        """One ticker failing (e.g. IB disconnect) must not abort the rest, and
+        the critical alert must always fire (review 1.5)."""
+        runner._positions = {"AAPL": 10, "MSFT": 5}
+
+        async def flaky(*, ticker, quantity, recommendation_id):
+            if ticker == "AAPL":
+                raise RuntimeError("IB disconnected")
+            return "order-x"
+
+        mock_order_manager.submit_exit.side_effect = flaky
+
+        await runner.process_kill(kill_message())
+
+        # Both tickers attempted despite AAPL failing.
+        assert mock_order_manager.submit_exit.await_count == 2
+        alerts = [
+            c for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert len(alerts) >= 1
+
+    @pytest.mark.asyncio
+    async def test_kill_skips_ticker_already_liquidated_via_ledger(
+        self, durable_runner
+    ):
+        """If the authoritative (risk) path already submitted the exit for this
+        kill, execution's defense-in-depth net must skip it — no double-sell."""
+        runner, ledger = durable_runner
+        msg = kill_message()
+        epoch = int(msg.timestamp.timestamp())
+        exit_id = f"liq-paper-AAPL-{epoch}"
+        # A real open AAPL position exists (so reconcile keeps it) ...
+        ledger.session.add(
+            Position(
+                account_id="DUN551088",
+                ticker="AAPL",
+                portfolio="momentum",
+                con_id=265598,
+                exchange="SMART",
+                currency="USD",
+                quantity=10,
+                avg_entry_price=100,
+                current_price=100,
+                peak_price=100,
+                highest_price_since_entry=100,
+                opened_at=BROKER_TIME,
+                status="open",
+            )
+        )
+        ledger.session.commit()
+        # ... but risk already created + submitted this deterministic exit.
+        seed_approved_intent(ledger, recommendation_id=exit_id, ib_order_id="77")
+
+        await runner.process_kill(msg)
+
+        runner._order_manager.submit_exit.assert_not_awaited()
+
+
+class TestUnfilledSweepDriver:
+    """A periodic driver must actually run the unfilled-order sweep (the logic
+    had no production caller before)."""
+
+    @pytest.mark.asyncio
+    async def test_maybe_run_unfilled_sweep_respects_interval(self, runner):
+        runner._market_calendar = MagicMock()
+        runner._order_manager.sweep_unfilled_orders = AsyncMock(return_value=0)
+        interval = runner._reprice_interval_seconds
+
+        assert await runner.maybe_run_unfilled_sweep(now=1000.0) is True
+        assert await runner.maybe_run_unfilled_sweep(now=1000.0 + interval - 1) is False
+        assert await runner.maybe_run_unfilled_sweep(now=1000.0 + interval + 1) is True
+        assert runner._order_manager.sweep_unfilled_orders.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_sweep_skipped_without_market_calendar(self, runner):
+        runner._market_calendar = None
+        runner._order_manager.sweep_unfilled_orders = AsyncMock()
+        assert await runner.maybe_run_unfilled_sweep(now=1000.0) is False
+        runner._order_manager.sweep_unfilled_orders.assert_not_awaited()
+
+
+class TestOrderStatusGuards:
+    """handle_ib_order_status must tolerate late/duplicate broker statuses on an
+    already-terminal intent and must never leak an open transaction (review)."""
+
+    @pytest.mark.asyncio
+    async def test_late_status_for_terminal_intent_is_ignored(self, durable_runner):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")  # -> SUBMITTED
+        ledger.transition("rec-1", OrderStatus.FILLED)
+        ledger.session.commit()
+
+        # A late Cancelled arrives after the fill already terminalized it.
+        await runner.handle_ib_order_status(
+            {"order_id": "9", "status": "Cancelled"}
+        )
+
+        assert ledger.get("rec-1").status == OrderStatus.FILLED.value
+        ledger.session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_transition_failure_is_caught_and_alerts(self, durable_runner):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")  # SUBMITTED
+        ledger.session.commit()
+
+        from shared.order_ledger import InvalidOrderTransition
+
+        with patch.object(
+            runner._order_ledger,
+            "transition",
+            side_effect=InvalidOrderTransition("boom"),
+        ):
+            # Must not propagate into the fire-and-forget IB callback task.
+            await runner.handle_ib_order_status(
+                {"order_id": "9", "status": "Cancelled"}
+            )
+
+        alerts = [
+            c for c in runner._redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert len(alerts) >= 1
+        # Session is usable afterwards (not left mid-transaction).
+        assert ledger.get("rec-1") is not None
+        ledger.session.rollback()
+
+
+class TestExecutionPoisonHandling:
+    """A poison message in the execution loop must DLQ + ack + alert (3.3)."""
+
+    @pytest.mark.asyncio
+    async def test_poison_message_dead_lettered_acked_alerted(
+        self, runner, mock_redis
+    ):
+        from types import SimpleNamespace
+
+        mock_redis.read_group = AsyncMock(
+            return_value=[SimpleNamespace(message_id="1-0", data={"x": "y"})]
+        )
+        mock_redis.send_to_dead_letter = AsyncMock()
+
+        async def boom(_):
+            raise ValueError("unparseable")
+
+        await runner._consume_and_process(
+            "stream:approved_orders", lambda d: d, boom, count=1, block_ms=0
+        )
+
+        mock_redis.send_to_dead_letter.assert_awaited_once()
+        mock_redis.ack.assert_awaited_once()
+        alerts = [
+            c for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert len(alerts) >= 1
+
 
 class TestGracefulShutdown:
     @pytest.mark.asyncio
@@ -1298,6 +1482,45 @@ class TestPaperAccountGuard:
 
         with patch("ib_insync.IB", return_value=fake_ib):
             await executor.connect(expect_paper=True)
+
+        assert executor._ib is fake_ib
+
+    @pytest.mark.asyncio
+    async def test_paper_account_on_live_port_refused(self):
+        """The mirror guard: live mode must refuse a paper (DU) Gateway session
+        so a mis-login never trades the wrong book."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from services.execution.ib_executor import (
+            IBExecutor,
+            WrongAccountTypeError,
+        )
+
+        executor = IBExecutor(host="h", port=7496, client_id=1)
+        fake_ib = MagicMock()
+        fake_ib.connectAsync = AsyncMock()
+        fake_ib.managedAccounts.return_value = ["DUN551088"]  # PAPER prefix
+
+        with patch("ib_insync.IB", return_value=fake_ib):
+            with pytest.raises(WrongAccountTypeError, match="PAPER"):
+                await executor.connect(expect_paper=False)
+
+        fake_ib.disconnect.assert_called_once()
+        assert executor._ib is None
+
+    @pytest.mark.asyncio
+    async def test_live_account_accepted_in_live_mode(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from services.execution.ib_executor import IBExecutor
+
+        executor = IBExecutor(host="h", port=7496, client_id=1)
+        fake_ib = MagicMock()
+        fake_ib.connectAsync = AsyncMock()
+        fake_ib.managedAccounts.return_value = ["U17723819"]  # live prefix
+
+        with patch("ib_insync.IB", return_value=fake_ib):
+            await executor.connect(expect_paper=False)
 
         assert executor._ib is fake_ib
 
