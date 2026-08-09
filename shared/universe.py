@@ -289,3 +289,42 @@ def lookup_sector(ticker: str) -> str:
     Returns "Unknown" only for tickers outside every traded universe.
     """
     return SECTOR_MAP.get(ticker) or ETF_SECTORS.get(ticker) or "Unknown"
+
+
+# Tickers the connected IB Gateway cannot resolve from their current symbol,
+# because its contract database still carries a pre-corporate-action symbol.
+# Pinning the IB conId sidesteps the symbol entirely — conId is stable across
+# ticker/exchange changes, so this keeps working even after a future rename.
+#
+# WORKAROUND, not a real fix: the underlying cause is a stale contract view on
+# the gateway (observed 2026-08-09 — `reqContractDetails` returned the *old*
+# symbols below, and the current symbols resolved to nothing → 0 bars → the
+# names were silently dropped from the paper universe). If the gateway's
+# contract data is ever refreshed, re-verify these conIds (`reqContractDetails`
+# by conId) and delete any entry the gateway can once again resolve by symbol.
+CONTRACT_CONID_OVERRIDES: dict[str, int] = {
+    "MMC": 9705,    # Marsh & McLennan Cos — gateway lists stale symbol "MRSH"
+    "FI": 269315,   # Fiserv Inc — gateway lists stale symbol "FISV" (pre-2023)
+}
+
+
+def contract_conid_for(ticker: str) -> int | None:
+    """Return a pinned IB conId for *ticker*, or None if the symbol resolves
+    normally. See :data:`CONTRACT_CONID_OVERRIDES`."""
+    return CONTRACT_CONID_OVERRIDES.get(ticker)
+
+
+def make_stock_contract(ticker: str):
+    """Build an ib_insync ``Stock`` for *ticker*.
+
+    For tickers in :data:`CONTRACT_CONID_OVERRIDES` the contract is pinned by
+    conId (with SMART routing) so a stale gateway symbol can't drop the name;
+    everything else uses the plain ``Stock(ticker, "SMART", "USD")`` form.
+    ib_insync is imported lazily so importing this module never requires it.
+    """
+    from ib_insync import Stock
+
+    conid = CONTRACT_CONID_OVERRIDES.get(ticker)
+    if conid is not None:
+        return Stock(conId=conid, exchange="SMART", currency="USD")
+    return Stock(ticker, "SMART", "USD")

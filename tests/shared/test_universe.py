@@ -10,7 +10,9 @@ from shared.universe import (
     ACTIVE_SLEEVES,
     UNIVERSE_REGISTRY,
     MembershipCalendar,
+    contract_conid_for,
     get_union_universe,
+    make_stock_contract,
     resolve_watchlist,
 )
 
@@ -105,6 +107,31 @@ class TestSectorLookup:
             if lookup_sector(t) == "Unknown"
         ]
         assert unmapped == []
+
+
+class TestContractConIdOverride:
+    def test_stale_symbols_pin_a_conid(self):
+        # The gateway's contract DB carries pre-corporate-action symbols for
+        # these two, so they must be pinned by the (stable) IB conId instead.
+        assert contract_conid_for("MMC") == 9705
+        assert contract_conid_for("FI") == 269315
+
+    def test_normal_symbols_have_no_override(self):
+        assert contract_conid_for("AAPL") is None
+        assert contract_conid_for("ZZZTEST") is None
+
+    def test_make_stock_contract_pins_conid_for_overrides(self):
+        pytest.importorskip("ib_insync")
+        c = make_stock_contract("MMC")
+        assert c.conId == 9705
+        assert c.exchange == "SMART"
+
+    def test_make_stock_contract_uses_symbol_for_normal_tickers(self):
+        pytest.importorskip("ib_insync")
+        c = make_stock_contract("AAPL")
+        assert c.symbol == "AAPL"
+        assert c.exchange == "SMART"
+        assert not c.conId  # 0 / unset until qualified
 
 
 SNAPSHOTS = {

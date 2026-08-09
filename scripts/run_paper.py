@@ -921,14 +921,16 @@ def resolve_contract_details_from_ib(
     tickers: list[str], *, host: str, port: int, client_id: int
 ) -> dict[str, Any]:
     """Qualify signal contracts so intents always carry durable conIds."""
-    from ib_insync import IB, Stock
+    from ib_insync import IB
+
+    from shared.universe import make_stock_contract
 
     ib = IB()
     try:
         ib.connect(host, port, clientId=client_id, readonly=True, timeout=15)
         result: dict[str, Any] = {}
         for ticker in sorted(set(tickers)):
-            qualified = ib.qualifyContracts(Stock(ticker, "SMART", "USD"))
+            qualified = ib.qualifyContracts(make_stock_contract(ticker))
             if len(qualified) != 1 or int(qualified[0].conId) <= 0:
                 raise ValueError(f"could not uniquely qualify IB contract {ticker}")
             result[ticker] = qualified[0]

@@ -113,6 +113,7 @@ from shared.universe import (  # noqa: F401
     UNIVERSE_REGISTRY,
     MembershipCalendar,
     get_union_universe,
+    make_stock_contract,
 )
 
 # Instruments that are tradable on every date because they are not index
@@ -212,7 +213,7 @@ def fetch_bars_from_ib(
     import asyncio as _asyncio
 
     _asyncio.set_event_loop(_asyncio.new_event_loop())
-    from ib_insync import IB, Stock
+    from ib_insync import IB
 
     ib = IB()
     ib.connect(host, port, clientId=client_id, timeout=15)
@@ -228,7 +229,7 @@ def fetch_bars_from_ib(
         t0 = time.time()
 
         try:
-            contract = Stock(ticker, "SMART", "USD")
+            contract = make_stock_contract(ticker)
             ib.qualifyContracts(contract)
 
             # Request in 1-year chunks to stay within IB limits

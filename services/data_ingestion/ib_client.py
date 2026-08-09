@@ -31,8 +31,8 @@ class IBClient:
             self._ib.disconnect()
 
     async def get_daily_bars(self, ticker: str, start: date, end: date) -> list[dict[str, Any]]:
-        from ib_insync import Stock
-        contract = Stock(ticker, "SMART", "USD")
+        from shared.universe import make_stock_contract
+        contract = make_stock_contract(ticker)
         bars = await self._ib.reqHistoricalDataAsync(
             contract, endDateTime=end.strftime("%Y%m%d 23:59:59"),
             durationStr=f"{(end - start).days + 1} D",
@@ -44,7 +44,7 @@ class IBClient:
         ]
 
     async def get_fundamentals(self, ticker: str) -> dict[str, Any]:
-        from ib_insync import Stock
-        contract = Stock(ticker, "SMART", "USD")
+        from shared.universe import make_stock_contract
+        contract = make_stock_contract(ticker)
         data = await self._ib.reqFundamentalDataAsync(contract, reportType="ReportSnapshot")
         return {"raw": data}

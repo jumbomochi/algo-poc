@@ -600,9 +600,11 @@ class IBExecutor:
         """Submit a limit buy order via IB."""
         await self._ensure_connected()
         quantity = self._effective_quantity(ticker, quantity)
-        from ib_insync import LimitOrder, Stock
+        from ib_insync import LimitOrder
 
-        contract = Stock(ticker, "SMART", "USD")
+        from shared.universe import make_stock_contract
+
+        contract = make_stock_contract(ticker)
         # Explicit TIF: without it the order inherits the TWS desktop preset,
         # which can mutate/cancel API orders (Error 10349 observed).
         order = LimitOrder("BUY", quantity, limit_price, tif="DAY")
@@ -630,9 +632,11 @@ class IBExecutor:
         """Submit a market sell order via IB."""
         await self._ensure_connected()
         quantity = self._effective_quantity(ticker, quantity)
-        from ib_insync import MarketOrder, Stock
+        from ib_insync import MarketOrder
 
-        contract = Stock(ticker, "SMART", "USD")
+        from shared.universe import make_stock_contract
+
+        contract = make_stock_contract(ticker)
         order = MarketOrder("SELL", quantity, tif="DAY")
         if recommendation_id is not None:
             order.orderRef = recommendation_id
