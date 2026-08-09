@@ -8,8 +8,9 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy project metadata and install Python dependencies
-COPY pyproject.toml ./
-RUN pip install --no-cache-dir .
+COPY pyproject.toml requirements.lock ./
+RUN pip install --no-cache-dir --no-deps -r requirements.lock && \
+    pip install --no-cache-dir --no-deps .
 
 # Copy shared code and service code
 COPY shared/ shared/

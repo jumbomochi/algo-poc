@@ -8,6 +8,7 @@ Entry point for operational documentation.
 - `rollback-playbook.md` — Time-bound rollback procedure
 - `divergence-monitor.md` — Daily live-vs-backtest divergence check (scripts/divergence_monitor.py)
 - `backtest-baseline.md` — Regenerating the headline backtest: point-in-time universe, next-open fills, real costs
+- `api-security.md` — TLS, secrets, auth lockout, dependency scanning, schema/model integrity (T9)
 - Reconciliation procedures (TBD)
 - Incident response/escalation procedures (TBD)
 

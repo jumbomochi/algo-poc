@@ -1,5 +1,10 @@
 from datetime import datetime, timezone
+
+import pytest
+from pydantic import ValidationError
+
 from shared.schemas.messages import (
+    CURRENT_SCHEMA_VERSION,
     MarketDataMessage, FundamentalMessage, EventMessage,
     SignalMessage, RecommendationMessage, ApprovedOrderMessage,
     FillMessage, AlertMessage, KillMessage,
@@ -47,6 +52,59 @@ def test_kill_message():
         triggered_by="operator", reason="Manual kill switch",
     )
     assert msg.triggered_by == "operator"
+
+
+class TestSchemaVersion:
+    """Every stream message carries a schema_version so a consumer can tell
+    a genuinely-incompatible message apart from one it just doesn't
+    recognize yet. Evolution is additive-only: new fields get defaults and
+    schema_version stays put; a breaking change bumps schema_version, and
+    old consumers must reject (not silently misinterpret) messages from a
+    newer version they don't understand.
+    """
+
+    def test_schema_version_defaults_to_current(self):
+        msg = KillMessage(
+            timestamp=datetime.now(timezone.utc),
+            triggered_by="operator", reason="test",
+        )
+        assert msg.schema_version == CURRENT_SCHEMA_VERSION
+
+    def test_schema_version_round_trips_through_stream_dict(self):
+        msg = KillMessage(
+            timestamp=datetime.now(timezone.utc),
+            triggered_by="operator", reason="test",
+        )
+        wire = msg.to_stream_dict()
+        assert wire["schema_version"] == str(CURRENT_SCHEMA_VERSION)
+        restored = KillMessage.from_stream_dict(wire)
+        assert restored.schema_version == CURRENT_SCHEMA_VERSION
+
+    def test_legacy_message_without_schema_version_defaults_to_current(self):
+        """Messages published before this field existed have no
+        schema_version key on the wire; they must still parse.
+        """
+        legacy = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "triggered_by": "operator",
+            "reason": "pre-versioning message",
+        }
+        restored = KillMessage.from_stream_dict(legacy)
+        assert restored.schema_version == CURRENT_SCHEMA_VERSION
+
+    def test_future_schema_version_is_rejected(self):
+        """A message from a schema_version newer than this codebase
+        understands must fail validation loudly (DLQ-worthy), not be
+        silently accepted and misinterpreted.
+        """
+        future = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "triggered_by": "operator",
+            "reason": "from the future",
+            "schema_version": str(CURRENT_SCHEMA_VERSION + 1),
+        }
+        with pytest.raises(ValidationError, match="schema_version"):
+            KillMessage.from_stream_dict(future)
 
 
 def test_fill_message_round_trips_execution_identity():

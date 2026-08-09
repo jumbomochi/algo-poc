@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import os
+import time
+from collections import OrderedDict
+from collections.abc import Callable
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel
 
+from shared.config import load_config
 from shared.logging import get_logger
 
 logger = get_logger("api.auth")
@@ -20,12 +24,34 @@ class APIUser(BaseModel):
     role: str
 
 
-def _load_api_keys() -> dict[str, str]:
+# Path to the app config, matching the convention used by every service
+# runner (`load_config("config/default.yaml")`) — see shared/config.py.
+CONFIG_PATH = "config/default.yaml"
+
+
+def resolve_mode() -> str:
+    """Resolve the running mode from the validated ``AppConfig``.
+
+    Deliberately goes through ``AppConfig.mode`` (a ``Literal["paper",
+    "live", "backtest"]``) rather than reading ``ALGO_MODE`` directly:
+    - A typo'd ``ALGO_MODE`` fails config validation at startup instead of
+      silently resolving to "not live" here.
+    - ``mode: live`` set only in the YAML config file (no env var override)
+      is honored too — the old raw-env-var check missed this entirely.
+    """
+    return load_config(CONFIG_PATH).mode
+
+
+def _load_api_keys(mode: str | None = None) -> dict[str, str]:
     """Load API key -> role mapping.
 
     Uses ``API_KEYS`` env var if set (format: ``key1:role1,key2:role2``),
     otherwise falls back to development defaults. The fallback is refused in
     live mode: an internet-reachable kill switch must never accept "test-key".
+
+    Args:
+        mode: The resolved app mode. Defaults to ``AppConfig.mode`` (via
+            ``resolve_mode()``); tests may pass this explicitly.
     """
     env_keys = os.environ.get("API_KEYS")
     if env_keys:
@@ -45,7 +71,7 @@ def _load_api_keys() -> dict[str, str]:
             raise ValueError("API_KEYS is set but contains no valid entries")
         return mapping
 
-    if os.environ.get("ALGO_MODE") == "live":
+    if (mode if mode is not None else resolve_mode()) == "live":
         raise RuntimeError(
             "API_KEYS must be set in live mode; refusing to start with "
             "development default keys"
@@ -65,23 +91,193 @@ def _load_api_keys() -> dict[str, str]:
 API_KEYS = _load_api_keys()
 
 
+# Lockout thresholds for repeated X-API-Key failures. The kill endpoint is
+# internet-reachable and admin-gated purely by this key, so an unbounded
+# guessing loop against one specific wrong key must be stopped — but this
+# must never cost the operator access to the kill switch. See
+# get_current_user() for how that's enforced: a valid key always succeeds
+# before lockout state is even consulted, and a missing header is never
+# counted as a guess.
+LOCKOUT_MAX_FAILURES = 5
+LOCKOUT_WINDOW_SECONDS = 60.0
+LOCKOUT_DURATION_SECONDS = 300.0
+# Hard cap on distinct tracked buckets, to bound memory under a
+# distributed/many-address attack — see _LockoutTracker.
+LOCKOUT_MAX_TRACKED_KEYS = 10_000
+
+
+class _LockoutTracker:
+    """Tracks auth failures per lockout bucket and locks out repeat offenders.
+
+    Callers choose the bucket key (``client_id``) — see
+    ``get_current_user()``, which keys on the resolved client address alone.
+    All invalid-key attempts from one address share one failure budget,
+    regardless of which wrong key was presented each time; see
+    ``get_current_user()``'s docstring for why a per-key-prefix bucket was
+    tried and reverted (it let a tool that varies the guessed key evade
+    lockout entirely).
+
+    In-memory and per-process: this is adequate for the single-process API
+    deployment this repo documents (no multi-instance API scaling exists
+    today). If the API is ever scaled horizontally, this state needs to move
+    to a shared store (e.g. Redis) to stay effective across instances.
+
+    Bounded: entries with no failures left inside the window and no active
+    lockout are swept on every ``record_failure`` call, and the tracker
+    hard-caps at ``max_tracked_keys`` buckets (evicting the
+    least-recently-active one) so an attack from many distinct buckets can't
+    grow this structure without bound.
+    """
+
+    def __init__(
+        self,
+        max_failures: int = LOCKOUT_MAX_FAILURES,
+        window_seconds: float = LOCKOUT_WINDOW_SECONDS,
+        lockout_seconds: float = LOCKOUT_DURATION_SECONDS,
+        max_tracked_keys: int = LOCKOUT_MAX_TRACKED_KEYS,
+        now_fn: Callable[[], float] = time.monotonic,
+    ):
+        self._max_failures = max_failures
+        self._window_seconds = window_seconds
+        self._lockout_seconds = lockout_seconds
+        self._max_tracked_keys = max_tracked_keys
+        self._now = now_fn
+        # Ordered so eviction can drop the least-recently-touched bucket.
+        self._failures: OrderedDict[str, list[float]] = OrderedDict()
+        self._locked_until: dict[str, float] = {}
+
+    def _forget(self, client_id: str) -> None:
+        self._failures.pop(client_id, None)
+        self._locked_until.pop(client_id, None)
+
+    def is_locked_out(self, client_id: str) -> bool:
+        locked_until = self._locked_until.get(client_id)
+        if locked_until is None:
+            return False
+        if self._now() >= locked_until:
+            # Lockout expired: clear it so the client gets a clean slate.
+            self._forget(client_id)
+            return False
+        return True
+
+    def record_failure(self, client_id: str) -> None:
+        now = self._now()
+
+        recent = [
+            t for t in self._failures.get(client_id, [])
+            if now - t < self._window_seconds
+        ]
+        recent.append(now)
+        self._failures[client_id] = recent
+        self._failures.move_to_end(client_id)
+        if len(recent) >= self._max_failures:
+            self._locked_until[client_id] = now + self._lockout_seconds
+
+        self._sweep(now)
+
+    def _sweep(self, now: float) -> None:
+        """Drop buckets that are neither actively failing nor locked out,
+        then enforce the hard cap by evicting the oldest survivors.
+        """
+        for client_id in list(self._failures.keys()):
+            recent = [
+                t for t in self._failures[client_id] if now - t < self._window_seconds
+            ]
+            if recent:
+                self._failures[client_id] = recent
+            elif client_id not in self._locked_until:
+                del self._failures[client_id]
+
+        self._evict_over_capacity()
+
+    def _evict_over_capacity(self) -> None:
+        """Drop the oldest *non-locked* bucket until back at capacity.
+
+        A currently-locked-out bucket is never evicted here: dropping it
+        would delete its ``_locked_until`` entry too, letting a genuinely
+        locked-out attacker regain access early just because the tracker
+        happened to be near capacity. If every tracked bucket is locked
+        out (an extreme, distributed-attack edge case), this temporarily
+        exceeds ``max_tracked_keys`` rather than lifting a lockout early —
+        ``_sweep`` reclaims the space once locks expire.
+        """
+        while len(self._failures) > self._max_tracked_keys:
+            evicted = False
+            for client_id in self._failures:  # oldest-first iteration order
+                if client_id in self._locked_until:
+                    continue
+                del self._failures[client_id]
+                evicted = True
+                break
+            if not evicted:
+                break
+
+    def reset(self) -> None:
+        self._failures.clear()
+        self._locked_until.clear()
+
+
+_lockout = _LockoutTracker()
+
+
+def reset_lockout() -> None:
+    """Clear all lockout state. Exposed for tests, which reuse the same
+    process-wide tracker across many TestClient instances that all appear to
+    come from the same client address.
+    """
+    _lockout.reset()
+
+
 def get_current_user(
+    request: Request,
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> APIUser:
-    """FastAPI dependency that validates the ``X-API-Key`` header."""
+    """FastAPI dependency that validates the ``X-API-Key`` header.
+
+    Validity is checked before any lockout state: a request presenting a
+    genuinely valid key always succeeds, full stop — the kill switch this
+    guards must stay reachable for the operator no matter how many
+    unrelated failures came from the same address. A missing header isn't
+    a guess and never touches lockout state either.
+
+    Every *invalid*-key attempt from one resolved client address shares a
+    single lockout bucket, regardless of which wrong key was presented.
+    Bucketing on ``(address, key-prefix)`` instead was tried and reverted:
+    it let a credential-guessing tool that varies the guessed key on every
+    attempt (the normal case) get a fresh 5-failure budget per distinct
+    prefix and never actually lock out. The address-sharing hazard that
+    motivated a per-key bucket — everyone behind one reverse proxy sharing
+    a single ``request.client.host`` — is handled instead by only trusting
+    ``X-Forwarded-For`` from a configured, trusted proxy
+    (``API_FORWARDED_ALLOW_IPS`` in ``services/api/runner.py``; see
+    ``docs/operations/api-security.md``). An attacker rotating their own
+    source address defeats any address-keyed scheme and is an accepted
+    residual risk, not something this bucket key can solve.
+    """
     if x_api_key is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing API key",
         )
+
     role = API_KEYS.get(x_api_key)
-    if role is None:
-        logger.warning("auth_failed", api_key=x_api_key[:4] + "***")
+    if role is not None:
+        return APIUser(api_key=x_api_key, role=role)
+
+    bucket = request.client.host if request.client else "unknown"
+
+    if _lockout.is_locked_out(bucket):
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API key",
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed authentication attempts; try again later",
         )
-    return APIUser(api_key=x_api_key, role=role)
+
+    _lockout.record_failure(bucket)
+    logger.warning("auth_failed", api_key=x_api_key[:4] + "***")
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or missing API key",
+    )
 
 
 def require_role(role: str):

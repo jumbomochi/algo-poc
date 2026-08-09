@@ -5,7 +5,7 @@ from typing import Any
 
 from fastapi import Depends, FastAPI
 
-from services.api.auth import APIUser, get_current_user
+from services.api.auth import APIUser, get_current_user, resolve_mode
 from services.api.routes import activity, backtest, kill, ml, portfolio, positions, risk
 from shared.logging import get_logger
 from shared.redis_client import RedisStreamClient
@@ -16,7 +16,7 @@ logger = get_logger("api.app")
 def create_app(
     redis_client: RedisStreamClient | None = None,
     db_sessionmaker: Any = None,
-    mode: str = "paper",
+    mode: str | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -27,8 +27,17 @@ def create_app(
         db_sessionmaker: Injected SQLAlchemy sessionmaker (used by tests). When
             omitted, one is created from config during app lifespan — the kill
             *clear* endpoint needs it to clear the durable halt.
-        mode: trading mode the halt table is scoped by (``paper``/``live``).
+        mode: The running mode (``"paper"``, ``"live"``, or ``"backtest"``).
+            Defaults to ``AppConfig.mode`` (see ``resolve_mode()``); tests
+            may pass this explicitly. Scopes the durable halt table (kill
+            *clear* endpoint) and gates the interactive docs — Swagger UI,
+            ReDoc, and the raw OpenAPI schema leak the full route surface and
+            must never be reachable in live mode. TLS termination is a
+            deployment-level concern (reverse proxy / load balancer), not
+            handled in-app — see docs/operations/api-security.md.
     """
+    resolved_mode = mode if mode is not None else resolve_mode()
+    docs_enabled = resolved_mode != "live"
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -66,12 +75,17 @@ def create_app(
         version="0.1.0",
         description="Trading bot monitoring and control API",
         lifespan=lifespan,
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
     )
     # Set immediately (not just in lifespan) so injected clients work even
     # when a TestClient is used without a `with` block (no lifespan events).
     app.state.redis = redis_client
     app.state.db_sessionmaker = db_sessionmaker
-    app.state.mode = mode
+    # Always a concrete mode (never None): scopes the durable halt table and
+    # must match the value resolve_mode() returns for a real container start.
+    app.state.mode = resolved_mode
 
     # Register route modules.
     app.include_router(portfolio.router)

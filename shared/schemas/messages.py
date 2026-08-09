@@ -4,10 +4,46 @@ import json
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+# The schema_version this codebase currently understands/produces for every
+# stream message.
+#
+# Evolution rule — additive-only:
+#   - Adding an optional field with a default does NOT require a version
+#     bump. Old consumers ignore fields they don't know about (pydantic's
+#     default `extra="ignore"`); new consumers apply the default when the
+#     field is absent from an old message.
+#   - Removing a field, renaming a field, or changing a field's meaning/type
+#     IS a breaking change: bump CURRENT_SCHEMA_VERSION and, if older
+#     consumers must keep parsing old messages, give them a migration path
+#     before dropping support for the previous version.
+#   - A message whose schema_version is higher than CURRENT_SCHEMA_VERSION
+#     came from a producer newer than this consumer; from_stream_dict raises
+#     a ValidationError rather than guess at fields it doesn't recognize.
+#     That failure is DLQ-worthy — existing runner code already routes
+#     ValidationError from from_stream_dict to the dead-letter stream.
+CURRENT_SCHEMA_VERSION = 1
 
 
 class StreamSerializable(BaseModel):
+    # Present on every message so a consumer can distinguish "a field I
+    # don't recognize" (fine, ignored) from "a message shape I don't
+    # understand" (reject). Defaults to the current version so messages
+    # written before this field existed keep parsing unchanged.
+    schema_version: int = CURRENT_SCHEMA_VERSION
+
+    @field_validator("schema_version")
+    @classmethod
+    def _reject_unsupported_schema_version(cls, value: int) -> int:
+        if value > CURRENT_SCHEMA_VERSION:
+            raise ValueError(
+                f"schema_version {value} is newer than this codebase "
+                f"understands (max supported: {CURRENT_SCHEMA_VERSION}); "
+                "refusing to parse a message from a newer producer"
+            )
+        return value
+
     def to_stream_dict(self) -> dict[str, str]:
         data = self.model_dump(mode="json")
         result: dict[str, str] = {}
