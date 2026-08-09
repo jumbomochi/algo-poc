@@ -6,7 +6,29 @@ drawdowns or operational issues compound.
 
 **Script:** `scripts/divergence_monitor.py`
 **Math layer:** `backtest/divergence.py` (pure functions, no I/O)
-**Tests:** `tests/backtest/test_divergence.py` (37 unit) + `tests/scripts/test_divergence_monitor.py` (8 integration)
+**Tests:** `tests/backtest/test_divergence.py` + `tests/scripts/test_divergence_monitor.py`
+
+---
+
+## The baseline has to be like-for-like
+
+The monitor only grades live against a backtest that live could actually have
+matched. It reads the baseline's declared execution model from the results
+JSON's `config` block and requires **next-open fills**, a **per-order commission
+floor**, and a **point-in-time universe**. Anything the config does not declare
+is treated as the unsafe value.
+
+A backtest that filled same-bar (entries at the decision day's low, exits at
+that day's open) is unachievable, so live trails it by construction; grading
+against one either excuses real drift or invents drift that is only the
+baseline's optimism. When the baseline fails the check, every report comes back
+`NO_DATA` with a note naming each unmet requirement, the header is tagged
+`[NOT LIKE-FOR-LIKE]`, the arithmetic is still printed so the gap is visible,
+and the process **exits 3** so the daily job cannot log it as OK.
+
+Fix: regenerate the baseline per
+[backtest-baseline.md](backtest-baseline.md). A results JSON with no
+`fill_model` key predates the 2026-08-06 rebaseline and is treated as same-bar.
 
 ---
 
@@ -14,11 +36,11 @@ drawdowns or operational issues compound.
 
 | Symptom | Manifests as | Action |
 |---|---|---|
-| Fills consistently worse than the 10 bps slippage assumed | `Slip bps` column much higher than 10 | Investigate IB routing, order timing, liquidity in thinly-traded ETFs |
+| Fills consistently worse than the baseline's slippage assumption | `Slip bps` column above 1.5× the baseline's rate | Investigate IB routing, order timing, liquidity in thinly-traded ETFs |
 | A signal not firing live the same way it fired in backtest | Live return diverges, daily correlation drops below ~0.7 | Diff the signal output between live and backtest for the same bars |
 | Order rejections or stuck positions | Trade count diverges, live equity flat while backtest moves | Check `services/execution` logs, order status in IB |
 | Universe drift (live trading a ticker no longer in the backtest universe) | Portfolio in DB but absent from backtest JSON | Re-run backtest, update CAPITAL_ALLOCATIONS, or accept and exclude |
-| Commission realization exceeding the $0.005/share assumed | Realized commission > 1.5× assumed | Review IB commission tier, check for high-frequency churn |
+| Commission realization exceeding the baseline's `max($1/order, $0.005/share)` | Realized commission > 1.5× assumed | Review IB commission tier, check for high-frequency churn |
 
 ## Usage
 
@@ -54,9 +76,14 @@ python scripts/divergence_monitor.py \
 
 | Code | Meaning | Cron / launchd action |
 |---|---|---|
-| 0 | All portfolios OK or WARNING | None |
+| 0 | All portfolios OK or WARNING (or genuinely no overlapping history yet) | None |
 | 1 | At least one portfolio BREACH | Alert (Slack/email) |
 | 2 | Hard error (DB unreachable, backtest missing, invalid args) | Page on-call |
+| 3 | Baseline not comparable — **the monitor is blind**, no drift detection is running | Alert; regenerate the baseline ([backtest-baseline.md](backtest-baseline.md)) |
+
+A breach outranks code 3 if both somehow apply. In practice they cannot
+co-occur: a non-comparable baseline forces every status to `NO_DATA`, so there
+is nothing left to breach — which is exactly why code 3 must not be 0.
 
 ---
 
@@ -98,8 +125,9 @@ below ~0.7, signals are firing differently between live and backtest.
 Returns `None` (renders as `—`) when the series is constant or too short.
 
 **`Slip bps`** — average realized slippage per fill, weighted by notional
-(`|quantity × exit_price|`). The backtest assumes 10 bps; consistent values
-above ~15 bps warrant investigation.
+(`|quantity × exit_price|`). Compared against the baseline's own declared
+slippage (printed in the header); consistent values above 1.5× it warrant
+investigation.
 
 **`Trades`** — count of closed trades whose `exit_date` falls within the
 window. Compare to expected trade frequency per sleeve.
@@ -127,10 +155,11 @@ written that day's `equity_snapshots` row. The deployed job is:
 | 04:45 | `scripts/divergence_monitor.py --prometheus-textfile ...` | Reads the snapshots just written |
 | 05:00 Tue | Backtest refresh (weekly, `local.algo-backtest-refresh`) | Updates the baseline that divergence is measured against. Tuesday, not Monday: IBKR's hist-data farm is routinely down from Saturday night through Monday pre-market. |
 
-**Alert wiring:** the script exits non-zero on BREACH. Wrap the cron line in:
+**Alert wiring:** the script exits non-zero on BREACH (1) and on a
+non-comparable baseline (3). Wrap the cron line in:
 
 ```bash
-python scripts/divergence_monitor.py || notify-slack "divergence breach"
+python scripts/divergence_monitor.py || notify-slack "divergence breach or blind monitor"
 ```
 
 Or use the JSON output as a Grafana data source for richer alerting.

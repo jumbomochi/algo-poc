@@ -11,7 +11,7 @@ import json
 import os
 import sys
 import time
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Callable
 
 
@@ -19,6 +19,15 @@ from typing import Any, Callable
 # management, fill projector) can resolve sectors too. Re-exported here
 # for existing importers (run_paper.py, validate_replacement_policy.py).
 from shared.universe import SECTOR_MAP  # noqa: F401
+
+# Calendar days after a fiscal period-end before its figures are assumed to be
+# public. yfinance's quarterly statements carry the period-end only, so this
+# stands in for the filing date. 45 days clears the SEC's 40-day 10-Q deadline
+# for large accelerated filers with a small margin; the annual 10-K deadline is
+# 60 days, so pass a larger lag if the cache mixes in fiscal-year-end periods
+# and you want to be strict about those too. Rows that do carry an explicit
+# ``filing_date`` use it instead of this lag.
+DEFAULT_FILING_LAG_DAYS = 45
 
 
 def save_fundamentals_cache(data: dict[str, list[dict]], path: str) -> None:
@@ -38,19 +47,40 @@ def load_fundamentals_cache(path: str) -> dict[str, list[dict]]:
 
 def build_fundamentals_lookup(
     cache: dict[str, list[dict]],
+    filing_lag_days: int = DEFAULT_FILING_LAG_DAYS,
 ) -> Callable[[str, date], dict | None]:
     """Build a point-in-time fundamentals lookup function.
 
-    Returns a function(ticker, as_of_date) -> dict | None that returns
-    the most recent fundamentals report filed before as_of_date.
-    Avoids look-ahead bias by only using data available at the time.
+    Returns a function(ticker, as_of_date) -> dict | None giving the most
+    recent report **available** on ``as_of_date``.
+
+    Availability is the filing date, not the fiscal period-end: a quarter
+    ending 31 March is not public knowledge on 31 March. Each row's
+    availability is:
+
+    - its explicit ``filing_date``, when the data source provides one; else
+    - ``report_date + filing_lag_days`` (see ``DEFAULT_FILING_LAG_DAYS``).
+
+    Keying off ``report_date`` — as this function used to — leaks figures weeks
+    early into both the backtest and live paper trading (finding 4.4 of the
+    2026-08-06 implementation review). Reports are ordered by availability, so
+    a late-filed or restated earlier period cannot shadow one that was already
+    public.
     """
+    if filing_lag_days < 0:
+        raise ValueError(f"filing_lag_days must be >= 0, got {filing_lag_days}")
+
+    lag = timedelta(days=filing_lag_days)
     sorted_cache: dict[str, list[tuple[date, dict]]] = {}
     for ticker, reports in cache.items():
         entries = []
         for r in reports:
-            rd = date.fromisoformat(r["report_date"]) if isinstance(r["report_date"], str) else r["report_date"]
-            entries.append((rd, r))
+            filed = r.get("filing_date")
+            if filed:
+                available = _as_date(filed)
+            else:
+                available = _as_date(r["report_date"]) + lag
+            entries.append((available, r))
         entries.sort(key=lambda x: x[0])
         sorted_cache[ticker] = entries
 
@@ -59,14 +89,18 @@ def build_fundamentals_lookup(
         if not entries:
             return None
         result = None
-        for rd, report in entries:
-            if rd <= as_of_date:
+        for available_date, report in entries:
+            if available_date <= as_of_date:
                 result = report
             else:
                 break
         return result
 
     return lookup
+
+
+def _as_date(value: date | str) -> date:
+    return value if isinstance(value, date) else date.fromisoformat(str(value))
 
 
 def fetch_fundamentals_from_yfinance(

@@ -11,8 +11,9 @@ For each paper-trading portfolio (and the aggregate), this script:
    slippage/commission from the ``trades`` table.
 4. Prints a console table, writes a JSON report, and optionally emits a
    Prometheus textfile for ``node_exporter`` to scrape.
-5. Exits non-zero if any portfolio's divergence breaches the threshold —
-   so cron/launchd jobs can alert.
+5. Exits non-zero if any portfolio's divergence breaches the threshold, or if
+   the baseline backtest is not comparable to live at all — so cron/launchd
+   jobs can alert. See ``exit_code_for`` for the contract.
 
 This is **not** a kill switch. It surfaces divergence so a human can decide
 whether to investigate, disable a sleeve, or carry on. Automated sleeve
@@ -41,15 +42,52 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from backtest.divergence import (
+    ASSUMED_SLIPPAGE_BPS,
     DEFAULT_THRESHOLD,
     DEFAULT_WINDOW_DAYS,
+    ExecutionModel,
     PortfolioDivergenceReport,
     aggregate_reports,
     any_breach,
     build_report,
+    execution_model_from_backtest_config,
 )
 from scripts.paper_state import PaperTradingState
 from shared.config import load_config
+
+
+# ---------------------------------------------------------------------------
+# Exit-code contract (mirrored in deploy/launchd/run_divergence.sh)
+# ---------------------------------------------------------------------------
+
+EXIT_OK = 0
+EXIT_BREACH = 1
+EXIT_ERROR = 2
+# The monitor ran but could not judge anything: the baseline backtest is not
+# like-for-like with live execution, so every report was forced to NO_DATA.
+# This needs its own code — folding it into EXIT_OK made a blind monitor
+# indistinguishable from a healthy one in the daily log.
+EXIT_BASELINE_NOT_COMPARABLE = 3
+
+
+def exit_code_for(
+    reports: list[PortfolioDivergenceReport],
+    execution_model: ExecutionModel | None = None,
+) -> int:
+    """Map the run's outcome onto the process exit code.
+
+    A breach outranks a stale baseline: it is the louder signal, and in practice
+    the two cannot co-occur (a non-comparable baseline forces every status to
+    NO_DATA). A genuine NO_DATA on a good baseline — no overlapping live history
+    yet — is not a fault and stays at EXIT_OK.
+    """
+    if any_breach(reports):
+        return EXIT_BREACH
+    if execution_model is not None and not execution_model.is_like_for_like:
+        return EXIT_BASELINE_NOT_COMPARABLE
+    if any(not r.baseline_comparable for r in reports):
+        return EXIT_BASELINE_NOT_COMPARABLE
+    return EXIT_OK
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +130,18 @@ def load_backtest_equity_series(
     }
     aggregate = _series(data["aggregate"]["portfolio_values"])
     return per_portfolio, aggregate
+
+
+def load_backtest_execution_model(backtest_path: str) -> ExecutionModel:
+    """Read the execution assumptions the baseline backtest ran under.
+
+    A baseline that filled same-bar, or that modelled no per-order commission
+    floor, is not something live execution can match — the monitor reports its
+    figures but refuses to grade live against it (finding 4.6).
+    """
+    with open(backtest_path) as f:
+        data = json.load(f)
+    return execution_model_from_backtest_config(data.get("config"))
 
 
 def load_live_equity_series(state: PaperTradingState, portfolio: str) -> dict[date, float]:
@@ -144,9 +194,18 @@ def print_report_table(
     reports: list[PortfolioDivergenceReport],
     window_days: int,
     threshold: float,
+    execution_model: ExecutionModel | None = None,
 ) -> None:
     print("=" * 110)
     print(f"  DIVERGENCE MONITOR — window {window_days} days, threshold {threshold:.0%}")
+    if execution_model is not None:
+        print(
+            f"  Baseline execution: {execution_model.fill_model} fills, "
+            f"{execution_model.slippage_bps:.0f} bps slippage, "
+            f"max(${execution_model.commission_minimum:.2f}, "
+            f"${execution_model.commission_per_share}/share) commission"
+            + ("" if execution_model.is_like_for_like else "  [NOT LIKE-FOR-LIKE]")
+        )
     print("=" * 110)
     print()
     header = (
@@ -170,15 +229,26 @@ def print_report_table(
     print()
 
     # Surface anything non-OK in plain English at the bottom.
-    actionable = [r for r in reports if r.status in ("WARNING", "BREACH")]
+    actionable = [
+        r for r in reports
+        if r.status in ("WARNING", "BREACH") or not r.baseline_comparable
+    ]
+    assumed_slippage = (
+        execution_model.slippage_bps
+        if execution_model is not None
+        else ASSUMED_SLIPPAGE_BPS
+    )
     for r in actionable:
         print(f"  [{r.status}] {r.portfolio}:")
         for note in r.notes:
             print(f"     • {note}")
-        if r.realized_slippage_bps is not None and r.realized_slippage_bps > 15:
+        if (
+            r.realized_slippage_bps is not None
+            and r.realized_slippage_bps > 1.5 * assumed_slippage
+        ):
             print(
                 f"     • Realized slippage {r.realized_slippage_bps:.1f} bps "
-                f"exceeds the 10 bps backtest assumption."
+                f"exceeds the {assumed_slippage:.0f} bps backtest assumption."
             )
         if r.assumed_commission_total > 0 and r.realized_commission_total > 1.5 * r.assumed_commission_total:
             print(
@@ -201,6 +271,7 @@ def write_json_report(
     backtest_path: str,
     window_days: int,
     threshold: float,
+    execution_model: ExecutionModel | None = None,
 ) -> None:
     """Write the full report to a JSON file for historical tracking / Grafana."""
 
@@ -218,6 +289,8 @@ def write_json_report(
         "threshold": threshold,
         "reports": [_serialize(r) for r in reports],
     }
+    if execution_model is not None:
+        payload["baseline_execution_model"] = asdict(execution_model)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(payload, f, indent=2)
@@ -336,13 +409,20 @@ def main() -> int:
     backtest_path = args.backtest or find_latest_backtest_json()
     if backtest_path is None:
         print("ERROR: No backtest JSON found. Pass --backtest or run scripts/run_backtest.py first.")
-        return 2
+        return EXIT_ERROR
     if not Path(backtest_path).is_file():
         print(f"ERROR: Backtest file not found: {backtest_path}")
-        return 2
+        return EXIT_ERROR
     print(f"  Backtest source: {backtest_path}")
 
     bt_per_portfolio, bt_aggregate = load_backtest_equity_series(backtest_path)
+    execution_model = load_backtest_execution_model(backtest_path)
+    if not execution_model.is_like_for_like:
+        print(
+            f"  ⚠ Baseline execution model is '{execution_model.fill_model}' — not "
+            "like-for-like with live. Divergence will be reported as NO_DATA; "
+            "re-run the baseline per docs/operations/backtest-baseline.md."
+        )
 
     # --- Open DB and load paper state ---
     # SQLAlchemy lazy-connects, so the actual connection attempt happens inside
@@ -353,13 +433,13 @@ def main() -> int:
         session: Session = session_factory()
     except Exception as e:
         print(f"ERROR: Failed to construct DB engine ({args.db_url}): {e}")
-        return 2
+        return EXIT_ERROR
 
     try:
         state = PaperTradingState.load(session)
     except ValueError:
         print("ERROR: No paper trading state in DB. Run scripts/run_paper.py --init first.")
-        return 2
+        return EXIT_ERROR
     except Exception as e:
         # Auth failure, network unreachable, missing tables, etc.
         print(f"ERROR: Could not load paper state from DB ({args.db_url}):")
@@ -368,7 +448,7 @@ def main() -> int:
             "       Check that the DB is running, credentials are correct, "
             "and migrations have run (`alembic upgrade head`)."
         )
-        return 2
+        return EXIT_ERROR
 
     portfolios = state.get_portfolio_names()
     if args.portfolio:
@@ -377,7 +457,7 @@ def main() -> int:
                 f"ERROR: Portfolio '{args.portfolio}' not in DB. "
                 f"Available: {', '.join(portfolios)}"
             )
-            return 2
+            return EXIT_ERROR
         portfolios = [args.portfolio]
 
     # --- Build per-portfolio reports ---
@@ -401,6 +481,7 @@ def main() -> int:
             trades=trades,
             window_days=args.window,
             threshold=args.threshold,
+            execution_model=execution_model,
         )
         reports.append(report)
 
@@ -421,12 +502,18 @@ def main() -> int:
             all_trades=all_trades,
             window_days=args.window,
             threshold=args.threshold,
+            execution_model=execution_model,
         )
         reports.append(agg_report)
 
     # --- Output ---
     print()
-    print_report_table(reports, window_days=args.window, threshold=args.threshold)
+    print_report_table(
+        reports,
+        window_days=args.window,
+        threshold=args.threshold,
+        execution_model=execution_model,
+    )
 
     if not args.no_output:
         output_path = args.output or f"output/divergence_{date.today().strftime('%Y%m%d')}.json"
@@ -435,12 +522,13 @@ def main() -> int:
             backtest_path=backtest_path,
             window_days=args.window,
             threshold=args.threshold,
+            execution_model=execution_model,
         )
 
     if args.prometheus_textfile:
         write_prometheus_textfile(reports, args.prometheus_textfile)
 
-    return 1 if any_breach(reports) else 0
+    return exit_code_for(reports, execution_model)
 
 
 if __name__ == "__main__":

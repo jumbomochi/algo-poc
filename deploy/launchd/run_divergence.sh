@@ -4,9 +4,13 @@
 # equity_snapshots row. Compares live paper equity to the latest backtest.
 #
 # Exit-code contract (from scripts/divergence_monitor.py):
-#   0 = all portfolios OK or WARNING   -> no action
-#   1 = at least one portfolio BREACH  -> alert
-#   2 = hard error (DB/backtest/args)  -> page
+#   0 = all portfolios OK or WARNING       -> no action
+#   1 = at least one portfolio BREACH      -> alert
+#   2 = hard error (DB/backtest/args)      -> page
+#   3 = baseline backtest not comparable   -> alert; the monitor is BLIND
+#       (same-bar fills, no commission floor, or a survivorship-biased
+#        universe: every report is forced to NO_DATA). Regenerate the baseline
+#        per docs/operations/backtest-baseline.md. Do NOT read this as OK.
 # NOTE: deliberately NOT using `set -e` around the python call, because exit
 # codes 1 and 2 are meaningful signals we branch on, not failures to abort on.
 
@@ -55,6 +59,14 @@ case "$EXIT_CODE" in
     2)
         echo "$(date): PAGE - divergence monitor hard error (exit 2)" >> "$LOG_FILE"
         # Page on-call here once a channel exists.
+        ;;
+    3)
+        echo "$(date): ALERT - divergence monitor BLIND: baseline backtest is not" \
+             "comparable to live (exit 3). No drift detection is running until the" \
+             "baseline is regenerated - see docs/operations/backtest-baseline.md" \
+             >> "$LOG_FILE"
+        # Notifications are disabled in config/default.yaml today. When enabled,
+        # wire a real alert here — a blind monitor is an outage, not a pass.
         ;;
     *)
         echo "$(date): UNEXPECTED exit code $EXIT_CODE from divergence monitor" >> "$LOG_FILE"

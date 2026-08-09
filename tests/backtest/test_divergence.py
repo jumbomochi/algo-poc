@@ -12,6 +12,9 @@ import pytest
 
 from backtest.divergence import (
     DEFAULT_THRESHOLD,
+    NEXT_OPEN_FILL_MODEL,
+    SAME_BAR_FILL_MODEL,
+    ExecutionModel,
     PortfolioDivergenceReport,
     aggregate_reports,
     align_and_window,
@@ -22,6 +25,7 @@ from backtest.divergence import (
     compute_divergence,
     correlation,
     daily_returns,
+    execution_model_from_backtest_config,
     filter_trades_to_window,
     slippage_bps,
     window_return,
@@ -243,14 +247,15 @@ def test_slippage_bps_uses_price_if_exit_price_missing() -> None:
 
 
 def test_commission_totals_returns_realized_and_assumed() -> None:
-    # 100 shares + 50 shares = 150 shares total; round trip is 300 fills * $0.005
+    # Both orders are small enough that the $1 per-order floor binds, so the
+    # assumed cost is 2 orders x $1 per round trip rather than $0.005/share.
     trades = [
         {"commission": 1.0, "quantity": 100},
         {"commission": 0.50, "quantity": 50},
     ]
     realized, assumed = commission_totals(trades)
     assert realized == pytest.approx(1.50)
-    assert assumed == pytest.approx(150 * 0.005 * 2)  # = $1.50
+    assert assumed == pytest.approx(4.0)
 
 
 # ---------------------------------------------------------------------------
@@ -413,3 +418,245 @@ def test_any_breach_false_if_no_report_breaches() -> None:
         ),
     ]
     assert any_breach(reports) is False
+
+
+# ---------------------------------------------------------------------------
+# ExecutionModel / like-for-like baseline
+# ---------------------------------------------------------------------------
+
+
+class TestExecutionModel:
+    """Finding 4.6: the monitor baselined against an unachievable backtest.
+
+    Comparing live fills to a same-bar-fill backtest means live trails "by
+    construction", so a real degradation is indistinguishable from the
+    baseline's own optimism.
+    """
+
+    def test_next_open_backtest_with_real_costs_is_comparable(self):
+        model = ExecutionModel(
+            fill_model=NEXT_OPEN_FILL_MODEL,
+            slippage_bps=10.0,
+            commission_per_share=0.005,
+            commission_minimum=1.0,
+            point_in_time_universe=True,
+        )
+        assert model.is_like_for_like is True
+
+    def test_same_bar_backtest_is_not_comparable(self):
+        model = ExecutionModel(
+            fill_model=SAME_BAR_FILL_MODEL,
+            slippage_bps=10.0,
+            commission_per_share=0.005,
+            commission_minimum=1.0,
+        )
+        assert model.is_like_for_like is False
+
+    def test_missing_commission_floor_is_not_comparable(self):
+        model = ExecutionModel(
+            fill_model=NEXT_OPEN_FILL_MODEL,
+            slippage_bps=10.0,
+            commission_per_share=0.005,
+            commission_minimum=0.0,
+        )
+        assert model.is_like_for_like is False
+
+    def test_config_without_a_fill_model_reads_as_legacy_same_bar(self):
+        """Backtests saved before the rebaseline declared no fill model."""
+        model = execution_model_from_backtest_config(
+            {"slippage_bps": 10, "commission_per_share": 0.005}
+        )
+        assert model.fill_model == SAME_BAR_FILL_MODEL
+        assert model.is_like_for_like is False
+
+    def test_config_round_trips_the_declared_execution_model(self):
+        model = execution_model_from_backtest_config({
+            "fill_model": NEXT_OPEN_FILL_MODEL,
+            "slippage_bps": 15,
+            "commission_per_share": 0.007,
+            "commission_minimum": 1.0,
+            "point_in_time_universe": True,
+        })
+        assert model.fill_model == NEXT_OPEN_FILL_MODEL
+        assert model.slippage_bps == pytest.approx(15.0)
+        assert model.commission_per_share == pytest.approx(0.007)
+        assert model.commission_minimum == pytest.approx(1.0)
+        assert model.is_like_for_like is True
+
+    def test_missing_config_reads_as_legacy(self):
+        assert execution_model_from_backtest_config(None).is_like_for_like is False
+
+
+class TestCommissionFloorInAssumption:
+    def test_assumed_commission_applies_the_per_order_floor(self):
+        """Small live orders pay IB's $1 minimum, not $0.005/share."""
+        model = ExecutionModel(
+            fill_model=NEXT_OPEN_FILL_MODEL,
+            slippage_bps=10.0,
+            commission_per_share=0.005,
+            commission_minimum=1.0,
+        )
+        # 4 shares: $0.02/side under the per-share rate, $1/side with the floor.
+        trades = [{"commission": 2.0, "quantity": 4}]
+
+        realized, assumed = commission_totals(trades, execution_model=model)
+
+        assert realized == pytest.approx(2.0)
+        assert assumed == pytest.approx(2.0)
+
+    def test_large_orders_still_pay_the_per_share_rate(self):
+        model = ExecutionModel(
+            fill_model=NEXT_OPEN_FILL_MODEL,
+            slippage_bps=10.0,
+            commission_per_share=0.005,
+            commission_minimum=1.0,
+        )
+        trades = [{"commission": 5.0, "quantity": 1_000}]
+
+        _, assumed = commission_totals(trades, execution_model=model)
+
+        assert assumed == pytest.approx(1_000 * 0.005 * 2)
+
+
+class TestBuildReportBaselineComparability:
+    def _series(self, start: date, days: int, daily: float) -> dict[date, float]:
+        return _equity_series(start, days, daily)
+
+    def test_report_records_the_baseline_execution_model(self):
+        start = date(2026, 5, 1)
+        model = ExecutionModel(
+            fill_model=NEXT_OPEN_FILL_MODEL,
+            slippage_bps=10.0,
+            commission_per_share=0.005,
+            commission_minimum=1.0,
+            point_in_time_universe=True,
+        )
+        report = build_report(
+            "momentum",
+            self._series(start, 10, 0.001),
+            self._series(start, 10, 0.001),
+            trades=[],
+            window_days=10,
+            execution_model=model,
+        )
+        assert report.baseline_fill_model == NEXT_OPEN_FILL_MODEL
+        assert report.baseline_comparable is True
+        assert report.status == "OK"
+
+    def test_same_bar_baseline_reports_no_data_instead_of_a_false_ok(self):
+        start = date(2026, 5, 1)
+        model = ExecutionModel(
+            fill_model=SAME_BAR_FILL_MODEL,
+            slippage_bps=10.0,
+            commission_per_share=0.005,
+            commission_minimum=0.0,
+        )
+        report = build_report(
+            "momentum",
+            self._series(start, 10, 0.001),
+            self._series(start, 10, 0.005),
+            trades=[],
+            window_days=10,
+            execution_model=model,
+        )
+        assert report.baseline_comparable is False
+        assert report.status == "NO_DATA"
+        assert any("not like-for-like" in note for note in report.notes)
+        assert any(SAME_BAR_FILL_MODEL in note for note in report.notes)
+        # The arithmetic is still reported so the operator can see the gap.
+        assert report.live_return is not None
+        assert report.backtest_return is not None
+
+    def test_omitting_the_execution_model_keeps_the_report_usable(self):
+        """Callers that never learned about baselines still get a report."""
+        start = date(2026, 5, 1)
+        report = build_report(
+            "momentum",
+            self._series(start, 10, 0.001),
+            self._series(start, 10, 0.001),
+            trades=[],
+            window_days=10,
+        )
+        assert report.status == "OK"
+        assert report.baseline_comparable is True
+
+    def test_aggregate_report_carries_the_execution_model(self):
+        start = date(2026, 5, 1)
+        model = ExecutionModel(
+            fill_model=SAME_BAR_FILL_MODEL,
+            slippage_bps=10.0,
+            commission_per_share=0.005,
+            commission_minimum=0.0,
+        )
+        report = aggregate_reports(
+            reports=[],
+            live_total=self._series(start, 10, 0.002),
+            backtest_total=self._series(start, 10, 0.0015),
+            all_trades=[],
+            window_days=10,
+            execution_model=model,
+        )
+        assert report.portfolio == "AGGREGATE"
+        assert report.baseline_comparable is False
+
+
+class TestSurvivorshipBiasedBaselineIsNotComparable:
+    """A next-open backtest over a survivorship-biased universe is still unfair.
+
+    `--universe-snapshots` is opt-in, so the most likely re-run is one that
+    fixed the fills and the costs but kept the static present-day ticker list.
+    That baseline is inflated by winner pre-selection and live cannot match it,
+    so the gate has to fail it too.
+    """
+
+    def _model(self, **overrides):
+        kwargs = dict(
+            fill_model=NEXT_OPEN_FILL_MODEL,
+            slippage_bps=10.0,
+            commission_per_share=0.005,
+            commission_minimum=1.0,
+            point_in_time_universe=True,
+        )
+        kwargs.update(overrides)
+        return ExecutionModel(**kwargs)
+
+    def test_static_universe_is_not_comparable(self):
+        assert self._model(point_in_time_universe=False).is_like_for_like is False
+
+    def test_point_in_time_universe_is_required_alongside_fills_and_costs(self):
+        assert self._model().is_like_for_like is True
+
+    def test_config_missing_the_flag_fails_safe(self):
+        model = execution_model_from_backtest_config({
+            "fill_model": NEXT_OPEN_FILL_MODEL,
+            "commission_minimum": 1.0,
+        })
+        assert model.point_in_time_universe is False
+        assert model.is_like_for_like is False
+
+    def test_config_flag_is_read(self):
+        model = execution_model_from_backtest_config({
+            "fill_model": NEXT_OPEN_FILL_MODEL,
+            "commission_minimum": 1.0,
+            "point_in_time_universe": True,
+        })
+        assert model.is_like_for_like is True
+
+    def test_default_field_value_fails_safe(self):
+        """Constructing a model without opting in must not claim comparability."""
+        bare = ExecutionModel(fill_model=NEXT_OPEN_FILL_MODEL, commission_minimum=1.0)
+        assert bare.point_in_time_universe is False
+
+    def test_report_forces_no_data_for_a_static_universe_baseline(self):
+        start = date(2026, 5, 1)
+        report = build_report(
+            "momentum",
+            _equity_series(start, 10, 0.001),
+            _equity_series(start, 10, 0.001),
+            trades=[],
+            window_days=10,
+            execution_model=self._model(point_in_time_universe=False),
+        )
+        assert report.baseline_comparable is False
+        assert report.status == "NO_DATA"
+        assert any("survivorship" in note.lower() for note in report.notes)

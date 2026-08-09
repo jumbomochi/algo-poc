@@ -19,6 +19,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from backtest.costs import (
+    DEFAULT_COMMISSION_MINIMUM,
+    DEFAULT_COMMISSION_PER_SHARE,
+    CostModel,
+)
 from backtest.metrics import BacktestMetrics
 from backtest.ranked_selection import ReplacementPolicy
 from backtest.runner import BacktestRunner
@@ -189,7 +194,8 @@ def evaluate_replacement_policies(
     score_margin: float = 0.25,
     walk_forward_days: int = 252,
     slippage_bps: int = 10,
-    commission_per_share: float = 0.005,
+    commission_per_share: float = DEFAULT_COMMISSION_PER_SHARE,
+    commission_minimum: float = DEFAULT_COMMISSION_MINIMUM,
     turnover_ceiling: float = 2.0,
 ) -> dict[str, Any]:
     """Run all replacement policies against the same immutable bar set."""
@@ -254,8 +260,11 @@ def evaluate_replacement_policies(
             ),
         }
         executor = SimulatedExecutor(
-            slippage_bps=slippage_bps,
-            commission_per_share=commission_per_share,
+            CostModel.with_liquidity_tiers(
+                slippage_bps=slippage_bps,
+                commission_per_share=commission_per_share,
+                commission_minimum=commission_minimum,
+            )
         )
         results = {
             name: BacktestRunner(executor, config.capital).run(
@@ -293,6 +302,7 @@ def evaluate_replacement_policies(
             "walk_forward_days": walk_forward_days,
             "slippage_bps": slippage_bps,
             "commission_per_share": commission_per_share,
+            "commission_minimum": commission_minimum,
             "turnover_ceiling": turnover_ceiling,
         },
         "policies": policies,
@@ -339,7 +349,13 @@ def main() -> None:
     parser.add_argument("--score-margin", type=float, default=0.25)
     parser.add_argument("--walk-forward-days", type=int, default=252)
     parser.add_argument("--slippage-bps", type=int, default=10)
-    parser.add_argument("--commission", type=float, default=0.005)
+    parser.add_argument(
+        "--commission", type=float, default=DEFAULT_COMMISSION_PER_SHARE
+    )
+    parser.add_argument(
+        "--commission-minimum", type=float, default=DEFAULT_COMMISSION_MINIMUM,
+        help="Per-order commission floor in USD (IB charges max($1, $0.005/share)).",
+    )
     parser.add_argument("--turnover-ceiling", type=float, default=2.0)
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
@@ -359,6 +375,7 @@ def main() -> None:
         walk_forward_days=args.walk_forward_days,
         slippage_bps=args.slippage_bps,
         commission_per_share=args.commission,
+        commission_minimum=args.commission_minimum,
         turnover_ceiling=args.turnover_ceiling,
     )
     report["source_bars"] = str(args.bars_from_json)

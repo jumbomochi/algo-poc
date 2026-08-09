@@ -4,12 +4,13 @@ from dataclasses import dataclass
 from datetime import date
 
 from backtest.runner import BacktestRunner, BacktestResult
+from backtest.costs import CostModel
 from backtest.simulator import SimulatedExecutor
 
 
 def test_runner_supports_multiple_lots_per_ticker():
     """Runner should accept multiple buy signals for the same ticker."""
-    executor = SimulatedExecutor(slippage_bps=0, commission_per_share=0)
+    executor = SimulatedExecutor(CostModel(slippage_bps=0, commission_per_share=0, commission_minimum=0.0))
     runner = BacktestRunner(executor=executor, initial_capital=100_000)
 
     # 10 days of data, price goes 100 -> 102 -> 105 -> 103 -> 108 -> 105 -> 110 -> 112 -> 115 -> 120
@@ -29,17 +30,19 @@ def test_runner_supports_multiple_lots_per_ticker():
         if len(bars_so_far) < 2:
             return None
         price = bars_so_far[-1]["close"]
-        # Buy on day 2 (price 102) and day 6 (price 105)
+        # Buy decided on day 2 (price 102) and day 6 (price 105). The limits are
+        # set wide enough to be reachable during the *following* session, since
+        # entries fill at the next open.
         if len(bars_so_far) == 2:
             call_count["buy"] += 1
-            return {"action": "buy", "ticker": ticker, "limit_price": price + 1,
+            return {"action": "buy", "ticker": ticker, "limit_price": price + 4,
                     "quantity": 10, "sector": "Test", "signals": {}}
         if len(bars_so_far) == 6:
             call_count["buy"] += 1
-            return {"action": "buy", "ticker": ticker, "limit_price": price + 1,
+            return {"action": "buy", "ticker": ticker, "limit_price": price + 4,
                     "quantity": 10, "sector": "Test", "signals": {}}
-        # Sell all on day 10 (price 120)
-        if len(bars_so_far) == 10:
+        # Sell all decided on day 9 (price 115) -> fills at day 10's open.
+        if len(bars_so_far) == 9:
             return {"action": "sell", "ticker": ticker, "limit_price": price,
                     "quantity": 0, "sector": "Test", "exit_reason": "trailing_stop",
                     "lot_index": "all"}
@@ -52,7 +55,10 @@ def test_runner_supports_multiple_lots_per_ticker():
         reason: str = "ok"
 
     class MockRisk:
-        def check_entry(self, ticker, quantity, price, sector, portfolio, existing_lots=0):
+        def check_entry(
+            self, ticker, quantity, price, sector, portfolio,
+            existing_lots=0, reserved_notional=0.0,
+        ):
             return AlwaysApprove(adjusted_quantity=quantity)
 
     result = runner.run(bars, signals_fn, MockRisk())

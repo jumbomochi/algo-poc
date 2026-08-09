@@ -3,12 +3,13 @@ from __future__ import annotations
 from datetime import date
 
 from backtest.runner import BacktestRunner, BacktestResult
+from backtest.costs import CostModel
 from backtest.simulator import SimulatedExecutor
 
 
 def test_backtest_result_includes_dates():
     """BacktestResult.dates should have one entry per trading day."""
-    executor = SimulatedExecutor(slippage_bps=10, commission_per_share=0.005)
+    executor = SimulatedExecutor(CostModel(slippage_bps=10, commission_per_share=0.005, commission_minimum=0.0))
     runner = BacktestRunner(executor=executor, initial_capital=100_000)
 
     bars_by_ticker = {

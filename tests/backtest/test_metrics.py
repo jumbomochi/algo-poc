@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import statistics
 from datetime import date
 
 import pytest
@@ -34,6 +36,29 @@ class TestSharpeRatio:
     def test_sharpe_near_zero_for_flat(self):
         values = [100_000] * 252
         result = BacktestMetrics.compute(portfolio_values=values, trades=[])
+        assert result["sharpe_ratio"] == pytest.approx(0.0)
+
+    def test_sharpe_uses_sample_stdev(self):
+        """Sharpe must use the ddof=1 sample stdev, not the population stdev.
+
+        The population stdev understates dispersion on a finite sample, which
+        inflates the reported Sharpe — exactly the kind of optimism the
+        headline backtest must not carry.
+        """
+        values = [100.0, 102.0, 101.0, 104.0, 103.0, 106.0]
+        result = BacktestMetrics.compute(portfolio_values=values, trades=[])
+
+        daily = [
+            values[i] / values[i - 1] - 1.0 for i in range(1, len(values))
+        ]
+        expected = (
+            statistics.fmean(daily) / statistics.stdev(daily) * math.sqrt(252)
+        )
+        assert result["sharpe_ratio"] == pytest.approx(expected)
+
+    def test_sharpe_zero_when_only_one_return_observation(self):
+        # A single daily return has no sample stdev (ddof=1 divides by zero).
+        result = BacktestMetrics.compute(portfolio_values=[100.0, 101.0], trades=[])
         assert result["sharpe_ratio"] == pytest.approx(0.0)
 
 
