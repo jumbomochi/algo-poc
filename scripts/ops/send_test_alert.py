@@ -3,7 +3,7 @@
 Usage:
     python -m scripts.ops.send_test_alert                     # low priority
     python -m scripts.ops.send_test_alert --priority critical
-    ALGO_REDIS_URL=redis://localhost:56379/0 python -m scripts.ops.send_test_alert
+    ALGO_REDIS_URL=redis://:$REDIS_PASSWORD@localhost:56379/0 python -m scripts.ops.send_test_alert
 
 The notifications service (docker compose) must be running; watch its logs
 and your Telegram chat for the delivery.

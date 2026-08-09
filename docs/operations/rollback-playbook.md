@@ -37,8 +37,11 @@ Execute each step in order. Target completion: **under 15 minutes** for steps
      -H "Content-Type: application/json" \
      -d '{"reason": "rollback: <brief description>"}'
    # Expect HTTP 200 with a "message_id" — a 503 means the kill did NOT
-   # reach the stream; fall back to publishing directly:
-   #   docker compose exec redis redis-cli XADD stream:kill '*' \
+   # reach the stream; fall back to publishing directly (Redis requires auth
+   # since the T3 message-bus lockdown — pass the same REDIS_PASSWORD that's
+   # in the repo's .env):
+   #   docker compose exec redis redis-cli -a "$REDIS_PASSWORD" --no-auth-warning \
+   #     XADD stream:kill '*' \
    #     timestamp "$(date -u +%FT%TZ)" triggered_by manual reason rollback
    ```
 3. Verify the kill switch is active:

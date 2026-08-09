@@ -1,0 +1,71 @@
+# Example local override for docker-compose.yml.
+#
+# `docker-compose.override.yml` (no `.example` suffix) is gitignored and
+# auto-loaded by `docker compose` alongside docker-compose.yml — copy this
+# file to that name and edit it for your machine. Typical reason to need
+# one: a host port (5433, 6379, 8000) is already taken by something else,
+# so you remap to a different machine-local port.
+#
+#   cp docker-compose.override.yml.example docker-compose.override.yml
+#
+# HARDENING RULE THIS OVERRIDE MUST NOT UNDO:
+#   Every host port binding below keeps the "127.0.0.1:<port>:<container-port>"
+#   form. Postgres, Redis, and the API are not supposed to be reachable from
+#   outside this machine under any port number — remap the left-hand port,
+#   never drop the "127.0.0.1:" prefix, and never publish these to "0.0.0.0"
+#   or a LAN-facing bind address.
+#
+# Auth (POSTGRES_PASSWORD / REDIS_PASSWORD) comes from the top-level `.env`
+# file and applies to both docker-compose.yml and this override automatically
+# — you do not need to (and should not) repeat credentials here.
+
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:55432:5432"
+
+  redis:
+    ports:
+      - "127.0.0.1:56379:6379"
+
+  api:
+    ports:
+      - "127.0.0.1:58000:8000"
+
+# ---------------------------------------------------------------------------
+# OPERATOR RUNBOOK: rotating credentials on an EXISTING volume
+# ---------------------------------------------------------------------------
+# POSTGRES_PASSWORD and REDIS_PASSWORD becoming *required* (see
+# docker-compose.yml / .env.example) only changes what a *fresh* `pgdata`
+# volume gets initialized with. If you already have a running stack with a
+# volume created before this change, follow these steps by hand — none of
+# this is automated, and none of it should be run by an agent on your behalf:
+#
+# 1. Pick strong values and put them in `.env`:
+#      openssl rand -hex 24   # run twice, once per secret
+#    POSTGRES_PASSWORD=<value 1>
+#    REDIS_PASSWORD=<value 2>
+#
+# 2. Redis picks up REQUIREPASS from the container command on next start —
+#    no data migration needed. After you restart the `redis` service
+#    (`docker compose up -d redis`), every service's ALGO_REDIS_URL already
+#    embeds the same ${REDIS_PASSWORD}, so they reconnect automatically.
+#
+# 3. Postgres needs an explicit ALTER USER — POSTGRES_PASSWORD in the
+#    environment only seeds a brand-new volume. With the *old* password
+#    still in place, connect once and change it:
+#      docker compose exec postgres psql -U algo -d algo_poc \
+#        -c "ALTER USER algo WITH PASSWORD '<value 1 from step 1>';"
+#    Only after that succeeds should you restart the other services so they
+#    pick up the new ALGO_DATABASE_URL from `.env`.
+#
+# 4. Any HOST-side script that hardcodes a DB/Redis URL outside of docker
+#    compose (this repo's launchd wrappers under deploy/launchd/ and
+#    ops/launchd/, and their deployed copies under ~/ibc/) must be updated
+#    with the same new credentials, or the nightly paper-trading / monitoring
+#    jobs will start failing auth after step 3. Check for the literal string
+#    "algo:algo" and any un-authenticated "redis://localhost:<port>" URL.
+#
+# 5. Verify: `docker compose ps` shows every service healthy/running, and
+#    the next scheduled launchd job (or a manual dry run of
+#    deploy/launchd/run_paper.sh) completes without an auth error in its log.

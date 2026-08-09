@@ -18,15 +18,23 @@ LOG_DIR="$HOME/ibc/logs"
 METRICS_DIR="$HOME/ibc/metrics"
 LOG_FILE="$LOG_DIR/divergence_$(date +%Y%m%d).log"
 PROM_FILE="$METRICS_DIR/divergence.prom"
-
-# The paper DB is the dockerized postgres on a machine-local port (see
-# docker-compose.override.yml); config/default.yaml's localhost:5432 default
-# points at nothing on this machine.
-export ALGO_DATABASE_URL="postgresql://algo:algo@localhost:55432/algo_poc"
+ENV_FILE="$ALGO_DIR/.env"
 
 mkdir -p "$LOG_DIR" "$METRICS_DIR"
 
 echo "$(date): Starting daily divergence monitor" >> "$LOG_FILE"
+
+# The paper DB is the dockerized postgres on a machine-local port (see
+# docker-compose.override.yml); config/default.yaml's localhost:5432 default
+# points at nothing on this machine. Postgres now requires auth (T3
+# message-bus lockdown) — credentials live in the repo's gitignored `.env`,
+# same split as the Telegram credentials in gateway_watchdog.sh.
+DB_PASSWORD=$(grep '^POSTGRES_PASSWORD=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-)
+if [ -z "$DB_PASSWORD" ]; then
+    echo "$(date): ERROR - POSTGRES_PASSWORD not set in $ENV_FILE" >> "$LOG_FILE"
+    exit 2
+fi
+export ALGO_DATABASE_URL="postgresql://algo:${DB_PASSWORD}@localhost:55432/algo_poc"
 
 cd "$ALGO_DIR"
 "$VENV" scripts/divergence_monitor.py \
