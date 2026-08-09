@@ -698,7 +698,7 @@ git commit -m "feat: add sleeve objectives and guardrails with blocked registrat
 - Consumes: `research.strategy.combine.combine_factor_scores`; `research.evaluation.portfolio.quantile_long_only`; `research.strategy.objectives.{SleeveObjective, ObjectiveContext}`; `research.evaluation.folds.InnerFold`.
 - Produces:
   - `@dataclass(frozen=True) class WeightFit`: `weights: tuple[float, ...]`, `threshold: float`, `score: float`.
-  - `optimize_weights(frames: dict[str, pd.DataFrame], forward: pd.DataFrame, inner_folds: tuple, thresholds: tuple[float, ...], objective: SleeveObjective, horizon: int, min_names: int, periods_per_year: float, seed: int) -> WeightFit`. `frames` keys are the factor ids in a fixed order; returned `weights` align to `sorted(frames)`. Deterministic: fixed simplex start set (equal-weight + unit vertices), fixed coordinate-refinement schedule; `seed` recorded but not used for randomness. Weights are non-negative and sum to 1.
+  - `optimize_weights(frames: dict[str, pd.DataFrame], forward: pd.DataFrame, inner_folds: tuple, thresholds: tuple[float, ...], objective: SleeveObjective, rebalance: int, min_names: int, periods_per_year: float, seed: int) -> WeightFit`. `frames` keys are the factor ids in a fixed order; returned `weights` align to `sorted(frames)`. `rebalance` is the position-holding stride passed to `quantile_long_only`; the return horizon is already baked into `forward` and is **not** a parameter here. Deterministic: fixed simplex start set (equal-weight + unit vertices), fixed coordinate-refinement schedule; `seed` recorded but not used for randomness. Weights are non-negative and sum to 1.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -736,7 +736,7 @@ def test_optimizer_prefers_the_predictive_factor():
         inner_folds=inner,
         thresholds=(0.2, 0.3),
         objective=ThematicMomentumObjective(),
-        horizon=horizon,
+        rebalance=horizon,
         min_names=3,
         periods_per_year=252.0 / horizon,
         seed=7,
@@ -753,7 +753,7 @@ def test_optimizer_is_deterministic():
     inner = (InnerFold(train=(0, 30), validate=(30, 55)),)
     kwargs = dict(
         frames=frames, forward=fwd, inner_folds=inner, thresholds=(0.2, 0.3),
-        objective=ThematicMomentumObjective(), horizon=horizon, min_names=3,
+        objective=ThematicMomentumObjective(), rebalance=horizon, min_names=3,
         periods_per_year=252.0 / horizon, seed=7,
     )
     a = optimize_weights(**kwargs)
@@ -767,7 +767,7 @@ def test_optimizer_only_reads_the_inner_validate_span():
     inner = (InnerFold(train=(0, 30), validate=(30, 55)),)
     kwargs = dict(
         frames=frames, forward=fwd, inner_folds=inner, thresholds=(0.2, 0.3),
-        objective=ThematicMomentumObjective(), horizon=horizon, min_names=3,
+        objective=ThematicMomentumObjective(), rebalance=horizon, min_names=3,
         periods_per_year=252.0 / horizon, seed=7,
     )
     base = optimize_weights(**kwargs)
@@ -835,7 +835,7 @@ def _evaluate(
     inner_folds,
     threshold: float,
     objective: SleeveObjective,
-    horizon: int,
+    rebalance: int,
     min_names: int,
     periods_per_year: float,
 ) -> float:
@@ -844,7 +844,9 @@ def _evaluate(
     for fold in inner_folds:
         v_scores = combined.iloc[fold.validate[0]:fold.validate[1]]
         v_forward = forward.iloc[fold.validate[0]:fold.validate[1]]
-        series = quantile_long_only(v_scores, v_forward, threshold, horizon, min_names)
+        series = quantile_long_only(
+            v_scores, v_forward, threshold, rebalance=rebalance, min_names=min_names
+        )
         if len(series.returns):
             scores.append(objective.score(series, ObjectiveContext(periods_per_year=periods_per_year)))
     return sum(scores) / len(scores) if scores else float("-inf")
@@ -856,7 +858,7 @@ def optimize_weights(
     inner_folds,
     thresholds: tuple[float, ...],
     objective: SleeveObjective,
-    horizon: int,
+    rebalance: int,
     min_names: int,
     periods_per_year: float,
     seed: int,
@@ -867,7 +869,7 @@ def optimize_weights(
     for threshold in thresholds:
         for start in _start_points(n):
             weights = _normalize(list(start))
-            score = _evaluate(keys, weights, frames, forward, inner_folds, threshold, objective, horizon, min_names, periods_per_year)
+            score = _evaluate(keys, weights, frames, forward, inner_folds, threshold, objective, rebalance, min_names, periods_per_year)
             for step in _STEP_SCHEDULE:
                 for _ in range(_REFINE_PASSES):
                     improved = False
@@ -880,7 +882,7 @@ def optimize_weights(
                             trial[j] -= step
                             trial = _normalize(trial)
                             trial_t = tuple(trial)
-                            trial_score = _evaluate(keys, trial_t, frames, forward, inner_folds, threshold, objective, horizon, min_names, periods_per_year)
+                            trial_score = _evaluate(keys, trial_t, frames, forward, inner_folds, threshold, objective, rebalance, min_names, periods_per_year)
                             if trial_score > score + 1e-12:
                                 weights, score, improved = trial_t, trial_score, True
                     if not improved:
@@ -1094,7 +1096,7 @@ def search_sleeve(sleeve, bars_by_ticker, baseline_records, config) -> dict:
                 inner_folds=outer.inner,
                 thresholds=config.thresholds,
                 objective=objective,
-                horizon=config.horizon,
+                rebalance=config.horizon,  # rebalance cadence; horizon lives in `forward`
                 min_names=config.min_names,
                 periods_per_year=periods_per_year,
                 seed=config.seed,
@@ -1104,7 +1106,10 @@ def search_sleeve(sleeve, bars_by_ticker, baseline_records, config) -> dict:
             combined = combine_factor_scores(frames, dict(zip(sorted(frames), fit.weights)))
             test_scores = combined.iloc[outer.test[0]:outer.test[1]]
             test_forward = forward.iloc[outer.test[0]:outer.test[1]]
-            series = quantile_long_only(test_scores, test_forward, threshold, config.horizon, config.min_names)
+            series = quantile_long_only(
+                test_scores, test_forward, threshold,
+                rebalance=config.horizon, min_names=config.min_names,
+            )
             oos_returns.append(series.returns)
             oos_ic.append(series.ic)
             oos_turnover.append(series.turnover)
@@ -1427,6 +1432,7 @@ git commit -m "feat: add offline Research Validation Score with no-renormalizati
 **Files:**
 - Create: `research/strategy/runcard.py`
 - Create: `scripts/run_strategy_search.py`
+- Modify: `research/evaluation/runcard.py` (add a `prefix` param to `write_run_card` so the strategy path reuses the shared `output/` guard + write)
 - Modify: `research/strategy/search.py` (attach RVS into each strategy dict)
 - Modify: `tests/research/test_architecture.py` (add strategy-subpackage boundary assertion)
 - Test: `tests/research/strategy/test_runcard.py`, `tests/scripts/test_run_strategy_search.py`
@@ -1544,15 +1550,32 @@ def test_write_is_byte_identical_for_identical_cards(tmp_path):
 Run: `pytest tests/research/strategy/test_runcard.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'research.strategy.runcard'`.
 
-- [ ] **Step 7: Write the run card implementation**
+- [ ] **Step 7: Write the run card implementation (reuse the evaluation writer)**
 
-Create `research/strategy/runcard.py`:
+First, parameterize the existing shared writer so the strategy path reuses its `output/` guard and byte-reproducible write instead of duplicating them. Edit `research/evaluation/runcard.py` — add a `prefix` parameter (defaulted so existing callers and their tests are unaffected):
+
+```python
+def write_run_card(card: dict, output_dir: str, prefix: str = "factor_evaluation") -> Path:
+    directory = Path(output_dir)
+    if "output" in directory.parts:
+        raise ValueError("run cards must not be written under output/")
+    directory.mkdir(parents=True, exist_ok=True)
+    cutoff = card["provenance"]["data_cutoff"]
+    path = directory / f"{prefix}_{cutoff}.json"
+    path.write_text(json.dumps(card, sort_keys=True, indent=2))
+    return path
+```
+
+Then create `research/strategy/runcard.py` as a thin layer. `build_strategy_run_card` stays (its card shape legitimately differs — it embeds `search`, and `search_result` has no top-level `config`), but the writer delegates to the shared one. Importing `research.evaluation.runcard` is permitted by the boundary scanner (`FORBIDDEN_DEPENDENCY_PREFIXES` covers `backtest/services/scripts/redis/importlib/...`, not `research.evaluation`).
 
 ```python
 from __future__ import annotations
 
-import json
 from pathlib import Path
+
+from research.evaluation.runcard import write_run_card
+
+_FILENAME_PREFIX = "strategy_search"
 
 
 def build_strategy_run_card(search_result: dict, git_revision: str, input_checksum: str) -> dict:
@@ -1566,15 +1589,10 @@ def build_strategy_run_card(search_result: dict, git_revision: str, input_checks
 
 
 def write_strategy_run_card(card: dict, output_dir: str) -> Path:
-    directory = Path(output_dir)
-    if "output" in directory.parts:
-        raise ValueError("run cards must not be written under output/")
-    directory.mkdir(parents=True, exist_ok=True)
-    cutoff = card["provenance"]["data_cutoff"]
-    path = directory / f"strategy_search_{cutoff}.json"
-    path.write_text(json.dumps(card, sort_keys=True, indent=2))
-    return path
+    return write_run_card(card, output_dir, prefix=_FILENAME_PREFIX)
 ```
+
+The Step 5 test (`test_runcard.py`) is unchanged: `write_strategy_run_card` still exists, still yields `strategy_search_<cutoff>.json`, still raises `ValueError` on an `output/` component (now from the shared guard), and stays byte-identical (same `json.dumps(sort_keys=True, indent=2)`).
 
 - [ ] **Step 8: Run test to verify it passes**
 
@@ -1770,7 +1788,7 @@ Run: `python -m compileall research/strategy scripts/run_strategy_search.py`
 Expected: no errors.
 
 ```bash
-git add research/strategy/runcard.py research/strategy/search.py scripts/run_strategy_search.py tests/research/test_architecture.py tests/research/strategy/test_runcard.py tests/research/strategy/test_search.py tests/scripts/test_run_strategy_search.py
+git add research/strategy/runcard.py research/evaluation/runcard.py research/strategy/search.py scripts/run_strategy_search.py tests/research/test_architecture.py tests/research/strategy/test_runcard.py tests/research/strategy/test_search.py tests/scripts/test_run_strategy_search.py
 git commit -m "feat: add strategy-search run card, CLI, and boundary coverage"
 ```
 
