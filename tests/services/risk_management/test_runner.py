@@ -404,6 +404,97 @@ class TestKillLiquidation:
         session.rollback()
 
     @pytest.mark.asyncio
+    async def test_kill_exit_intent_is_approved_before_publish(
+        self, db_runner, mock_redis
+    ):
+        """Risk is the approver of its own exits (KAN-4).
+
+        Publishing a PROPOSED intent means execution's record_submission does
+        an illegal PROPOSED->SUBMITTED transition *after* the IB order is live.
+        """
+        runner, ledger, session = db_runner
+        await runner.process_kill(_kill_msg())
+
+        for order in _approved_orders(mock_redis):
+            intent = ledger.get(order.recommendation_id)
+            assert intent.status == OrderStatus.APPROVED.value
+            assert intent.approved_at is not None
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_kill_approves_pre_existing_proposed_intent(
+        self, db_runner, mock_redis
+    ):
+        """A pre-fix leftover (intent created at PROPOSED by an older build)
+        must be approved by the adopt branch, not left stranded."""
+        runner, ledger, session = db_runner
+        kill = _kill_msg()
+        exit_id = runner._liquidation_exit_id("AAPL", int(kill.timestamp.timestamp()))
+        ledger.create_intent(
+            SimpleNamespace(
+                recommendation_id=exit_id,
+                account_id="DUTEST",
+                mode="paper",
+                portfolio="momentum",
+                con_id=111,
+                symbol="AAPL",
+                exchange="SMART",
+                currency="USD",
+                action="SELL",
+                quantity=10.0,
+                limit_price=None,
+                order_type="MKT",
+            )
+        )
+        session.commit()
+
+        await runner.process_kill(kill)
+
+        intent = ledger.get(exit_id)
+        assert intent.status == OrderStatus.APPROVED.value
+        assert intent.approved_at is not None
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_kill_leaves_already_submitted_intent_untouched(
+        self, db_runner, mock_redis
+    ):
+        """A replayed kill whose exit is already live at the broker must not
+        re-transition it (APPROVED/SUBMITTED are illegal sources for APPROVED)."""
+        runner, ledger, session = db_runner
+        kill = _kill_msg()
+        exit_id = runner._liquidation_exit_id("AAPL", int(kill.timestamp.timestamp()))
+        ledger.create_intent(
+            SimpleNamespace(
+                recommendation_id=exit_id,
+                account_id="DUTEST",
+                mode="paper",
+                portfolio="momentum",
+                con_id=111,
+                symbol="AAPL",
+                exchange="SMART",
+                currency="USD",
+                action="SELL",
+                quantity=10.0,
+                limit_price=None,
+                order_type="MKT",
+            )
+        )
+        ledger.transition(exit_id, OrderStatus.APPROVED)
+        ledger.record_submission(exit_id, "77")
+        session.commit()
+        submitted_at = ledger.get(exit_id).submitted_at
+        session.rollback()
+
+        await runner.process_kill(kill)  # must not raise
+
+        intent = ledger.get(exit_id)
+        assert intent.status == OrderStatus.SUBMITTED.value
+        assert intent.ib_order_id == "77"
+        assert intent.submitted_at == submitted_at
+        session.rollback()
+
+    @pytest.mark.asyncio
     async def test_second_kill_while_halted_does_not_reliquidate(
         self, db_runner, mock_redis
     ):

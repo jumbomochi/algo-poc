@@ -1128,13 +1128,24 @@ class RiskServiceRunner:
                 order_type="MKT",
             )
             try:
-                self._order_ledger.create_intent(proposal)
+                # Risk IS the approver of its own exits: publishing a PROPOSED
+                # intent makes execution's record_submission an illegal
+                # PROPOSED->SUBMITTED transition *after* the IB order is live.
+                # Create and approve in one transaction.
+                intent = self._order_ledger.create_intent(proposal)
+                if OrderStatus(intent.status) is OrderStatus.PROPOSED:
+                    self._order_ledger.transition(exit_id, OrderStatus.APPROVED)
                 self._order_ledger.session.commit()
             except ConflictingOrderIntent:
                 # An intent for this deterministic id already exists (a replay or
                 # the concurrent execution-side net). Keep it — that is exactly
-                # the idempotency guarantee.
+                # the idempotency guarantee — but a pre-fix leftover must not
+                # stay stranded at PROPOSED.
                 self._order_ledger.session.rollback()
+                intent = self._order_ledger.get(exit_id)
+                if OrderStatus(intent.status) is OrderStatus.PROPOSED:
+                    self._order_ledger.transition(exit_id, OrderStatus.APPROVED)
+                self._order_ledger.session.commit()
             except Exception:
                 self._order_ledger.session.rollback()
                 raise
