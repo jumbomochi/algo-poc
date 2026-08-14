@@ -1,0 +1,27 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    name: pytest (full suite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      # No service containers: the suite is self-contained. Migration tests
+      # use a throwaway sqlite database in tmp_path, and nothing skips on a
+      # missing postgres/redis/docker — so a passing run here means the whole
+      # suite actually ran, not that most of it was skipped.
+      - name: Install locked dev dependencies
+        run: pip install -r requirements-dev.lock
+      - name: Install the project (no deps — the lockfile owns versions)
+        run: pip install --no-deps -e .
+      - name: Run the suite
+        run: pytest -q

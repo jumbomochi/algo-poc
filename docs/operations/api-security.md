@@ -117,13 +117,14 @@ compose. Two hardening steps, in order of effort:
 ## Dependency supply chain
 
 - `requirements.lock` / `requirements-dev.lock` are generated from
-  `pyproject.toml` via `uv pip compile` (see the header comment in each
-  file for the exact command). Regenerate after any `pyproject.toml`
-  dependency change:
+  `pyproject.toml` via `uv pip compile`. Regenerate after any
+  `pyproject.toml` dependency change — **use these commands verbatim**;
+  every flag is load-bearing, and `docs/operations/dependency-lockfile.md`
+  explains why, plus how to upgrade a package on purpose:
 
   ```bash
-  uv pip compile pyproject.toml -o requirements.lock
-  uv pip compile pyproject.toml --extra dev -o requirements-dev.lock
+  uv pip compile pyproject.toml --universal --python-version 3.12 -o requirements.lock
+  uv pip compile pyproject.toml --extra dev --universal --python-version 3.12 -o requirements-dev.lock
   ```
 
 - `.github/workflows/security.yml` runs `pip-audit` against **both**

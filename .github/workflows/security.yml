@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install locked dependencies (includes pip-audit itself)
@@ -35,16 +35,26 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
-      - name: Recompile and diff
+        uses: astral-sh/setup-uv@v7
+      # Recompile IN PLACE, over the committed lockfiles. That is what makes
+      # this job deterministic: uv treats existing pins as preferences, so an
+      # upstream release of any dependency does not by itself turn the job
+      # red — only a change to pyproject.toml (or a pin that no longer
+      # satisfies it) does. Compiling to a fresh path instead, as this job
+      # used to, resolves newest-available every run and goes red on its own.
+      # --universal --python-version 3.12 pin the other two axes: without
+      # them the resolution varies by host platform and interpreter version.
+      # See docs/operations/dependency-lockfile.md.
+      - name: Recompile the lockfiles in place
         run: |
-          uv pip compile pyproject.toml -o /tmp/requirements.lock
-          uv pip compile pyproject.toml --extra dev -o /tmp/requirements-dev.lock
-          diff -q requirements.lock /tmp/requirements.lock || {
-            echo "requirements.lock is stale — run: uv pip compile pyproject.toml -o requirements.lock" >&2
-            exit 1
-          }
-          diff -q requirements-dev.lock /tmp/requirements-dev.lock || {
-            echo "requirements-dev.lock is stale — run: uv pip compile pyproject.toml --extra dev -o requirements-dev.lock" >&2
+          uv pip compile pyproject.toml --universal --python-version 3.12 -o requirements.lock
+          uv pip compile pyproject.toml --extra dev --universal --python-version 3.12 -o requirements-dev.lock
+      # git diff (not diff -q) so the log shows exactly which pins are stale,
+      # and one invocation covering both files so neither can hide behind the
+      # other's early exit.
+      - name: Check the lockfiles are consistent with pyproject.toml
+        run: |
+          git diff --exit-code -- requirements.lock requirements-dev.lock || {
+            echo "::error::Lockfiles are inconsistent with pyproject.toml — see the diff above. Regenerate with the two commands in docs/operations/dependency-lockfile.md" >&2
             exit 1
           }

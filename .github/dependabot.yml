@@ -14,6 +14,14 @@ updates:
     labels:
       - dependencies
       - security
+    # The upper bounds in pyproject.toml are a deliberate guardrail on a
+    # real-money system — a major upgrade gets an explicit evaluation, not an
+    # automated range widening. pip-audit (security.yml) remains the CVE
+    # tripwire, and it runs against the lockfiles regardless of these ranges.
+    # See docs/operations/dependency-lockfile.md.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   # One entry per Dockerfile location — Dependabot's docker ecosystem does
   # not glob subdirectories.
