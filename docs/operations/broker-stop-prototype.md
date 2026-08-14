@@ -68,7 +68,9 @@ option for KAN-19 — see the go/no-go.
 
 ## Running the spike
 
-Prerequisites: run from the repo root with the Gateway logged into the **paper**
+Prerequisites: run from the repo root — `load_config` resolves
+`config/default.yaml` relatively, so any other working directory fails before
+connecting — with the Gateway logged into the **paper**
 session on 7497. Every phase refuses a non-`DU` account and is dry-run until
 `--apply`, which needs an interactive TTY and an exact typed confirmation. The
 harness uses client ids 118/119/128, distinct from execution (1), data (2),
@@ -114,10 +116,14 @@ Question 1's trigger half needs a stop that actually fires, which sells real
 paper shares. It is refused by default; opt in deliberately and keep it to one
 share:
 
+Substitute real numbers for `STOP` and `LAST` — a literal `<placeholder>` is an
+input redirect in zsh and the shell will reject it before the harness runs.
+`STOP` must be above `LAST` for the stop to fire on arrival.
+
 ```bash
+STOP=66.00 LAST=65.00   # read LAST off the `place` dry-run or the tape
 python -m scripts.ops.broker_stop_spike place --symbol CSCO --quantity 1 \
-  --stop-price <above the last trade> --last-price <last trade> \
-  --allow-trigger --apply
+  --stop-price "$STOP" --last-price "$LAST" --allow-trigger --apply
 ```
 
 ---
