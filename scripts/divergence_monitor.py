@@ -54,6 +54,7 @@ from backtest.divergence import (
 )
 from scripts.paper_state import PaperTradingState
 from shared.config import load_config
+from shared.universe import is_excluded_portfolio
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +465,20 @@ def main() -> int:
     reports: list[PortfolioDivergenceReport] = []
     live_series_by_portfolio: dict[str, dict[date, float]] = {}
     for name in portfolios:
+        # Synthetic portfolios ("__drill__", "_aggregate", "__liquidation__")
+        # are never divergence input: a drill's fills exist to prove the safety
+        # machinery works, not to be scored against a strategy baseline. Today
+        # such a sleeve is also absent from the backtest JSON and would fall
+        # through the branch below, but that is incidental — the exclusion is
+        # explicit here so it cannot silently stop working if a same-named
+        # sleeve ever appears in a baseline.
+        if is_excluded_portfolio(name):
+            print(
+                f"  ⚠ Skipping '{name}': excluded portfolio (synthetic/drill "
+                f"tag — never scored against a backtest sleeve; see "
+                f"docs/operations/drill-evidence-isolation.md)."
+            )
+            continue
         live = load_live_equity_series(state, name)
         live_series_by_portfolio[name] = live
         if name not in bt_per_portfolio:

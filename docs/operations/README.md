@@ -10,6 +10,7 @@ Entry point for operational documentation.
 - `backtest-baseline.md` — Regenerating the headline backtest: point-in-time universe, next-open fills, real costs
 - `api-security.md` — TLS, secrets, auth lockout, dependency scanning, schema/model integrity (T9)
 - `dependency-lockfile.md` — Regenerating the lockfiles, why each `uv pip compile` flag exists, upgrade procedure, version-ceiling policy (KAN-36)
+- `drill-evidence-isolation.md` — The portfolio exclusion contract: which readers must exclude `__drill__`/`_`-prefixed portfolios, and how to run a tagged drill (KAN-24)
 - Reconciliation procedures (TBD)
 - Incident response/escalation procedures (TBD)
 

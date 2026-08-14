@@ -12,6 +12,7 @@ from shared.models.equity_snapshot import EquitySnapshot
 from shared.models.portfolio import Position
 from shared.models.portfolio_config import PortfolioConfig
 from shared.position_loader import load_open_positions, load_portfolio_state
+from shared.universe import DRILL_PORTFOLIO
 
 NOW = datetime(2026, 7, 1, tzinfo=timezone.utc)
 
@@ -137,5 +138,30 @@ class TestAggregateRowExclusion:
                                      cash=10_000.0, created_at=NOW, updated_at=NOW))
         session.add(PortfolioConfig(portfolio="_aggregate", capital=10_000.0,
                                      cash=10_000.0, created_at=NOW, updated_at=NOW))
+        session.flush()
+        assert load_portfolio_state(session)["cash"] == pytest.approx(10_000.0)
+
+    def test_peak_nav_excludes_drill_portfolio(self, session):
+        """A drill's equity must never raise peak_nav.
+
+        The drill sleeve is funded separately and its fills are real. Counting
+        its equity would inflate peak_nav, and every later drawdown would be
+        measured against a peak the graded book never reached.
+        """
+        session.add(PortfolioConfig(portfolio="momentum", capital=10_000.0,
+                                    cash=10_000.0, created_at=NOW, updated_at=NOW))
+        d = date(2026, 7, 7)
+        session.add(EquitySnapshot(portfolio="momentum", date=d, equity=10_000.0,
+                                   cash=10_000.0, market_value=0.0, created_at=NOW))
+        session.add(EquitySnapshot(portfolio=DRILL_PORTFOLIO, date=d, equity=500.0,
+                                   cash=500.0, market_value=0.0, created_at=NOW))
+        session.flush()
+        assert load_portfolio_state(session)["peak_nav"] == pytest.approx(10_000.0)
+
+    def test_cash_excludes_drill_portfolio(self, session):
+        session.add(PortfolioConfig(portfolio="momentum", capital=10_000.0,
+                                    cash=10_000.0, created_at=NOW, updated_at=NOW))
+        session.add(PortfolioConfig(portfolio=DRILL_PORTFOLIO, capital=500.0,
+                                    cash=500.0, created_at=NOW, updated_at=NOW))
         session.flush()
         assert load_portfolio_state(session)["cash"] == pytest.approx(10_000.0)

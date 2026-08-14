@@ -87,6 +87,32 @@ ACTIVE_SLEEVES = [
     "tail_risk_hedge",
 ]
 
+# Portfolio names starting with this prefix are *synthetic*: they exist in the
+# tables the graded readers query but must never contribute to the evidence
+# record (NAV, peak NAV, divergence scoring, gate metrics). The convention
+# predates this constant — it was introduced for the "_aggregate" rollup row
+# after peak_nav double-counted it and read 2x NAV, tripping the circuit
+# breaker. The exclusion contract for every reader lives in
+# docs/operations/drill-evidence-isolation.md.
+EXCLUDED_PORTFOLIO_PREFIX = "_"
+
+# Sleeve that epoch drills book into: a drill places a real paper order and
+# takes a real fill, so its trades land in the same tables the go-live gate
+# reads. Tagging them keeps a drill that proves the safety machinery works
+# from corrupting the record proving the strategy works (direction doc D15).
+DRILL_PORTFOLIO = "__drill__"
+
+
+def is_excluded_portfolio(name: str) -> bool:
+    """Return True if ``name`` is a synthetic portfolio excluded from evidence.
+
+    Covers the drill tag ("__drill__"), the "_aggregate" rollup row, and the
+    "__liquidation__" kill-path fallback. Every graded reader must consult this
+    rather than repeating the prefix test — see the exclusion contract in
+    docs/operations/drill-evidence-isolation.md.
+    """
+    return name.startswith(EXCLUDED_PORTFOLIO_PREFIX)
+
 
 class MembershipCalendar:
     """Point-in-time index membership: which tickers were in the universe when.
