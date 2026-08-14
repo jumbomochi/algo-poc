@@ -77,6 +77,13 @@ harness uses client ids 118/119/128, distinct from execution (1), data (2),
 `reconcile_paper` (57), `run_paper` (58/59), `convert_paper_fx` (95) and
 `flatten_paper_account` (105).
 
+**No market-data subscription is required.** The reference price for the stop
+level comes from `reqHistoricalData` daily bars — the call `data_ingestion`
+already makes on this account (`services/data_ingestion/ib_client.py:36`) —
+not a streaming quote. A close is the right reference anyway: the IPS trailing
+rule is close-based. `--stop-price` with `--last-price` bypasses the fetch
+entirely if IB refuses even that.
+
 > **Timing.** Do not leave a spike stop resting across the 04:15 paper run or
 > the 04:45 divergence monitor — per fact (b) it will read as an
 > `order_missing_in_db` discrepancy and disable entries for that session. Either

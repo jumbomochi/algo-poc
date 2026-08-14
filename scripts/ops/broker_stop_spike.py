@@ -349,21 +349,40 @@ def _confirm(prompt: str) -> str:
     return input(prompt).strip()
 
 
-async def _last_price(ib, contract) -> float:
-    """Last trade price, falling back to the midpoint when the tape is closed."""
-    [ticker] = await ib.reqTickersAsync(contract)
-    for candidate in (ticker.last, ticker.close, ticker.markPrice):
-        value = float(candidate) if candidate is not None else float("nan")
+def last_close_from_bars(bars, *, symbol: str) -> float:
+    """Newest usable close from a daily-bar series.
+
+    Bars arrive oldest-first; scan backwards so a trailing bar with no print
+    (a holiday stub) falls through to the last real one.
+    """
+    for bar in reversed(list(bars)):
+        close = getattr(bar, "close", None)
+        value = float(close) if close is not None else float("nan")
         if math.isfinite(value) and value > 0:
             return value
-    bid = float(ticker.bid or float("nan"))
-    ask = float(ticker.ask or float("nan"))
-    if math.isfinite(bid) and math.isfinite(ask) and bid > 0 and ask > 0:
-        return (bid + ask) / 2
     raise SpikeRefusedError(
-        f"no usable price for {_symbol_of(contract)}; "
-        "run during market hours or pass --stop-price"
+        f"no usable daily close for {symbol}; pass --stop-price and --last-price"
     )
+
+
+async def _last_price(ib, contract) -> float:
+    """Reference price for the stop level and the immediate-trigger guard.
+
+    Uses ``reqHistoricalData`` daily bars rather than a streaming quote:
+    ``data_ingestion`` already pulls bars on this account
+    (services/data_ingestion/ib_client.py:36), so no market-data subscription
+    is needed, and the IPS trailing rule is a close-based rule anyway.
+    """
+    symbol = _symbol_of(contract)
+    bars = await ib.reqHistoricalDataAsync(
+        contract,
+        endDateTime="",
+        durationStr="5 D",
+        barSizeSetting="1 day",
+        whatToShow="TRADES",
+        useRTH=True,
+    )
+    return last_close_from_bars(bars, symbol=symbol)
 
 
 def _dump(label: str, payload) -> None:
@@ -429,17 +448,20 @@ async def _cmd_positions(ib, config, args) -> int:
 
 
 async def _cmd_place(ib, config, args) -> int:
-    from ib_insync import Stock
+    from shared.universe import make_stock_contract
 
     account_id = _require_paper_account(ib)
     positions = list(await ib.reqPositionsAsync())
 
     last_price = args.last_price
     if last_price is None and args.stop_price is None:
+        # make_stock_contract carries the conId overrides for names the paper
+        # Gateway still lists under pre-2023 symbols (shared/universe.py:305).
         [contract] = await ib.qualifyContractsAsync(
-            Stock(args.symbol.upper(), "SMART", "USD")
+            make_stock_contract(args.symbol.upper())
         )
         last_price = await _last_price(ib, contract)
+        print(f"Reference last close for {args.symbol.upper()}: {last_price}")
     elif last_price is None:
         # Only used for the triggers-immediately guard; --allow-trigger is the
         # explicit opt-out, so an unknown tape must not silently disable it.

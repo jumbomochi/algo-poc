@@ -10,6 +10,7 @@ from scripts.ops.broker_stop_spike import (
     SpikeRefusedError,
     describe_order,
     ips_stop_price,
+    last_close_from_bars,
     missing_from_broker_open_order,
     order_ref_for,
     place_stop,
@@ -86,6 +87,29 @@ def test_ips_stop_price_refuses_nonsense_inputs():
         ips_stop_price(100.0, 0.0)
     with pytest.raises(SpikeRefusedError, match="trailing pct"):
         ips_stop_price(100.0, 100.0)
+
+
+# --- reference price (no market-data subscription on this account) -----------
+
+
+def _bar(close):
+    return SimpleNamespace(close=close)
+
+
+def test_last_close_from_bars_takes_the_newest_bar():
+    # Bars arrive oldest-first.
+    assert last_close_from_bars([_bar(60.0), _bar(65.5)], symbol="CIBR") == 65.5
+
+
+def test_last_close_from_bars_skips_a_trailing_bar_with_no_print():
+    assert last_close_from_bars(
+        [_bar(60.0), _bar(65.5), _bar(0.0)], symbol="CIBR"
+    ) == 65.5
+
+
+def test_last_close_from_bars_refuses_an_empty_series():
+    with pytest.raises(SpikeRefusedError, match="no usable daily close"):
+        last_close_from_bars([], symbol="CIBR")
 
 
 # --- whole-share interaction (question 5) -----------------------------------
