@@ -22,17 +22,34 @@ LOG_DIR="$HOME/ibc/logs"
 LOG_FILE="$LOG_DIR/db_backup_$(date +%Y%m%d).log"
 DUMP_FILE="$BACKUP_DIR/algo_poc_$(date +%Y%m%d_%H%M%S).dump"
 RETENTION_DAYS=30
-ENV_FILE="/Users/huiliang/GitHub/algo-poc/.env"
+ALGO_DIR="/Users/huiliang/GitHub/algo-poc"
+# Secrets come from the macOS login keychain via the shared loader. Sourced by
+# path from the repo (never from the deployed ~/ibc copy) so there is exactly
+# one implementation of the lookup and it cannot drift.
+ALGO_SECRETS_ENV_FILE="$ALGO_DIR/.env"   # regular-file fallback only
+# shellcheck source=deploy/launchd/secrets.sh
+. "$ALGO_DIR/deploy/launchd/secrets.sh"
 
 ts() { date "+%Y-%m-%d %H:%M:%S %Z"; }
 
 telegram() {
-    # Best-effort Telegram alert; never fails the backup job.
-    [ -f "$ENV_FILE" ] || return 0
+    # Best-effort Telegram alert; never fails the backup job. A missing
+    # credential is LOGGED, never silently swallowed — the old
+    # `[ -f "$ENV_FILE" ] || return 0` guard was FALSE for the 1Password FIFO
+    # that replaced .env on 2026-08-12, muting every alert channel at once.
     local token chat
-    token=$(grep '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" | head -1 | cut -d= -f2-)
-    chat=$(grep '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | head -1 | cut -d= -f2-)
-    [ -n "$token" ] && [ -n "$chat" ] || return 0
+    if ! algo_secret_into TELEGRAM_BOT_TOKEN; then
+        echo "$(ts): WARNING - cannot send alert: $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
+        algo_alert_local "db backup cannot alert: $ALGO_SECRETS_ERROR"
+        return 0
+    fi
+    token="$_ALGO_SECRET_VALUE"
+    if ! algo_secret_into TELEGRAM_CHAT_ID; then
+        echo "$(ts): WARNING - cannot send alert: $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
+        algo_alert_local "db backup cannot alert: $ALGO_SECRETS_ERROR"
+        return 0
+    fi
+    chat="$_ALGO_SECRET_VALUE"
     curl -s -m 10 "https://api.telegram.org/bot${token}/sendMessage" \
         -d chat_id="$chat" --data-urlencode text="$1" >/dev/null 2>&1 || true
 }

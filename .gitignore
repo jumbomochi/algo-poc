@@ -7,8 +7,13 @@ dist/
 .coverage
 config/secrets.yaml
 *.db
-.env
+# Match the whole class, not just `.env` — a stray `.env copy` / `.env.bak` /
+# `.env.local` holds the same live credentials and was previously committable.
+.env*
+!.env.example
 docker-compose.override.yml
+# Local CodeGraph index — machine-specific, rebuilt on demand.
+.codegraph/
 output/
 .DS_Store
 .worktrees/

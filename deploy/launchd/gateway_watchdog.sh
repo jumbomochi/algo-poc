@@ -27,18 +27,39 @@ AUTH_MARKER="$HOME/ibc/.gateway_auth_failure_alerted"
 CONN_MARKER="$HOME/ibc/state/gateway_connectivity_lost"
 CONN_ALERT_MARKER="$HOME/ibc/.gateway_connectivity_alerted"
 CONN_SUSTAINED_SECS=180        # ignore a 1100 that self-heals within one cycle
-ENV_FILE="/Users/huiliang/GitHub/algo-poc/.env"
+ALGO_DIR="/Users/huiliang/GitHub/algo-poc"
+# Secrets come from the macOS login keychain via the shared loader. Sourced by
+# path from the repo (never from the deployed ~/ibc copy) so there is exactly
+# one implementation of the lookup and it cannot drift.
+ALGO_SECRETS_ENV_FILE="$ALGO_DIR/.env"   # regular-file fallback only
+# shellcheck source=deploy/launchd/secrets.sh
+. "$ALGO_DIR/deploy/launchd/secrets.sh"
 
 mkdir -p "$LOG_DIR"
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
 telegram() {
     # Best-effort Telegram alert; never fails the watchdog.
-    [ -f "$ENV_FILE" ] || return 0
+    #
+    # This used to open with `[ -f "$ENV_FILE" ] || return 0`. On 2026-08-12
+    # `.env` became a 1Password FIFO, for which `-f` is FALSE — so this
+    # returned *success* and the watchdog quietly stopped alerting. The paper
+    # run had already been dead for two days before anyone noticed. Never
+    # swallow a missing credential: log it, and raise the secret-free local
+    # alert so the failure is visible even when there is no token to send with.
     local token chat
-    token=$(grep '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" | head -1 | cut -d= -f2-)
-    chat=$(grep '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | head -1 | cut -d= -f2-)
-    [ -n "$token" ] && [ -n "$chat" ] || return 0
+    if ! algo_secret_into TELEGRAM_BOT_TOKEN; then
+        echo "$(ts): WARNING - cannot send alert: $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
+        algo_alert_local "watchdog cannot alert: $ALGO_SECRETS_ERROR"
+        return 0
+    fi
+    token="$_ALGO_SECRET_VALUE"
+    if ! algo_secret_into TELEGRAM_CHAT_ID; then
+        echo "$(ts): WARNING - cannot send alert: $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
+        algo_alert_local "watchdog cannot alert: $ALGO_SECRETS_ERROR"
+        return 0
+    fi
+    chat="$_ALGO_SECRET_VALUE"
     curl -s -m 10 "https://api.telegram.org/bot${token}/sendMessage" \
         -d chat_id="$chat" --data-urlencode text="$1" >/dev/null 2>&1 || true
 }
