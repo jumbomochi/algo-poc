@@ -4,11 +4,22 @@ global:
 
 # T6: alert rules live in alert_rules.yml (mounted alongside this file in
 # docker-compose.observability.yml). Evaluated and visible at
-# http://localhost:9091/alerts even without Alertmanager configured — wiring
-# actual paging/notification routing is a separate follow-up beyond this
-# thread's checklist ("Alert rules"), not done here.
+# http://localhost:9091/alerts.
 rule_files:
   - "alert_rules.yml"
+
+# KAN-14: the follow-up T6 deferred. Until this block existed, every rule in
+# alert_rules.yml fired into Prometheus's own web UI and stopped there — a
+# monitor nobody watches. `alertmanager` is the service in
+# docker-compose.observability.yml; see config/alertmanager.yml for why
+# delivery does not reuse the notifications service.
+#
+# Verify after `up`: http://localhost:9091/api/v1/alertmanagers should list
+# alertmanager:9093 under activeAlertmanagers.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
 
 scrape_configs:
   - job_name: "data-ingestion"
