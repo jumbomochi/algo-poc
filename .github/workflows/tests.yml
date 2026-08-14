@@ -1,0 +1,33 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    name: pytest (full suite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      # No service containers: the suite is self-contained. Migration tests
+      # use a throwaway sqlite database in tmp_path, and nothing skips on a
+      # missing postgres/redis/docker — so a passing run here means the whole
+      # suite actually ran, not that most of it was skipped.
+      # tests/deploy/test_launchd_secrets_keychain.py drives the launchd secret
+      # loader through a real zsh to prove it refuses to be sourced from one
+      # (the 2026-08-12 outage). The runner image has no zsh, and the test
+      # skips itself without one — install it so CI actually runs it.
+      - name: Install zsh (required by the launchd loader tests)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+      - name: Install locked dev dependencies
+        run: pip install -r requirements-dev.lock
+      - name: Install the project (no deps — the lockfile owns versions)
+        run: pip install --no-deps -e .
+      - name: Run the suite
+        run: pytest -q

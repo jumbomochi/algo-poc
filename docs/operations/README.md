@@ -9,6 +9,7 @@ Entry point for operational documentation.
 - `divergence-monitor.md` — Daily live-vs-backtest divergence check (scripts/divergence_monitor.py)
 - `backtest-baseline.md` — Regenerating the headline backtest: point-in-time universe, next-open fills, real costs
 - `api-security.md` — TLS, secrets, auth lockout, dependency scanning, schema/model integrity (T9)
+- `dependency-lockfile.md` — Regenerating the lockfiles, why each `uv pip compile` flag exists, upgrade procedure, version-ceiling policy (KAN-36)
 - Reconciliation procedures (TBD)
 - Incident response/escalation procedures (TBD)
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import textwrap
 import time
@@ -301,6 +302,11 @@ def test_wrappers_export_compose_vars_before_calling_docker_compose():
         )
 
 
+@pytest.mark.skipif(
+    shutil.which("zsh") is None,
+    reason="needs a real zsh to drive the loader; the operator's mac ships one, "
+    "a bare linux image may not. tests.yml installs it so CI does not skip this.",
+)
 def test_loader_refuses_to_be_sourced_from_a_non_bash_shell():
     """zsh does not define BASH_SOURCE (so the sourced/executed guard collapsed
     to $0 == $0 and ran the CLI) and does not word-split unquoted parameter
