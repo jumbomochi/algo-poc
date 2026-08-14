@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import asdict
 from datetime import date, datetime, timezone
@@ -369,7 +370,12 @@ def main() -> int:
     try:
         default_db_url = load_config("config/default.yaml").database.url
     except Exception:
-        default_db_url = "postgresql://algo:algo@localhost:5432/algo_poc"
+        # Honour ALGO_DATABASE_URL even when the config file can't be loaded, so
+        # a missing/unreadable config can't silently fall back to the wrong DB
+        # (the launchd wrapper always exports ALGO_DATABASE_URL).
+        default_db_url = os.environ.get(
+            "ALGO_DATABASE_URL", "postgresql://algo:algo@localhost:5432/algo_poc"
+        )
 
     parser = argparse.ArgumentParser(
         description="Compare live paper-trading equity to backtest expectations."
