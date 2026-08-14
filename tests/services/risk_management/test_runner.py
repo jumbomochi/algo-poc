@@ -426,7 +426,8 @@ class TestKillLiquidation:
         self, db_runner, mock_redis
     ):
         """A pre-fix leftover (intent created at PROPOSED by an older build)
-        must be approved by the adopt branch, not left stranded."""
+        with matching economics is adopted by create_intent and must be
+        approved, not left stranded."""
         runner, ledger, session = db_runner
         kill = _kill_msg()
         exit_id = runner._liquidation_exit_id("AAPL", int(kill.timestamp.timestamp()))
@@ -492,6 +493,55 @@ class TestKillLiquidation:
         assert intent.status == OrderStatus.SUBMITTED.value
         assert intent.ib_order_id == "77"
         assert intent.submitted_at == submitted_at
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_conflicting_exit_intent_is_flagged_not_published(
+        self, db_runner, mock_redis
+    ):
+        """A row for this kill epoch that disagrees with the position (only
+        _ensure_same_economics raises ConflictingOrderIntent) must NOT be
+        approved and published: execution submits the published quantity
+        verbatim, so the broker order would contradict the ledger. Flag it and
+        keep flattening the rest of the book."""
+        runner, ledger, session = db_runner
+        kill = _kill_msg()
+        exit_id = runner._liquidation_exit_id("AAPL", int(kill.timestamp.timestamp()))
+        ledger.create_intent(
+            SimpleNamespace(
+                recommendation_id=exit_id,
+                account_id="DUTEST",
+                mode="paper",
+                portfolio="momentum",
+                con_id=111,
+                symbol="AAPL",
+                exchange="SMART",
+                currency="USD",
+                action="SELL",
+                quantity=4.0,  # position now holds 10 — economics conflict
+                limit_price=None,
+                order_type="MKT",
+            )
+        )
+        session.commit()
+
+        await runner.process_kill(kill)  # must not raise
+
+        orders = _approved_orders(mock_redis)
+        assert all(o.ticker != "AAPL" for o in orders)  # nothing we cannot back
+        alerts = [
+            str(c.args[1])
+            for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert any("AAPL" in a and "manual" in a.lower() for a in alerts)
+        # The conflicting row is left exactly as found ...
+        intent = ledger.get(exit_id)
+        assert intent.status == OrderStatus.PROPOSED.value
+        assert intent.requested_quantity == pytest.approx(4.0)
+        session.rollback()
+        # ... and the session survives, so the rest of the book still flattens.
+        assert any(o.ticker == "MSFT" and o.action == "sell" for o in orders)
         session.rollback()
 
     @pytest.mark.asyncio
