@@ -17,14 +17,100 @@ host. The **live** copies are deployed outside the repo:
 | `run_pipeline_report.sh` | `~/ibc/run_pipeline_report.sh` (chmod +x) — 04:52 SGT Tue–Sat pipeline report + Telegram heartbeat |
 | `local.algo-pipeline-report.plist` | `~/Library/LaunchAgents/local.algo-pipeline-report.plist` |
 
-Both `run_paper.sh` and `run_divergence.sh` export
-`ALGO_DATABASE_URL=postgresql://algo:algo@localhost:55432/algo_poc` — the
-dockerized paper DB on its machine-local override port. The stock
-`config/default.yaml` URL (localhost:5432) points at nothing on this host;
-this was why every nightly paper run failed from April through July 2026.
+`run_paper.sh` and `run_divergence.sh` export
+`ALGO_DATABASE_URL=postgresql://algo:<pw>@localhost:55432/algo_poc` (plus the
+authenticated redis URL) — the dockerized paper DB/redis on their machine-local
+override ports. The stock `config/default.yaml` URLs (localhost:5432 / 6379)
+point at nothing on this host and carry no auth; this was why every nightly
+paper run failed from April through July 2026, and why a **stale deployed copy**
+still using the old `algo:algo` creds broke the 2026-08-11 cold boot.
 
 These are tracked here so the wiring is version-controlled and survives a
-machine rebuild. If you edit a deployed copy, sync it back here (and vice-versa).
+machine rebuild. **The repo copy is canonical** — deploy with `deploy.sh`
+(below); do not hand-edit the deployed `~/ibc` copies (hand-editing is what
+drifted).
+
+## Secrets: the macOS login keychain
+
+Every wrapper gets its credentials from **`secrets.sh`**, sourced by path from
+this directory. The store of record is the macOS login keychain:
+
+```
+service = algo-poc          (override with $ALGO_KEYCHAIN_SERVICE)
+account = the variable name (POSTGRES_PASSWORD, REDIS_PASSWORD,
+                             TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, API_KEYS)
+```
+
+```bash
+deploy/launchd/secrets.sh --check              # presence only, never values
+deploy/launchd/secrets.sh --import             # interactive; value never hits argv
+deploy/launchd/secrets.sh --import-from-env F  # bulk from a plaintext env file
+eval "$(deploy/launchd/secrets.sh --export)"   # for docker compose / a shell
+```
+
+`secrets.sh` is deliberately **not** deployed to `~/ibc` — it is sourced from
+the repo so there is exactly one copy of the lookup logic and it cannot drift
+the way the hand-copied wrappers did.
+
+### Why not a plaintext `.env`, and why not 1Password
+
+On **2026-08-12 10:51** 1Password Environments replaced the repo's `.env` with a
+named pipe it serves from the desktop app. The wrappers read credentials with
+`grep '^POSTGRES_PASSWORD=' .env`; against an app-backed FIFO that nothing is
+serving, that open **blocks ~60s and then returns nothing**:
+
+| Job | Starts | `.env` reads | Aborted at | Delay |
+|---|---|---|---|---|
+| `run_paper.sh` | 04:15:00 | 2 | 04:17:01 | ~121s |
+| `run_divergence.sh` | 04:45:00 | 1 | 04:46:02 | ~62s |
+
+Both died before doing any work on 2026-08-13 and 2026-08-14. Nobody was told,
+because `gateway_watchdog.sh` gated its Telegram alerting on
+`[ -f "$ENV_FILE" ]` — **false for a FIFO** — so the alert path short-circuited
+to *success*. With the operator at the keyboard and 1Password unlocked the pipe
+serves instantly, so every hand-test passed.
+
+A 1Password **service-account token** was considered and rejected: launchd
+cannot do interactive auth, so the token would itself be plaintext on disk, and
+unlike these loopback-only Postgres/Redis passwords it is a *network* credential
+usable from any machine — a wider blast radius for no gain. (Its `op://`
+references also cannot address a 1Password *Environment*; they only resolve
+against classic vault items.)
+
+A keychain item is encrypted at rest, grants nothing off this box, and is
+readable non-interactively by a *user* LaunchAgent: verified that
+`security find-generic-password` returns the value with no controlling TTY,
+closed stdin and a stripped environment. The login keychain is `no-timeout` on
+this host, so screen lock and sleep do **not** relock it.
+
+**The one constraint:** a launchd *user agent* needs a logged-in GUI session.
+After a reboot with nobody logging in the keychain stays locked — but Docker
+Desktop and IB Gateway would be down too, so this adds no new requirement. That
+case is reported as `LOCKED`, distinct from a missing secret, because the
+operator action differs.
+
+`.env` is still accepted as a fallback **only when it is a regular file**. If it
+exists and is not one, every wrapper now fails in under a second with a named
+error instead of hanging — see
+`tests/deploy/test_launchd_secrets_keychain.py`, whose FIFO test blocks and
+times out if that guard is ever removed.
+
+## Deploying / syncing
+
+`deploy/launchd/deploy.sh` is the one command that pushes these wrappers +
+plists to their live locations. It replaces the manual per-file `cp`:
+
+```bash
+deploy/launchd/deploy.sh --dry-run   # show what would change, write nothing
+deploy/launchd/deploy.sh             # copy changed *.sh -> ~/ibc, *.plist -> ~/Library/LaunchAgents
+```
+
+It skips unchanged files, prints a diff of each change, and — for any plist it
+touched — prints the `launchctl bootout/bootstrap` reload commands for you to
+run (launchctl is a human step, CLAUDE.md). Each wrapper also self-checks at
+startup and logs a loud `WARNING - … differs from repo canonical` line if it
+was launched from a drifted copy, so drift surfaces the same morning instead of
+failing silently at 04:15.
 
 ## Daily divergence monitor
 
@@ -37,9 +123,13 @@ the 04:15 `local.algo-paper-trading` job has written that day's
 - **Prometheus textfile:** `~/ibc/metrics/divergence.prom`. node_exporter is not
   installed yet — once it is, point its textfile collector at `~/ibc/metrics/`
   (or change `PROM_FILE` in the wrapper to the collector dir).
-- **Exit codes:** 0 = OK/WARNING, 1 = BREACH (alert), 2 = hard error (page). The
-  wrapper logs the appropriate level; real alert/page channels are stubbed until
-  `notifications` are enabled in `config/default.yaml`.
+- **Exit codes:** 0 = OK/WARNING, 1 = BREACH (alert), 2 = hard error (page),
+  3 = baseline not comparable → the monitor is **BLIND** (every report forced to
+  `NO_DATA`; regenerate the baseline per
+  [backtest-baseline.md](../../docs/operations/backtest-baseline.md) — do NOT
+  read exit 3 as OK). The wrapper logs the appropriate level; real alert/page
+  channels are stubbed until `notifications` are enabled in
+  `config/default.yaml`.
 
 ### Install / reload
 
@@ -83,8 +173,16 @@ attempts), sends **one Telegram alert**, and waits for a human re-login. It
 alerts again on recovery.
 
 **Telegram alerts** (best-effort) are sent on: auth-failure refusal, kickstart
-action, and recovery. Credentials are read from the repo's gitignored `.env`
-(`TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`).
+action, and recovery. Credentials come from the login keychain
+(`TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`) via `secrets.sh`. A credential that
+cannot be read is now **logged and raised locally**, never silently skipped —
+the old `[ -f "$ENV_FILE" ] || return 0` guard turned a dead alert path into a
+success and hid the 2026-08-13/14 outage for two days.
+
+When there is no token to send with (locked keychain), `algo_alert_local` still
+fires: it appends to `~/ibc/logs/ALERTS.log` — one persistent file, not a
+per-day log a failed run never creates — and raises a desktop notification. It
+needs no credential, so the "nothing can alert" hole is closed.
 
 - **Logs:** `~/ibc/logs/gateway_watchdog_YYYYMMDD.log` (only logs on state
   change / action, to stay quiet), launchd stdout/stderr to

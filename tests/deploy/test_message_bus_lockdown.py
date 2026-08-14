@@ -138,31 +138,41 @@ def test_launchd_scripts_no_longer_hardcode_the_default_password():
     for script in (*LAUNCHD_SCRIPTS_WITH_DB_ONLY, LAUNCHD_SCRIPT_WITH_DB_AND_REDIS):
         text = script.read_text()
         assert "algo:algo" not in text, f"{script} still hardcodes the old default password"
-        assert "POSTGRES_PASSWORD=" in text, f"{script} does not read POSTGRES_PASSWORD from .env"
+        # Since 2026-08-14 the credential comes from the macOS login keychain
+        # via the shared loader rather than a grep against .env (which blocked
+        # ~60s per read once .env became a 1Password FIFO). What must hold is
+        # that the password is *obtained*, not how.
+        assert "algo_load_secrets POSTGRES_PASSWORD" in text, (
+            f"{script} does not load POSTGRES_PASSWORD through the shared loader"
+        )
+        assert "${POSTGRES_PASSWORD}" in text, f"{script} does not use POSTGRES_PASSWORD in its DSN"
 
 
-def test_run_paper_reads_redis_password_from_env_file():
+def test_run_paper_loads_redis_password_through_the_shared_loader():
     text = LAUNCHD_SCRIPT_WITH_DB_AND_REDIS.read_text()
-    assert "REDIS_PASSWORD=" in text
+    assert "algo_load_secrets POSTGRES_PASSWORD REDIS_PASSWORD" in text
     assert "redis://localhost:56379/0" not in text  # old unauthenticated form
     assert 'redis://:${REDIS_PASSWORD}@localhost:56379/0' in text
 
 
-def test_launchd_scripts_fail_loudly_when_env_password_missing():
+def test_launchd_scripts_fail_loudly_when_the_password_cannot_be_loaded():
     for script in (*LAUNCHD_SCRIPTS_WITH_DB_ONLY, LAUNCHD_SCRIPT_WITH_DB_AND_REDIS):
         text = script.read_text()
-        assert 'if [ -z "$DB_PASSWORD"' in text
+        assert "if ! algo_load_secrets" in text, f"{script} does not branch on a failed load"
+        # The reason must reach the operator; a bare "not found" is what made
+        # the 2026-08-13/14 aborts look like a config typo.
+        assert "$ALGO_SECRETS_ERROR" in text, f"{script} discards the failure reason"
         assert "exit" in text
 
 
 def test_env_and_override_example_files_are_not_gitignored():
     gitignore = GITIGNORE_PATH.read_text().splitlines()
-    # Exact-match entries only (no wildcarding in this repo's .gitignore for
-    # these two lines), so the `.example` filenames are distinct patterns and
-    # must stay trackable.
-    assert ".env" in gitignore
+    # `.env*` covers the whole class: a hand-made `.env copy` held the same live
+    # credentials and was previously committable under a name `.env` missed.
+    # The negation keeps the tracked example files trackable.
+    assert ".env*" in gitignore
+    assert "!.env.example" in gitignore
     assert "docker-compose.override.yml" in gitignore
-    assert ".env.example" not in gitignore
     assert "docker-compose.override.yml.example" not in gitignore
     assert ENV_EXAMPLE_PATH.exists()
     assert OVERRIDE_EXAMPLE_PATH.exists()

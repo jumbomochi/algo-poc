@@ -20,22 +20,52 @@ LOG_DIR="$HOME/ibc/logs"
 TODAY=$(date +%Y%m%d)
 LOG_FILE="$LOG_DIR/pipeline_report_${TODAY}.log"
 PAPER_LOG="$LOG_DIR/paper_trading_${TODAY}.log"
-ENV_FILE="$ALGO_DIR/.env"
+# Secrets come from the macOS login keychain via the shared loader. Sourced by
+# path from the repo (never from the deployed ~/ibc copy) so there is exactly
+# one implementation of the lookup and it cannot drift.
+ALGO_SECRETS_ENV_FILE="$ALGO_DIR/.env"   # regular-file fallback only
+# shellcheck source=deploy/launchd/secrets.sh
+. "$ALGO_DIR/deploy/launchd/secrets.sh"
 
 ts() { date "+%Y-%m-%d %H:%M:%S %Z"; }
 
 telegram() {
-    [ -f "$ENV_FILE" ] || return 0
+    # A missing credential is LOGGED, never silently swallowed. The old
+    # `[ -f "$ENV_FILE" ] || return 0` guard was FALSE for the 1Password FIFO
+    # that replaced .env on 2026-08-12, so this heartbeat went quiet at the
+    # same moment the paper run started failing — and the daily report kept
+    # writing the failure to a log nobody reads.
     local token chat
-    token=$(grep '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" | head -1 | cut -d= -f2-)
-    chat=$(grep '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | head -1 | cut -d= -f2-)
-    [ -n "$token" ] && [ -n "$chat" ] || return 0
+    if ! algo_secret_into TELEGRAM_BOT_TOKEN; then
+        echo "$(ts): WARNING - cannot send alert: $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
+        algo_alert_local "pipeline report cannot alert: $ALGO_SECRETS_ERROR"
+        return 0
+    fi
+    token="$_ALGO_SECRET_VALUE"
+    if ! algo_secret_into TELEGRAM_CHAT_ID; then
+        echo "$(ts): WARNING - cannot send alert: $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
+        algo_alert_local "pipeline report cannot alert: $ALGO_SECRETS_ERROR"
+        return 0
+    fi
+    chat="$_ALGO_SECRET_VALUE"
     curl -s -m 10 "https://api.telegram.org/bot${token}/sendMessage" \
         -d chat_id="$chat" --data-urlencode text="$1" >/dev/null 2>&1 || true
 }
 
 mkdir -p "$LOG_DIR"
 cd "$ALGO_DIR"
+
+# `docker compose` interpolates ${POSTGRES_PASSWORD:?} / ${REDIS_PASSWORD:?} in
+# docker-compose.yml by reading `.env` ITSELF — it never goes through the loader
+# above. So on 2026-08-13/14, with .env a 1Password FIFO nothing was serving,
+# every compose call in this report died with:
+#   "required variable POSTGRES_PASSWORD is missing a value"
+# Exporting them first fixes it for good: compose resolves ${VAR} from the
+# process environment in preference to `.env`, so the file is never consulted.
+# Non-fatal — the report still has value without its compose-backed sections.
+if ! algo_load_secrets POSTGRES_PASSWORD REDIS_PASSWORD; then
+    echo "$(ts): WARNING - docker compose sections will fail: $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
+fi
 
 {
     echo "$(ts): ===== daily pipeline report ====="
