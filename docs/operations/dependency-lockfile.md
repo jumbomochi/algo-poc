@@ -58,6 +58,23 @@ This is the same semantics as `uv lock --check` or `poetry lock --check`.
 Upgrades are then always deliberate — see below — rather than something that
 happens to you on a Tuesday.
 
+Worth being precise about what that buys and what it costs. The job **fails**
+on:
+
+- a pin that `pyproject.toml` no longer permits (hand-editing `redis==5.3.1`
+  to `6.4.0` against `redis>=5.0,<6.0` is corrected back, and the diff shows
+  it);
+- a dependency missing from a lockfile, or one present that nothing requires
+  — including the case that matters most, adding a package to
+  `pyproject.toml` and forgetting to regenerate.
+
+It deliberately does **not** fail merely because a newer version exists
+upstream. A hand-edit from `coverage==7.15.4` to `7.15.0` is left alone,
+because both satisfy the manifest and uv prefers what it finds. That is the
+whole point — "is this lockfile a valid solution of this manifest" is a
+property of this repo, whereas "is this lockfile the newest solution" is a
+property of PyPI on the day you asked, and only the first can be a gate.
+
 ### Known sensitivity: the uv version
 
 `setup-uv` installs the latest uv, and uv's output format is not frozen
