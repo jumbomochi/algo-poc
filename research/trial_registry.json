@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "note": "Declared search history for deflated-Sharpe correction (KAN-38). Every search that could have produced a candidate now under evaluation gets an entry here, before that candidate is scored. Adding a strategy, a factor, or a parameterization sweep means adding to this file in the same commit -- see docs/operations/edge-validation-framework.md.",
+  "entries": [
+    {
+      "searched_at": "2026-05-26",
+      "what": "Sleeve selection for the live portfolio: eight candidate sleeves searched, six retained after mean_reversion and short_term_mr were dropped",
+      "n_trials": 8,
+      "source": "docs/strategies/mean-reversion-failure-analysis.md"
+    },
+    {
+      "searched_at": "2026-08-02",
+      "what": "Native factor catalog: four price-only factors specified and scored (price_momentum_126d, high_52w, low_volatility_63d, liquidity_20d)",
+      "n_trials": 4,
+      "source": "research/factors/catalog.py"
+    }
+  ]
+}
