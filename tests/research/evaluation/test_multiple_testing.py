@@ -1,6 +1,8 @@
 # tests/research/evaluation/test_multiple_testing.py
 from __future__ import annotations
 
+import pytest
+
 from research.evaluation.multiple_testing import (
     benjamini_hochberg,
     control,
@@ -35,3 +37,31 @@ def test_control_requires_both_gates():
     assert verdicts["strong"].survives is True
     assert verdicts["noise"].survives is False
     assert verdicts["noise"].passes_fdr is False
+
+
+def _two_candidates() -> dict[str, dict]:
+    return {
+        "strong": {"sr": 0.5, "n": 500, "skew": 0.0, "kurt": 3.0, "ic_p": 0.001},
+        "noise": {"sr": 0.001, "n": 500, "skew": 0.0, "kurt": 3.0, "ic_p": 0.95},
+    }
+
+
+def test_expected_max_sharpe_uses_the_declared_count_not_the_sample_size():
+    # The spread estimate still comes from the observed SRs -- that is the only
+    # sample there is -- but the E[max] benchmark must scale with the number of
+    # trials actually searched, which is larger than the number in this run.
+    srs = [0.0, 0.2]
+    assert expected_max_sharpe(srs, n_trials=8) > expected_max_sharpe(srs)
+
+
+def test_explicit_trial_count_deflates_harder_than_a_smaller_one():
+    # This is the whole point of KAN-38: deflating against the four candidates
+    # in today's run understates a search that has really tried eight.
+    four = control(_two_candidates(), n_trials=4)
+    eight = control(_two_candidates(), n_trials=8)
+    assert eight["strong"].deflated_sharpe < four["strong"].deflated_sharpe
+
+
+def test_declared_trial_count_below_the_run_is_rejected():
+    with pytest.raises(ValueError, match="declared trial count"):
+        control(_two_candidates(), n_trials=1)

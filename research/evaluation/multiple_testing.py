@@ -36,12 +36,25 @@ def inv_norm(p: float) -> float:
         (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1))
 
 
-def expected_max_sharpe(trial_srs: list[float]) -> float:
-    m = len(trial_srs)
+def expected_max_sharpe(trial_srs: list[float], n_trials: int | None = None) -> float:
+    """López de Prado's SR* -- the Sharpe a pure-noise search of this size wins.
+
+    ``trial_srs`` supplies the *spread* of the trials, which is the only thing
+    the observed candidates can tell us. ``n_trials`` supplies the *count*, and
+    the two are not the same number: a run scoring four factors today is one
+    slice of a search that has really tried many more parameterizations, so
+    deflating against four understates the selection bias. When ``n_trials`` is
+    omitted the count falls back to ``len(trial_srs)`` -- the pre-KAN-38
+    behaviour.
+    """
+    sample = len(trial_srs)
+    if sample < 2:
+        return 0.0
+    m = sample if n_trials is None else n_trials
     if m < 2:
         return 0.0
-    mean = sum(trial_srs) / m
-    var = sum((s - mean) ** 2 for s in trial_srs) / (m - 1)
+    mean = sum(trial_srs) / sample
+    var = sum((s - mean) ** 2 for s in trial_srs) / (sample - 1)
     if var <= 0:
         return 0.0
     std = math.sqrt(var)
@@ -70,9 +83,25 @@ class MultipleTestingVerdict:
 
 
 def control(
-    per_factor: dict[str, dict], q: float = 0.10, dsr_threshold: float = 0.95
+    per_factor: dict[str, dict],
+    q: float = 0.10,
+    dsr_threshold: float = 0.95,
+    n_trials: int | None = None,
 ) -> dict[str, MultipleTestingVerdict]:
-    sr_star = expected_max_sharpe([v["sr"] for v in per_factor.values()])
+    """Deflated-Sharpe + BH-FDR verdicts for one evaluation run.
+
+    ``n_trials`` is the declared size of the search that produced these
+    candidates -- see :mod:`research.evaluation.trial_registry`. Passing a
+    count smaller than the number of candidates scored here is rejected rather
+    than silently honoured: under-declaring the search is exactly the failure
+    this argument exists to prevent.
+    """
+    if n_trials is not None and n_trials < len(per_factor):
+        raise ValueError(
+            f"declared trial count {n_trials} is below the {len(per_factor)} "
+            "candidates scored in this run"
+        )
+    sr_star = expected_max_sharpe([v["sr"] for v in per_factor.values()], n_trials)
     fdr = benjamini_hochberg({fid: v["ic_p"] for fid, v in per_factor.items()}, q)
     verdicts: dict[str, MultipleTestingVerdict] = {}
     for fid, v in per_factor.items():
