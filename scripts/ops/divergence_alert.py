@@ -103,14 +103,36 @@ def _blind_reasons(report: dict[str, Any] | None) -> list[str]:
 
 
 # `scheme://user:password@host` — the monitor prints the full DSN when it
-# cannot reach the DB (divergence_monitor.py:453), and that DSN carries the
+# cannot reach the DB (divergence_monitor.py:443,453), and that DSN carries the
 # live Postgres password. Telegram is not a secret store, so the password is
 # stripped before the line leaves this process.
-_DSN_CREDENTIAL = re.compile(r"(?P<prefix>[a-zA-Z][\w+.-]*://[^\s:/@]+:)[^\s@]*@")
+#
+# The password is NOT percent-encoded: run_divergence.sh interpolates whatever
+# `secrets.sh` returned, and an operator may legally have typed '@' or a space.
+# So the match must run to the LAST '@' on the line (greedy `.*`) and must not
+# exclude whitespace — an earlier non-greedy `[^\s@]*@` leaked the tail of
+# `p@ssw0rd` and missed `pa ss` entirely. Over-redacting is the safe direction;
+# under-redacting ships a live credential.
+_DSN_CREDENTIAL = re.compile(r"(?P<prefix>[a-zA-Z][\w+.-]*://[^\s/@]*:).*@")
+
+# Telegram's sendMessage caps a body at 4096 characters and answers HTTP 400
+# beyond it; the wrapper discards curl's status, so an over-long alert would be
+# dropped in silence — the exact failure this job exists to remove. The body is
+# now data-dependent (one line per breaching sleeve, or a whole exception
+# string on exit 2), so it is bounded here rather than hoped about.
+MAX_MESSAGE_CHARS = 3500
+_TRUNCATION_NOTE = "\n… truncated — see the log for the full detail."
 
 
 def _redact(text: str) -> str:
     return _DSN_CREDENTIAL.sub(r"\g<prefix>***@", text)
+
+
+def _cap(text: str) -> str:
+    if len(text) <= MAX_MESSAGE_CHARS:
+        return text
+    keep = MAX_MESSAGE_CHARS - len(_TRUNCATION_NOTE)
+    return text[:keep].rstrip() + _TRUNCATION_NOTE
 
 
 def _last_error_line(log_tail: str) -> str:
@@ -135,7 +157,14 @@ def render_alert(
     """
     if exit_code == 0:
         return None
+    return _cap(_render(exit_code, report, log_tail))
 
+
+def _render(
+    exit_code: int,
+    report: dict[str, Any] | None,
+    log_tail: str,
+) -> str:
     if exit_code == 1:
         lines = _breach_lines(report)
         body = "\n".join(lines) if lines else (
@@ -164,26 +193,51 @@ def render_alert(
     return f"🚨 Divergence monitor returned UNEXPECTED exit code {exit_code}."
 
 
-def _load_report(path: str | None) -> dict[str, Any] | None:
+def _load_report(
+    path: str | None,
+    not_before: float | None = None,
+) -> dict[str, Any] | None:
+    """Load the run's JSON report, or None if it is missing or stale.
+
+    ``not_before`` is the epoch second the run started. Exit 1 does not by
+    itself prove a breach — ``divergence_monitor.py`` ends in
+    ``sys.exit(main())``, so any uncaught exception also exits 1 — and a report
+    left by an earlier run that day would then be narrated as though this run
+    had computed it. An older file is treated as absent, which downgrades the
+    message to the generic body rather than to silence.
+    """
     if not path:
         return None
     try:
-        with open(path) as f:
+        p = Path(path)
+        if not_before is not None and p.stat().st_mtime < not_before:
+            return None
+        with p.open() as f:
             data = json.load(f)
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
 
 
-def _load_log_tail(path: str | None, max_bytes: int = 65536) -> str:
+def _load_log_tail(
+    path: str | None,
+    offset: int = 0,
+    max_bytes: int = 65536,
+) -> str:
+    """Read the log from ``offset`` on — the byte count at which this run began.
+
+    A day's log holds every run against that date, so without the offset the
+    last ``ERROR:`` line could belong to an earlier run entirely.
+    """
     if not path:
         return ""
     try:
         p = Path(path)
         size = p.stat().st_size
+        start = max(offset, size - max_bytes) if size > offset + max_bytes else offset
         with p.open("rb") as f:
-            if size > max_bytes:
-                f.seek(size - max_bytes)
+            if start:
+                f.seek(start)
             return f.read().decode("utf-8", "replace")
     except OSError:
         return ""
@@ -194,12 +248,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--exit-code", type=int, required=True)
     parser.add_argument("--report", default=None)
     parser.add_argument("--log", default=None)
+    parser.add_argument(
+        "--not-before", type=float, default=None,
+        help="Epoch second this run started; an older report is treated as stale.",
+    )
+    parser.add_argument(
+        "--log-offset", type=int, default=0,
+        help="Byte offset in the log at which this run began.",
+    )
     args = parser.parse_args(argv)
 
     text = render_alert(
         args.exit_code,
-        _load_report(args.report),
-        _load_log_tail(args.log),
+        _load_report(args.report, args.not_before),
+        _load_log_tail(args.log, args.log_offset),
     )
     if text:
         print(text)

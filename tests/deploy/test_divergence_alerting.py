@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
-from scripts.ops.divergence_alert import render_alert
+import pytest
+
+from scripts.ops.divergence_alert import MAX_MESSAGE_CHARS, render_alert
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -168,6 +171,105 @@ def test_cli_prints_the_breach_message(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Review follow-ups: redaction, length, staleness, the fallback path
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("password", [
+    "sup3r-s3cret",
+    "p@ssw0rd",          # an '@' in the secret used to split the match
+    "Tr0ub4dor@3",
+    "pa ss",             # whitespace used to defeat the match entirely
+    "a:b@c d@e",
+])
+def test_hard_error_redacts_any_password_from_the_db_url(password):
+    """The monitor prints the full DSN on a connection failure and the DSN
+    carries the live Postgres password verbatim — secrets.sh imports whatever
+    the operator typed, so '@' and spaces are both legal. Anchoring on the
+    first '@' leaked the tail; the match now runs to the last one."""
+    log = (
+        "ERROR: Could not load paper state from DB "
+        f"(postgresql://algo:{password}@localhost:55432/algo_poc):\n"
+    )
+    msg = render_alert(2, None, log_tail=log)
+    assert password not in msg, msg
+    assert "***@localhost:55432/algo_poc" in msg, msg
+
+
+def test_hard_error_redacts_a_dsn_with_no_username():
+    log = "ERROR: bad DSN postgresql://:only-a-password@localhost/algo_poc\n"
+    msg = render_alert(2, None, log_tail=log)
+    assert "only-a-password" not in msg, msg
+
+
+def test_a_huge_message_is_truncated_below_the_telegram_limit():
+    """Telegram rejects sendMessage over 4096 chars with HTTP 400, and the
+    wrapper discards curl's status — so an over-long body is silently dropped.
+    That is silence on a BREACH, the exact failure this story removes."""
+    msg = render_alert(2, None, log_tail="ERROR: " + ("x" * 20000) + "\n")
+    assert len(msg) <= MAX_MESSAGE_CHARS
+    assert "truncated" in msg
+
+
+def test_truncation_keeps_the_headline():
+    many = _report(*[
+        _portfolio(f"sleeve_{i:03d}", "BREACH") for i in range(400)
+    ])
+    msg = render_alert(1, many)
+    assert len(msg) <= MAX_MESSAGE_CHARS
+    assert "BREACH" in msg
+    assert "truncated" in msg
+
+
+def test_a_stale_report_is_ignored_rather_than_reported_as_this_run(tmp_path):
+    """`sys.exit(main())` means ANY uncaught exception exits 1, so exit 1 does
+    not by itself prove a breach. Yesterday's — or this morning's — report must
+    not be narrated as though this run had computed it."""
+    report = tmp_path / "divergence.json"
+    report.write_text(json.dumps(_report(_portfolio("momentum", "BREACH"))))
+    os.utime(report, (1_000_000, 1_000_000))
+    res = subprocess.run(
+        [sys.executable, str(REPO / "scripts/ops/divergence_alert.py"),
+         "--exit-code", "1", "--report", str(report), "--log", os.devnull,
+         "--not-before", "2000000"],
+        capture_output=True, text=True, cwd=REPO, timeout=60,
+    )
+    assert res.returncode == 0, res.stderr
+    assert "momentum" not in res.stdout, res.stdout
+    # Still alerts — a stale report must not buy silence either.
+    assert "BREACH" in res.stdout
+
+
+def test_a_fresh_report_is_used(tmp_path):
+    report = tmp_path / "divergence.json"
+    report.write_text(json.dumps(_report(_portfolio("momentum", "BREACH"))))
+    res = subprocess.run(
+        [sys.executable, str(REPO / "scripts/ops/divergence_alert.py"),
+         "--exit-code", "1", "--report", str(report), "--log", os.devnull,
+         "--not-before", "1000000"],
+        capture_output=True, text=True, cwd=REPO, timeout=60,
+    )
+    assert res.returncode == 0, res.stderr
+    assert "momentum" in res.stdout
+
+
+def test_log_offset_scopes_the_error_to_this_run(tmp_path):
+    """A day's log holds every run. Without an offset the alert would quote an
+    earlier run's ERROR as this one's cause."""
+    log = tmp_path / "divergence.log"
+    earlier = "ERROR: an earlier run's unrelated failure\n"
+    log.write_text(earlier + "ERROR: this run could not reach the DB\n")
+    res = subprocess.run(
+        [sys.executable, str(REPO / "scripts/ops/divergence_alert.py"),
+         "--exit-code", "2", "--log", str(log),
+         "--log-offset", str(len(earlier))],
+        capture_output=True, text=True, cwd=REPO, timeout=60,
+    )
+    assert res.returncode == 0, res.stderr
+    assert "this run could not reach the DB" in res.stdout
+    assert "earlier run" not in res.stdout
+
+
+# ---------------------------------------------------------------------------
 # The shared telegram() helper (AC5)
 # ---------------------------------------------------------------------------
 
@@ -225,7 +327,9 @@ def test_the_shared_helper_is_not_deployed_to_ibc():
 RUN_DIVERGENCE = DEPLOY_DIR / "run_divergence.sh"
 
 
-def _drive_wrapper(tmp_path, exit_code, report_payload=None, curl_exit=0):
+def _drive_wrapper(tmp_path, exit_code, report_payload=None, curl_exit=0,
+                   renderer_fails=False, serve_credentials=True,
+                   stale_report=None):
     """Run run_divergence.sh end-to-end against a stubbed monitor and curl.
 
     Everything the wrapper reaches out to is stubbed on PATH: ``nc`` (the DB
@@ -258,9 +362,9 @@ def _drive_wrapper(tmp_path, exit_code, report_payload=None, curl_exit=0):
     stub("security", """#!/bin/bash
 case "${@: -1}" in
   POSTGRES_PASSWORD)  echo "stub-pg" ;;
-  TELEGRAM_BOT_TOKEN) echo "stub-token" ;;
+""" + ("""  TELEGRAM_BOT_TOKEN) echo "stub-token" ;;
   TELEGRAM_CHAT_ID)   echo "stub-chat" ;;
-  *) echo "could not be found" >&2; exit 44 ;;
+""" if serve_credentials else "") + """  *) echo "could not be found" >&2; exit 44 ;;
 esac
 """)
     # Record every argument on its own line so the test can assert on the
@@ -270,14 +374,28 @@ esac
 exit {curl_exit}
 """)
 
+    # The report is staged as a fixture and copied into place *by the stub
+    # monitor*, exactly as the real monitor writes it mid-run. Pre-writing it
+    # would be rejected by the wrapper's staleness guard — correctly, since a
+    # report older than the run start belongs to an earlier run.
     report = tmp_path / "divergence.json"
+    fixture = tmp_path / "fixture.json"
     if report_payload is not None:
-        report.write_text(json.dumps(report_payload))
+        fixture.write_text(json.dumps(report_payload))
+    if stale_report is not None:
+        # Left behind by an earlier run today; the stub monitor does not
+        # rewrite it, so its mtime stays before this run's start.
+        report.write_text(json.dumps(stale_report))
+        os.utime(report, (1_000_000, 1_000_000))
 
+    renderer = (
+        "exit 99" if renderer_fails else f'exec {sys.executable} "$@"'
+    )
     fake_python = stub("fake-python", f"""#!/bin/bash
 case "$1" in
-  *divergence_alert.py) exec {sys.executable} "$@" ;;
+  *divergence_alert.py) {renderer} ;;
 esac
+[ -f {fixture} ] && cp {fixture} {report}
 echo "stub monitor ran" >&2
 echo "ERROR: stub monitor could not load paper state from DB"
 exit {exit_code}
@@ -365,3 +483,76 @@ def test_a_failing_send_does_not_change_the_exit_code(tmp_path):
     )
     assert res.returncode == 1
     assert len(sends) == 1, sends
+
+
+def test_a_broken_renderer_degrades_to_the_generic_message_not_to_silence(tmp_path):
+    """The load-bearing guarantee. If divergence_alert.py cannot run at all —
+    a syntax error, a missing venv, a bad import — the BREACH must still reach
+    the operator, just with less detail. Silence is the one unacceptable
+    outcome, and it is the outcome this whole story exists to remove."""
+    res, sends, log = _drive_wrapper(
+        tmp_path, 1, _report(_portfolio("momentum", "BREACH")),
+        renderer_fails=True,
+    )
+    assert res.returncode == 1
+    assert len(sends) == 1, sends
+    assert "Divergence BREACH" in sends[0]
+    # The generic fallback, not the rendered detail.
+    assert "momentum" not in sends[0], sends[0]
+
+
+def test_a_broken_renderer_still_alerts_on_the_blind_path(tmp_path):
+    res, sends, _ = _drive_wrapper(tmp_path, 3, renderer_fails=True)
+    assert res.returncode == 3
+    assert len(sends) == 1, sends
+    assert "BLIND" in sends[0]
+
+
+def test_missing_telegram_credentials_do_not_change_the_exit_code(tmp_path):
+    """A locked keychain must not turn a BREACH into a crash. It sends nothing
+    over the network, logs why, and raises the secret-free local alert."""
+    res, sends, log = _drive_wrapper(
+        tmp_path, 1, _report(_portfolio("momentum", "BREACH")),
+        serve_credentials=False,
+    )
+    assert res.returncode == 1
+    assert sends == [], sends
+    assert "cannot send alert" in log, log
+
+
+def test_the_helper_is_sourced_before_the_first_telegram_call():
+    """AC5, placement not just presence: a source line that lands after the
+    first call would give `telegram: command not found` at exactly the moment
+    the alert matters."""
+    for wrapper in WRAPPERS:
+        text = wrapper.read_text()
+        source_at = text.index('. "$ALGO_DIR/deploy/launchd/lib/telegram.sh"')
+        calls = [
+            m.start() for m in re.finditer(r"(?m)^\s*telegram\s+[\"']", text)
+        ]
+        assert calls, f"{wrapper.name} sources the helper but never calls it"
+        assert source_at < min(calls), (
+            f"{wrapper.name} calls telegram before sourcing the helper"
+        )
+
+
+def test_no_wrapper_defines_telegram_in_any_shell_syntax():
+    """Tighter than the plain-string check: catches `telegram()\\n{`,
+    `function telegram {`, and indented definitions too."""
+    pattern = re.compile(r"(?m)^\s*(function\s+telegram\b|telegram\s*\(\s*\))")
+    offenders = [w.name for w in WRAPPERS if pattern.search(w.read_text())]
+    assert offenders == [], f"wrappers still define their own telegram(): {offenders}"
+
+
+def test_an_earlier_runs_report_is_not_narrated_as_this_runs(tmp_path):
+    """`sys.exit(main())` means an uncaught exception also exits 1. If the
+    operator hand-ran the monitor earlier today and it wrote a report with
+    momentum in BREACH, a later crashing run must not confidently report
+    momentum's numbers as though it had computed them."""
+    res, sends, _ = _drive_wrapper(
+        tmp_path, 1, stale_report=_report(_portfolio("momentum", "BREACH")),
+    )
+    assert res.returncode == 1
+    assert len(sends) == 1, sends
+    assert "BREACH" in sends[0]
+    assert "momentum" not in sends[0], sends[0]

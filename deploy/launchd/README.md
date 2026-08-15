@@ -185,7 +185,21 @@ the 04:15 `local.algo-paper-trading` job has written that day's
   BREACH names the breaching sleeves and their divergence, and a BLIND run
   names which like-for-like requirement the baseline failed. If rendering
   fails the wrapper falls back to a generic message — never to silence. A
-  failed send never changes the wrapper's exit code.
+  failed send never changes the wrapper's exit code. Bodies are capped below
+  Telegram's 4096-char limit, and any password in a logged DSN is redacted
+  before it leaves the host.
+- **Attributing artifacts to the run:** the wrapper stamps `RUN_STARTED` and
+  the log's byte offset just before invoking the monitor, and passes both to
+  the renderer. A report older than the run start is treated as absent — exit 1
+  does not prove a breach (the monitor ends in `sys.exit(main())`, so an
+  uncaught exception exits 1 too), and an earlier same-day run's report must
+  never be narrated as this one's.
+- **Test-only env hooks:** `ALGO_DIR`, `ALGO_PYTHON` and
+  `ALGO_DIVERGENCE_REPORT` exist so the test suite can drive the wrapper
+  end-to-end against stubs. launchd starts jobs with an empty environment, so
+  production always takes the defaults. **Never export them in a login shell** —
+  a manual run would then use whatever tree, interpreter, or report path they
+  point at, and `ALGO_PYTHON` swaps the interpreter for the monitor too.
 
 ### Install / reload
 

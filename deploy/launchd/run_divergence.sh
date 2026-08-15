@@ -16,10 +16,13 @@
 
 set -uo pipefail
 
-# Overridable only so tests/deploy/test_divergence_alerting.py can drive this
-# wrapper end-to-end against stubs — launchd starts jobs with an empty
-# environment, so production always takes the defaults. Never export ALGO_DIR
-# in a login shell: a manual run would then use whatever tree that points at.
+# ALGO_DIR / ALGO_PYTHON / ALGO_DIVERGENCE_REPORT are overridable only so
+# tests/deploy/test_divergence_alerting.py can drive this wrapper end-to-end
+# against stubs — launchd starts jobs with an empty environment, so production
+# always takes the defaults. Never export any of the three in a login shell: a
+# manual run would then use whatever tree, interpreter or report path they
+# point at. ALGO_PYTHON swaps the interpreter for the monitor too, not just for
+# the alert renderer.
 ALGO_DIR="${ALGO_DIR:-/Users/huiliang/GitHub/algo-poc}"
 VENV="${ALGO_PYTHON:-$ALGO_DIR/.venv/bin/python}"
 LOG_DIR="$HOME/ibc/logs"
@@ -29,6 +32,11 @@ PROM_FILE="$METRICS_DIR/divergence.prom"
 # Passed to the monitor explicitly (it would default to the same path) so the
 # alert renderer knows exactly which report to read back.
 REPORT_FILE="${ALGO_DIVERGENCE_REPORT:-$ALGO_DIR/output/divergence_$(date +%Y%m%d).json}"
+# Stamped just before the monitor runs, so the renderer can tell this run's
+# artifacts from an earlier same-day run's. Initialised here because `set -u`
+# is on and the early-abort paths below exit before they are stamped.
+RUN_STARTED=0
+LOG_OFFSET=0
 # Secrets come from the macOS login keychain via the shared loader. Sourced by
 # path from the repo (never from the deployed ~/ibc copy) so there is exactly
 # one implementation of the lookup and it cannot drift.
@@ -50,6 +58,7 @@ divergence_alert_text() {
     local text
     text=$("$VENV" "$ALGO_DIR/scripts/ops/divergence_alert.py" \
                --exit-code "$1" --report "$REPORT_FILE" --log "$LOG_FILE" \
+               --not-before "$RUN_STARTED" --log-offset "$LOG_OFFSET" \
                2>>"$LOG_FILE") || text=""
     [ -n "$text" ] || text="$2"
     printf '%s' "$text"
@@ -106,6 +115,14 @@ if ! wait_for_port 127.0.0.1 55432 "paper DB (docker compose up?)" 300; then
 fi
 
 cd "$ALGO_DIR"
+# Everything the renderer reads back must be attributable to THIS run: a report
+# left by an earlier run today would otherwise be narrated as this one's, and
+# exit 1 does not prove a breach (the monitor ends in `sys.exit(main())`, so an
+# uncaught exception exits 1 too).
+RUN_STARTED=$(date +%s)
+LOG_OFFSET=$(wc -c < "$LOG_FILE" 2>/dev/null | tr -d ' ')
+[ -n "$LOG_OFFSET" ] || LOG_OFFSET=0
+
 "$VENV" scripts/divergence_monitor.py \
     --output "$REPORT_FILE" \
     --prometheus-textfile "$PROM_FILE" \

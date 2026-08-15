@@ -16,7 +16,10 @@
 # operator could edit with no effect.
 #
 # Requires: secrets.sh sourced first (algo_secret_into, algo_alert_local).
-# Expects:  $LOG_FILE        — where the "cannot alert" line goes
+# Expects:  $LOG_FILE        — where the "cannot alert" line goes (optional:
+#                              falls back to /dev/null, because a helper whose
+#                              contract is "never fails a caller" must not die
+#                              on an unset variable under `set -u`)
 #           $ALGO_JOB_LABEL  — this job's name, e.g. "divergence monitor"
 #
 # Usage:
@@ -43,13 +46,13 @@ _algo_telegram_ts() {
 telegram() {
     local token chat
     if ! algo_secret_into TELEGRAM_BOT_TOKEN; then
-        echo "$(_algo_telegram_ts): WARNING - cannot send alert: $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
+        echo "$(_algo_telegram_ts): WARNING - cannot send alert: $ALGO_SECRETS_ERROR" >> "${LOG_FILE:-/dev/null}"
         algo_alert_local "$ALGO_JOB_LABEL cannot alert: $ALGO_SECRETS_ERROR"
         return 0
     fi
     token="$_ALGO_SECRET_VALUE"
     if ! algo_secret_into TELEGRAM_CHAT_ID; then
-        echo "$(_algo_telegram_ts): WARNING - cannot send alert: $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
+        echo "$(_algo_telegram_ts): WARNING - cannot send alert: $ALGO_SECRETS_ERROR" >> "${LOG_FILE:-/dev/null}"
         algo_alert_local "$ALGO_JOB_LABEL cannot alert: $ALGO_SECRETS_ERROR"
         return 0
     fi
