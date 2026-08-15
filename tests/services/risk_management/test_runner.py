@@ -386,6 +386,51 @@ class TestKillLiquidation:
         session.rollback()
 
     @pytest.mark.asyncio
+    async def test_two_sleeves_holding_one_ticker_flatten_as_one_kill_exit(
+        self, db_runner, mock_redis
+    ):
+        """KAN-6 regression: load_liquidation_targets now returns one row per
+        {account, portfolio, con_id}, but the kill path's exit id is still
+        ticker-scoped (execution's defense-in-depth net derives the same id, so
+        both sides must agree or they double-sell). The kill path therefore has
+        to re-merge per-ticker: two rows sharing a ticker would otherwise mint
+        the same id with different economics, and the second would be rejected
+        as a conflict — leaving half the position un-flattened during a kill.
+        """
+        runner, ledger, session = db_runner
+        session.add(
+            Position(
+                account_id="DUTEST",
+                ticker="AAPL",
+                portfolio="quality_value",
+                con_id=111,
+                exchange="SMART",
+                currency="USD",
+                quantity=30.0,
+                avg_entry_price=100,
+                current_price=100,
+                peak_price=100,
+                highest_price_since_entry=100,
+                opened_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+                status="open",
+            )
+        )
+        session.commit()
+
+        await runner.process_kill(_kill_msg())
+
+        sells = [o for o in _approved_orders(mock_redis) if o.ticker == "AAPL"]
+        assert len(sells) == 1
+        assert sells[0].quantity == pytest.approx(40.0)  # the whole holding
+        alerts = [
+            str(c.args[1])
+            for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert not any("manual" in a.lower() for a in alerts)
+        session.rollback()
+
+    @pytest.mark.asyncio
     async def test_replayed_kill_does_not_double_submit(self, db_runner, mock_redis):
         runner, ledger, session = db_runner
         await runner.process_kill(_kill_msg())
