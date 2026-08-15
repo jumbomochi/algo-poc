@@ -107,6 +107,10 @@ services:
       # container and says why.
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      # KAN-15: where the permanently-firing Watchdog alert is pinged. Unset
+      # is tolerated (the entrypoint drops the Watchdog and warns) — see the
+      # `deadman` receiver in config/alertmanager.yml.
+      - DEADMAN_WATCHDOG_URL=${DEADMAN_WATCHDOG_URL}
     entrypoint: ["/bin/sh", "/etc/alertmanager/entrypoint.sh"]
     command:
       # No --config.file here: the entrypoint passes the rendered one.

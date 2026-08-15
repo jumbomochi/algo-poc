@@ -1,0 +1,457 @@
+# KAN-15 (P1-12) — promtool unit tests for config/alert_rules.yml.
+#
+# Run by the `promtool test rules` job in .github/workflows/tests.yml, and by
+# tests/deploy/test_alert_rules.py whenever a promtool binary is on PATH.
+#
+#   promtool test rules tests/deploy/alert_rules_test.yml
+#
+# Why this file exists: the previous revision of the rules was reviewed by eye
+# and shipped a rule (`increase(approved_orders[60m]) == 0`) that was true for
+# ~23 hours of every day. Nothing could have caught that except replaying a
+# normal day through the rules, which is exactly what this does. The two
+# properties that matter are equally weighted here:
+#
+#   1. SILENCE ON A NORMAL DAY. A pager that cries wolf gets muted, and a muted
+#      channel is less monitoring than one that was never wired up.
+#   2. NOISE ON A REAL FAILURE. Every one of the nine substantive rules has a
+#      test that drives it to fire, so "quiet" can never be achieved by
+#      accident (e.g. a typo'd metric name).
+#
+# `rule_files` is resolved relative to THIS file.
+rule_files:
+  - ../../config/alert_rules.yml
+
+# Default; long-horizon groups override it so a 3-day scenario does not need
+# 4320 samples per series.
+evaluation_interval: 1m
+
+tests:
+  # -------------------------------------------------------------------------
+  # AC1 / AC3 — the whole point of this story.
+  #
+  # A full weekend of a completely healthy, completely idle system: nothing
+  # trades, nothing moves, every service is up and heartbeating. The ONLY
+  # alert allowed to be firing is the Watchdog, which fires by design.
+  # -------------------------------------------------------------------------
+  - interval: 5m
+    name: a normal quiet weekend produces no alerts but the watchdog
+    input_series:
+      - series: 'up{job="data-ingestion"}'
+        values: "1+0x576"
+      - series: 'up{job="signal-generation"}'
+        values: "1+0x576"
+      - series: 'up{job="ml-model"}'
+        values: "1+0x576"
+      - series: 'up{job="risk-management"}'
+        values: "1+0x576"
+      - series: 'up{job="execution"}'
+        values: "1+0x576"
+      - series: 'up{job="api"}'
+        values: "1+0x576"
+      - series: 'up{job="notifications"}'
+        values: "1+0x576"
+      - series: 'up{job="portfolio-accounting"}'
+        values: "1+0x576"
+      # Fresh heartbeats everywhere, including the API — which had no series
+      # at all before this story.
+      - series: 'algo_heartbeat_age_seconds{job="signal-generation"}'
+        values: "3+0x576"
+      - series: 'algo_heartbeat_age_seconds{job="api"}'
+        values: "12+0x576"
+      - series: 'algo_heartbeat_age_seconds{job="data-ingestion"}'
+        values: "600+0x576"
+      # Every stream flat for the whole 48h: no recommendations, no approved
+      # orders, no fills, no kill events. This is a weekend.
+      - series: 'redis_stream_entries_added{key="stream:recommendations"}'
+        values: "4200+0x576"
+      - series: 'redis_stream_entries_added{key="stream:approved_orders"}'
+        values: "930+0x576"
+      - series: 'redis_stream_entries_added{key="stream:fills"}'
+        values: "870+0x576"
+      - series: 'redis_stream_entries_added{key="stream:kill"}'
+        values: "2+0x576"
+      - series: 'redis_stream_length{key="stream:fills:dlq"}'
+        values: "0+0x576"
+      - series: "redis_memory_used_bytes"
+        values: "104857600+0x576"
+      - series: "redis_memory_max_bytes"
+        values: "536870912+0x576"
+    alert_rule_test:
+      # Sampled across the whole weekend rather than at one instant: the old
+      # rules were quiet at 04:20 and screaming by 05:30.
+      - eval_time: 1h
+        alertname: ApprovedOrdersStreamIdle
+        exp_alerts: []
+      - eval_time: 12h
+        alertname: ApprovedOrdersStreamIdle
+        exp_alerts: []
+      - eval_time: 47h
+        alertname: ApprovedOrdersStreamIdle
+        exp_alerts: []
+      - eval_time: 1h
+        alertname: NoFillsRecently
+        exp_alerts: []
+      - eval_time: 24h
+        alertname: NoFillsRecently
+        exp_alerts: []
+      - eval_time: 47h
+        alertname: NoFillsRecently
+        exp_alerts: []
+      - eval_time: 47h
+        alertname: ServiceMetricsEndpointDown
+        exp_alerts: []
+      - eval_time: 47h
+        alertname: HeartbeatStale
+        exp_alerts: []
+      - eval_time: 47h
+        alertname: HeartbeatStaleDataIngestion
+        exp_alerts: []
+      - eval_time: 47h
+        alertname: DeadLetterQueueBacklog
+        exp_alerts: []
+      - eval_time: 47h
+        alertname: KillStreamActivity
+        exp_alerts: []
+      - eval_time: 47h
+        alertname: PassiveBreachDetected
+        exp_alerts: []
+      - eval_time: 47h
+        alertname: RedisMemoryHigh
+        exp_alerts: []
+      # ...and the one alert that must never be silent.
+      - eval_time: 47h
+        alertname: Watchdog
+        exp_alerts:
+          - exp_labels:
+              alertname: Watchdog
+              severity: none
+              channel: deadman
+              component: monitoring
+            exp_annotations:
+              summary: "Monitoring pipeline is alive"
+              description: >-
+                This alert is always firing, by design. Its ABSENCE is the
+                signal: if the external checker stops receiving it, Prometheus,
+                Alertmanager, docker, or the host itself has stopped — and no
+                rule in this file could have told you, because they all run on
+                the machine that died. Paired with the run_paper.sh dead-man
+                ping (deploy/launchd/deadman.sh), which covers the narrower case
+                of "the host is up but the 04:15 trading run did not happen".
+
+  # -------------------------------------------------------------------------
+  # AC3 — a normal NO-TRADE day. Not a weekend: the run happened, on a real
+  # NYSE session, and every signal came back SKIP. scripts/run_paper.py
+  # publishes nothing in that case (publish_unpublished_intents replays only
+  # PROPOSED intents), so the whole pipeline is legitimately still.
+  #
+  # This is the case the old `increase(fills[24h]) == 0` rule paged on.
+  # -------------------------------------------------------------------------
+  - interval: 30m
+    name: a no-trade day does not page
+    input_series:
+      - series: 'redis_stream_entries_added{key="stream:recommendations"}'
+        values: "4200+0x144"
+      - series: 'redis_stream_entries_added{key="stream:approved_orders"}'
+        values: "930+0x144"
+      - series: 'redis_stream_entries_added{key="stream:fills"}'
+        values: "870+0x144"
+    alert_rule_test:
+      - eval_time: 24h
+        alertname: ApprovedOrdersStreamIdle
+        exp_alerts: []
+      - eval_time: 24h
+        alertname: NoFillsRecently
+        exp_alerts: []
+      - eval_time: 71h
+        alertname: NoFillsRecently
+        exp_alerts: []
+
+  # -------------------------------------------------------------------------
+  # AC2 — each rule fires on its genuine failure condition.
+  # -------------------------------------------------------------------------
+  - interval: 1m
+    name: a dead metrics endpoint pages
+    input_series:
+      - series: 'up{job="execution"}'
+        values: "1 1 0+0x10"
+      - series: 'up{job="api"}'
+        values: "1+0x12"
+    alert_rule_test:
+      # Below `for: 2m` — deliberately not yet firing, so the debounce is
+      # tested and not just the threshold.
+      - eval_time: 3m
+        alertname: ServiceMetricsEndpointDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: ServiceMetricsEndpointDown
+        exp_alerts:
+          - exp_labels:
+              alertname: ServiceMetricsEndpointDown
+              job: execution
+              severity: critical
+              channel: telegram
+              component: service-health
+            exp_annotations:
+              summary: "execution metrics endpoint unreachable"
+              description: >-
+                Prometheus has failed to scrape execution:9090/metrics for 2+
+                minutes. Check `docker compose ps execution` and its logs — this
+                is either a crashed/restarting container or a wedged event loop.
+
+  - interval: 1m
+    name: a wedged main loop pages, and the api is now covered by it
+    input_series:
+      # AC7: this series did not exist before KAN-15, so a wedged API could
+      # not trip HeartbeatStale no matter how long it hung.
+      - series: 'algo_heartbeat_age_seconds{job="api"}'
+        values: "10 70 130 190 250 310 370 430"
+      - series: 'algo_heartbeat_age_seconds{job="notifications"}'
+        values: "5+0x8"
+      # data-ingestion is excluded from this rule by its own matcher: its
+      # 15-minute poll cadence is normal, not a wedge.
+      - series: 'algo_heartbeat_age_seconds{job="data-ingestion"}'
+        values: "800+0x8"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HeartbeatStale
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: HeartbeatStale
+        exp_alerts:
+          - exp_labels:
+              alertname: HeartbeatStale
+              job: api
+              severity: critical
+              channel: telegram
+              component: service-health
+            exp_annotations:
+              summary: "api's main loop has not iterated in over 2 minutes"
+              description: >-
+                algo_heartbeat_age_seconds is 310s. The metrics endpoint is
+                still up (see ServiceMetricsEndpointDown), so this is the
+                wedged-but-alive case: a blocking call (IB, DB, a stuck lock)
+                that never returns. Check `docker compose logs api` for the last
+                thing it was doing.
+      # The data-ingestion series is well past 120s and must NOT appear above.
+      - eval_time: 5m
+        alertname: HeartbeatStaleDataIngestion
+        exp_alerts: []
+
+  - interval: 1m
+    name: a wedged data-ingestion loop pages on its own slower threshold
+    input_series:
+      - series: 'algo_heartbeat_age_seconds{job="data-ingestion"}'
+        values: "2600 2660 2720 2780 2840 2900 2960 3020"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HeartbeatStaleDataIngestion
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: HeartbeatStaleDataIngestion
+        exp_alerts:
+          - exp_labels:
+              alertname: HeartbeatStaleDataIngestion
+              job: data-ingestion
+              severity: critical
+              channel: telegram
+              component: service-health
+            exp_annotations:
+              summary: "data-ingestion's main loop has not iterated in over 45 minutes"
+              description: >-
+                algo_heartbeat_age_seconds is 3020s. data-ingestion's outer loop
+                sleeps polling_interval_minutes (15m default) between cycles and
+                heartbeats every cycle regardless of market-hours gating, so 45m
+                (3x cadence) is already a generous threshold — matches the
+                container healthcheck in docker-compose.yml.
+
+  # The retuned stream rules, driven to their real failure conditions.
+  - interval: 5m
+    name: recommendations that produce no approved orders page
+    input_series:
+      # The 04:15 run publishes 12 intents, then stops.
+      - series: 'redis_stream_entries_added{key="stream:recommendations"}'
+        values: "4200 4212+0x40"
+      # ...and risk-management emits nothing at all. Wedged, or holding every
+      # buy back behind a `major` reconciliation mismatch.
+      - series: 'redis_stream_entries_added{key="stream:approved_orders"}'
+        values: "930+0x41"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ApprovedOrdersStreamIdle
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: ApprovedOrdersStreamIdle
+        exp_alerts:
+          - exp_labels:
+              alertname: ApprovedOrdersStreamIdle
+              severity: warning
+              channel: telegram
+              component: pipeline
+            exp_annotations:
+              summary: "Recommendations reached the bus but risk-management approved none of them"
+              description: >-
+                stream:recommendations grew in the last 2h while
+                stream:approved_orders did not. Either risk-management is not
+                consuming (check its heartbeat and `docker compose logs
+                risk-management`), or every intent was blocked at entry — a
+                `major` reconciliation mismatch blocks all buys fail-closed.
+                Check the risk service's alerts and the reconciliation status.
+
+  - interval: 1h
+    name: approved orders that never fill page after a weekend has passed
+    input_series:
+      # Friday's run approves 6 orders...
+      - series: 'redis_stream_entries_added{key="stream:approved_orders"}'
+        values: "930 936+0x71"
+      # ...and by Monday nothing has filled. Orders dropped across a Gateway
+      # session, or a wedged execution service.
+      - series: 'redis_stream_entries_added{key="stream:fills"}'
+        values: "870+0x72"
+    alert_rule_test:
+      - eval_time: 60h
+        alertname: NoFillsRecently
+        exp_alerts:
+          - exp_labels:
+              alertname: NoFillsRecently
+              severity: warning
+              channel: telegram
+              component: pipeline
+            exp_annotations:
+              summary: "Orders were approved but nothing has filled in 3 days"
+              description: >-
+                stream:approved_orders grew within the last 3 days and
+                stream:fills did not grow at all in that time — long enough to
+                span a weekend, so this is not a quiet-market artefact. Check IB
+                Gateway connectivity, `docker compose logs execution`, and
+                whether day orders were dropped across a Gateway session
+                restart.
+
+  - interval: 1m
+    name: a dead letter queue backlog pages
+    input_series:
+      - series: 'redis_stream_length{key="stream:fills:dlq"}'
+        values: "0 4 11+0x10"
+      # At the threshold, not over it: `> 10` must not fire on exactly 10.
+      - series: 'redis_stream_length{key="stream:signals:dlq"}'
+        values: "10+0x12"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: DeadLetterQueueBacklog
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: DeadLetterQueueBacklog
+        exp_alerts:
+          - exp_labels:
+              alertname: DeadLetterQueueBacklog
+              key: "stream:fills:dlq"
+              severity: critical
+              channel: telegram
+              component: pipeline
+            exp_annotations:
+              summary: "Dead-letter queue stream:fills:dlq has 11 unprocessed messages"
+              description: >-
+                Messages are failing validation/processing and landing in a DLQ
+                instead of being handled/acked. See shared/redis_client.py's
+                send_to_dead_letter().
+
+  - interval: 1m
+    name: any kill switch activity is reported immediately
+    input_series:
+      - series: 'redis_stream_entries_added{key="stream:kill"}'
+        values: "2 2 3+0x10"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: KillStreamActivity
+        exp_alerts:
+          - exp_labels:
+              alertname: KillStreamActivity
+              key: "stream:kill"
+              severity: info
+              channel: telegram
+              component: pipeline
+            exp_annotations:
+              summary: "stream:kill received a new message"
+              description: >-
+                A kill event was published in the last 5 minutes. Confirm
+                whether this was an intentional operator action
+                (docs/operations/rollback-playbook.md) or unexpected.
+
+  - interval: 1m
+    name: a passive risk breach on a held position is reported
+    input_series:
+      - series: 'algo_risk_breach_total{breach_type="trim"}'
+        values: "0 0 1+0x20"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: PassiveBreachDetected
+        exp_alerts:
+          - exp_labels:
+              alertname: PassiveBreachDetected
+              breach_type: trim
+              severity: warning
+              channel: telegram
+              component: risk
+            exp_annotations:
+              summary: "Passive breach detected on a held position (trim)"
+              description: >-
+                algo_risk_breach_total incremented for breach_type=trim in the
+                last 15m. "trim" breaches are high-priority (see
+                services/risk_management/passive_monitor.py); "notify" are
+                informational.
+
+  - interval: 1m
+    name: redis memory pressure pages before noeviction starts refusing writes
+    input_series:
+      - series: "redis_memory_used_bytes"
+        values: "429496729+1073741x20"
+      - series: "redis_memory_max_bytes"
+        values: "536870912+0x20"
+    alert_rule_test:
+      # 429496729 / 536870912 = 0.7999... — must not fire at the boundary.
+      - eval_time: 0m
+        alertname: RedisMemoryHigh
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: RedisMemoryHigh
+        exp_alerts:
+          - exp_labels:
+              alertname: RedisMemoryHigh
+              severity: warning
+              channel: telegram
+              component: infrastructure
+            exp_annotations:
+              summary: "Redis memory usage above 80% of configured maxmemory"
+              description: >-
+                redis_memory_max_bytes reflects the `maxmemory` set on the redis
+                service's command in docker-compose.yml. Policy is `noeviction`,
+                so crossing 100% means writes start failing loudly rather than
+                silently evicting stream data (review Theme 6.3) — this alert
+                should fire well before that.
+
+  # -------------------------------------------------------------------------
+  # AC5 — the dead-man's switch fires from the very first evaluation, with no
+  # input series at all. If it ever needs one, it has stopped being a
+  # dead-man's switch.
+  # -------------------------------------------------------------------------
+  - interval: 1m
+    name: the watchdog fires immediately and unconditionally
+    input_series: []
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: Watchdog
+        exp_alerts:
+          - exp_labels:
+              alertname: Watchdog
+              severity: none
+              channel: deadman
+              component: monitoring
+            exp_annotations:
+              summary: "Monitoring pipeline is alive"
+              description: >-
+                This alert is always firing, by design. Its ABSENCE is the
+                signal: if the external checker stops receiving it, Prometheus,
+                Alertmanager, docker, or the host itself has stopped — and no
+                rule in this file could have told you, because they all run on
+                the machine that died. Paired with the run_paper.sh dead-man
+                ping (deploy/launchd/deadman.sh), which covers the narrower case
+                of "the host is up but the 04:15 trading run did not happen".

@@ -22,6 +22,10 @@ OBSERVABILITY_COMPOSE_PATH = Path("docker-compose.observability.yml")
 PROMETHEUS_CONFIG_PATH = Path("config/prometheus.yml")
 ALERT_RULES_PATH = Path("config/alert_rules.yml")
 
+# Services whose container healthcheck reads the heartbeat *file*. The api is
+# not one of them — it is probed through /healthz instead, because a FastAPI
+# process answering HTTP is the same evidence for it that a fresh heartbeat
+# file is for a worker loop.
 HEARTBEAT_SERVICES = (
     "data-ingestion",
     "signal-generation",
@@ -32,6 +36,13 @@ HEARTBEAT_SERVICES = (
     "portfolio-accounting",
 )
 ALL_METRICS_SERVICES = HEARTBEAT_SERVICES + ("api",)
+
+# KAN-15 (AC7): services that must publish algo_heartbeat_age_seconds. This is
+# eight, not seven. HeartbeatStale matches job!="data-ingestion", which
+# *includes* api — but api registered no collector, so no series existed and
+# the rule could never fire for it however long the API hung. The alert
+# believed it covered a service it did not.
+HEARTBEAT_METRIC_SERVICES = HEARTBEAT_SERVICES + ("api",)
 
 RUNNER_FILES_EXPECTING_HEARTBEAT = {
     "data-ingestion": Path("services/data_ingestion/runner.py"),
@@ -44,6 +55,11 @@ RUNNER_FILES_EXPECTING_HEARTBEAT = {
 }
 
 RUNNER_FILES_EXPECTING_SETUP_METRICS = {
+    **RUNNER_FILES_EXPECTING_HEARTBEAT,
+    "api": Path("services/api/app.py"),
+}
+
+RUNNER_FILES_EXPECTING_HEARTBEAT_METRIC = {
     **RUNNER_FILES_EXPECTING_HEARTBEAT,
     "api": Path("services/api/app.py"),
 }
@@ -63,6 +79,24 @@ def test_every_worker_service_writes_a_heartbeat() -> None:
     for service, runner_path in RUNNER_FILES_EXPECTING_HEARTBEAT.items():
         text = runner_path.read_text()
         assert "write_heartbeat(" in text, f"{service} ({runner_path}) never calls write_heartbeat()"
+
+
+def test_all_eight_scraped_services_publish_the_heartbeat_gauge() -> None:
+    """KAN-15 AC7 — HeartbeatStale's job!="data-ingestion" matcher covers the
+    api, so the api has to actually emit the series or the rule is quietly
+    covering seven services while claiming eight."""
+    assert set(HEARTBEAT_METRIC_SERVICES) == set(ALL_METRICS_SERVICES)
+    for service, runner_path in RUNNER_FILES_EXPECTING_HEARTBEAT_METRIC.items():
+        text = runner_path.read_text()
+        assert "register_heartbeat_collector(" in text, (
+            f"{service} ({runner_path}) never registers a heartbeat collector, so "
+            "algo_heartbeat_age_seconds has no series for it and HeartbeatStale "
+            "cannot fire however wedged it gets"
+        )
+        assert "write_heartbeat(" in text, (
+            f"{service} ({runner_path}) registers a collector but never writes the "
+            "file — the gauge would report inf from the first scrape"
+        )
 
 
 def test_api_exposes_an_unauthenticated_healthz_route() -> None:
@@ -444,7 +478,14 @@ def test_alertmanager_config_carries_no_secret_literal() -> None:
 
 
 def test_alertmanager_route_sends_everything_to_telegram() -> None:
-    """A route that drops a severity on the floor is a silent monitor."""
+    """A route that drops a severity on the floor is a silent monitor.
+
+    KAN-15 added exactly one deliberate exception: the always-firing Watchdog
+    goes to the `deadman` webhook rather than to Telegram. That route is
+    asserted separately in tests/deploy/test_alert_rules.py; here we only
+    require that every sub-route names a receiver that actually exists, so a
+    typo cannot swallow a severity silently.
+    """
     config = _load_yaml(ALERTMANAGER_CONFIG_PATH)
     receiver_names = {receiver["name"] for receiver in config["receivers"]}
     root = config["route"]

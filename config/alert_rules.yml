@@ -1,19 +1,47 @@
 # T6 — observability & unattended healthchecks.
+# KAN-15 (P1-12) — retuned for this system's real cadence, labelled for
+# routing, and given a dead-man's switch.
 #
-# These rules are visible/evaluated in Prometheus's own UI
-# (http://localhost:9091/alerts) as soon as the observability compose
-# overlay is up. Wiring an actual notification channel (Alertmanager ->
-# Telegram/Slack/email) is a separate follow-up: the checklist item this
-# thread implements is "alert rules" (the PromQL + thresholds), not a full
-# paging pipeline.
+# These rules are evaluated by Prometheus and delivered by the Alertmanager
+# container in docker-compose.observability.yml (see config/alertmanager.yml
+# for why delivery does not reuse the notifications service).
 #
-# IMPORTANT CADENCE CAVEAT: this system trades once/day via a scheduled
-# paper run (deploy/launchd/run_paper.sh, ~04:15 SGT), not continuously
-# intraday. "Idle" is completely normal outside that window and on
-# weekends. The windows below are picked to avoid flapping on a normal day
-# rather than to page within minutes of a real intraday system — retune (or
-# gate these by business-hours) before wiring any of this to a pager, and
-# definitely before/if this ever runs a continuous intraday strategy.
+# CADENCE — read this before adding or retuning a rule.
+# This system trades ONCE A DAY: deploy/launchd/run_paper.sh fires at ~04:15
+# SGT (20:15 UTC, ~16:15 ET, just after the US close). Outside that window,
+# and all weekend, every stream is idle and every service is simply waiting.
+# "Idle" is therefore the normal state, not a symptom.
+#
+# The previous revision of this file warned that its thresholds were not
+# pager-ready, and it was right: `increase(approved_orders[60m]) == 0` is
+# true for ~23 hours of every day, so wiring it to Telegram would have paged
+# nightly until the operator muted the bot — less monitoring than never
+# having wired it at all.
+#
+# The fix is NOT a business-hours window. A time-of-day gate would still page
+# on NYSE holidays, would drift with US daylight-saving, and would still fire
+# on a perfectly healthy day where every signal was a SKIP. Instead the two
+# cadence-sensitive rules are now expressed as *pipeline* conditions: they
+# require upstream activity before they can fire at all, so a quiet evening,
+# a weekend, a holiday and an all-SKIP day are all silent by construction —
+# nothing went in, so nothing is expected out.
+#
+# The thing that genuinely cannot be detected from inside is "the daily run
+# never happened" — an all-SKIP day and a Mac that is switched off look
+# identical to every metric in this file, and a monitor running on the dead
+# host cannot report its own death. That check is deliberately external:
+# run_paper.sh pings a dead-man URL on success (deploy/launchd/deadman.sh),
+# and the Watchdog rule at the bottom of this file is pinged out to the same
+# kind of external checker via Alertmanager. Do not "fix" that by adding a
+# `no trades today` rule here; it would page on every legitimate no-trade day.
+#
+# ROUTING LABELS. Every rule carries three labels, and Alertmanager routes on
+# them rather than on severity alone:
+#   severity  — critical | warning | info | none
+#   channel   — telegram | deadman   (which delivery path)
+#   component — service-health | pipeline | risk | infrastructure | monitoring
+# A rule with no `channel` would fall through to the root receiver and still
+# be delivered, but it would be undeclared intent; keep them exhaustive.
 groups:
   - name: algo-poc-service-health
     rules:
@@ -30,6 +58,8 @@ groups:
         for: 2m
         labels:
           severity: critical
+          channel: telegram
+          component: service-health
         annotations:
           summary: "{{ $labels.job }} metrics endpoint unreachable"
           description: >-
@@ -50,11 +80,21 @@ groups:
       # even while the main loop is stuck, which is exactly the signal
       # ServiceMetricsEndpointDown can't provide. One rule per cadence class,
       # matching the container healthcheck thresholds in docker-compose.yml.
+      #
+      # KAN-15: this now covers eight services, not seven. services/api/app.py
+      # called setup_metrics() but never registered a heartbeat collector, so
+      # the job!="data-ingestion" matcher below *believed* it covered the API
+      # while no such series existed — a wedged API was invisible. The API
+      # writes its heartbeat from a background task on the same event loop
+      # that serves requests, so a wedged loop stalls it exactly as a wedged
+      # worker loop stalls a worker's.
       - alert: HeartbeatStale
         expr: algo_heartbeat_age_seconds{job!="data-ingestion"} > 120
         for: 2m
         labels:
           severity: critical
+          channel: telegram
+          component: service-health
         annotations:
           summary: "{{ $labels.job }}'s main loop has not iterated in over 2 minutes"
           description: >-
@@ -69,6 +109,8 @@ groups:
         for: 5m
         labels:
           severity: critical
+          channel: telegram
+          component: service-health
         annotations:
           summary: "data-ingestion's main loop has not iterated in over 45 minutes"
           description: >-
@@ -80,35 +122,75 @@ groups:
 
   - name: algo-poc-stream-health
     rules:
-      # "stream-idle": no new approved orders during what should be an
-      # active window. Tune/gate by business-hours before paging on this —
-      # see the cadence caveat above.
+      # KAN-15 RETUNE. Was: increase(approved_orders[60m]) == 0 — true for
+      # ~23h of every day, i.e. a guaranteed nightly page.
+      #
+      # What this actually means now: recommendations reached the bus and
+      # risk-management emitted nothing at all in response. Because the
+      # first clause requires upstream traffic, this is silent overnight, at
+      # weekends, on NYSE holidays and on an all-SKIP day — on all of those
+      # scripts/run_paper.py publishes no recommendations (it replays only
+      # PROPOSED intents, see publish_unpublished_intents), so there is
+      # nothing to approve and nothing to complain about.
+      #
+      # It DOES fire when every recommendation was blocked at entry — most
+      # often a `major` reconciliation mismatch holding buys back. That is
+      # intentional: a book that quietly stops entering for days is precisely
+      # the failure this system has had before, and it is a warning, not a
+      # page in the middle of the night.
+      #
+      # sum() on both sides is load-bearing: the two series carry different
+      # `key` labels, so without it the `and` would never match.
       - alert: ApprovedOrdersStreamIdle
-        expr: increase(redis_stream_entries_added{key="stream:approved_orders"}[60m]) == 0
-        for: 5m
+        expr: |
+          sum(increase(redis_stream_entries_added{key="stream:recommendations"}[2h])) > 0
+          and
+          sum(increase(redis_stream_entries_added{key="stream:approved_orders"}[2h])) == 0
+        for: 15m
         labels:
           severity: warning
+          channel: telegram
+          component: pipeline
         annotations:
-          summary: "No new approved orders in the last 60 minutes"
+          summary: "Recommendations reached the bus but risk-management approved none of them"
           description: >-
-            stream:approved_orders has not grown in 60m
-            (redis_stream_entries_added, via redis_exporter
-            --check-streams-pattern). Expected during off-hours/weekends.
+            stream:recommendations grew in the last 2h while
+            stream:approved_orders did not. Either risk-management is not
+            consuming (check its heartbeat and `docker compose logs
+            risk-management`), or every intent was blocked at entry — a
+            `major` reconciliation mismatch blocks all buys fail-closed.
+            Check the risk service's alerts and the reconciliation status.
 
-      # "no-fills-in-N-min": using a 24h window rather than literal minutes
-      # because fills only happen once/day, shortly after the 04:15 SGT
-      # paper run — see the cadence caveat above.
+      # KAN-15 RETUNE. Was: increase(fills[24h]) == 0 — fires on every
+      # legitimate no-trade day and on every weekend.
+      #
+      # Now: orders were approved and NOTHING filled. The window is 3 days
+      # rather than hours because the 04:15 SGT run places orders ~15 minutes
+      # AFTER the US close, so they cannot fill until the next session opens
+      # (~22:30 SGT) — and a Friday run's orders do not get a session until
+      # Monday. Anything shorter than a weekend would page on a completely
+      # normal Saturday. Approved-but-unfilled for three whole days is a real
+      # execution/IB problem: orders that vanished across a Gateway session
+      # (the known day-order failure mode), a wedged execution service, or a
+      # Gateway that never reconnected.
       - alert: NoFillsRecently
-        expr: increase(redis_stream_entries_added{key="stream:fills"}[24h]) == 0
-        for: 10m
+        expr: |
+          sum(increase(redis_stream_entries_added{key="stream:approved_orders"}[3d])) > 0
+          and
+          sum(increase(redis_stream_entries_added{key="stream:fills"}[3d])) == 0
+        for: 30m
         labels:
           severity: warning
+          channel: telegram
+          component: pipeline
         annotations:
-          summary: "No fills recorded in the last 24 hours"
+          summary: "Orders were approved but nothing has filled in 3 days"
           description: >-
-            stream:fills has not grown in 24h. Investigate execution / IB
-            Gateway connectivity if this fires on a day the paper run was
-            expected to trade.
+            stream:approved_orders grew within the last 3 days and
+            stream:fills did not grow at all in that time — long enough to
+            span a weekend, so this is not a quiet-market artefact. Check IB
+            Gateway connectivity, `docker compose logs execution`, and
+            whether day orders were dropped across a Gateway session restart.
 
       # "dlq-depth": shared with T4 (idempotent fills & stream hygiene).
       # Sourced from redis_exporter's generic per-key stream introspection
@@ -122,6 +204,8 @@ groups:
         for: 5m
         labels:
           severity: critical
+          channel: telegram
+          component: pipeline
         annotations:
           summary: "Dead-letter queue {{ $labels.key }} has {{ $value }} unprocessed messages"
           description: >-
@@ -137,6 +221,8 @@ groups:
         expr: increase(redis_stream_entries_added{key="stream:kill"}[5m]) > 0
         labels:
           severity: info
+          channel: telegram
+          component: pipeline
         annotations:
           summary: "stream:kill received a new message"
           description: >-
@@ -151,14 +237,13 @@ groups:
       # RiskServiceRunner.run_passive_scan() for stop-loss/ceiling/margin
       # breaches on already-held positions, distinct from
       # algo_order_lifecycle_transitions_total{status="RISK_REJECTED"} (new
-      # orders rejected at entry). NOTE: run_passive_scan() is not yet
-      # invoked from RiskServiceRunner.run() on main — that's T2's thread —
-      # so this rule won't fire until T2 lands it; defined now so the signal
-      # exists the moment it does.
+      # orders rejected at entry).
       - alert: PassiveBreachDetected
         expr: increase(algo_risk_breach_total[15m]) > 0
         labels:
           severity: warning
+          channel: telegram
+          component: risk
         annotations:
           summary: "Passive breach detected on a held position ({{ $labels.breach_type }})"
           description: >-
@@ -174,6 +259,8 @@ groups:
         for: 5m
         labels:
           severity: warning
+          channel: telegram
+          component: infrastructure
         annotations:
           summary: "Redis memory usage above 80% of configured maxmemory"
           description: >-
@@ -182,3 +269,35 @@ groups:
             so crossing 100% means writes start failing loudly rather than
             silently evicting stream data (review Theme 6.3) — this alert
             should fire well before that.
+
+  - name: algo-poc-deadman
+    rules:
+      # KAN-15: the standard Alertmanager dead-man's switch, and the reason
+      # every other rule in this file is allowed to be quiet.
+      #
+      # A silent Telegram chat is ambiguous: it means either "nothing is
+      # wrong" or "Prometheus/Alertmanager/the Mac is dead and nothing can
+      # tell you". This rule always fires, so the delivery path is exercised
+      # continuously. config/alertmanager.yml routes it — and ONLY it — to
+      # the `deadman` webhook receiver rather than to Telegram, so it costs
+      # the operator nothing to read; an external checker (healthchecks.io or
+      # equivalent) pages when the pings stop.
+      #
+      # severity: none keeps it out of the critical sub-route and out of any
+      # future severity-based routing. Do not raise it.
+      - alert: Watchdog
+        expr: vector(1)
+        labels:
+          severity: none
+          channel: deadman
+          component: monitoring
+        annotations:
+          summary: "Monitoring pipeline is alive"
+          description: >-
+            This alert is always firing, by design. Its ABSENCE is the
+            signal: if the external checker stops receiving it, Prometheus,
+            Alertmanager, docker, or the host itself has stopped — and no
+            rule in this file could have told you, because they all run on
+            the machine that died. Paired with the run_paper.sh dead-man
+            ping (deploy/launchd/deadman.sh), which covers the narrower case
+            of "the host is up but the 04:15 trading run did not happen".

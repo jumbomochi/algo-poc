@@ -3,7 +3,11 @@
 # Runs after US market close (4:15 AM SGT / 4:15 PM ET)
 # Signals are computed on finalized daily bars to avoid intraday noise
 
-ALGO_DIR="/Users/huiliang/GitHub/algo-poc"
+# Overridable only so tests/deploy/test_deadman_ping.py can drive this wrapper
+# end-to-end against a stub tree — launchd starts jobs with an empty
+# environment, so production always takes the default. Never export ALGO_DIR
+# in a login shell: a manual run would then use whatever tree that points at.
+ALGO_DIR="${ALGO_DIR:-/Users/huiliang/GitHub/algo-poc}"
 VENV="$ALGO_DIR/.venv/bin/python"
 LOG_DIR="$HOME/ibc/logs"
 LOG_FILE="$LOG_DIR/paper_trading_$(date +%Y%m%d).log"
@@ -13,6 +17,9 @@ LOG_FILE="$LOG_DIR/paper_trading_$(date +%Y%m%d).log"
 ALGO_SECRETS_ENV_FILE="$ALGO_DIR/.env"   # regular-file fallback only
 # shellcheck source=deploy/launchd/secrets.sh
 . "$ALGO_DIR/deploy/launchd/secrets.sh"
+# KAN-15: the external dead-man switch. Sourced by path for the same reason.
+# shellcheck source=deploy/launchd/deadman.sh
+. "$ALGO_DIR/deploy/launchd/deadman.sh"
 
 # AC#17: create the log directory before the first write. Every other wrapper
 # does this; run_paper.sh did not, so on a fresh host the opening line (and the
@@ -137,6 +144,18 @@ if [ "$EXIT_CODE" != "0" ]; then
     algo_alert_local "paper run FAILED (exit $EXIT_CODE) — see $LOG_FILE"
     telegram "🚨 Paper trading run FAILED (exit $EXIT_CODE). No signals committed today. See $LOG_FILE"
 fi
+
+# KAN-15: tell the OUTSIDE world the run happened. Every alert above this line
+# is sent by this host about this host, so none of them can fire when the Mac
+# is off, asleep, or off the network — which is exactly what "no run at all"
+# looks like, and exactly what nobody noticed on 2026-08-13/14. Pinged only on
+# success; a failed run must stay silent so the external check pages.
+#
+# Deliberately AFTER the failure alerts and deliberately incapable of failing
+# (see deploy/launchd/deadman.sh) — this reports on the run, it must never be
+# able to change its outcome.
+algo_deadman_ping "$EXIT_CODE"
+echo "$(date): dead-man switch: $ALGO_DEADMAN_STATUS" >> "$LOG_FILE"
 
 # Clean up logs older than 30 days
 find "$LOG_DIR" -name "paper_trading_*.log" -mtime +30 -delete 2>/dev/null

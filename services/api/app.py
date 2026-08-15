@@ -1,16 +1,58 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI
 
 from services.api.auth import APIUser, get_current_user, resolve_mode
 from services.api.routes import activity, backtest, kill, ml, portfolio, positions, risk
+from shared.heartbeat import (
+    DEFAULT_HEARTBEAT_PATH,
+    register_heartbeat_collector,
+    write_heartbeat,
+)
 from shared.logging import get_logger
 from shared.redis_client import RedisStreamClient
 
 logger = get_logger("api.app")
+
+# KAN-15 (P1-12). Well under the 120s HeartbeatStale threshold in
+# config/alert_rules.yml, so a single slow iteration is not an alert while a
+# genuinely wedged loop still trips it inside the rule's `for: 2m`.
+API_HEARTBEAT_INTERVAL_SECONDS = 30
+
+
+async def _heartbeat_loop(
+    path: str | Path = DEFAULT_HEARTBEAT_PATH,
+    interval: float = API_HEARTBEAT_INTERVAL_SECONDS,
+) -> None:
+    """Write the API's liveness heartbeat until cancelled.
+
+    The seven worker services heartbeat from the top of their own main loop.
+    The API has no such loop — it is FastAPI waiting on requests — so this
+    task is its equivalent: it runs on the same event loop that serves every
+    request, so anything that wedges that loop (a blocking DB or IB call in a
+    sync route, a deadlock) stops the heartbeat exactly the way it stops the
+    service.
+
+    Before this existed, ``services/api/app.py`` called ``setup_metrics()``
+    but never registered a heartbeat collector, so
+    ``algo_heartbeat_age_seconds`` had no ``job="api"`` series at all — and
+    ``HeartbeatStale``'s ``job!="data-ingestion"`` matcher *believed* it
+    covered the API while a wedged API was in fact invisible to it.
+
+    Deliberately does not swallow ``write_heartbeat`` failures (see
+    shared/heartbeat.py's fail-loud note): if this task dies, the gauge keeps
+    climbing at scrape time and ``HeartbeatStale`` fires — which is the
+    correct outcome, not something to paper over.
+    """
+    while True:
+        write_heartbeat(path)
+        await asyncio.sleep(interval)
 
 
 def create_app(
@@ -42,6 +84,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         owned_conn = None
+        heartbeat_task: asyncio.Task | None = None
         if app.state.redis is None or app.state.db_sessionmaker is None:
             from shared.config import load_config
             from shared.observability import setup_metrics
@@ -52,6 +95,12 @@ def create_app(
             # branch never runs then), so it only binds a real port for a
             # real container start.
             setup_metrics("api", port=config.observability.prometheus_port)
+            # KAN-15: publish algo_heartbeat_age_seconds for job="api" too.
+            # Inside the same guard as setup_metrics() so a TestClient with
+            # injected doubles never writes to /var/algo or leaves a stray
+            # collector on the global registry.
+            register_heartbeat_collector()
+            heartbeat_task = asyncio.create_task(_heartbeat_loop())
             if app.state.redis is None:
                 import redis.asyncio as aioredis
 
@@ -67,6 +116,10 @@ def create_app(
                 app.state.mode = config.mode
                 logger.info("api_db_connected")
         yield
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
         if owned_conn is not None:
             await owned_conn.aclose()
 

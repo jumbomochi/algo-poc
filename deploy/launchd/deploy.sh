@@ -80,6 +80,9 @@ for f in "$SRC"/*.sh; do
     # that broke the 2026-08-11 cold boot: an operator edits ~/ibc/secrets.sh,
     # sees no effect, and the real logic silently stays behind.
     [ "$(basename "$f")" = "secrets.sh" ] && continue
+    # deadman.sh, same reason: sourced by path from the repo, never executed
+    # from ~/ibc. A deployed copy would only ever be a decoy.
+    [ "$(basename "$f")" = "deadman.sh" ] && continue
     sync_one "$f" "$IBC/$(basename "$f")" exec
 done
 
