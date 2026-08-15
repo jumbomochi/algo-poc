@@ -56,6 +56,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--fdr-q", type=float, default=0.10)
     parser.add_argument("--min-names", type=int, default=5)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--n-trials",
+        type=int,
+        default=None,
+        help="Size of the search to deflate against. Defaults to the declared "
+             "count in research/trial_registry.json; override only to model a "
+             "larger search than the registry records.",
+    )
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args(argv)
 
@@ -68,6 +76,7 @@ def main(argv: list[str] | None = None) -> int:
         horizon=args.horizon, n_outer=args.outer_folds, n_inner=args.inner_folds,
         embargo=args.embargo if args.embargo is not None else args.horizon,
         quantiles=tuple(args.quantiles), fdr_q=args.fdr_q, min_names=args.min_names, seed=args.seed,
+        n_trials=args.n_trials,
     )
     evaluation = evaluate_factors(bars, baseline_records=baseline_records, config=config)
     card = build_run_card(evaluation, _git_revision(), _checksum(args.bars_from_json))

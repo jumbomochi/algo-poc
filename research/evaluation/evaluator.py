@@ -17,6 +17,7 @@ from research.evaluation.metrics import (
 from research.evaluation.multiple_testing import control
 from research.evaluation.overlap import attribute, baseline_selections_from_records
 from research.evaluation.portfolio import quantile_long_only, top_quantile_names
+from research.evaluation.trial_registry import declared_trial_count
 from research.factors.catalog import DEFAULT_FACTOR_IDS, build_default_registry
 from research.factors.engine import FactorEngine
 from research.factors.panel import build_factor_panel
@@ -32,6 +33,10 @@ class EvaluationConfig:
     fdr_q: float = 0.10
     min_names: int = 5
     seed: int = 7
+    # Size of the search these candidates came out of. None means "read the
+    # declared history from research/trial_registry.json" -- deflating against
+    # the handful of candidates in one run would understate the real search.
+    n_trials: int | None = None
 
 
 def _slice(frame: pd.DataFrame, bounds: tuple[int, int]) -> pd.DataFrame:
@@ -124,7 +129,8 @@ def evaluate_factors(
             "ic_stat": ic_stat, "selection": factor_selection, "chosen_quantile": quantile,
         }
 
-    verdicts = control(per_factor_stats, q=config.fdr_q)
+    n_trials = config.n_trials if config.n_trials is not None else declared_trial_count()
+    verdicts = control(per_factor_stats, q=config.fdr_q, n_trials=n_trials)
 
     factors: dict[str, dict] = {}
     for factor_id in factor_ids:
@@ -155,5 +161,6 @@ def evaluate_factors(
             "horizon": config.horizon, "n_outer": config.n_outer, "n_inner": config.n_inner,
             "embargo": config.embargo, "quantiles": list(config.quantiles),
             "fdr_q": config.fdr_q, "min_names": config.min_names, "seed": config.seed,
+            "n_trials": n_trials,
         },
     }

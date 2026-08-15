@@ -6,6 +6,7 @@ import sys
 from datetime import date, timedelta
 
 from research.evaluation.evaluator import EvaluationConfig, evaluate_factors
+from research.evaluation.trial_registry import declared_trial_count
 
 
 def _trending_bars(n_days=400):
@@ -31,6 +32,24 @@ def test_evaluate_returns_per_factor_evidence_and_provenance():
     assert {"sharpe", "deflated_sharpe", "survives_multiple_testing", "ic_mean", "chosen_quantile"} <= set(momentum)
     assert isinstance(result["snapshot_identity"], str) and result["snapshot_identity"]
     assert "data_cutoff" in result["provenance"]
+
+
+def test_evaluation_deflates_against_the_declared_registry_count():
+    # The trial count is an input of record, not whatever happened to be scored
+    # in this run -- and it comes from the committed registry, not a literal.
+    config = EvaluationConfig(horizon=5, n_outer=3, n_inner=2, embargo=5, min_names=3)
+    result = evaluate_factors(_trending_bars(), config=config)
+    assert result["config"]["n_trials"] == declared_trial_count()
+
+
+def test_a_larger_declared_search_never_raises_the_deflated_sharpe():
+    shared = dict(horizon=5, n_outer=3, n_inner=2, embargo=5, min_names=3)
+    bars = _trending_bars()
+    lenient = evaluate_factors(bars, config=EvaluationConfig(n_trials=4, **shared))
+    strict = evaluate_factors(bars, config=EvaluationConfig(n_trials=64, **shared))
+    assert lenient["config"]["n_trials"] == 4
+    for factor_id, row in strict["factors"].items():
+        assert row["deflated_sharpe"] <= lenient["factors"][factor_id]["deflated_sharpe"]
 
 
 def test_determinism_same_bars_same_result():
