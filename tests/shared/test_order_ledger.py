@@ -177,3 +177,54 @@ def test_mark_published_accepts_explicit_timestamp(session):
     ledger.mark_published("rec-1", published_at=published_at)
 
     assert intent.published_at == published_at
+
+
+class TestExitSuppressionQueries:
+    """KAN-7: the two queries the recurring exit paths depend on."""
+
+    def test_nonterminal_sell_is_scoped_to_the_identity_not_the_ticker(
+        self, session
+    ):
+        """One sleeve's working sell must not strand another sleeve's exit, and
+        a filled sell must not block the next breach forever."""
+        ledger = OrderLedger(session)
+        ledger.create_intent(make_proposal("sell-momentum", action="SELL"))
+        scope = {"account_id": "DU12345", "con_id": 265598}
+
+        assert ledger.nonterminal_sell_exists(portfolio="momentum", **scope)
+        assert not ledger.nonterminal_sell_exists(portfolio="quality", **scope)
+
+        ledger.transition("sell-momentum", OrderStatus.RISK_REJECTED, reason="x")
+        assert not ledger.nonterminal_sell_exists(portfolio="momentum", **scope)
+
+    def test_a_proposed_sell_counts_as_outstanding(self, session):
+        """PENDING_ORDER_STATUSES omits PROPOSED; suppression must not, or an
+        exit created-but-not-yet-published gets emitted a second time."""
+        ledger = OrderLedger(session)
+        intent = ledger.create_intent(make_proposal("sell-1", action="SELL"))
+
+        assert intent.status == OrderStatus.PROPOSED.value
+        assert ledger.nonterminal_sell_exists(
+            account_id="DU12345", portfolio="momentum", con_id=265598
+        )
+
+    def test_a_buy_never_suppresses_an_exit(self, session):
+        ledger = OrderLedger(session)
+        ledger.create_intent(make_proposal("buy-1", action="BUY"))
+
+        assert not ledger.nonterminal_sell_exists(
+            account_id="DU12345", portfolio="momentum", con_id=265598
+        )
+
+    def test_prefix_count_escapes_like_wildcards(self, session):
+        """Sleeve names contain underscores (`thematic_momentum`), and `_` is a
+        single-character wildcard in LIKE. Unescaped, one sleeve's exits would
+        be counted against another's sequence."""
+        ledger = OrderLedger(session)
+        ledger.create_intent(make_proposal("stop-loss-DU-thematic_momentum-1-x-0"))
+        ledger.create_intent(make_proposal("stop-loss-DU-thematicXmomentum-1-x-0"))
+
+        assert ledger.count_intents_with_id_prefix(
+            "stop-loss-DU-thematic_momentum-1-x-"
+        ) == 1
+        assert ledger.count_intents_with_id_prefix("stop-loss-DU-") == 2

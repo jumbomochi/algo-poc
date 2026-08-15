@@ -32,6 +32,21 @@ def liquidation_exit_id(mode: str, ticker: str, epoch: int) -> str:
     return f"liq-{mode}-{ticker}-{epoch}"
 
 
+def exit_intent_prefix(
+    kind: str,
+    account_id: str,
+    portfolio: str,
+    con_id: int,
+    trading_date: date,
+) -> str:
+    """Everything an :func:`exit_intent_id` shares with its same-day siblings.
+
+    One id family = one {kind, identity scope, day}. Counting the ledger rows
+    under this prefix is how a caller picks the next free ``seq``.
+    """
+    return f"{kind}-{account_id}-{portfolio}-{con_id}-{trading_date.isoformat()}-"
+
+
 def exit_intent_id(
     kind: str,
     account_id: str,
@@ -50,7 +65,10 @@ def exit_intent_id(
     :func:`liquidation_exit_id`, which is epoch-based because a kill fires once
     while stop-losses recur.
     """
-    return f"{kind}-{account_id}-{portfolio}-{con_id}-{trading_date.isoformat()}-{seq}"
+    return (
+        exit_intent_prefix(kind, account_id, portfolio, con_id, trading_date)
+        + str(seq)
+    )
 
 
 def load_liquidation_targets(session: Session, *, account_id: str | None = None) -> list[dict[str, Any]]:

@@ -66,6 +66,13 @@ TERMINAL_STATUSES = {
     OrderStatus.CANCELLED,
     OrderStatus.EXPIRED,
 }
+# Everything a terminal status is not — including PROPOSED, which
+# PENDING_ORDER_STATUSES deliberately omits. An exit must not be emitted while
+# *any* of these is outstanding for the position, and a PROPOSED sell is still
+# an order somebody intends to place.
+NONTERMINAL_STATUSES = tuple(
+    status.value for status in OrderStatus if status not in TERMINAL_STATUSES
+)
 
 IMMUTABLE_ECONOMIC_FIELDS = (
     "account_id",
@@ -348,6 +355,55 @@ class OrderLedger:
                 )
             total += quantity * price + commission
         return total
+
+    def nonterminal_sell_exists(
+        self,
+        *,
+        account_id: str | None,
+        portfolio: str | None,
+        con_id: int | None,
+    ) -> bool:
+        """True if an unfinished SELL intent exists for this identity scope.
+
+        Two open sells against one position is never correct: the second one
+        oversells the moment the first fills. Recurring exits (stop-loss,
+        passive trim) re-evaluate every scan and would otherwise re-emit for as
+        long as the breach persists, so they ask this first.
+
+        Scoped by ``{account_id, portfolio, con_id}`` — the same scope
+        :func:`shared.liquidation.load_liquidation_targets` aggregates by — and
+        deliberately not by ``kind``: a plain non-exit sell blocks a stop-loss
+        just as an outstanding stop-loss does.
+        """
+        stmt = select(
+            exists().where(
+                OrderIntent.account_id == account_id,
+                OrderIntent.portfolio == portfolio,
+                OrderIntent.con_id == con_id,
+                func.upper(OrderIntent.action) == "SELL",
+                OrderIntent.status.in_(NONTERMINAL_STATUSES),
+            )
+        )
+        return bool(self.session.scalar(stmt))
+
+    def count_intents_with_id_prefix(self, prefix: str) -> int:
+        """How many intents already carry a recommendation id under ``prefix``.
+
+        Feeds the ``seq`` of :func:`shared.liquidation.exit_intent_id`: the
+        callers ask only once every prior exit in that family is terminal, so
+        the count is the next free sequence number and a legitimate repeat exit
+        (a post-fill re-entry that breaches again the same day) gets its own id
+        instead of colliding with the filled one.
+        """
+        escaped = (
+            prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        stmt = (
+            select(func.count())
+            .select_from(OrderIntent)
+            .where(OrderIntent.recommendation_id.like(f"{escaped}%", escape="\\"))
+        )
+        return int(self.session.scalar(stmt) or 0)
 
     def load_pending_orders(
         self, *, account_id: str | None = None
