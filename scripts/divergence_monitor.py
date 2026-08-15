@@ -426,9 +426,10 @@ def main() -> int:
     execution_model = load_backtest_execution_model(backtest_path)
     if not execution_model.is_like_for_like:
         print(
-            f"  ⚠ Baseline execution model is '{execution_model.fill_model}' — not "
-            "like-for-like with live. Divergence will be reported as NO_DATA; "
-            "re-run the baseline per docs/operations/backtest-baseline.md."
+            "  ⚠ Baseline is not like-for-like with live: "
+            + "; ".join(execution_model.unmet_requirements())
+            + ". Divergence will be reported as NO_DATA; re-run the baseline "
+            "per docs/operations/backtest-baseline.md."
         )
 
     # --- Open DB and load paper state ---

@@ -283,6 +283,7 @@ def test_load_execution_model_reads_the_declared_fill_model(tmp_path: Path):
         "commission_per_share": 0.005,
         "commission_minimum": 1.0,
         "point_in_time_universe": True,
+        "coverage": {"state": "OK", "excluded_pct": 1.2},
     })
     path.write_text(json.dumps(data))
 
@@ -290,6 +291,28 @@ def test_load_execution_model_reads_the_declared_fill_model(tmp_path: Path):
 
     assert model.fill_model == "next_open"
     assert model.is_like_for_like is True
+
+
+def test_load_execution_model_refuses_a_baseline_that_lost_its_delistings(
+    tmp_path: Path,
+):
+    """A PIT baseline whose members could not be priced is still not comparable."""
+    path = _write_backtest_json(tmp_path)
+    data = json.loads(path.read_text())
+    data["config"].update({
+        "fill_model": "next_open",
+        "slippage_bps": 10,
+        "commission_per_share": 0.005,
+        "commission_minimum": 1.0,
+        "point_in_time_universe": True,
+        "coverage": {"state": "BLOCKED", "excluded_pct": 9.7},
+    })
+    path.write_text(json.dumps(data))
+
+    model = load_backtest_execution_model(str(path))
+
+    assert model.is_like_for_like is False
+    assert exit_code_for([], model) == EXIT_BASELINE_NOT_COMPARABLE
 
 
 def test_load_execution_model_treats_a_pre_rebaseline_backtest_as_same_bar(
@@ -302,6 +325,59 @@ def test_load_execution_model_treats_a_pre_rebaseline_backtest_as_same_bar(
 
     assert model.fill_model == "same_bar"
     assert model.is_like_for_like is False
+
+
+def test_main_exits_three_against_a_blocked_coverage_baseline(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """End-to-end: a lossy point-in-time baseline is refused, loudly.
+
+    The artifact is otherwise perfect — next-open fills, a commission floor, a
+    point-in-time universe — so this pins that the coverage floor alone drives
+    the run to exit 3 rather than scoring numbers it should not trust.
+    """
+    from scripts import divergence_monitor
+
+    db_url = f"sqlite:///{tmp_path / 'blocked.db'}"
+    engine = create_engine(db_url)
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    _seed_state(session)
+    session.commit()
+    session.close()
+
+    bt_path = _write_backtest_json(tmp_path)
+    data = json.loads(bt_path.read_text())
+    data["config"].update({
+        "fill_model": "next_open",
+        "commission_minimum": 1.0,
+        "point_in_time_universe": True,
+        "coverage": {
+            "state": "BLOCKED",
+            "excluded_pct": 9.7,
+            "total_membership_days": 12_000,
+            "excluded_membership_days": 1_164,
+            "excluded_tickers": {"DEAD": 1_164},
+            "floor_pct": 5.0,
+        },
+    })
+    bt_path.write_text(json.dumps(data))
+
+    report_path = tmp_path / "divergence.json"
+    monkeypatch.setattr(divergence_monitor.sys, "argv", [
+        "divergence_monitor.py",
+        "--backtest", str(bt_path),
+        "--db-url", db_url,
+        "--window", "5",
+        "--output", str(report_path),
+    ])
+
+    code = divergence_monitor.main()
+
+    assert code == EXIT_BASELINE_NOT_COMPARABLE
+    assert "coverage" in capsys.readouterr().out.lower()
+    statuses = {p["status"] for p in json.loads(report_path.read_text())["reports"]}
+    assert statuses == {"NO_DATA"}
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +406,7 @@ def _model(comparable: bool):
         fill_model="next_open" if comparable else "same_bar",
         commission_minimum=1.0 if comparable else 0.0,
         point_in_time_universe=comparable,
+        coverage_state="OK" if comparable else "BLOCKED",
     )
 
 

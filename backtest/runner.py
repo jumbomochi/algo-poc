@@ -110,7 +110,7 @@ class BacktestRunner:
         dates: list = []
 
         # Collect all unique dates across tickers, sorted
-        all_dates = _collect_sorted_dates(bars_by_ticker)
+        all_dates = collect_sorted_dates(bars_by_ticker)
 
         # Build date-indexed bar lookups for each ticker
         bars_by_date: dict[str, dict] = {}
@@ -413,8 +413,13 @@ class _Lot:
             self.peak_price = self.entry_price
 
 
-def _collect_sorted_dates(bars_by_ticker: dict[str, list[dict]]) -> list:
-    """Collect all unique dates across tickers, sorted chronologically."""
+def collect_sorted_dates(bars_by_ticker: dict[str, list[dict]]) -> list:
+    """Collect all unique dates across tickers, sorted chronologically.
+
+    Public because the coverage measurement in ``scripts/run_backtest`` has to
+    count membership-days over exactly the sessions this runner replays; two
+    independent derivations of "the session list" would drift.
+    """
     dates = set()
     for bars in bars_by_ticker.values():
         for bar in bars:

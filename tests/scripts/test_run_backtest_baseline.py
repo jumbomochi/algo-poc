@@ -7,12 +7,18 @@ execution model*, without needing IB data.
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
 from backtest.costs import CostModel
 from backtest.divergence import NEXT_OPEN_FILL_MODEL, execution_model_from_backtest_config
+from backtest.membership import (
+    COVERAGE_BLOCKED,
+    COVERAGE_OK,
+    measure_coverage,
+    priced_days_from_bars,
+)
 from scripts.run_backtest import (
     ALWAYS_TRADABLE,
     build_base_config,
@@ -20,7 +26,7 @@ from scripts.run_backtest import (
     load_membership_calendar,
     resolve_backtest_universe,
 )
-from shared.universe import ACTIVE_SLEEVES, get_union_universe
+from shared.universe import ACTIVE_SLEEVES, MembershipCalendar, get_union_universe
 
 
 class TestResolveBacktestUniverse:
@@ -76,6 +82,19 @@ class TestBuildCostModel:
         assert model.commission_for(1) == pytest.approx(0.005)
 
 
+def _coverage(excluded_days: int = 0, sessions: int = 100):
+    """A CoverageReport built the way ``main()`` builds it, from bars."""
+    days = [date(2020, 1, 6) + timedelta(days=i) for i in range(sessions)]
+    membership = MembershipCalendar({days[0]: ["AAA", "BBB"]})
+    bars = {
+        "AAA": [{"date": d} for d in days],
+        "BBB": [{"date": d} for d in days[excluded_days:]],
+    }
+    return measure_coverage(
+        membership, sessions=days, priced_tickers=priced_days_from_bars(bars)
+    )
+
+
 class TestBuildBaseConfig:
     def _config(self, **overrides):
         kwargs = dict(
@@ -87,9 +106,36 @@ class TestBuildBaseConfig:
             replacement_score_margin=0.25,
             portfolio_capitals={"momentum": 23_080.0},
             point_in_time_universe=True,
+            coverage=_coverage(),
         )
         kwargs.update(overrides)
         return build_base_config(**kwargs)
+
+    def test_records_the_measured_universe_coverage(self):
+        config = self._config(coverage=_coverage(excluded_days=4))
+
+        assert config["coverage"] == {
+            "total_membership_days": 200,
+            "excluded_membership_days": 4,
+            "excluded_pct": pytest.approx(2.0),
+            "excluded_tickers": {"BBB": 4},
+            "floor_pct": pytest.approx(5.0),
+            "state": COVERAGE_OK,
+        }
+        assert json.dumps(config["coverage"])  # artifact-serialisable
+
+    def test_a_run_without_snapshots_omits_coverage_rather_than_zeroing_it(self):
+        """An unmeasured run must not be indistinguishable from a clean one."""
+        config = self._config(coverage=None, point_in_time_universe=False)
+
+        assert "coverage" not in config
+        assert execution_model_from_backtest_config(config).is_like_for_like is False
+
+    def test_a_blocked_coverage_baseline_is_refused_by_the_monitor(self):
+        config = self._config(coverage=_coverage(excluded_days=30))
+
+        assert config["coverage"]["state"] == COVERAGE_BLOCKED
+        assert execution_model_from_backtest_config(config).is_like_for_like is False
 
     def test_declares_the_next_open_execution_model(self):
         config = self._config()

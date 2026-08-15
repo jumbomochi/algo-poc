@@ -23,14 +23,16 @@ results so downstream tools can check it:
 | Slippage | 10 bps base, ×2.0 for inverse ETFs, ×2.5 for thematic ETFs | One number for a mega-cap and for `PRNT` was never credible. |
 | Commission | `max($1/order, $0.005/share)` | IB's actual schedule. At this account size the **floor** is what binds, not the per-share rate. |
 | Universe | point-in-time membership, when snapshots are supplied | Otherwise the run is survivorship-biased and says so, loudly. |
+| Universe coverage | ≥ 95% of membership-days priceable | A point-in-time member whose bars cannot be pulled is silently skipped, and the skipped names are disproportionately the delistings. |
 | Fundamentals | available 45 days after period-end (or the row's `filing_date`) | A quarter ending 31 March is not public on 31 March. |
 
 `config.fill_model`, `config.commission_minimum`,
-`config.slippage_bps_by_ticker` and `config.point_in_time_universe` are written
-into every results JSON. `scripts/divergence_monitor.py` reads them and reports
-`NO_DATA` rather than a misleading OK/BREACH if the baseline is not
-like-for-like. All three of next-open fills, a per-order commission floor **and**
-a point-in-time universe are required — a re-run that fixed the fills and the
+`config.slippage_bps_by_ticker`, `config.point_in_time_universe` and
+`config.coverage` are written into every results JSON.
+`scripts/divergence_monitor.py` reads them and reports `NO_DATA` rather than a
+misleading OK/BREACH if the baseline is not like-for-like. All four of
+next-open fills, a per-order commission floor, a point-in-time universe **and**
+an `OK` coverage state are required — a re-run that fixed the fills and the
 costs but kept the static ticker list is still inflated by winner
 pre-selection, so it does not pass. Anything the config does not declare is
 read as the unsafe value; absence is never a pass.
@@ -96,6 +98,33 @@ for the equity sleeves to work properly on delisted names:
    delisted names currently fall into the `Unknown` sector bucket and are
    grouped together by the sector-concentration limit. Extend `SECTOR_MAP`
    when the snapshot file lands.
+
+**Coverage floor: ≥ 95% of membership-days must be priceable.** Point-in-time
+membership only removes survivorship bias if the historical members can
+actually be priced — a name whose bars fail to pull is skipped in silence, and
+the names that fail are disproportionately the delistings. Every run with
+`--universe-snapshots` therefore measures coverage in **membership-days** (the
+sum over sessions of how many constituents the index had that day, so a name
+that left in 2019 weighs less than one present throughout) and writes it to
+`config.coverage`:
+
+```json
+"coverage": {
+  "total_membership_days": 1258000,
+  "excluded_membership_days": 21400,
+  "excluded_pct": 1.7,
+  "excluded_tickers": {"DELISTED_CO": 3020, "...": 0},
+  "floor_pct": 5.0,
+  "state": "OK"
+}
+```
+
+`state` is `BLOCKED` above the floor, and the run prints the ten worst
+exclusions so you know which bars to chase. A `BLOCKED` baseline — or one with
+no `coverage` block at all, which is how every pre-KAN-22 artifact reads — is
+not like-for-like, so the monitor exits 3 rather than scoring against it. The
+floor is inclusive: exactly 5.0% excluded still passes. See
+`backtest/membership.py`.
 
 **Sleeve universes are scoped, and each equity sleeve ranks point-in-time.**
 `bars_by_ticker` is the union of every sleeve's instruments, so each ranking
@@ -176,8 +205,11 @@ the trainer is purged by holding period and embargoed by 5 days, and reports
 
 ## After regenerating
 
-1. Point the divergence monitor at the new file (it picks the latest
+1. Check `config.coverage.state` in the new artifact. If it is `BLOCKED`, the
+   baseline is not usable — chase the bars for the tickers in
+   `excluded_tickers` (highest membership-day counts first) and re-run.
+2. Point the divergence monitor at the new file (it picks the latest
    `output/backtest_multi_*.json` automatically) and confirm the header no
    longer says `[NOT LIKE-FOR-LIKE]`.
-2. Re-check the IPS's stated expectations against the new numbers — if the
+3. Re-check the IPS's stated expectations against the new numbers — if the
    strategy's justification moved, the IPS has to move with it.
