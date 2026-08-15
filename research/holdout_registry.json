@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "note": "Pre-registered holdout splits (KAN-38). A split is written down here BEFORE it is looked at, and research/evaluation/holdout.py records its single evaluation in the `evaluations` list below. Commit the burn when it happens: a holdout whose use is not in git is a holdout on the honour system.",
+  "splits": [
+    {
+      "split_id": "incumbent_sleeves_2026",
+      "holdout_start": "2026-06-01",
+      "horizon": 21,
+      "embargo": 21,
+      "registered_at": "2026-08-16T00:00:00+00:00",
+      "note": "Formal edge evaluation of the six incumbent sleeves (KAN-40, direction doc D10). The six-sleeve set was fixed on 2026-05-26 when mean_reversion and short_term_mr were dropped, so no bar from 2026-06-01 onward was part of the search that produced it. The window is short and grows with every trading day; report its length alongside the result."
+    }
+  ],
+  "evaluations": []
+}
