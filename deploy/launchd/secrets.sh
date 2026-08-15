@@ -71,10 +71,29 @@ ALGO_SECRETS_ENV_FILE="${ALGO_SECRETS_ENV_FILE:-/Users/huiliang/GitHub/algo-poc/
 # reads our secrets. Overridable only so the test suite can stub it.
 ALGO_SECURITY_BIN="${ALGO_SECURITY_BIN:-/usr/bin/security}"
 
+# Same rationale, and overridable for the same single reason: without it the
+# test suite raises real desktop notifications on the developer's machine every
+# time it exercises a wrapper's failure path.
+ALGO_OSASCRIPT_BIN="${ALGO_OSASCRIPT_BIN:-/usr/bin/osascript}"
+
 # Every secret the stack needs. Order is the order --import prompts in.
 # Overridable so an import/check can be scoped to a subset, e.g.
 #   ALGO_SECRET_NAMES="POSTGRES_PASSWORD REDIS_PASSWORD" ... --import-from-env F
 ALGO_SECRET_NAMES="${ALGO_SECRET_NAMES:-POSTGRES_PASSWORD REDIS_PASSWORD TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID API_KEYS}"
+
+# KAN-15: secrets the stack runs WITHOUT, but is less observable without.
+# Kept out of $ALGO_SECRET_NAMES on purpose — --check/--export must not start
+# reporting failure on a host that simply has not configured a dead-man switch
+# yet, or the exit status stops meaning "the stack cannot authenticate".
+# --import still prompts for these, and --export/--env-file still emit them
+# when present (docker compose needs DEADMAN_WATCHDOG_URL for the
+# alertmanager container).
+#
+#   DEADMAN_WATCHDOG_URL   — Alertmanager pings this every 5m (the Watchdog
+#                            alert in config/alert_rules.yml)
+#   ALGO_DEADMAN_PAPER_URL — run_paper.sh pings this on a successful run
+#                            (deploy/launchd/deadman.sh)
+ALGO_OPTIONAL_SECRET_NAMES="${ALGO_OPTIONAL_SECRET_NAMES:-DEADMAN_WATCHDOG_URL ALGO_DEADMAN_PAPER_URL}"
 
 # Human-readable reason the last lookup failed. Callers log this verbatim; it
 # names the operator action, which is the whole point of separating the failure
@@ -225,7 +244,7 @@ algo_alert_local() {
     local msg="$1" alert_log="${HOME}/ibc/logs/ALERTS.log"
     mkdir -p "$(dirname "$alert_log")" 2>/dev/null || true
     printf '%s: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$msg" >> "$alert_log" 2>/dev/null || true
-    /usr/bin/osascript -e 'on run argv
+    "$ALGO_OSASCRIPT_BIN" -e 'on run argv
         display notification (item 1 of argv) with title "algo-poc job failed"
     end run' "$msg" >/dev/null 2>&1 || true
     return 0
@@ -282,6 +301,17 @@ _algo_cli_check() {
             rc=1
         fi
     done
+    # Optional: reported, never fatal. See $ALGO_OPTIONAL_SECRET_NAMES.
+    if [ -n "$ALGO_OPTIONAL_SECRET_NAMES" ]; then
+        echo "dead-man switches (optional, but nothing external watches this host without them):"
+        for name in $ALGO_OPTIONAL_SECRET_NAMES; do
+            if algo_secret "$name" >/dev/null 2>&1; then
+                echo "  OK      $name"
+            else
+                echo "  ABSENT  $name — not configured; import it with: $0 --import"
+            fi
+        done
+    fi
     return $rc
 }
 
@@ -290,7 +320,7 @@ _algo_cli_import() {
     echo "Importing into keychain service '$ALGO_KEYCHAIN_SERVICE' (login keychain)."
     echo "Values are read by \`security\` itself — not via argv, not into history."
     echo ""
-    for name in $ALGO_SECRET_NAMES; do
+    for name in $ALGO_SECRET_NAMES $ALGO_OPTIONAL_SECRET_NAMES; do
         _algo_keychain_put_interactive "$name" || echo "  (skipped $name)" >&2
     done
     echo ""
@@ -330,6 +360,14 @@ _algo_cli_export() {
             rc=1
         fi
     done
+    # Optional names are emitted when present and skipped silently otherwise —
+    # an unconfigured dead-man switch must not make `eval "$(... --export)"`
+    # return non-zero under `set -e`.
+    for name in $ALGO_OPTIONAL_SECRET_NAMES; do
+        if val=$(algo_secret "$name"); then
+            printf 'export %s=%s\n' "$name" "$(_algo_shell_quote "$val")"
+        fi
+    done
     return $rc
 }
 
@@ -343,6 +381,13 @@ _algo_cli_env_file() {
         else
             echo "# $name unavailable: $ALGO_SECRETS_ERROR" >&2
             rc=1
+        fi
+    done
+    # See _algo_cli_export: present-only, never fatal. docker compose reads
+    # DEADMAN_WATCHDOG_URL from here for the alertmanager container.
+    for name in $ALGO_OPTIONAL_SECRET_NAMES; do
+        if val=$(algo_secret "$name"); then
+            printf '%s=%s\n' "$name" "$val"
         fi
     done
     return $rc

@@ -12,6 +12,7 @@ Entry point for operational documentation.
 - `dependency-lockfile.md` — Regenerating the lockfiles, why each `uv pip compile` flag exists, upgrade procedure, version-ceiling policy (KAN-36)
 - `drill-evidence-isolation.md` — The portfolio exclusion contract: which readers must exclude `__drill__`/`_`-prefixed portfolios, and how to run a tagged drill (KAN-24)
 - `broker-stop-prototype.md` — Broker-native GTC stop spike on the paper account: runbook, findings, go/no-go for KAN-19 (scripts/ops/broker_stop_spike.py)
+- `dead-man-switches.md` — The two external checks that page when this host goes quiet, why "no trades today" is deliberately not an internal alert, and the delivery drill (KAN-15)
 - Reconciliation procedures (TBD)
 - Incident response/escalation procedures (TBD)
 

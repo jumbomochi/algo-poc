@@ -13,7 +13,10 @@
 # deploy/alertmanager/entrypoint.sh renders it at container start:
 #   - $TELEGRAM_BOT_TOKEN is written to the tmpfs path `bot_token_file`
 #     points at (never on a writable layer, never in git);
-#   - the `chat_id` placeholder below is substituted with $TELEGRAM_CHAT_ID.
+#   - the `chat_id` placeholder below is substituted with $TELEGRAM_CHAT_ID;
+#   - the `deadman` receiver's placeholder URL is substituted with
+#     $DEADMAN_WATCHDOG_URL, or the Watchdog route is repointed at the `null`
+#     receiver when that variable is unset (KAN-15).
 # The placeholder is a real integer rather than a `${...}` marker so that
 # `amtool check-config config/alertmanager.yml` (see .github/workflows/
 # tests.yml) can validate this file as committed — Alertmanager rejects
@@ -35,9 +38,24 @@ route:
   group_interval: 5m
   # This system trades once a day (deploy/launchd/run_paper.sh, ~04:15 SGT),
   # so a re-notify cadence tuned for an intraday pager would just train the
-  # operator to mute the bot. Threshold/cadence retuning is KAN-15.
+  # operator to mute the bot.
   repeat_interval: 12h
   routes:
+    # KAN-15: the dead-man's switch. config/alert_rules.yml's Watchdog rule
+    # fires permanently, so it must NEVER reach Telegram — it goes out to an
+    # external checker instead, and the operator hears about it only when the
+    # pings STOP. First in the list because sub-routes are first-match-wins.
+    #
+    # repeat_interval is deliberately far shorter than every other route:
+    # this is a heartbeat, and the external checker's grace period has to be
+    # longer than it. 5m ping vs. a typical 15-30m grace leaves room for one
+    # missed ping without a false page.
+    - matchers:
+        - alertname = "Watchdog"
+      receiver: deadman
+      group_wait: 0s
+      group_interval: 5m
+      repeat_interval: 5m
     - matchers:
         - severity = critical
       receiver: telegram
@@ -45,6 +63,33 @@ route:
       repeat_interval: 2h
 
 receivers:
+  # KAN-15. The URL is a PLACEHOLDER, substituted by
+  # deploy/alertmanager/entrypoint.sh from $DEADMAN_WATCHDOG_URL at container
+  # start — a check URL is a bearer capability (anyone holding it can forge a
+  # healthy ping) and belongs in the keychain/.env, not in git. `.invalid` is
+  # the reserved TLD from RFC 2606, so an unrendered placeholder cannot
+  # resolve to a real host by accident.
+  #
+  # When $DEADMAN_WATCHDOG_URL is unset the entrypoint repoints the Watchdog
+  # route at the `null` receiver below instead of failing the container: an
+  # unconfigured dead-man check is a gap in monitoring, but refusing to start
+  # over it would take Telegram delivery down as well, which is strictly
+  # worse. It says so loudly on stderr.
+  - name: deadman
+    webhook_configs:
+      - url: https://deadman.invalid/replaced-at-container-start
+        # A ping is a liveness signal, not an incident: `resolved` would only
+        # ever arrive if the Watchdog stopped firing, which is exactly when
+        # Alertmanager can no longer send anything anyway.
+        send_resolved: false
+        # The payload is irrelevant — healthchecks.io-style endpoints care
+        # only that a request arrived. Keep it small.
+        max_alerts: 1
+
+  # Deliberately empty: a receiver with a name and no configs delivers
+  # nothing. This is the fallback for an unconfigured dead-man URL.
+  - name: "null"
+
   - name: telegram
     telegram_configs:
       # Rendered by the entrypoint from $TELEGRAM_BOT_TOKEN onto a tmpfs.

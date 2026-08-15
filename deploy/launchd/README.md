@@ -50,7 +50,27 @@ eval "$(deploy/launchd/secrets.sh --export)"   # for docker compose / a shell
 
 `secrets.sh` is deliberately **not** deployed to `~/ibc` — it is sourced from
 the repo so there is exactly one copy of the lookup logic and it cannot drift
-the way the hand-copied wrappers did.
+the way the hand-copied wrappers did. `deadman.sh` (below) is excluded for the
+same reason.
+
+Two further accounts are **optional** (`$ALGO_OPTIONAL_SECRET_NAMES`):
+`DEADMAN_WATCHDOG_URL` and `ALGO_DEADMAN_PAPER_URL`. `--import` prompts for
+them and `--check` reports them, but their absence does not make `--check`
+exit non-zero — that status means "the stack cannot authenticate", which is a
+different problem from "no external check is watching this host".
+
+## Dead-man switches: `deadman.sh`
+
+`run_paper.sh` sources `deadman.sh` and pings `$ALGO_DEADMAN_PAPER_URL` **only
+on a successful run**. Every alert the wrappers send is sent by this host,
+about this host, so none of them can fire when the Mac is off — which is
+exactly what "the 04:15 run never happened" looks like from the inside, and
+what went unnoticed for two days on 2026-08-13/14. The ping is fire-and-forget
+by construction and cannot fail the run; its outcome is written to the day's
+log as `dead-man switch: …`.
+
+Full setup, cadence guidance and the delivery drill:
+[`docs/operations/dead-man-switches.md`](../../docs/operations/dead-man-switches.md).
 
 ### Why not a plaintext `.env`, and why not 1Password
 

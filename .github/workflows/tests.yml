@@ -70,3 +70,53 @@ jobs:
       # arrives — which is indistinguishable from a healthy system.
       - name: Check the Alertmanager routing config
         run: amtool check-config config/alertmanager.yml
+      # KAN-15 (AC4). check-config only proves the file parses. This proves
+      # intent: every severity a rule can carry still lands on the Telegram
+      # receiver, and the always-firing Watchdog lands on the dead-man webhook
+      # instead of Telegram — a Watchdog routed to Telegram would page every
+      # 5 minutes forever and get the bot muted, taking every real alert with
+      # it.
+      - name: Check every alert still routes where it is meant to
+        run: |
+          set -euo pipefail
+          for severity in critical warning info; do
+            receiver=$(amtool config routes test --config.file=config/alertmanager.yml "severity=$severity")
+            if [ "$receiver" != "telegram" ]; then
+              echo "severity=$severity routes to '$receiver', expected 'telegram'" >&2
+              exit 1
+            fi
+          done
+          watchdog=$(amtool config routes test --config.file=config/alertmanager.yml alertname=Watchdog severity=none)
+          if [ "$watchdog" != "deadman" ]; then
+            echo "the Watchdog routes to '$watchdog', expected 'deadman'" >&2
+            exit 1
+          fi
+
+  # KAN-15 (P1-12) — the alert rules are unit-tested artifacts, not
+  # reviewed-by-eye YAML. The rule this replaced
+  # (`increase(approved_orders[60m]) == 0`) was true for ~23 hours of every
+  # day and no amount of reading caught it; replaying a normal weekend through
+  # the rules catches it in one second.
+  alert-rules:
+    name: promtool test rules
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      # Pinned to the same tag as the prometheus image in
+      # docker-compose.observability.yml, for the same reason the amtool job
+      # is — testing rules with a different evaluator than the one that runs
+      # them is a green check that proves nothing.
+      # tests/deploy/test_alert_rules.py asserts the two stay in step.
+      - name: Install promtool (pinned to the prometheus image tag)
+        env:
+          PROMETHEUS_VERSION: "2.51.0"
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz" \
+            | tar -xz
+          sudo install "prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+      - name: Check the rules parse
+        run: promtool check rules config/alert_rules.yml
+      - name: Replay a quiet weekend and every failure mode through the rules
+        run: promtool test rules tests/deploy/alert_rules_test.yml
