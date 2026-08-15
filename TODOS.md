@@ -24,7 +24,7 @@ Deferred work with context. Added by /plan-eng-review and /plan-ceo-review 2026-
 - **Pros:** Closes the stale-book window after any daytime restart; makes the halt reconcile sweep's broker-truth view complete.
 - **Cons:** ~1-2 days human / ~1-2h CC; replay logic must respect the T4 idempotent-fills path.
 - **Context:** The eng review's D12 decision (stamp `orderRef=recommendation_id` on every IB submission) makes this deterministic: `reqExecutions` + orderRef → intent mapping. Start: `services/execution/runner.py` `setup()` after `restore_broker_tracking`.
-- **Depends on / blocked by:** D12 (orderRef stamping) landing in tranche 1.
+- **Depends on / blocked by:** Nothing. D12 orderRef stamping has shipped — `services/execution/ib_executor.py` sets `order.orderRef` on both submission paths and reads it back via `find_order_by_ref`/`restore_order_by_ref`.
 
 ## Dependabot lockfile auto-regeneration
 - **What:** CI workflow that recompiles `requirements.lock` inside Dependabot PRs so they pass the lockfile-freshness gate automatically.

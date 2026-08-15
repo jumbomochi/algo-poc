@@ -1617,6 +1617,148 @@ class TestPaperAccountGuard:
         assert executor._ib is fake_ib
 
 
+class TestExactAccountPin:
+    """A DU prefix is not an identity. With ``account_id`` configured the
+    session must serve exactly that account — a second paper account, or a
+    Gateway repointed at a different one, must refuse to trade."""
+
+    @staticmethod
+    def _fake_ib(accounts):
+        from unittest.mock import AsyncMock, MagicMock
+
+        fake_ib = MagicMock()
+        fake_ib.connectAsync = AsyncMock()
+        fake_ib.managedAccounts.return_value = accounts
+        fake_ib.isConnected.return_value = True
+        return fake_ib
+
+    def _executor(self, account_id="DUN551088"):
+        from services.execution.ib_executor import IBExecutor
+
+        return IBExecutor(
+            host="h", port=7497, client_id=1, account_id=account_id
+        )
+
+    @pytest.mark.asyncio
+    async def test_other_paper_account_refused_despite_matching_prefix(self):
+        """The test that fails without the pin: DU9999999 passes the prefix
+        guard but is not the configured book."""
+        from unittest.mock import patch
+
+        from services.execution.ib_executor import WrongAccountTypeError
+
+        executor = self._executor()
+        fake_ib = self._fake_ib(["DU9999999"])
+
+        with patch("ib_insync.IB", return_value=fake_ib):
+            with pytest.raises(WrongAccountTypeError) as excinfo:
+                await executor.connect(expect_paper=True)
+
+        # The message must name both ids so the operator can see the swap.
+        assert "DUN551088" in str(excinfo.value)
+        assert "DU9999999" in str(excinfo.value)
+        fake_ib.disconnect.assert_called_once()
+        assert executor._ib is None
+
+    @pytest.mark.asyncio
+    async def test_configured_account_connects(self):
+        from unittest.mock import patch
+
+        executor = self._executor()
+        fake_ib = self._fake_ib(["DUN551088"])
+
+        with patch("ib_insync.IB", return_value=fake_ib):
+            await executor.connect(expect_paper=True)
+
+        assert executor._ib is fake_ib
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_multi_account_session_refused(self):
+        """Configured account present but not alone: an ambiguous session is
+        how orders reach the wrong book, so reject it — the same
+        exactly-one-account rule IBAccountReader.snapshot() enforces."""
+        from unittest.mock import patch
+
+        from services.execution.ib_executor import WrongAccountTypeError
+
+        executor = self._executor()
+        fake_ib = self._fake_ib(["DUN551088", "DU9999999"])
+
+        with patch("ib_insync.IB", return_value=fake_ib):
+            with pytest.raises(WrongAccountTypeError) as excinfo:
+                await executor.connect(expect_paper=True)
+
+        assert "DUN551088" in str(excinfo.value)
+        assert "DU9999999" in str(excinfo.value)
+        fake_ib.disconnect.assert_called_once()
+        assert executor._ib is None
+
+    @pytest.mark.asyncio
+    async def test_unset_account_id_keeps_todays_behaviour(self):
+        """Regression: with no pin configured, any DU account still connects."""
+        from unittest.mock import patch
+
+        executor = self._executor(account_id=None)
+        fake_ib = self._fake_ib(["DU9999999", "DU1111111"])
+
+        with patch("ib_insync.IB", return_value=fake_ib):
+            await executor.connect(expect_paper=True)
+
+        assert executor._ib is fake_ib
+
+    @pytest.mark.asyncio
+    async def test_pin_survives_reconnect(self):
+        """The auto-reconnect path re-runs connect(); a Gateway that comes back
+        serving a different account must not be trusted."""
+        from unittest.mock import patch
+
+        from services.execution.ib_executor import WrongAccountTypeError
+
+        executor = self._executor()
+        with patch("ib_insync.IB", return_value=self._fake_ib(["DUN551088"])):
+            await executor.connect(expect_paper=True)
+
+        executor._ib.isConnected.return_value = False  # session dropped
+        with patch("ib_insync.IB", return_value=self._fake_ib(["DU9999999"])):
+            with pytest.raises(WrongAccountTypeError, match="DU9999999"):
+                await executor.submit_limit_order("CSCO", 17.0, 121.31)
+
+    async def _place(self, account_id):
+        from unittest.mock import MagicMock, patch
+
+        executor = self._executor(account_id=account_id)
+        fake_ib = self._fake_ib(["DUN551088"])
+        trade = MagicMock()
+        trade.order.orderId = 7
+        fake_ib.placeOrder.return_value = trade
+
+        with patch("ib_insync.IB", return_value=fake_ib):
+            await executor.connect(expect_paper=True)
+            await executor.submit_limit_order(
+                "AAPL", 5, 150.0, recommendation_id="rec-1"
+            )
+            await executor.submit_market_order(
+                "AAPL", 5, recommendation_id="rec-2"
+            )
+
+        return [call.args[1] for call in fake_ib.placeOrder.call_args_list]
+
+    @pytest.mark.asyncio
+    async def test_orders_are_stamped_with_the_configured_account(self):
+        limit_order, market_order = await self._place("DUN551088")
+
+        assert limit_order.account == "DUN551088"
+        assert market_order.account == "DUN551088"
+
+    @pytest.mark.asyncio
+    async def test_orders_are_unstamped_when_no_account_configured(self):
+        limit_order, market_order = await self._place(None)
+
+        # ib_insync's default: the Gateway picks the session's account.
+        assert limit_order.account == ""
+        assert market_order.account == ""
+
+
 class TestWholeShareFallback:
     """Accounts without fractional API support round down; sub-1-share skips."""
 

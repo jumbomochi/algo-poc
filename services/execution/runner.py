@@ -877,6 +877,7 @@ if __name__ == "__main__":
             port=config.ib.paper_port if config.mode != "live" else config.ib.live_port,
             client_id=config.ib.client_id,
             allow_fractional=config.execution.fractional_orders,
+            account_id=config.ib.account_id,
         )
         # Connect BEFORE consuming orders. A failed connect exits nonzero so
         # the container restart policy retries; running without IB would

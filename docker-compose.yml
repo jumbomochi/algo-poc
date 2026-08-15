@@ -219,6 +219,9 @@ services:
       - ALGO_IB_HOST=host.docker.internal
       # Where execution writes the Error-1100 marker for the host watchdog.
       - ALGO_GATEWAY_STATE_DIR=/var/algo/state
+      # Pin the exact account this container may trade. Empty/absent leaves
+      # the DU/U prefix guard as the only check (see .env.example).
+      - ALGO_IB_ACCOUNT_ID=${ALGO_IB_ACCOUNT_ID:-}
     # T6: heartbeat-file healthcheck — see the data-ingestion comment above.
     # execution shares /var/algo/state with the host Gateway watchdog for a
     # different purpose (the IB Error-1100 marker); the heartbeat file below
