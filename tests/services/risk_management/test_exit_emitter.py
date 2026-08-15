@@ -16,13 +16,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from services.risk_management import runner as runner_module
 from services.risk_management.runner import RiskServiceRunner
 from shared.config import AppConfig, CurrencyConfig, RiskConfig
-from shared.models import Base, OrderStatus, Position
+from shared.models import Base, OrderIntent, OrderStatus, Position
 from shared.order_ledger import OrderLedger
 
 # The entry path publishes approved *buys* from an intent risk itself approved
@@ -160,20 +160,13 @@ def db_runner(mock_config, mock_redis):
     return runner, ledger, session
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "run_stop_loss_check and _trim_position_to_target still publish their "
-        "own unbacked orders; KAN-7 routes them through the emitter and must "
-        "then delete this marker"
-    ),
-)
 def test_emit_ledgered_exit_is_the_only_exit_publish_site():
     """Exactly one exit publish site, and it is the emitter.
 
-    Strict xfail is the sequencing enforcement: this goes green the moment
-    KAN-7 lands, and a strict xfail that unexpectedly passes fails the suite —
-    so KAN-7 cannot forget to flip it.
+    Written as a strict xfail in KAN-5 and flipped here (AC 8): stop-loss and
+    passive-trim now route through the emitter, so the assertion holds for the
+    first time. It stays as a live test because the regression it catches —
+    someone adding a second, unbacked publish — is the original P0.
     """
     exit_sites = {
         method: count
@@ -366,3 +359,301 @@ class TestEmitterGeneralisesForKan7:
         assert "stop_loss" in adjustments
         assert "kill_switch" not in adjustments
         session.rollback()
+
+
+def _position(
+    ticker: str = "AAPL",
+    *,
+    portfolio: str = "momentum",
+    con_id: int | None = 111,
+    quantity: float = 10.0,
+) -> Position:
+    return Position(
+        account_id="DUTEST",
+        ticker=ticker,
+        portfolio=portfolio,
+        con_id=con_id,
+        exchange="SMART",
+        currency="USD",
+        quantity=quantity,
+        avg_entry_price=100,
+        current_price=100,
+        peak_price=100,
+        highest_price_since_entry=100,
+        opened_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        status="open",
+    )
+
+
+def _breaching(runner, *, ticker: str = "AAPL", quantity: float = 10.0):
+    """Put the in-memory book in a state the trailing stop must fire on."""
+    runner._portfolio.nav = 100_000
+    runner._portfolio.positions = {
+        ticker: {
+            "quantity": quantity,
+            "sector": "Technology",
+            "highest_price_since_entry": 100.0,
+        }
+    }
+    runner._current_prices = {ticker: 84.0}  # 16% off the high, stop is 15%
+
+
+def _intents(session) -> list[OrderIntent]:
+    session.rollback()
+    return list(session.scalars(select(OrderIntent).order_by(OrderIntent.id)))
+
+
+class TestStopLossReachesTheBroker:
+    """KAN-7: the P0 itself — stop-loss sells that execution can actually route."""
+
+    @pytest.mark.asyncio
+    async def test_breach_creates_an_approved_intent_and_publishes_it(
+        self, db_runner, mock_redis
+    ):
+        """AC 1 (risk half): the published id is the intent's id, so execution's
+        opening ledger lookup finds it instead of dead-lettering."""
+        runner, ledger, session = db_runner
+        _breaching(runner)
+
+        await runner.run_stop_loss_check()
+
+        (order,) = _published_orders(mock_redis)
+        (intent,) = _intents(session)
+        assert order["recommendation_id"] == intent.recommendation_id
+        assert intent.status == OrderStatus.APPROVED.value
+        assert intent.con_id == 111
+        assert intent.portfolio == "momentum"
+        assert float(order["quantity"]) == pytest.approx(10.0)
+        assert "stop_loss" in order["risk_adjustments"]
+
+    @pytest.mark.asyncio
+    async def test_identity_comes_from_the_db_not_the_in_memory_book(
+        self, db_runner, mock_redis
+    ):
+        """The in-memory position carries no con_id/account — resolving through
+        load_liquidation_targets is what makes the intent creatable at all."""
+        runner, _ledger, session = db_runner
+        _breaching(runner, quantity=999.0)  # in-memory quantity is not authority
+
+        await runner.run_stop_loss_check()
+
+        (order,) = _published_orders(mock_redis)
+        assert float(order["quantity"]) == pytest.approx(10.0)
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_a_persistent_breach_yields_one_intent_at_a_time(
+        self, db_runner, mock_redis
+    ):
+        """AC 2 / design test #4: the scan runs every few minutes and the breach
+        does not clear on its own. Three scans, one working sell."""
+        runner, _ledger, session = db_runner
+        _breaching(runner)
+
+        for _ in range(3):
+            await runner.run_stop_loss_check()
+
+        assert len(_published_orders(mock_redis)) == 1
+        assert len(_intents(session)) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_plain_non_exit_sell_suppresses_the_stop_loss(
+        self, db_runner, mock_redis
+    ):
+        """AC 4 / design test #8: suppression is about the position, not about
+        exits. A sleeve-rebalance sell already working means the shares are
+        spoken for; a second sell oversells the moment the first fills."""
+        runner, ledger, session = db_runner
+        ledger.create_intent(
+            SimpleNamespace(
+                recommendation_id="sleeve-rebalance-AAPL",
+                account_id="DUTEST",
+                mode="paper",
+                portfolio="momentum",
+                con_id=111,
+                symbol="AAPL",
+                exchange="SMART",
+                currency="USD",
+                action="SELL",
+                quantity=4.0,
+                limit_price=None,
+                order_type="MKT",
+            )
+        )
+        session.commit()
+        _breaching(runner)
+
+        await runner.run_stop_loss_check()
+
+        assert _published_orders(mock_redis) == []
+        assert [i.recommendation_id for i in _intents(session)] == [
+            "sleeve-rebalance-AAPL"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_terminal_earlier_exit_does_not_suppress_a_new_breach(
+        self, db_runner, mock_redis
+    ):
+        """The flip side of AC 2: once the exit has filled, a fresh breach the
+        same day must be able to exit again — under its own id, not the filled
+        one's (seq + 1)."""
+        runner, ledger, session = db_runner
+        _breaching(runner)
+        await runner.run_stop_loss_check()
+        first = _intents(session)[0].recommendation_id
+        ledger.transition(first, OrderStatus.SUBMITTED)
+        ledger.transition(first, OrderStatus.FILLED)
+        session.commit()
+
+        await runner.run_stop_loss_check()
+
+        ids = [i.recommendation_id for i in _intents(session)]
+        assert len(ids) == 2
+        assert ids[0].endswith("-0") and ids[1].endswith("-1")
+        assert len(_published_orders(mock_redis)) == 2
+
+    @pytest.mark.asyncio
+    async def test_missing_con_id_alerts_with_kind_and_publishes_nothing(
+        self, db_runner, mock_redis
+    ):
+        """AC 3 / design test #7: an unroutable stop-loss is escalated the way an
+        unroutable kill is, and names the control that could not route."""
+        runner, _ledger, session = db_runner
+        position = session.scalars(select(Position)).one()
+        position.con_id = None
+        session.commit()
+        _breaching(runner)
+
+        await runner.run_stop_loss_check()
+
+        assert _published_orders(mock_redis) == []
+        assert _intents(session) == []
+        unroutable = [a for a in _alerts(mock_redis) if "liquidation_unroutable" in a]
+        assert len(unroutable) == 1
+        assert "stop-loss" in unroutable[0]
+        assert not [a for a in _alerts(mock_redis) if "stop_loss_triggered" in a]
+
+    @pytest.mark.asyncio
+    async def test_an_identical_re_entry_adopts_the_existing_intent(
+        self, db_runner, mock_redis
+    ):
+        """AC 5: a replay of the same exit — same id, same economics — adopts the
+        row that is already there rather than raising ConflictingOrderIntent or
+        minting a duplicate."""
+        runner, _ledger, session = db_runner
+
+        for _ in range(2):
+            published = await runner._emit_ledgered_exit(
+                "stop-loss",
+                _target(),
+                exit_id="stop-loss-DUTEST-momentum-111-2026-08-15-0",
+                reason="trailing stop hit",
+            )
+            assert published is True
+
+        assert len(_intents(session)) == 1
+
+
+@pytest.fixture()
+def two_sleeve_runner(mock_config, mock_redis):
+    """AAPL held by two sleeves: 10 shares in momentum, 30 in quality.
+
+    The six-sleeve book does this routinely, and it is the case a ticker-keyed
+    exit gets wrong — one sleeve's identity carrying the other sleeve's shares.
+    """
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    session.add(_position(portfolio="momentum", quantity=10.0))
+    session.add(_position(portfolio="quality", quantity=30.0))
+    session.commit()
+    ledger = OrderLedger(session)
+    runner = RiskServiceRunner(
+        config=mock_config,
+        redis_client=mock_redis,
+        db_session=session,
+        order_ledger=ledger,
+    )
+    runner._portfolio.positions = {}
+    return runner, ledger, session
+
+
+class TestExitsFanOutPerSleeve:
+    """AC 6 / 7: one breach, one exit per identity scope."""
+
+    @pytest.mark.asyncio
+    async def test_stop_loss_exits_each_sleeve_under_its_own_id(
+        self, two_sleeve_runner, mock_redis
+    ):
+        runner, _ledger, session = two_sleeve_runner
+        _breaching(runner, quantity=40.0)
+
+        await runner.run_stop_loss_check()
+
+        orders = _published_orders(mock_redis)
+        assert len(orders) == 2
+        assert len({o["recommendation_id"] for o in orders}) == 2
+        by_portfolio = {i.portfolio: i for i in _intents(session)}
+        assert by_portfolio["momentum"].requested_quantity == pytest.approx(10.0)
+        assert by_portfolio["quality"].requested_quantity == pytest.approx(30.0)
+
+    @pytest.mark.asyncio
+    async def test_trim_sells_each_sleeve_its_own_share_not_the_ticker_total(
+        self, two_sleeve_runner, mock_redis
+    ):
+        """The ceiling is breached by the ticker (40 shares at $100 = 40% of a
+        $10k NAV, ceiling 10%), but 30 of those shares are quality's. Selling
+        the whole 30-share overage out of momentum would flatten momentum and
+        leave quality untouched."""
+        runner, _ledger, session = two_sleeve_runner
+        runner._portfolio.nav = 10_000
+        runner._current_prices = {"AAPL": 100.0}
+
+        await runner._trim_position_to_target(
+            SimpleNamespace(
+                ticker="AAPL",
+                target_pct=10.0,
+                current_pct=40.0,
+                message="hard ceiling breach",
+            )
+        )
+
+        by_portfolio = {i.portfolio: i for i in _intents(session)}
+        # overage = 40 - 10 = 30 shares, split 10:30 across the sleeves.
+        assert by_portfolio["momentum"].requested_quantity == pytest.approx(7.5)
+        assert by_portfolio["quality"].requested_quantity == pytest.approx(22.5)
+        assert sum(
+            float(o["quantity"]) for o in _published_orders(mock_redis)
+        ) == pytest.approx(30.0)
+
+    @pytest.mark.asyncio
+    async def test_a_working_sell_in_one_sleeve_does_not_block_the_other(
+        self, two_sleeve_runner, mock_redis
+    ):
+        """Suppression is scoped to {account, portfolio, con_id} — scoping it to
+        the ticker would let one sleeve's working order strand the other's."""
+        runner, ledger, session = two_sleeve_runner
+        ledger.create_intent(
+            SimpleNamespace(
+                recommendation_id="working-momentum-sell",
+                account_id="DUTEST",
+                mode="paper",
+                portfolio="momentum",
+                con_id=111,
+                symbol="AAPL",
+                exchange="SMART",
+                currency="USD",
+                action="SELL",
+                quantity=10.0,
+                limit_price=None,
+                order_type="MKT",
+            )
+        )
+        session.commit()
+        _breaching(runner, quantity=40.0)
+
+        await runner.run_stop_loss_check()
+
+        (order,) = _published_orders(mock_redis)
+        assert float(order["quantity"]) == pytest.approx(30.0)
+        assert {i.portfolio for i in _intents(session)} == {"momentum", "quality"}

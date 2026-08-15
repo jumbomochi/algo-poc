@@ -2182,3 +2182,154 @@ class TestAutoReconnect:
                 await executor.submit_limit_order("CSCO", 17.0, 121.31)
 
         live_ib.placeOrder.assert_not_called()
+
+
+class TestRecurringExitsCrossToExecution:
+    """KAN-7 AC 1: the P0 end to end.
+
+    Stop-loss and passive-trim sells used to publish a uuid4 recommendation_id
+    with no backing intent. Execution's first act on an approved order is a
+    ledger lookup, so every one of them raised OrderIntentNotFound and landed in
+    stream:approved_orders:dlq — silently, every scan, for as long as the breach
+    lasted. Driving the real consume path here is what makes the no-DLQ half of
+    the assertion mean anything.
+    """
+
+    @staticmethod
+    def _risk_runner(ledger, ledger_session):
+        from unittest.mock import MagicMock as _MagicMock
+
+        from services.risk_management.runner import RiskServiceRunner
+        from shared.config import CurrencyConfig, RiskConfig
+
+        config = _MagicMock(spec=AppConfig)
+        config.mode = "paper"
+        config.risk = RiskConfig()
+        config.currency = CurrencyConfig()
+        redis = AsyncMock()
+        redis.publish = AsyncMock(return_value="msg-1")
+        redis.stream_length = AsyncMock(return_value=0)
+        runner = RiskServiceRunner(
+            config=config,
+            redis_client=redis,
+            db_session=ledger_session,
+            order_ledger=ledger,
+        )
+        return runner, redis
+
+    @staticmethod
+    def _hold(ledger_session, *, quantity: float = 10.0) -> None:
+        ledger_session.add(Position(
+            account_id="DUN551088",
+            ticker="AAPL",
+            portfolio="momentum",
+            con_id=265598,
+            exchange="SMART",
+            currency="USD",
+            quantity=quantity,
+            avg_entry_price=100,
+            current_price=100,
+            peak_price=100,
+            highest_price_since_entry=100,
+            opened_at=BROKER_TIME,
+            status="open",
+        ))
+        ledger_session.commit()
+
+    @staticmethod
+    def _published(risk_redis) -> list[ApprovedOrderMessage]:
+        return [
+            ApprovedOrderMessage.from_stream_dict(c.args[1])
+            for c in risk_redis.publish.call_args_list
+            if c.args[0] == "stream:approved_orders"
+        ]
+
+    async def _consume(
+        self, execution_runner, mock_redis, order: ApprovedOrderMessage
+    ) -> None:
+        """Feed the exit through the real consumer, DLQ path armed."""
+        mock_redis.read_group = AsyncMock(return_value=[
+            SimpleNamespace(message_id="1-1", data=order.to_stream_dict())
+        ])
+        mock_redis.send_to_dead_letter = AsyncMock()
+        await execution_runner._consume_and_process(
+            "stream:approved_orders",
+            ApprovedOrderMessage.from_stream_dict,
+            execution_runner.process_approved_order,
+            count=10,
+            block_ms=0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_loss_exit_submits_to_ib_and_never_dead_letters(
+        self, mock_config, mock_redis, mock_order_manager, ledger_session
+    ):
+        self._hold(ledger_session)
+        ledger = OrderLedger(ledger_session)
+        risk_runner, risk_redis = self._risk_runner(ledger, ledger_session)
+        risk_runner._portfolio.positions = {
+            "AAPL": {"quantity": 10, "highest_price_since_entry": 100.0}
+        }
+        risk_runner._current_prices = {"AAPL": 84.0}
+
+        await risk_runner.run_stop_loss_check()
+        ledger_session.rollback()
+
+        (exit_order,) = self._published(risk_redis)
+        execution_runner = ExecutionServiceRunner(
+            config=mock_config,
+            redis_client=mock_redis,
+            order_manager=mock_order_manager,
+            order_ledger=ledger,
+        )
+        await self._consume(execution_runner, mock_redis, exit_order)
+
+        mock_order_manager.submit_exit.assert_awaited_once_with(
+            ticker="AAPL",
+            quantity=10.0,
+            recommendation_id=exit_order.recommendation_id,
+        )
+        mock_redis.send_to_dead_letter.assert_not_awaited()
+        assert ledger.get(exit_order.recommendation_id).status == (
+            OrderStatus.SUBMITTED.value
+        )
+        ledger_session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_passive_trim_exit_submits_the_partial_quantity(
+        self, mock_config, mock_redis, mock_order_manager, ledger_session
+    ):
+        """A trim is a partial sell: the intent, the published order and the IB
+        submission must all carry the same partial quantity, or the ledger and
+        the broker disagree about what is outstanding."""
+        self._hold(ledger_session, quantity=40.0)
+        ledger = OrderLedger(ledger_session)
+        risk_runner, risk_redis = self._risk_runner(ledger, ledger_session)
+        risk_runner._portfolio.nav = 10_000
+        risk_runner._current_prices = {"AAPL": 100.0}
+
+        await risk_runner._trim_position_to_target(SimpleNamespace(
+            ticker="AAPL",
+            target_pct=10.0,
+            current_pct=40.0,
+            message="hard ceiling breach",
+        ))
+        ledger_session.rollback()
+
+        (exit_order,) = self._published(risk_redis)
+        assert exit_order.quantity == pytest.approx(30.0)
+        execution_runner = ExecutionServiceRunner(
+            config=mock_config,
+            redis_client=mock_redis,
+            order_manager=mock_order_manager,
+            order_ledger=ledger,
+        )
+        await self._consume(execution_runner, mock_redis, exit_order)
+
+        mock_order_manager.submit_exit.assert_awaited_once_with(
+            ticker="AAPL",
+            quantity=30.0,
+            recommendation_id=exit_order.recommendation_id,
+        )
+        mock_redis.send_to_dead_letter.assert_not_awaited()
+        ledger_session.rollback()

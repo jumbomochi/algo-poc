@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import math
-import uuid
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -22,7 +21,11 @@ from services.risk_management.passive_monitor import PassiveBreachMonitor
 from shared.config import AppConfig
 from shared.halt_state import HaltStateRepository
 from shared.heartbeat import register_heartbeat_collector, write_heartbeat
-from shared.liquidation import liquidation_exit_id, load_liquidation_targets
+from shared.liquidation import (
+    exit_intent_prefix,
+    liquidation_exit_id,
+    load_liquidation_targets,
+)
 from shared.logging import get_logger
 from shared.models import CapitalSnapshot, OrderIntent, OrderStatus, Position
 from shared.order_ledger import (
@@ -1106,6 +1109,92 @@ class RiskServiceRunner:
     def _liquidation_exit_id(self, ticker: str, epoch: int) -> str:
         return liquidation_exit_id(self._config.mode, ticker, epoch)
 
+    @staticmethod
+    def _trading_date() -> date:
+        return datetime.now(timezone.utc).date()
+
+    def _exit_targets(self, ticker: str) -> list[dict[str, Any]]:
+        """Identity-scoped rows for one ticker, for the recurring exit paths.
+
+        The in-memory ``self._portfolio.positions`` is keyed by ticker and
+        carries no broker identity, so a breach detected there cannot be turned
+        into an order intent — which is exactly why stop-loss sells published
+        with a uuid4 id and dead-lettered. Resolving through
+        ``load_liquidation_targets`` (KAN-6) gives each holding its real
+        ``{account_id, portfolio, con_id}``, and a ticker held by two sleeves
+        comes back as two rows so each sleeve exits its own shares.
+
+        Without a ledger (unit paths, backtests) there is no DB to resolve
+        against; fall back to the in-memory quantity with null identity, which
+        the emitter publishes unbacked exactly as it did before.
+        """
+        if self._order_ledger is None:
+            pos = self._portfolio.positions.get(ticker)
+            quantity = pos.get("quantity", 0) if isinstance(pos, dict) else 0
+            return [
+                {
+                    "ticker": ticker,
+                    "quantity": quantity,
+                    "con_id": None,
+                    "account_id": None,
+                    "exchange": None,
+                    "currency": None,
+                    "portfolio": None,
+                }
+            ]
+        targets = [
+            row
+            for row in load_liquidation_targets(self._order_ledger.session)
+            if row["ticker"] == ticker
+        ]
+        self._order_ledger.session.rollback()
+        return targets
+
+    def _has_pending_sell(self, target: dict[str, Any]) -> bool:
+        """True when the ledger already holds an unfinished sell for this scope."""
+        if self._order_ledger is None:
+            return False
+        pending = self._order_ledger.nonterminal_sell_exists(
+            account_id=target.get("account_id"),
+            portfolio=target.get("portfolio"),
+            con_id=target.get("con_id"),
+        )
+        self._order_ledger.session.rollback()
+        return pending
+
+    def _next_exit_id(self, kind: str, target: dict[str, Any]) -> str:
+        """Deterministic id for the next exit of ``kind`` on this scope.
+
+        ``seq`` is the number of exits already minted for this
+        {kind, scope, day}. Callers reach here only once every earlier exit in
+        the family is terminal (the suppression rule holds the nonterminal
+        case), so the count names a free id and a same-day re-entry that
+        breaches again does not collide with the filled exit.
+
+        The day is the UTC date, which is one-to-one with an NYSE session for
+        regular trading hours (00:00 UTC is 20:00 ET, after the close).
+
+        With no con_id — only reachable on the no-ledger fallback, since the
+        emitter refuses to publish an unroutable position — the ticker stands in
+        for it so two identity-less tickers cannot share one id.
+        """
+        con_id = target.get("con_id")
+        prefix = exit_intent_prefix(
+            kind,
+            target.get("account_id") or "",
+            target.get("portfolio") or "__unscoped__",
+            con_id if con_id is not None else target["ticker"],
+            self._trading_date(),
+        )
+        seq = (
+            0
+            if self._order_ledger is None
+            else self._order_ledger.count_intents_with_id_prefix(prefix)
+        )
+        if self._order_ledger is not None:
+            self._order_ledger.session.rollback()
+        return f"{prefix}{seq}"
+
     def _approve_exit_intent(self, intent: OrderIntent) -> None:
         """Commit a risk-side exit intent as APPROVED.
 
@@ -1153,6 +1242,7 @@ class RiskServiceRunner:
         reason: str,
         quantity: float | None = None,
         risk_adjustments: dict[str, Any] | None = None,
+        suppress_if_pending: bool = False,
     ) -> bool:
         """Create an APPROVED ledger intent for a risk-side exit and publish it.
 
@@ -1168,6 +1258,40 @@ class RiskServiceRunner:
         tell which control could not route. ``quantity`` defaults to flattening
         the whole target; a partial exit (passive trim) passes its own.
 
+        The exit-intent lifecycle, end to end (design §T2)::
+
+            breach detected (risk, every scan)
+                   |
+                   v
+            pending sell for {account, portfolio, con_id}? --yes--> emit nothing
+                   | no                                              (this scan)
+                   v
+            create_intent(exit_id)  PROPOSED
+                   |                    |
+                   |                    +-- same economics --> adopt existing row
+                   |                    +-- different       --> unroutable alert,
+                   |                                            publish nothing
+                   v
+            transition -> APPROVED  (risk is the approver of its own exits)
+                   v
+            publish stream:approved_orders
+                   v
+            execution: ledger lookup -> submit_exit -> SUBMITTED
+                   v
+            IB fill -> FILLED (terminal; a later breach may exit again, seq+1)
+
+        Everything above the publish happens in one transaction, so an exit is
+        either backed by an APPROVED intent or not published at all. What is
+        *not* covered here: a crash between APPROVED and the publish leaves the
+        intent nonterminal and the suppression rule then blocks re-emission —
+        re-publishing that orphan is KAN-8.
+
+        ``suppress_if_pending`` turns on the first branch, for the recurring
+        controls (stop-loss, passive trim) that re-evaluate the same breach
+        every scan. The kill path leaves it off deliberately: a kill must
+        flatten the whole book, and skipping a position because a partial trim
+        is in flight would leave the rest of it held through the emergency.
+
         Returns True when an exit was published. The ledger intent is what lets
         execution actually place the sell (a synthetic id with no intent is
         rejected), and a deterministic id makes a replay a no-op.
@@ -1175,6 +1299,17 @@ class RiskServiceRunner:
         if quantity is None:
             quantity = target["quantity"]
         if quantity is None or quantity <= 0:
+            return False
+
+        if suppress_if_pending and self._has_pending_sell(target):
+            self._logger.info(
+                "Exit suppressed: a sell is already outstanding for this scope",
+                kind=kind,
+                ticker=target["ticker"],
+                portfolio=target.get("portfolio"),
+                con_id=target.get("con_id"),
+                recommendation_id=exit_id,
+            )
             return False
 
         # With a ledger, a missing con_id means we cannot create the backing
@@ -1331,48 +1466,65 @@ class RiskServiceRunner:
             )
 
     async def _trim_position_to_target(self, breach: Any) -> None:
-        """Emit a market sell that reduces a position to its target ceiling."""
-        pos = self._portfolio.positions.get(breach.ticker)
+        """Trim a hard-ceiling breach back to its target, one sleeve at a time.
+
+        The breach is measured on the ticker (the ceiling is a share of NAV, and
+        NAV does not care which sleeve holds what), but the sell cannot be: an
+        order needs a con_id and an account, and a ticker held twice has two of
+        each. So the ticker-level overage is computed once and then split across
+        the scopes pro rata to what each actually holds — selling the ticker
+        total out of one sleeve would flatten a holding that was never in
+        breach.
+        """
         price = self._current_prices.get(breach.ticker, 0.0)
         nav = self._portfolio.nav
-        if pos is None or price <= 0 or nav <= 0:
-            return
-        quantity = pos.get("quantity", 0) if isinstance(pos, dict) else 0
-        if quantity <= 0:
-            return
-        target_value = nav * breach.target_pct / 100.0
-        sell_quantity = round((quantity * price - target_value) / price, 4)
-        if sell_quantity <= 0:
+        if price <= 0 or nav <= 0:
             return
 
-        order = ApprovedOrderMessage(
-            ticker=breach.ticker,
-            timestamp=datetime.now(timezone.utc),
-            action="sell",
-            quantity=sell_quantity,
-            order_type="market",
-            limit_price=None,
-            recommendation_id=f"passive-trim-{uuid.uuid4()}",
-            risk_adjustments={
-                "passive_trim": True,
-                "target_pct": breach.target_pct,
-                "current_pct": breach.current_pct,
-            },
-        )
-        await self._redis.publish(APPROVED_ORDERS_STREAM, order.to_stream_dict())
-        self._logger.warning(
-            "Hard-ceiling auto-trim order published",
-            ticker=breach.ticker,
-            sell_quantity=sell_quantity,
-            current_pct=breach.current_pct,
-            target_pct=breach.target_pct,
-        )
+        targets = self._exit_targets(breach.ticker)
+        held = sum(t["quantity"] or 0.0 for t in targets)
+        if held <= 0:
+            return
+
+        target_value = nav * breach.target_pct / 100.0
+        overage = round((held * price - target_value) / price, 4)
+        if overage <= 0:
+            return
+
+        for target in targets:
+            share = round(overage * (target["quantity"] / held), 4)
+            if share <= 0:
+                continue
+            published = await self._emit_ledgered_exit(
+                "passive-trim",
+                target,
+                exit_id=self._next_exit_id("passive-trim", target),
+                reason=breach.message,
+                quantity=share,
+                risk_adjustments={
+                    "passive_trim": True,
+                    "target_pct": breach.target_pct,
+                    "current_pct": breach.current_pct,
+                },
+                suppress_if_pending=True,
+            )
+            if published:
+                self._logger.warning(
+                    "Hard-ceiling auto-trim order published",
+                    ticker=breach.ticker,
+                    portfolio=target.get("portfolio"),
+                    sell_quantity=share,
+                    current_pct=breach.current_pct,
+                    target_pct=breach.target_pct,
+                )
 
     async def run_stop_loss_check(self) -> None:
         """Check all positions for trailing stop-loss triggers.
 
-        For each position, checks if the current price has dropped
-        beyond the trailing stop threshold from the highest price since entry.
+        The trigger is a price fact, so it is evaluated once per ticker against
+        the trailing high. The *exit* is per identity scope: each sleeve holding
+        the ticker is flattened through its own ledgered intent, because that is
+        the only form execution can route.
         """
         for ticker, pos_data in self._portfolio.positions.items():
             if not isinstance(pos_data, dict):
@@ -1387,31 +1539,36 @@ class RiskServiceRunner:
                 current_price=current_price,
                 highest_price_since_entry=highest,
             )
+            if decision.approved:
+                continue
 
-            if not decision.approved:
-                # Emit sell order
-                quantity = pos_data.get("quantity", 0)
-                order = ApprovedOrderMessage(
-                    ticker=ticker,
-                    timestamp=datetime.now(timezone.utc),
-                    action="sell",
-                    quantity=quantity,
-                    order_type="market",
-                    limit_price=None,
-                    recommendation_id=f"stop-loss-{uuid.uuid4()}",
-                    risk_adjustments={"stop_loss": True, "reason": decision.reason},
+            for target in self._exit_targets(ticker):
+                published = await self._emit_ledgered_exit(
+                    "stop-loss",
+                    target,
+                    exit_id=self._next_exit_id("stop-loss", target),
+                    reason=decision.reason,
+                    risk_adjustments={
+                        "stop_loss": True,
+                        "reason": decision.reason,
+                    },
+                    suppress_if_pending=True,
                 )
-
-                await self._redis.publish(
-                    APPROVED_ORDERS_STREAM,
-                    order.to_stream_dict(),
-                )
-
+                if not published:
+                    # Suppressed (a sell is already working) or unroutable — the
+                    # emitter has already logged/alerted. Raising the high-
+                    # priority trigger alert anyway would page every scan for as
+                    # long as the breach lasts, which is how alerts get muted.
+                    continue
                 await self._publish_alert(
                     event_type="stop_loss_triggered",
                     priority="high",
                     message=decision.reason,
-                    context={"ticker": ticker, "quantity": quantity},
+                    context={
+                        "ticker": ticker,
+                        "quantity": target["quantity"],
+                        "portfolio": target.get("portfolio"),
+                    },
                 )
 
     async def run_periodic_risk_checks(self) -> None:
