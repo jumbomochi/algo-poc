@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from shared.config import AppConfig
+from shared.halt_state import HaltStateRepository
 from shared.heartbeat import write_heartbeat
 from shared.liquidation import liquidation_exit_id
 from shared.logging import get_logger
@@ -29,6 +30,20 @@ ALERTS_STREAM = "stream:alerts"
 
 CONSUMER_GROUP = "execution_service"
 CONSUMER_NAME = "execution_worker_1"
+
+# Backoff between attempts to read the durable halt latch. One entry per
+# retry; the first attempt is not delayed. Exhausting the schedule raises
+# HaltStateUnavailable — it never degrades into "assume clear".
+HALT_LOOKUP_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 2.0, 4.0)
+
+
+class HaltStateUnavailable(RuntimeError):
+    """The durable halt latch could not be read.
+
+    Distinct from both "halted" and "not halted": guessing either way is
+    wrong — one silently drops orders, the other submits into a halt. The
+    message is retained (no ack, no DLQ) and paged independently.
+    """
 
 
 @dataclass(frozen=True)
@@ -67,6 +82,14 @@ class ExecutionServiceRunner:
         self._redis = redis_client
         self._order_manager = order_manager
         self._order_ledger = order_ledger
+        # Direction-aware halt gate. Reuses the ledger's session — execution
+        # owns no session of its own — so it is inert when no ledger is
+        # injected (tests, and any embedding that runs without durability).
+        self._halt_store: HaltStateRepository | None = (
+            HaltStateRepository(order_ledger.session)
+            if order_ledger is not None
+            else None
+        )
         self._logger = get_logger("execution_service")
         self._running = False
 
@@ -128,6 +151,10 @@ class ExecutionServiceRunner:
                 await self.process_approved_order(order)
                 await self._redis.ack(
                     APPROVED_ORDERS_STREAM, CONSUMER_GROUP, msg.message_id
+                )
+            except HaltStateUnavailable as exc:
+                await self._retain_for_unknown_halt_state(
+                    APPROVED_ORDERS_STREAM, msg.message_id, exc
                 )
             except Exception as exc:
                 self._logger.exception(
@@ -217,6 +244,119 @@ class ExecutionServiceRunner:
                 return intent
         return None
 
+    async def _load_active_halt(self, store: HaltStateRepository):
+        """Read the durable halt latch, retrying transient DB failures.
+
+        Raises :class:`HaltStateUnavailable` once the backoff schedule is
+        exhausted. Never returns a guess.
+        """
+        last_exc: Exception | None = None
+        attempts = len(HALT_LOOKUP_RETRY_BACKOFF_SECONDS) + 1
+        for attempt in range(attempts):
+            try:
+                halt = store.load_active_halt(mode=self._config.mode)
+            except Exception as exc:
+                last_exc = exc
+                # The read left the shared session mid-transaction; every
+                # later ledger call would fail on it.
+                try:
+                    store.session.rollback()
+                except Exception:
+                    self._logger.exception(
+                        "Rollback after a failed halt read also failed"
+                    )
+                self._logger.warning(
+                    "Halt-state read failed",
+                    attempt=attempt + 1,
+                    attempts=attempts,
+                    error=str(exc),
+                )
+                if attempt < len(HALT_LOOKUP_RETRY_BACKOFF_SECONDS):
+                    await asyncio.sleep(
+                        HALT_LOOKUP_RETRY_BACKOFF_SECONDS[attempt]
+                    )
+                continue
+            store.session.rollback()
+            return halt
+        raise HaltStateUnavailable(
+            f"unable to determine halt state after {attempts} attempts: "
+            f"{last_exc}"
+        ) from last_exc
+
+    async def _rejected_as_halted(self, order: ApprovedOrderMessage) -> bool:
+        """Durably reject ``order`` if the halt latch forbids submitting it.
+
+        Returns True when the order was rejected — the caller must not submit,
+        and its message is acked normally.
+
+        Halt enforcement path (design 3A) — the gate blocks exposure-INCREASING
+        orders only::
+
+            startup setup()                    per-message loop
+                 │                                   │
+                 ▼                                   ▼
+            PEL replay of approved orders    approved order arrives
+                 │                                   │
+                 └───────────────┬───────────────────┘
+                                 ▼
+                      HaltStateRepository check (DB latch)
+                                 │
+               ┌─────────────────┼──────────────────────┐
+               │ halted + BUY    │ halted + ledgered     │ not halted
+               ▼                 │ risk-reducing SELL    ▼
+          durably reject + ack   └──────────► submit to IB
+          (SUBMISSION_FAILED                 (orderRef=rec_id)
+           reason=halted; never
+           DLQ, never retained)
+               │ lookup FAILED (DB down):
+               ▼ retain, retry w/ backoff,
+               page "unable to determine halt state"
+
+        A halt is exactly when the risk service publishes liquidation sells to
+        this stream, so a sell never consults the latch at all — the emergency
+        flatten must not be blocked, and must not be blocked by a DB outage
+        either. Kill-initiated exits bypass this path structurally
+        (:meth:`process_kill` calls ``submit_exit`` directly).
+        """
+        store, ledger = self._halt_store, self._order_ledger
+        if store is None or ledger is None:
+            return False
+        if order.action != "buy":
+            return False
+        if await self._load_active_halt(store) is None:
+            return False
+
+        self._logger.critical(
+            "Rejecting buy: system is halted",
+            ticker=order.ticker,
+            quantity=order.quantity,
+            recommendation_id=order.recommendation_id,
+        )
+        ledger.transition(
+            order.recommendation_id,
+            OrderStatus.SUBMISSION_FAILED,
+            reason="halted",
+        )
+        self._commit_ledger()
+        # Acked by the caller, not retained: a halt is an operator-attention
+        # event, and a buy decided before the incident must not execute after
+        # the clear against a market and a book that have both moved. The
+        # intent survives as SUBMISSION_FAILED — visible, re-creatable.
+        await self._publish_alert(
+            event_type="halted_order_rejected",
+            priority="high",
+            message=(
+                f"System halted — rejected {order.action} "
+                f"{order.quantity} {order.ticker}"
+            ),
+            context={
+                "ticker": order.ticker,
+                "action": order.action,
+                "recommendation_id": order.recommendation_id,
+            },
+        )
+        return True
+
     async def process_approved_order(
         self, order: ApprovedOrderMessage
     ) -> None:
@@ -270,6 +410,12 @@ class ExecutionServiceRunner:
             # await point and IB callbacks use this same service-owned
             # session, so end the read before yielding control.
             self._order_ledger.session.rollback()
+
+        # Halt gate — see :meth:`_rejected_as_halted` for the enforcement
+        # diagram. Immediately before submission, and on the setup() PEL replay
+        # path too: a restart replays orders approved seconds before a halt.
+        if await self._rejected_as_halted(order):
+            return
 
         try:
             if order.action == "buy":
@@ -519,6 +665,33 @@ class ExecutionServiceRunner:
             )
         finally:
             self._order_ledger.session.rollback()
+
+    async def _retain_for_unknown_halt_state(
+        self, stream: str, message_id: str, exc: Exception
+    ) -> None:
+        """Leave a message in the PEL and page.
+
+        Neither an ack nor a dead-letter: an unreadable halt latch is an
+        infrastructure fault, not a poison message. The entry stays in the
+        pending list so the next ``setup()`` replay retries it once the DB is
+        reachable, and the alert is independent of the halt itself so it fires
+        even when nothing else can tell the operator anything.
+        """
+        self._logger.error(
+            "Unable to determine halt state; retaining order for retry",
+            stream=stream,
+            message_id=str(message_id),
+            error=str(exc),
+        )
+        await self._publish_alert(
+            event_type="halt_state_unavailable",
+            priority="critical",
+            message=(
+                "Unable to determine halt state; order retained unsubmitted "
+                f"on {stream}: {exc}"
+            ),
+            context={"stream": stream, "message_id": str(message_id)},
+        )
 
     async def _publish_alert(
         self,
@@ -816,6 +989,11 @@ class ExecutionServiceRunner:
         for msg in messages:
             try:
                 await handler(parser(msg.data))
+            except HaltStateUnavailable as exc:
+                await self._retain_for_unknown_halt_state(
+                    stream, msg.message_id, exc
+                )
+                continue
             except Exception as exc:
                 self._logger.exception(
                     "Poison message; sending to DLQ",
