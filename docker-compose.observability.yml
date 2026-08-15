@@ -1,5 +1,9 @@
 services:
   prometheus:
+    # KAN-14: every app service in docker-compose.yml is `unless-stopped`;
+    # without this a host reboot brought the trading stack back up with
+    # monitoring left down.
+    restart: unless-stopped
     image: prom/prometheus:v2.51.0
     ports:
       # Loopback-only, consistent with the T3 message-bus lockdown pattern
@@ -24,8 +28,10 @@ services:
       - notifications
       - portfolio-accounting
       - redis-exporter
+      - alertmanager
 
   grafana:
+    restart: unless-stopped
     image: grafana/grafana:10.4.0
     ports:
       # Loopback-only — see the prometheus ports comment above.
@@ -37,9 +43,9 @@ services:
       # finding as T3's Redis/Postgres lockdown (review Theme 5.1), just not
       # in that thread's file list. Generate one (e.g. `openssl rand -hex
       # 24`) and put it in the repo's gitignored `.env` alongside
-      # POSTGRES_PASSWORD/REDIS_PASSWORD (see .env.example on the T3
-      # message-bus-lockdown branch — merge GRAFANA_ADMIN_PASSWORD into that
-      # file once both branches land).
+      # POSTGRES_PASSWORD/REDIS_PASSWORD. (KAN-14: that merge is done —
+      # GRAFANA_ADMIN_PASSWORD is documented in .env.example, so this overlay
+      # now renders for anyone following the docs.)
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env before starting the observability stack}
       - GF_AUTH_ANONYMOUS_ENABLED=false
     volumes:
@@ -61,17 +67,64 @@ services:
   # redis_stream_entries_added series, which back the dlq-depth and
   # stream-idle/no-fills alerts in config/alert_rules.yml.
   redis-exporter:
+    restart: unless-stopped
     image: oliver006/redis_exporter:v1.62.0
     environment:
       - REDIS_ADDR=redis://redis:6379
-      # NOTE for merge with T3 (message-bus lockdown): once Redis requires
-      # auth, this also needs REDIS_PASSWORD (oliver006/redis_exporter reads
-      # it natively as REDIS_PASSWORD) sourced from the same `.env`.
+      # KAN-14: the T3 lockdown landed (docker-compose.yml runs redis-server
+      # --requirepass) and this was never updated, so every scrape got NOAUTH
+      # and none of the redis_stream_* / redis_memory_* series the DLQ,
+      # stream-idle and redis-memory alerts read actually existed.
+      # oliver006/redis_exporter reads this variable natively.
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env (see .env.example) before starting the stack}
     command:
       - "--check-streams-pattern=stream:*"
     depends_on:
       - redis
 
+  # KAN-14: alert rules that evaluate into a web UI nobody watches are not
+  # monitoring. This is the delivery half.
+  #
+  # v0.26+ is REQUIRED, not just preferred: telegram_configs.bot_token_file
+  # does not exist before it, and without it the token would have to be a
+  # literal in a config file.
+  #
+  # Independent of services/notifications ON PURPOSE — see the header comment
+  # in config/alertmanager.yml.
+  alertmanager:
+    restart: unless-stopped
+    image: prom/alertmanager:v0.27.0
+    ports:
+      # Loopback-only — see the prometheus ports comment above. This is the
+      # silence/inhibition UI; it needs no off-host reachability.
+      - "127.0.0.1:9093:9093"
+    environment:
+      # Deliberately NOT `${VAR:?}`: .env.example ships these blank (they are
+      # optional for the rest of the stack), and a required-variable guard
+      # here would make `docker compose config` fail for everyone — the exact
+      # unstartable-overlay failure this story removes. The entrypoint
+      # refuses to start with a named error instead, which fails only this
+      # container and says why.
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+    entrypoint: ["/bin/sh", "/etc/alertmanager/entrypoint.sh"]
+    command:
+      # No --config.file here: the entrypoint passes the rendered one.
+      - "--storage.path=/alertmanager"
+      - "--web.listen-address=:9093"
+    volumes:
+      - ./config/alertmanager.yml:/etc/alertmanager/alertmanager.template.yml:ro
+      - ./deploy/alertmanager/entrypoint.sh:/etc/alertmanager/entrypoint.sh:ro
+      - alertmanager_data:/alertmanager
+    tmpfs:
+      # The rendered config and the bot token live here and nowhere else:
+      # never on a writable layer, never in a named volume, never in git.
+      # uid/gid 65534 = `nobody`, the user the prom/alertmanager image runs as.
+      - /etc/alertmanager/secrets:mode=0700,uid=65534,gid=65534
+
 volumes:
   prometheus_data:
   grafana_data:
+  # Silences and the notification log — without this, a container restart
+  # re-fires every alert an operator had already silenced.
+  alertmanager_data:

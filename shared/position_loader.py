@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from shared.models.equity_snapshot import EquitySnapshot
 from shared.models.portfolio import Position
 from shared.models.portfolio_config import PortfolioConfig
-from shared.universe import lookup_sector
+from shared.universe import EXCLUDED_PORTFOLIO_PREFIX, lookup_sector
 
 
 def load_open_positions(session: Session) -> dict[str, dict[str, Any]]:
@@ -75,11 +75,16 @@ def load_portfolio_state(session: Session) -> dict[str, Any]:
     """
     positions = load_open_positions(session)
 
-    # Exclude synthetic rollup rows (e.g. "_aggregate") — including them
-    # double-counts: peak_nav read 2x NAV and tripped the circuit breaker.
+    # Exclude synthetic portfolios (the "_aggregate" rollup row, the
+    # "__drill__" tag) — including them double-counts: peak_nav read 2x NAV
+    # and tripped the circuit breaker. Prefix owned by
+    # shared.universe.is_excluded_portfolio; the SQL form is used here so the
+    # filter runs in the database rather than over a full table scan.
     total_cash = session.execute(
         select(func.coalesce(func.sum(PortfolioConfig.cash), 0.0)).where(
-            ~PortfolioConfig.portfolio.startswith("_", autoescape=True)
+            ~PortfolioConfig.portfolio.startswith(
+                EXCLUDED_PORTFOLIO_PREFIX, autoescape=True
+            )
         )
     ).scalar_one()
 
@@ -89,10 +94,15 @@ def load_portfolio_state(session: Session) -> dict[str, Any]:
     nav = float(total_cash) + market_value
 
     # Highest aggregate equity across snapshot dates (excluding synthetic
-    # rollup rows like "_aggregate", which would double the total).
+    # portfolios like "_aggregate", which would double the total, and
+    # "__drill__", whose equity is not part of the graded record).
     peak_row = session.execute(
         select(func.sum(EquitySnapshot.equity).label("total"))
-        .where(~EquitySnapshot.portfolio.startswith("_", autoescape=True))
+        .where(
+            ~EquitySnapshot.portfolio.startswith(
+                EXCLUDED_PORTFOLIO_PREFIX, autoescape=True
+            )
+        )
         .group_by(EquitySnapshot.date)
         .order_by(func.sum(EquitySnapshot.equity).desc())
         .limit(1)

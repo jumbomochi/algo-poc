@@ -1,0 +1,63 @@
+# KAN-14 (P1-11) — Alertmanager routing for config/alert_rules.yml.
+#
+# WHY A FOURTH CONTAINER RATHER THAN ROUTING THROUGH THE APP:
+# services/notifications already delivers to Telegram off `stream:alerts`, so
+# reusing it would be the smaller diff. But the highest-value rule in
+# alert_rules.yml is HeartbeatStale, which exists precisely to detect a wedged
+# notifications service — delivering that alert through the wedged service is
+# a monitor that dies with its subject. Every Prometheus alert therefore
+# leaves the host through this independent path. Reject any "simplification"
+# that routes these back through stream:alerts.
+#
+# THIS FILE IS A TEMPLATE, NOT THE RUNNING CONFIG.
+# deploy/alertmanager/entrypoint.sh renders it at container start:
+#   - $TELEGRAM_BOT_TOKEN is written to the tmpfs path `bot_token_file`
+#     points at (never on a writable layer, never in git);
+#   - the `chat_id` placeholder below is substituted with $TELEGRAM_CHAT_ID.
+# The placeholder is a real integer rather than a `${...}` marker so that
+# `amtool check-config config/alertmanager.yml` (see .github/workflows/
+# tests.yml) can validate this file as committed — Alertmanager rejects
+# chat_id 0, and does no env interpolation of its own.
+#
+# The ~/ibc hand-fork incident is the precedent for the split: a config that
+# needs a secret literal to work is a config that eventually gets one
+# committed.
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: telegram
+  # alertname+job keeps one wedged service to one message rather than one per
+  # firing rule; severity so a critical never waits behind a warning batch.
+  group_by: ["alertname", "job", "severity"]
+  group_wait: 30s
+  group_interval: 5m
+  # This system trades once a day (deploy/launchd/run_paper.sh, ~04:15 SGT),
+  # so a re-notify cadence tuned for an intraday pager would just train the
+  # operator to mute the bot. Threshold/cadence retuning is KAN-15.
+  repeat_interval: 12h
+  routes:
+    - matchers:
+        - severity = critical
+      receiver: telegram
+      group_wait: 10s
+      repeat_interval: 2h
+
+receivers:
+  - name: telegram
+    telegram_configs:
+      # Rendered by the entrypoint from $TELEGRAM_BOT_TOKEN onto a tmpfs.
+      - bot_token_file: /etc/alertmanager/secrets/telegram_token
+        # PLACEHOLDER — replaced with $TELEGRAM_CHAT_ID at container start.
+        chat_id: 1
+        send_resolved: true
+        # Empty disables Telegram-side markup parsing: alert descriptions
+        # contain PromQL, backticks and `{{ }}`, any of which can make
+        # Telegram reject an HTML/Markdown-parsed message — a rejected
+        # message is an undelivered alert.
+        parse_mode: ""
+        message: |-
+          {{ .Status | toUpper }}{{ if eq .Status "firing" }} x{{ .Alerts.Firing | len }}{{ end }} [{{ .CommonLabels.severity }}] {{ .CommonLabels.alertname }}
+          {{ range .Alerts }}- {{ .Annotations.summary }}
+          {{ end }}

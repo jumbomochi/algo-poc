@@ -1077,6 +1077,27 @@ class RiskServiceRunner:
     def _liquidation_exit_id(self, ticker: str, epoch: int) -> str:
         return liquidation_exit_id(self._config.mode, ticker, epoch)
 
+    def _approve_exit_intent(self, intent: OrderIntent) -> None:
+        """Commit a risk-side exit intent as APPROVED.
+
+        A replay that adopted an already APPROVED/SUBMITTED/terminal intent is
+        a no-op (APPROVED->APPROVED is illegal per ALLOWED_TRANSITIONS). Mirrors
+        the metrics side of :meth:`_persist_risk_approval` so a kill-path
+        approval is as visible on the operator dashboard as an entry approval.
+        """
+        approving = OrderStatus(intent.status) is OrderStatus.PROPOSED
+        account_id, mode = intent.account_id, intent.mode
+        if approving:
+            self._order_ledger.transition(
+                intent.recommendation_id, OrderStatus.APPROVED
+            )
+        self._order_ledger.session.commit()
+        if approving:
+            self._metrics.lifecycle_transitions.labels(
+                status=OrderStatus.APPROVED.value
+            ).inc()
+            self._refresh_lifecycle_metrics(account_id, mode)
+
     async def _emit_liquidation_exit(
         self, pos: dict[str, Any], *, epoch: int, reason: str
     ) -> bool:
@@ -1128,13 +1149,46 @@ class RiskServiceRunner:
                 order_type="MKT",
             )
             try:
-                self._order_ledger.create_intent(proposal)
-                self._order_ledger.session.commit()
+                # Risk IS the approver of its own exits: publishing a PROPOSED
+                # intent makes execution's record_submission an illegal
+                # PROPOSED->SUBMITTED transition *after* the IB order is live.
+                # Create and approve in one transaction. A same-economics
+                # replay is adopted here (create_intent returns the existing
+                # row) and left alone unless it is a pre-fix PROPOSED leftover.
+                self._approve_exit_intent(
+                    self._order_ledger.create_intent(proposal)
+                )
             except ConflictingOrderIntent:
-                # An intent for this deterministic id already exists (a replay or
-                # the concurrent execution-side net). Keep it — that is exactly
-                # the idempotency guarantee.
+                # Only _ensure_same_economics raises this, so a row for this
+                # kill epoch exists but disagrees with the position we are
+                # flattening (quantity, con_id, account, ...). Execution submits
+                # the published quantity verbatim, so approving that row and
+                # publishing anyway would leave a broker order the ledger
+                # contradicts — open_order_mismatch, the divergence class that
+                # blocks buys. Same call as a missing con_id: flag it loudly and
+                # publish nothing, rather than place an order we cannot back.
                 self._order_ledger.session.rollback()
+                self._logger.critical(
+                    "Cannot auto-liquidate position: exit intent conflicts",
+                    ticker=pos["ticker"],
+                    quantity=quantity,
+                    recommendation_id=exit_id,
+                )
+                await self._publish_alert(
+                    event_type="liquidation_unroutable",
+                    priority="critical",
+                    message=(
+                        f"Cannot auto-liquidate {pos['ticker']} ({quantity}): "
+                        "exit intent conflicts on economics — manual action "
+                        "required"
+                    ),
+                    context={
+                        "ticker": pos["ticker"],
+                        "quantity": quantity,
+                        "recommendation_id": exit_id,
+                    },
+                )
+                return False
             except Exception:
                 self._order_ledger.session.rollback()
                 raise

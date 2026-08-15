@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import asdict
 from datetime import date, datetime, timezone
@@ -54,6 +55,7 @@ from backtest.divergence import (
 )
 from scripts.paper_state import PaperTradingState
 from shared.config import load_config
+from shared.universe import is_excluded_portfolio
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +371,12 @@ def main() -> int:
     try:
         default_db_url = load_config("config/default.yaml").database.url
     except Exception:
-        default_db_url = "postgresql://algo:algo@localhost:5432/algo_poc"
+        # Honour ALGO_DATABASE_URL even when the config file can't be loaded, so
+        # a missing/unreadable config can't silently fall back to the wrong DB
+        # (the launchd wrapper always exports ALGO_DATABASE_URL).
+        default_db_url = os.environ.get(
+            "ALGO_DATABASE_URL", "postgresql://algo:algo@localhost:5432/algo_poc"
+        )
 
     parser = argparse.ArgumentParser(
         description="Compare live paper-trading equity to backtest expectations."
@@ -464,6 +471,20 @@ def main() -> int:
     reports: list[PortfolioDivergenceReport] = []
     live_series_by_portfolio: dict[str, dict[date, float]] = {}
     for name in portfolios:
+        # Synthetic portfolios ("__drill__", "_aggregate", "__liquidation__")
+        # are never divergence input: a drill's fills exist to prove the safety
+        # machinery works, not to be scored against a strategy baseline. Today
+        # such a sleeve is also absent from the backtest JSON and would fall
+        # through the branch below, but that is incidental — the exclusion is
+        # explicit here so it cannot silently stop working if a same-named
+        # sleeve ever appears in a baseline.
+        if is_excluded_portfolio(name):
+            print(
+                f"  ⚠ Skipping '{name}': excluded portfolio (synthetic/drill "
+                f"tag — never scored against a backtest sleeve; see "
+                f"docs/operations/drill-evidence-isolation.md)."
+            )
+            continue
         live = load_live_equity_series(state, name)
         live_series_by_portfolio[name] = live
         if name not in bt_per_portfolio:
