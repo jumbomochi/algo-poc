@@ -1,9 +1,20 @@
 name: tests
 
 on:
+  # develop is the integration branch: every PR merges there first and is
+  # verified before it is promoted to main. Two individually-green PRs can
+  # still conflict semantically once both are on develop, and nothing catches
+  # that unless the branch itself is built after the merge.
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
+
+# Cancel superseded pull_request runs only. Pushes to main and develop always
+# run to completion: a branch build is the record that the merged tree is
+# green, and a cancelled run leaves that record ambiguous.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   pytest:

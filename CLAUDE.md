@@ -124,6 +124,39 @@ Environment variables take precedence over `config/default.yaml`:
 - Stream message schemas live in `shared/schemas/messages.py`
 - Each service Dockerfile builds from Python 3.12-slim and sets `ENTRYPOINT ["python", "-m", "services.<name>.runner"]`
 
+## Branch Flow — develop is the integration branch
+
+```
+feature branch  ──PR──>  develop  ──PR──>  main
+                          (verify)         (production)
+```
+
+- **Never commit or push directly to `main` or `develop`.** All work lands
+  through a PR. `develop` enforces this with branch protection; `main` does
+  not, so on `main` it is a rule you follow rather than one the server keeps.
+- **`main` is production.** The launchd jobs, the paper book, and the live IB
+  account all run from what is on `main`. Only promote to `main` from
+  `develop`, and only after develop's CI is green on the merged tree.
+- **Branch off `develop`, not `main`.** `develop` contains everything `main`
+  has plus whatever is awaiting promotion; branching off `main` reintroduces
+  conflicts that were already resolved.
+- **CI runs on both PRs and branch pushes.** `.github/workflows/tests.yml` and
+  `security.yml` build every PR and every push to `main`/`develop`. The
+  post-merge build on `develop` is the one that catches two individually-green
+  PRs that conflict semantically once both have landed.
+- **Required checks on `develop`:** `pytest (full suite)`,
+  `pip-audit (dependency vulnerability scan)`,
+  `lockfile matches pyproject.toml`, `amtool check-config`. Renaming a job
+  renames its check and blocks merges until the protection rule is updated to
+  match.
+- **Admins are not enforced** on `develop` — a genuinely urgent fix can be
+  merged red, as with the 2026-08-14 KAN-16 secrets outage. Doing so is a
+  deliberate override: record the reason in a PR comment.
+- CI depth is unit-level by design (self-contained suite, sqlite in
+  `tmp_path`, no service containers). Real Postgres, `alembic upgrade head`
+  against it, and `docker compose build` are **not** covered — verify those by
+  hand before promoting anything that touches migrations or images.
+
 ## Destructive Actions — Human Confirmation Required
 
 This repo runs a real trading system with state that cannot be recreated

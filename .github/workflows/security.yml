@@ -1,12 +1,21 @@
 name: security
 
 on:
+  # See tests.yml for why develop is built on push as well as on PR.
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
   schedule:
     # Weekly scan for newly-disclosed CVEs in already-pinned dependencies.
+    # GitHub only fires schedule triggers on the default branch, so this runs
+    # from main regardless of what is listed above — adding develop to the
+    # push list does not give develop its own weekly scan.
     - cron: "0 6 * * 1"
+
+# Cancel superseded pull_request runs only; see tests.yml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   pip-audit:
