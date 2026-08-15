@@ -1072,7 +1072,36 @@ class RiskServiceRunner:
 
         targets = load_liquidation_targets(self._order_ledger.session)
         self._order_ledger.session.rollback()
-        return targets
+        return self._merge_by_ticker(targets)
+
+    @staticmethod
+    def _merge_by_ticker(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Collapse identity-scoped rows back to one row per ticker for the
+        kill path only (KAN-6).
+
+        ``load_liquidation_targets`` returns one row per
+        {account, portfolio, con_id} so a stop-loss can exit one sleeve without
+        touching another. The kill path cannot use that granularity yet: its
+        exit id is ``liq-{mode}-{ticker}-{epoch}``, and the execution service's
+        defense-in-depth net derives the identical id from its own ticker-keyed
+        book — both sides must agree or a kill double-sells. Feeding two
+        same-ticker rows into the emitter would mint one id with two different
+        economics, so the second raises ConflictingOrderIntent and that sleeve's
+        shares go un-flattened mid-kill.
+
+        A kill flattens the whole book, so summing the ticker is the right
+        quantity; the surviving inaccuracy is which sleeve the exit is booked
+        against. Fixing that requires an identity-scoped kill id on both
+        services (see KAN-7's :func:`exit_intent_id`) — out of scope here.
+        """
+        merged: dict[str, dict[str, Any]] = {}
+        for row in targets:
+            existing = merged.get(row["ticker"])
+            if existing is None:
+                merged[row["ticker"]] = dict(row)
+            else:
+                existing["quantity"] += row["quantity"]
+        return list(merged.values())
 
     def _liquidation_exit_id(self, ticker: str, epoch: int) -> str:
         return liquidation_exit_id(self._config.mode, ticker, epoch)
