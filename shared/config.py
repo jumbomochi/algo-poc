@@ -107,6 +107,22 @@ class IBConfig(BaseModel):
     # ad-hoc probes 42+.)
     client_id: int = 1
     data_client_id: int = 2
+    # The exact account this system is allowed to trade (e.g. "DUN551088").
+    # A DU/U prefix check proves the account *type*, not its identity — a
+    # second paper account, or a Gateway repointed at a different one, passes
+    # the prefix guard and takes the orders. When set, the execution session
+    # must serve exactly this account and every order is stamped with it.
+    # None = unpinned (prefix guard only), which is the pre-existing behaviour.
+    account_id: str | None = None
+
+    @model_validator(mode="after")
+    def _blank_account_id_means_unpinned(self) -> "IBConfig":
+        # An empty ALGO_IB_ACCOUNT_ID (the shape .env.example ships, and what
+        # compose interpolates when the var is absent) means "not configured",
+        # not "pin to the empty account" — which would refuse every session.
+        if self.account_id is not None and not self.account_id.strip():
+            self.account_id = None
+        return self
 
 
 class DatabaseConfig(BaseModel):
@@ -211,6 +227,7 @@ ENV_MAP: dict[str, str] = {
     "ALGO_DATABASE_URL": "database.url",
     "ALGO_REDIS_URL": "redis.url",
     "ALGO_IB_HOST": "ib.host",  # containers set this to host.docker.internal
+    "ALGO_IB_ACCOUNT_ID": "ib.account_id",
 }
 
 

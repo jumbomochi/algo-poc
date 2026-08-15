@@ -95,6 +95,12 @@ ib:
   paper_port: 7497
   client_id: 1        # execution service — every concurrent client needs a distinct id
   data_client_id: 2   # data_ingestion service
+  # The exact account execution is allowed to trade, e.g. "DUN551088". The
+  # DU/U prefix guard proves the account TYPE, not its identity — set this and
+  # the session must serve exactly this account, and every order is stamped
+  # with it. Override per environment with ALGO_IB_ACCOUNT_ID.
+  # null = unpinned (prefix guard only).
+  account_id: null
 
 notifications:
   slack_enabled: false

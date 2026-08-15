@@ -116,11 +116,16 @@ class IBExecutor:
         client_id: int,
         allow_fractional: bool = False,
         state_dir: str | Path | None = None,
+        account_id: str | None = None,
     ) -> None:
         self._host = host
         self._port = port
         self._client_id = client_id
         self._allow_fractional = allow_fractional
+        # The one account this executor may trade. Read from executor state at
+        # submission time rather than passed per order, so the submit_*
+        # signatures stay as they are.
+        self._account_id = account_id
         self._ib = None  # Will hold ib_insync.IB instance
         self._trades: dict[str, Any] = {}  # order_id -> ib_insync.Trade
         self._trade_meta: dict[str, tuple[str, str]] = {}  # order_id -> (ticker, side)
@@ -160,6 +165,15 @@ class IBExecutor:
             placed=rounded,
         )
         return rounded
+
+    def _stamp_account(self, order: Any) -> None:
+        """Bind the order to the configured account at the broker.
+
+        Left untouched when unpinned, so the Gateway keeps picking the
+        session's account exactly as it did before.
+        """
+        if self._account_id is not None:
+            order.account = self._account_id
 
     @property
     def is_connected(self) -> bool:
@@ -230,6 +244,10 @@ class IBExecutor:
                 against the Gateway being logged into a LIVE session on the
                 paper port — which happened on 2026-07-04 (live account
                 U-prefix answering on 7497 after a manual live login).
+
+        When ``account_id`` was configured, the session must additionally
+        serve exactly that one account. The prefix guard proves the account
+        *type*; only this proves its identity.
         """
         self._expect_paper = expect_paper
         try:
@@ -266,6 +284,22 @@ class IBExecutor:
                         f"account(s) {paper} on port {self._port}. "
                         "Re-login the Gateway with the live credentials."
                     )
+
+            if self._account_id is not None and list(accounts) != [
+                self._account_id
+            ]:
+                # Exactly one, and exactly the right one. A second account in
+                # the session is refused even when the configured one is
+                # present: an ambiguous session is how orders reach the wrong
+                # book (the same rule IBAccountReader.snapshot() enforces).
+                self._ib.disconnect()
+                self._ib = None
+                raise WrongAccountTypeError(
+                    f"Configured to trade account {self._account_id!r} but the "
+                    f"Gateway session on port {self._port} serves "
+                    f"{list(accounts)!r}. Re-point the Gateway at "
+                    f"{self._account_id} or correct ib.account_id."
+                )
 
             # A reconnect recreates the IB client, orphaning the fill/status
             # callbacks bound to the previous Trade objects. Re-register them for
@@ -610,6 +644,7 @@ class IBExecutor:
         order = LimitOrder("BUY", quantity, limit_price, tif="DAY")
         if recommendation_id is not None:
             order.orderRef = recommendation_id
+        self._stamp_account(order)
         trade = self._ib.placeOrder(contract, order)
         order_id = str(trade.order.orderId)
         self._register_trade(order_id, trade, ticker=ticker, side="buy")
@@ -640,6 +675,7 @@ class IBExecutor:
         order = MarketOrder("SELL", quantity, tif="DAY")
         if recommendation_id is not None:
             order.orderRef = recommendation_id
+        self._stamp_account(order)
         trade = self._ib.placeOrder(contract, order)
         order_id = str(trade.order.orderId)
         self._register_trade(order_id, trade, ticker=ticker, side="sell")

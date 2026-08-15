@@ -142,6 +142,39 @@ def test_paper_entries_enabled_and_guarded_by_reconciliation():
     assert major.entries_allowed is False
 
 
+def test_ib_account_id_defaults_to_none(tmp_path):
+    """Unset means "no pin" — behaviour is unchanged for anyone who has not
+    configured an account id."""
+    path = tmp_path / "config.yaml"
+    path.write_text("mode: paper\n")
+
+    config = load_config(str(path))
+
+    assert config.ib.account_id is None
+
+
+def test_ib_account_id_from_yaml_and_env_override(tmp_path, monkeypatch):
+    path = tmp_path / "config.yaml"
+    path.write_text("mode: paper\nib:\n  account_id: DUN551088\n")
+
+    assert load_config(str(path)).ib.account_id == "DUN551088"
+
+    monkeypatch.setenv("ALGO_IB_ACCOUNT_ID", "DU9999999")
+    assert load_config(str(path)).ib.account_id == "DU9999999"
+
+
+def test_blank_ib_account_id_is_unpinned_not_an_empty_pin(tmp_path, monkeypatch):
+    """`.env.example` ships ALGO_IB_ACCOUNT_ID= empty, and compose interpolates
+    an absent var to "". That must mean unpinned — an empty pin would refuse
+    every Gateway session."""
+    path = tmp_path / "config.yaml"
+    path.write_text("mode: paper\nib:\n  account_id: DUN551088\n")
+
+    monkeypatch.setenv("ALGO_IB_ACCOUNT_ID", "")
+
+    assert load_config(str(path)).ib.account_id is None
+
+
 def test_research_shadow_is_disabled_by_default(tmp_path):
     path = tmp_path / "config.yaml"
     path.write_text("mode: paper\n")
