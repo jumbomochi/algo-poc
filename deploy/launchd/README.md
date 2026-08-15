@@ -50,14 +50,43 @@ eval "$(deploy/launchd/secrets.sh --export)"   # for docker compose / a shell
 
 `secrets.sh` is deliberately **not** deployed to `~/ibc` — it is sourced from
 the repo so there is exactly one copy of the lookup logic and it cannot drift
-the way the hand-copied wrappers did. `deadman.sh` (below) is excluded for the
-same reason.
+the way the hand-copied wrappers did. `deadman.sh` (below) and
+`lib/telegram.sh` (next section) are excluded for the same reason.
 
 Two further accounts are **optional** (`$ALGO_OPTIONAL_SECRET_NAMES`):
 `DEADMAN_WATCHDOG_URL` and `ALGO_DEADMAN_PAPER_URL`. `--import` prompts for
 them and `--check` reports them, but their absence does not make `--check`
 exit non-zero — that status means "the stack cannot authenticate", which is a
 different problem from "no external check is watching this host".
+
+## Sending alerts: `lib/telegram.sh`
+
+Every wrapper sends Telegram alerts through the single `telegram()` defined in
+**`lib/telegram.sh`**, sourced by path from the repo right after `secrets.sh`:
+
+```bash
+ALGO_JOB_LABEL="divergence monitor"
+. "$ALGO_DIR/deploy/launchd/lib/telegram.sh"
+telegram "🚨 something happened"
+```
+
+Until KAN-43 each of the six wrappers carried its own hand-copied copy, and
+they had already drifted: four raised `algo_alert_local` when no credential
+resolved and two did not, so on a locked keychain those two failed silently —
+the exact hole KAN-16 was opened to close. One copy means a fix (a timeout, a
+retry) lands everywhere at once.
+
+It lives under `lib/` so `deploy.sh`'s `"$SRC"/*.sh` glob cannot reach it: like
+`secrets.sh` and `deadman.sh` it is **never** deployed to `~/ibc`, because a
+copy there would be a decoy an operator could edit with no effect.
+
+`telegram()` always returns 0 — a job's own verdict outranks the delivery of
+its notification, and no wrapper's exit code may depend on Telegram.
+
+**After changing any wrapper, run `deploy/launchd/deploy.sh`** to resync
+`~/ibc`. No plist changed for KAN-43, so no `launchctl` reload is needed. To
+confirm delivery end-to-end afterwards, use
+`python scripts/ops/send_test_alert.py`.
 
 ## Dead-man switches: `deadman.sh`
 
@@ -147,9 +176,30 @@ the 04:15 `local.algo-paper-trading` job has written that day's
   3 = baseline not comparable → the monitor is **BLIND** (every report forced to
   `NO_DATA`; regenerate the baseline per
   [backtest-baseline.md](../../docs/operations/backtest-baseline.md) — do NOT
-  read exit 3 as OK). The wrapper logs the appropriate level; real alert/page
-  channels are stubbed until `notifications` are enabled in
-  `config/default.yaml`.
+  read exit 3 as OK).
+- **Alerting (KAN-43):** exit 1, 2 and 3 each send **exactly one** Telegram
+  message; exit 0 sends nothing, so a healthy day never trains you to ignore
+  the channel. The body is rendered by
+  [`scripts/ops/divergence_alert.py`](../../scripts/ops/divergence_alert.py)
+  from the monitor's own JSON report (`output/divergence_YYYYMMDD.json`), so a
+  BREACH names the breaching sleeves and their divergence, and a BLIND run
+  names which like-for-like requirement the baseline failed. If rendering
+  fails the wrapper falls back to a generic message — never to silence. A
+  failed send never changes the wrapper's exit code. Bodies are capped below
+  Telegram's 4096-char limit, and any password in a logged DSN is redacted
+  before it leaves the host.
+- **Attributing artifacts to the run:** the wrapper stamps `RUN_STARTED` and
+  the log's byte offset just before invoking the monitor, and passes both to
+  the renderer. A report older than the run start is treated as absent — exit 1
+  does not prove a breach (the monitor ends in `sys.exit(main())`, so an
+  uncaught exception exits 1 too), and an earlier same-day run's report must
+  never be narrated as this one's.
+- **Test-only env hooks:** `ALGO_DIR`, `ALGO_PYTHON` and
+  `ALGO_DIVERGENCE_REPORT` exist so the test suite can drive the wrapper
+  end-to-end against stubs. launchd starts jobs with an empty environment, so
+  production always takes the defaults. **Never export them in a login shell** —
+  a manual run would then use whatever tree, interpreter, or report path they
+  point at, and `ALGO_PYTHON` swaps the interpreter for the monitor too.
 
 ### Install / reload
 

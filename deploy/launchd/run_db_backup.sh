@@ -29,30 +29,13 @@ ALGO_DIR="/Users/huiliang/GitHub/algo-poc"
 ALGO_SECRETS_ENV_FILE="$ALGO_DIR/.env"   # regular-file fallback only
 # shellcheck source=deploy/launchd/secrets.sh
 . "$ALGO_DIR/deploy/launchd/secrets.sh"
+# Shared best-effort Telegram sender (KAN-43), sourced by path for the same
+# reason: one copy of the credential-reading logic that cannot drift.
+ALGO_JOB_LABEL="db backup"
+# shellcheck source=deploy/launchd/lib/telegram.sh
+. "$ALGO_DIR/deploy/launchd/lib/telegram.sh"
 
 ts() { date "+%Y-%m-%d %H:%M:%S %Z"; }
-
-telegram() {
-    # Best-effort Telegram alert; never fails the backup job. A missing
-    # credential is LOGGED, never silently swallowed — the old
-    # `[ -f "$ENV_FILE" ] || return 0` guard was FALSE for the 1Password FIFO
-    # that replaced .env on 2026-08-12, muting every alert channel at once.
-    local token chat
-    if ! algo_secret_into TELEGRAM_BOT_TOKEN; then
-        echo "$(ts): WARNING - cannot send alert: $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
-        algo_alert_local "db backup cannot alert: $ALGO_SECRETS_ERROR"
-        return 0
-    fi
-    token="$_ALGO_SECRET_VALUE"
-    if ! algo_secret_into TELEGRAM_CHAT_ID; then
-        echo "$(ts): WARNING - cannot send alert: $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
-        algo_alert_local "db backup cannot alert: $ALGO_SECRETS_ERROR"
-        return 0
-    fi
-    chat="$_ALGO_SECRET_VALUE"
-    curl -s -m 10 "https://api.telegram.org/bot${token}/sendMessage" \
-        -d chat_id="$chat" --data-urlencode text="$1" >/dev/null 2>&1 || true
-}
 
 fail() {
     echo "$(ts): ERROR - $1" >> "$LOG_FILE"

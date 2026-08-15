@@ -16,40 +16,57 @@
 
 set -uo pipefail
 
-ALGO_DIR="/Users/huiliang/GitHub/algo-poc"
-VENV="$ALGO_DIR/.venv/bin/python"
+# ALGO_DIR / ALGO_PYTHON / ALGO_DIVERGENCE_REPORT are overridable only so
+# tests/deploy/test_divergence_alerting.py can drive this wrapper end-to-end
+# against stubs — launchd starts jobs with an empty environment, so production
+# always takes the defaults. Never export any of the three in a login shell: a
+# manual run would then use whatever tree, interpreter or report path they
+# point at. ALGO_PYTHON swaps the interpreter for the monitor too, not just for
+# the alert renderer.
+ALGO_DIR="${ALGO_DIR:-/Users/huiliang/GitHub/algo-poc}"
+VENV="${ALGO_PYTHON:-$ALGO_DIR/.venv/bin/python}"
 LOG_DIR="$HOME/ibc/logs"
 METRICS_DIR="$HOME/ibc/metrics"
 LOG_FILE="$LOG_DIR/divergence_$(date +%Y%m%d).log"
 PROM_FILE="$METRICS_DIR/divergence.prom"
+# Passed to the monitor explicitly (it would default to the same path) so the
+# alert renderer knows exactly which report to read back.
+REPORT_FILE="${ALGO_DIVERGENCE_REPORT:-$ALGO_DIR/output/divergence_$(date +%Y%m%d).json}"
+# Stamped just before the monitor runs, so the renderer can tell this run's
+# artifacts from an earlier same-day run's. Initialised here because `set -u`
+# is on and the early-abort paths below exit before they are stamped.
+RUN_STARTED=0
+LOG_OFFSET=0
 # Secrets come from the macOS login keychain via the shared loader. Sourced by
 # path from the repo (never from the deployed ~/ibc copy) so there is exactly
 # one implementation of the lookup and it cannot drift.
 ALGO_SECRETS_ENV_FILE="$ALGO_DIR/.env"   # regular-file fallback only
 # shellcheck source=deploy/launchd/secrets.sh
 . "$ALGO_DIR/deploy/launchd/secrets.sh"
+# Shared best-effort Telegram sender (KAN-43), sourced by path for the same
+# reason: one copy of the credential-reading logic that cannot drift.
+ALGO_JOB_LABEL="divergence monitor"
+# shellcheck source=deploy/launchd/lib/telegram.sh
+. "$ALGO_DIR/deploy/launchd/lib/telegram.sh"
+
+# Render the alert body from the monitor's own JSON report, so the message
+# names the breaching sleeves / the unmet baseline requirement rather than just
+# saying "something happened". A rendering failure must degrade to the generic
+# text, never to silence — being told nothing is the failure mode this job
+# exists to remove. $1 = exit code, $2 = fallback text.
+divergence_alert_text() {
+    local text
+    text=$("$VENV" "$ALGO_DIR/scripts/ops/divergence_alert.py" \
+               --exit-code "$1" --report "$REPORT_FILE" --log "$LOG_FILE" \
+               --not-before "$RUN_STARTED" --log-offset "$LOG_OFFSET" \
+               2>>"$LOG_FILE") || text=""
+    [ -n "$text" ] || text="$2"
+    printf '%s' "$text"
+}
 
 mkdir -p "$LOG_DIR" "$METRICS_DIR"
 
 echo "$(date): Starting daily divergence monitor" >> "$LOG_FILE"
-
-# Best-effort Telegram alert. A missing credential is LOGGED, never silently
-# swallowed — muting this is what hid the 2026-08-13/14 outage for two days.
-telegram() {
-    local token chat
-    if ! algo_secret_into TELEGRAM_BOT_TOKEN; then
-        echo "$(date): WARNING - cannot send alert: $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
-        return 0
-    fi
-    token="$_ALGO_SECRET_VALUE"
-    if ! algo_secret_into TELEGRAM_CHAT_ID; then
-        echo "$(date): WARNING - cannot send alert: $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
-        return 0
-    fi
-    chat="$_ALGO_SECRET_VALUE"
-    curl -s -m 10 "https://api.telegram.org/bot${token}/sendMessage" \
-        -d chat_id="$chat" --data-urlencode text="$1" >/dev/null 2>&1 || true
-}
 
 # Drift guard: warn loudly if this deployed copy has fallen behind the repo
 # canonical. On 2026-08-11 the deployed copy was a stale pre-T3 revision (old
@@ -98,7 +115,16 @@ if ! wait_for_port 127.0.0.1 55432 "paper DB (docker compose up?)" 300; then
 fi
 
 cd "$ALGO_DIR"
+# Everything the renderer reads back must be attributable to THIS run: a report
+# left by an earlier run today would otherwise be narrated as this one's, and
+# exit 1 does not prove a breach (the monitor ends in `sys.exit(main())`, so an
+# uncaught exception exits 1 too).
+RUN_STARTED=$(date +%s)
+LOG_OFFSET=$(wc -c < "$LOG_FILE" 2>/dev/null | tr -d ' ')
+[ -n "$LOG_OFFSET" ] || LOG_OFFSET=0
+
 "$VENV" scripts/divergence_monitor.py \
+    --output "$REPORT_FILE" \
     --prometheus-textfile "$PROM_FILE" \
     >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
@@ -109,12 +135,12 @@ case "$EXIT_CODE" in
         ;;
     1)
         echo "$(date): ALERT - divergence BREACH (exit 1)" >> "$LOG_FILE"
-        telegram "🚨 Divergence BREACH ($(date +%F)) — live paper equity has diverged from the backtest baseline. See $LOG_FILE"
+        telegram "$(divergence_alert_text 1 "🚨 Divergence BREACH ($(date +%F)) — live paper equity has diverged from the backtest baseline. See $LOG_FILE")"
         ;;
     2)
         echo "$(date): PAGE - divergence monitor hard error (exit 2)" >> "$LOG_FILE"
         algo_alert_local "divergence monitor hard error (exit 2) — see $LOG_FILE"
-        telegram "🚨 Divergence monitor HARD ERROR (exit 2) on $(date +%F). See $LOG_FILE"
+        telegram "$(divergence_alert_text 2 "🚨 Divergence monitor HARD ERROR (exit 2) on $(date +%F). See $LOG_FILE")"
         ;;
     3)
         echo "$(date): ALERT - divergence monitor BLIND: baseline backtest is not" \
@@ -122,7 +148,7 @@ case "$EXIT_CODE" in
              "baseline is regenerated - see docs/operations/backtest-baseline.md" \
              >> "$LOG_FILE"
         # A blind monitor is an outage, not a pass.
-        telegram "⚠️ Divergence monitor is BLIND (exit 3): the baseline backtest is not comparable to live, so every report is forced to NO_DATA. No drift detection is running. Regenerate per docs/operations/backtest-baseline.md"
+        telegram "$(divergence_alert_text 3 "⚠️ Divergence monitor is BLIND (exit 3): the baseline backtest is not comparable to live, so every report is forced to NO_DATA. No drift detection is running. Regenerate per docs/operations/backtest-baseline.md")"
         ;;
     *)
         echo "$(date): UNEXPECTED exit code $EXIT_CODE from divergence monitor" >> "$LOG_FILE"
