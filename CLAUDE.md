@@ -132,8 +132,9 @@ feature branch  ──PR──>  develop  ──PR──>  main
 ```
 
 - **Never commit or push directly to `main` or `develop`.** All work lands
-  through a PR. `develop` enforces this with branch protection; `main` does
-  not, so on `main` it is a rule you follow rather than one the server keeps.
+  through a PR. This is a rule you follow, not one the server keeps — see
+  "the protection does not bind you" below. Agents must treat it as absolute:
+  never push to either branch, whatever the API allows.
 - **`main` is production.** The launchd jobs, the paper book, and the live IB
   account all run from what is on `main`. Only promote to `main` from
   `develop`, and only after develop's CI is green on the merged tree.
@@ -149,9 +150,14 @@ feature branch  ──PR──>  develop  ──PR──>  main
   `lockfile matches pyproject.toml`, `amtool check-config`. Renaming a job
   renames its check and blocks merges until the protection rule is updated to
   match.
-- **Admins are not enforced** on `develop` — a genuinely urgent fix can be
-  merged red, as with the 2026-08-14 KAN-16 secrets outage. Doing so is a
-  deliberate override: record the reason in a PR comment.
+- **The protection does not bind you.** `develop` is protected with
+  `enforce_admins: false`, and the repo has no non-admin collaborators — so
+  the owner, and any agent holding the owner's token, can still push directly
+  and still merge red. This is deliberate: it preserves the escape hatch used
+  for the 2026-08-14 KAN-16 secrets outage, where merging red was the right
+  call. Treat the rules as binding anyway, and when you do override, record
+  the reason in a PR comment. `main` has no protection at all.
+  Flip with `gh api -X PUT repos/jumbomochi/algo-poc/branches/develop/protection/enforce_admins`.
 - CI depth is unit-level by design (self-contained suite, sqlite in
   `tmp_path`, no service containers). Real Postgres, `alembic upgrade head`
   against it, and `docker compose build` are **not** covered — verify those by
