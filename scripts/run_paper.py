@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from copy import deepcopy
 from dataclasses import dataclass
@@ -1212,8 +1213,15 @@ def main():
         default_redis_url = _config.redis.url
     except Exception:
         _config = AppConfig()
-        default_db_url = "postgresql://algo:algo@localhost:5432/algo_poc"
-        default_redis_url = "redis://localhost:6379/0"
+        # Honour the env overrides even when the config file can't be loaded, so
+        # a missing/unreadable config can't silently point at the wrong DB (the
+        # launchd wrappers always export ALGO_DATABASE_URL / ALGO_REDIS_URL).
+        default_db_url = os.environ.get(
+            "ALGO_DATABASE_URL", "postgresql://algo:algo@localhost:5432/algo_poc"
+        )
+        default_redis_url = os.environ.get(
+            "ALGO_REDIS_URL", "redis://localhost:6379/0"
+        )
 
     args = _parser(default_db_url, default_redis_url).parse_args()
 
