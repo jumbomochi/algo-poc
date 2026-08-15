@@ -31,3 +31,31 @@ jobs:
         run: pip install --no-deps -e .
       - name: Run the suite
         run: pytest -q
+
+  alertmanager-config:
+    name: amtool check-config
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      # Pinned to the same tag as the image in
+      # docker-compose.observability.yml — validating the config with a
+      # different Alertmanager version than the one that runs it is a green
+      # check that proves nothing.
+      # tests/deploy/test_observability_healthchecks.py asserts the two stay
+      # in step.
+      - name: Install amtool (pinned to the alertmanager image tag)
+        env:
+          ALERTMANAGER_VERSION: "0.27.0"
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://github.com/prometheus/alertmanager/releases/download/v${ALERTMANAGER_VERSION}/alertmanager-${ALERTMANAGER_VERSION}.linux-amd64.tar.gz" \
+            | tar -xz
+          sudo install "alertmanager-${ALERTMANAGER_VERSION}.linux-amd64/amtool" /usr/local/bin/amtool
+      # config/alertmanager.yml is a secret-free template (the entrypoint
+      # renders the token and chat_id at container start), so it is
+      # checkable exactly as committed. A malformed route silences alerts,
+      # and the only way to notice that at runtime is an alert that never
+      # arrives — which is indistinguishable from a healthy system.
+      - name: Check the Alertmanager routing config
+        run: amtool check-config config/alertmanager.yml

@@ -18,7 +18,11 @@ docker compose up
 # Rebuild Docker images after code changes
 docker compose build
 
-# Start with observability stack (Prometheus + Grafana)
+# Start with observability stack (Prometheus + Grafana + Alertmanager).
+# Needs GRAFANA_ADMIN_PASSWORD in .env. Alertmanager delivers Prometheus
+# alerts to Telegram independently of the notifications service, so it also
+# needs TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID and refuses to start without
+# them rather than coming up as a silent monitor.
 docker compose -f docker-compose.yml -f docker-compose.observability.yml up
 ```
 
