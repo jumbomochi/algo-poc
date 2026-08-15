@@ -28,28 +28,15 @@ PROM_FILE="$METRICS_DIR/divergence.prom"
 ALGO_SECRETS_ENV_FILE="$ALGO_DIR/.env"   # regular-file fallback only
 # shellcheck source=deploy/launchd/secrets.sh
 . "$ALGO_DIR/deploy/launchd/secrets.sh"
+# Shared best-effort Telegram sender (KAN-43), sourced by path for the same
+# reason: one copy of the credential-reading logic that cannot drift.
+ALGO_JOB_LABEL="divergence monitor"
+# shellcheck source=deploy/launchd/lib/telegram.sh
+. "$ALGO_DIR/deploy/launchd/lib/telegram.sh"
 
 mkdir -p "$LOG_DIR" "$METRICS_DIR"
 
 echo "$(date): Starting daily divergence monitor" >> "$LOG_FILE"
-
-# Best-effort Telegram alert. A missing credential is LOGGED, never silently
-# swallowed — muting this is what hid the 2026-08-13/14 outage for two days.
-telegram() {
-    local token chat
-    if ! algo_secret_into TELEGRAM_BOT_TOKEN; then
-        echo "$(date): WARNING - cannot send alert: $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
-        return 0
-    fi
-    token="$_ALGO_SECRET_VALUE"
-    if ! algo_secret_into TELEGRAM_CHAT_ID; then
-        echo "$(date): WARNING - cannot send alert: $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
-        return 0
-    fi
-    chat="$_ALGO_SECRET_VALUE"
-    curl -s -m 10 "https://api.telegram.org/bot${token}/sendMessage" \
-        -d chat_id="$chat" --data-urlencode text="$1" >/dev/null 2>&1 || true
-}
 
 # Drift guard: warn loudly if this deployed copy has fallen behind the repo
 # canonical. On 2026-08-11 the deployed copy was a stale pre-T3 revision (old

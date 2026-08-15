@@ -34,35 +34,14 @@ ALGO_DIR="/Users/huiliang/GitHub/algo-poc"
 ALGO_SECRETS_ENV_FILE="$ALGO_DIR/.env"   # regular-file fallback only
 # shellcheck source=deploy/launchd/secrets.sh
 . "$ALGO_DIR/deploy/launchd/secrets.sh"
+# Shared best-effort Telegram sender (KAN-43), sourced by path for the same
+# reason: one copy of the credential-reading logic that cannot drift.
+ALGO_JOB_LABEL="watchdog"
+# shellcheck source=deploy/launchd/lib/telegram.sh
+. "$ALGO_DIR/deploy/launchd/lib/telegram.sh"
 
 mkdir -p "$LOG_DIR"
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
-
-telegram() {
-    # Best-effort Telegram alert; never fails the watchdog.
-    #
-    # This used to open with `[ -f "$ENV_FILE" ] || return 0`. On 2026-08-12
-    # `.env` became a 1Password FIFO, for which `-f` is FALSE — so this
-    # returned *success* and the watchdog quietly stopped alerting. The paper
-    # run had already been dead for two days before anyone noticed. Never
-    # swallow a missing credential: log it, and raise the secret-free local
-    # alert so the failure is visible even when there is no token to send with.
-    local token chat
-    if ! algo_secret_into TELEGRAM_BOT_TOKEN; then
-        echo "$(ts): WARNING - cannot send alert: $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
-        algo_alert_local "watchdog cannot alert: $ALGO_SECRETS_ERROR"
-        return 0
-    fi
-    token="$_ALGO_SECRET_VALUE"
-    if ! algo_secret_into TELEGRAM_CHAT_ID; then
-        echo "$(ts): WARNING - cannot send alert: $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
-        algo_alert_local "watchdog cannot alert: $ALGO_SECRETS_ERROR"
-        return 0
-    fi
-    chat="$_ALGO_SECRET_VALUE"
-    curl -s -m 10 "https://api.telegram.org/bot${token}/sendMessage" \
-        -d chat_id="$chat" --data-urlencode text="$1" >/dev/null 2>&1 || true
-}
 
 # Drift guard: warn loudly if this deployed copy has fallen behind the repo
 # canonical. The 2026-08-11 cold-boot auth failure was a stale ~/ibc copy still

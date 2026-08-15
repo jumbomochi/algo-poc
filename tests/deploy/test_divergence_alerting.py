@@ -153,3 +153,54 @@ def test_cli_prints_the_breach_message(tmp_path):
     )
     assert res.returncode == 0, res.stderr
     assert "momentum" in res.stdout
+
+
+# ---------------------------------------------------------------------------
+# The shared telegram() helper (AC5)
+# ---------------------------------------------------------------------------
+
+DEPLOY_DIR = REPO / "deploy" / "launchd"
+TELEGRAM_LIB = DEPLOY_DIR / "lib" / "telegram.sh"
+WRAPPERS = (
+    DEPLOY_DIR / "run_paper.sh",
+    DEPLOY_DIR / "run_divergence.sh",
+    DEPLOY_DIR / "run_pipeline_report.sh",
+    DEPLOY_DIR / "run_db_backup.sh",
+    DEPLOY_DIR / "run_backtest_refresh.sh",
+    DEPLOY_DIR / "gateway_watchdog.sh",
+)
+
+
+def test_the_shared_telegram_helper_exists():
+    assert TELEGRAM_LIB.is_file(), "deploy/launchd/lib/telegram.sh is missing"
+    text = TELEGRAM_LIB.read_text()
+    assert "telegram()" in text
+    assert "api.telegram.org" in text
+
+
+def test_no_wrapper_defines_its_own_telegram_copy():
+    """AC5. Six copies of a credential-reading function is a maintenance
+    hazard: a fix to one (a timeout, say) silently misses the other five."""
+    offenders = [w.name for w in WRAPPERS if "\ntelegram() {" in w.read_text()]
+    assert offenders == [], f"wrappers still define their own telegram(): {offenders}"
+
+
+def test_every_wrapper_sources_the_shared_helper():
+    for wrapper in WRAPPERS:
+        text = wrapper.read_text()
+        assert 'deploy/launchd/lib/telegram.sh"' in text, (
+            f"{wrapper.name} does not source the shared telegram helper"
+        )
+        assert "ALGO_JOB_LABEL=" in text, (
+            f"{wrapper.name} must name itself for the 'cannot alert' path"
+        )
+
+
+def test_the_shared_helper_is_not_deployed_to_ibc():
+    """It is sourced by path from the repo, like secrets.sh and deadman.sh. A
+    copy under ~/ibc would be a decoy an operator could edit with no effect."""
+    deploy_sh = (DEPLOY_DIR / "deploy.sh").read_text()
+    assert '"$SRC"/*.sh' in deploy_sh, (
+        "deploy.sh no longer globs $SRC/*.sh — re-check that lib/ stays undeployed"
+    )
+    assert '"$SRC"/lib' not in deploy_sh
