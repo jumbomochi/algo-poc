@@ -65,3 +65,27 @@ def test_explicit_trial_count_deflates_harder_than_a_smaller_one():
 def test_declared_trial_count_below_the_run_is_rejected():
     with pytest.raises(ValueError, match="declared trial count"):
         control(_two_candidates(), n_trials=1)
+
+
+def test_declaring_a_search_the_sample_cannot_support_is_refused():
+    # One candidate gives no estimate of the spread of trial Sharpes, so SR*
+    # collapses to zero and the deflation silently becomes a no-op -- while
+    # the run card still records the declared count. For a capital gate the
+    # only safe direction is to fail loudly.
+    lone = {"strong": {"sr": 0.5, "n": 500, "skew": 0.0, "kurt": 3.0, "ic_p": 0.001}}
+    with pytest.raises(ValueError, match="at least 2 candidates"):
+        control(lone, n_trials=12)
+
+
+def test_expected_max_sharpe_refuses_a_declared_count_it_cannot_deflate():
+    with pytest.raises(ValueError, match="at least 2 candidates"):
+        expected_max_sharpe([0.4], n_trials=12)
+
+
+def test_declaring_the_run_size_reproduces_the_implicit_default():
+    # AC2, pinned as an invariant rather than by the absence of failures:
+    # the default path is exactly n_trials == the number of candidates.
+    per_factor = _two_candidates()
+    implicit = control(per_factor)
+    explicit = control(per_factor, n_trials=len(per_factor))
+    assert implicit == explicit

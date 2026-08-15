@@ -73,11 +73,19 @@ def _now() -> str:
 
 
 def _as_iso(value: date | datetime | str) -> str:
-    if isinstance(value, str):
-        return value[:10]
+    """Normalise a date to ``YYYY-MM-DD``.
+
+    Boundaries are compared lexicographically, so a non-ISO string would pick
+    the wrong row rather than fail. Everything is validated through
+    ``date.fromisoformat``.
+    """
     if isinstance(value, datetime):
         return value.date().isoformat()
-    return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, str):
+        return date.fromisoformat(value[:10]).isoformat()
+    raise TypeError(f"expected a date, datetime or ISO date string; got {type(value)!r}")
 
 
 class HoldoutProtocol:
@@ -92,7 +100,7 @@ class HoldoutProtocol:
         extra: dict | None = None,
     ) -> None:
         self._path = path
-        self._registrations = registrations
+        self._registrations = dict(registrations)
         self._evaluations = list(evaluations)
         self._version = version
         # Keys the file carries that this class does not model -- the prose
@@ -137,7 +145,7 @@ class HoldoutProtocol:
         self,
         *,
         split_id: str,
-        holdout_start: date | str,
+        holdout_start: date | datetime | str,
         horizon: int,
         embargo: int,
         note: str = "",
@@ -172,7 +180,11 @@ class HoldoutProtocol:
     # -- resolution ------------------------------------------------------
 
     def resolve(self, split_id: str, dates: Sequence[date | datetime | str]) -> HoldoutSplit:
-        """Map a registration onto a date index, purging the boundary rows."""
+        """Map a registration onto a date index, purging the boundary rows.
+
+        ``dates`` must be sorted ascending -- the panel's own index, not a
+        reordering of it.
+        """
         registration = self.registration(split_id)
         gap = registration.gap
         n_dates = len(dates)
@@ -216,7 +228,13 @@ class HoldoutProtocol:
         label: str,
         evaluated_at: str | None = None,
     ) -> HoldoutSplit:
-        """Claim the split's one evaluation and record the burn on disk."""
+        """Claim the split's one evaluation and record the burn on disk.
+
+        The on-disk record is re-read first: another holder of the same file
+        may have spent the split since this object was loaded, and a burn lost
+        to last-writer-wins would defeat the whole protocol.
+        """
+        self._refresh_evaluations()
         burned = self.evaluations(split_id)
         if burned:
             first = burned[0]
@@ -235,6 +253,16 @@ class HoldoutProtocol:
         return split
 
     # -- persistence -----------------------------------------------------
+
+    def _refresh_evaluations(self) -> None:
+        """Merge in any burns recorded on disk since this object was loaded."""
+        if not self._path.exists():
+            return
+        on_disk = HoldoutProtocol.load(self._path)
+        known = {(e.split_id, e.label, e.evaluated_at) for e in self._evaluations}
+        for row in on_disk._evaluations:
+            if (row.split_id, row.label, row.evaluated_at) not in known:
+                self._evaluations.append(row)
 
     def _save(self) -> None:
         payload = {
@@ -260,4 +288,10 @@ class HoldoutProtocol:
                 for e in self._evaluations
             ],
         }
-        self._path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        # Write-then-rename: a truncating write that dies mid-flight would take
+        # every registration and every recorded burn with it, and this file is
+        # the tamper-evident record of a spent holdout. Key order is fixed
+        # rather than sorted so recording a burn produces a one-line diff.
+        temp = self._path.with_suffix(f"{self._path.suffix}.tmp")
+        temp.write_text(json.dumps(payload, indent=2) + "\n")
+        temp.replace(self._path)

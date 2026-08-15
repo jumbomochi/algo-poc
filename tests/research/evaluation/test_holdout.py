@@ -109,6 +109,31 @@ def test_saving_preserves_the_file_prose(tmp_path):
     assert json.loads(path.read_text())["note"] == "read me first"
 
 
+def test_a_burn_recorded_by_another_process_is_honoured(tmp_path):
+    # Two holders of the same registry file. The registry is the record of a
+    # spent holdout, so a burn must never be lost to last-writer-wins.
+    path = tmp_path / "holdout_registry.json"
+    first = _registered(tmp_path)
+    second = HoldoutProtocol.load(path)
+    first.evaluate("s", _dates(), label="first", evaluated_at="2026-08-16T01:00:00+00:00")
+    with pytest.raises(HoldoutAlreadyEvaluated):
+        second.evaluate("s", _dates(), label="racing", evaluated_at="2026-08-16T01:00:01+00:00")
+    assert [row.label for row in HoldoutProtocol.load(path).evaluations("s")] == ["first"]
+
+
+def test_a_malformed_date_string_is_rejected(tmp_path):
+    # resolve() compares ISO dates lexicographically; a non-ISO boundary would
+    # silently pick the wrong row rather than fail.
+    path = tmp_path / "holdout_registry.json"
+    path.write_text(json.dumps({"version": 1, "splits": [], "evaluations": []}))
+    protocol = HoldoutProtocol.load(path)
+    with pytest.raises(ValueError):
+        protocol.register(
+            split_id="s", holdout_start="6/1/2026", horizon=HORIZON, embargo=EMBARGO,
+            registered_at="2026-08-16T00:00:00+00:00",
+        )
+
+
 def test_unregistered_split_is_rejected(tmp_path):
     with pytest.raises(KeyError, match="unknown"):
         _registered(tmp_path).resolve("nope", _dates())

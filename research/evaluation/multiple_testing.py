@@ -46,8 +46,23 @@ def expected_max_sharpe(trial_srs: list[float], n_trials: int | None = None) -> 
     deflating against four understates the selection bias. When ``n_trials`` is
     omitted the count falls back to ``len(trial_srs)`` -- the pre-KAN-38
     behaviour.
+
+    Declaring a count against fewer than two observed candidates raises. One
+    Sharpe supports no estimate of the spread, so SR* would collapse to zero
+    and the deflation would silently become a no-op on the very run that asked
+    for it -- the wrong failure direction for a capital gate.
+
+    Known limitation: the spread is estimated from the candidates that
+    *survived* the search, while the count covers the whole search. A
+    truncated sample understates the spread, so this estimator still
+    under-deflates. See docs/operations/edge-validation-framework.md.
     """
     sample = len(trial_srs)
+    if n_trials is not None and sample < 2:
+        raise ValueError(
+            f"deflating against {n_trials} declared trials needs at least 2 "
+            f"candidates to estimate the spread of trial Sharpes; got {sample}"
+        )
     if sample < 2:
         return 0.0
     m = sample if n_trials is None else n_trials
@@ -99,7 +114,8 @@ def control(
     if n_trials is not None and n_trials < len(per_factor):
         raise ValueError(
             f"declared trial count {n_trials} is below the {len(per_factor)} "
-            "candidates scored in this run"
+            "candidates scored in this run; add the missing search to "
+            "research/trial_registry.json"
         )
     sr_star = expected_max_sharpe([v["sr"] for v in per_factor.values()], n_trials)
     fdr = benjamini_hochberg({fid: v["ic_p"] for fid, v in per_factor.items()}, q)

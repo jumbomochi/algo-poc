@@ -61,6 +61,29 @@ search, not just the batch it happened to be scored in. Declaring a count below
 the number of candidates in a run is rejected outright — under-declaring is the
 exact failure the argument exists to prevent.
 
+### Three limits to state when you cite a deflated Sharpe
+
+1. **The spread is estimated from survivors.** `n_trials` supplies the count,
+   but the standard deviation of trial Sharpes still comes from the candidates
+   in the run — which are what *survived*. The dropped low-Sharpe tail is
+   counted in `m` and absent from the sample, so the estimated spread is
+   truncated, `SR*` is too small, and the correction still **under**-deflates.
+   The direction of the residual error is at least the safe one to know about.
+   Carrying per-entry SR dispersion in the registry would fix this properly;
+   it is not built.
+2. **Two candidates is a one-degree-of-freedom variance.** With a small
+   candidate set, `SR*` is dominated by sampling noise and a large `n_trials`
+   merely scales that noise. Declaring a count against fewer than two
+   candidates is refused outright rather than silently returning zero
+   deflation — the run card would otherwise record a correction that never
+   happened.
+3. **The sum is unscoped.** Every entry counts toward every run, so a factor
+   evaluation is deflated against sleeve and (later) sentiment searches it
+   could not have drawn from. That is over-deflation, i.e. false negatives at
+   the gate — a real cost, not free safety margin. Once the registry grows
+   past a handful of entries, scope them (`applies_to`) rather than letting
+   the total drift upward forever.
+
 ## The pre-registered holdout
 
 `research/holdout_registry.json` plus `research/evaluation/holdout.py`.
@@ -109,7 +132,16 @@ holdout_rows = frame.iloc[slice(*split.holdout)]
 ```
 
 Commit the resulting registry change. A holdout whose use is not in git is a
-holdout on the honour system.
+holdout on the honour system — and note that `registered_at` / `evaluated_at`
+are caller-supplied and therefore backdatable. The evidence of record is the
+**git commit date of `research/holdout_registry.json`**, not the field. An
+anti-p-hacking device whose timestamp is an input proves nothing on its own.
+
+The single-use check re-reads the file before recording a burn, so a burn
+written by another process is honoured rather than lost, and the write is
+atomic (temp file + rename) so a crash cannot destroy the registry. Neither is
+a lock: two processes evaluating the *same* split within the same instant is
+not defended against.
 
 ### Currently registered
 
@@ -121,6 +153,19 @@ holdout on the honour system.
   incumbent evaluation (KAN-40). The window is short today and grows with
   every trading day — report its length alongside the result, because a
   holdout too small to be significant is evidence of nothing.
+
+  Two limits, both of which belong in any writeup that cites it:
+
+  - **It was registered on 2026-08-16, after the window opened.** That makes
+    it out-of-*search*-sample, not out-of-sight-sample: the paper book ran
+    over June–August and was watched daily. It is the cleanest split
+    available, not a clean one.
+  - **It is valid for the six sleeves only.** The native factor catalog was
+    specified 2026-08-02, *inside* the window, so spending this split on a
+    factor evaluation would be contaminated. Register a separate split with a
+    later boundary for that. Nothing in the code enforces this — the scope
+    lives in the registration's note, and `evaluate()` will happily hand you
+    the split for any purpose.
 
 ## Operator checklist for a promotion
 
