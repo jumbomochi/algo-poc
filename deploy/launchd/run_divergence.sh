@@ -16,12 +16,19 @@
 
 set -uo pipefail
 
-ALGO_DIR="/Users/huiliang/GitHub/algo-poc"
-VENV="$ALGO_DIR/.venv/bin/python"
+# Overridable only so tests/deploy/test_divergence_alerting.py can drive this
+# wrapper end-to-end against stubs — launchd starts jobs with an empty
+# environment, so production always takes the defaults. Never export ALGO_DIR
+# in a login shell: a manual run would then use whatever tree that points at.
+ALGO_DIR="${ALGO_DIR:-/Users/huiliang/GitHub/algo-poc}"
+VENV="${ALGO_PYTHON:-$ALGO_DIR/.venv/bin/python}"
 LOG_DIR="$HOME/ibc/logs"
 METRICS_DIR="$HOME/ibc/metrics"
 LOG_FILE="$LOG_DIR/divergence_$(date +%Y%m%d).log"
 PROM_FILE="$METRICS_DIR/divergence.prom"
+# Passed to the monitor explicitly (it would default to the same path) so the
+# alert renderer knows exactly which report to read back.
+REPORT_FILE="${ALGO_DIVERGENCE_REPORT:-$ALGO_DIR/output/divergence_$(date +%Y%m%d).json}"
 # Secrets come from the macOS login keychain via the shared loader. Sourced by
 # path from the repo (never from the deployed ~/ibc copy) so there is exactly
 # one implementation of the lookup and it cannot drift.
@@ -33,6 +40,20 @@ ALGO_SECRETS_ENV_FILE="$ALGO_DIR/.env"   # regular-file fallback only
 ALGO_JOB_LABEL="divergence monitor"
 # shellcheck source=deploy/launchd/lib/telegram.sh
 . "$ALGO_DIR/deploy/launchd/lib/telegram.sh"
+
+# Render the alert body from the monitor's own JSON report, so the message
+# names the breaching sleeves / the unmet baseline requirement rather than just
+# saying "something happened". A rendering failure must degrade to the generic
+# text, never to silence — being told nothing is the failure mode this job
+# exists to remove. $1 = exit code, $2 = fallback text.
+divergence_alert_text() {
+    local text
+    text=$("$VENV" "$ALGO_DIR/scripts/ops/divergence_alert.py" \
+               --exit-code "$1" --report "$REPORT_FILE" --log "$LOG_FILE" \
+               2>>"$LOG_FILE") || text=""
+    [ -n "$text" ] || text="$2"
+    printf '%s' "$text"
+}
 
 mkdir -p "$LOG_DIR" "$METRICS_DIR"
 
@@ -86,6 +107,7 @@ fi
 
 cd "$ALGO_DIR"
 "$VENV" scripts/divergence_monitor.py \
+    --output "$REPORT_FILE" \
     --prometheus-textfile "$PROM_FILE" \
     >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
@@ -96,12 +118,12 @@ case "$EXIT_CODE" in
         ;;
     1)
         echo "$(date): ALERT - divergence BREACH (exit 1)" >> "$LOG_FILE"
-        telegram "🚨 Divergence BREACH ($(date +%F)) — live paper equity has diverged from the backtest baseline. See $LOG_FILE"
+        telegram "$(divergence_alert_text 1 "🚨 Divergence BREACH ($(date +%F)) — live paper equity has diverged from the backtest baseline. See $LOG_FILE")"
         ;;
     2)
         echo "$(date): PAGE - divergence monitor hard error (exit 2)" >> "$LOG_FILE"
         algo_alert_local "divergence monitor hard error (exit 2) — see $LOG_FILE"
-        telegram "🚨 Divergence monitor HARD ERROR (exit 2) on $(date +%F). See $LOG_FILE"
+        telegram "$(divergence_alert_text 2 "🚨 Divergence monitor HARD ERROR (exit 2) on $(date +%F). See $LOG_FILE")"
         ;;
     3)
         echo "$(date): ALERT - divergence monitor BLIND: baseline backtest is not" \
@@ -109,7 +131,7 @@ case "$EXIT_CODE" in
              "baseline is regenerated - see docs/operations/backtest-baseline.md" \
              >> "$LOG_FILE"
         # A blind monitor is an outage, not a pass.
-        telegram "⚠️ Divergence monitor is BLIND (exit 3): the baseline backtest is not comparable to live, so every report is forced to NO_DATA. No drift detection is running. Regenerate per docs/operations/backtest-baseline.md"
+        telegram "$(divergence_alert_text 3 "⚠️ Divergence monitor is BLIND (exit 3): the baseline backtest is not comparable to live, so every report is forced to NO_DATA. No drift detection is running. Regenerate per docs/operations/backtest-baseline.md")"
         ;;
     *)
         echo "$(date): UNEXPECTED exit code $EXIT_CODE from divergence monitor" >> "$LOG_FILE"

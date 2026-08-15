@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -101,12 +102,23 @@ def _blind_reasons(report: dict[str, Any] | None) -> list[str]:
     return reasons
 
 
+# `scheme://user:password@host` — the monitor prints the full DSN when it
+# cannot reach the DB (divergence_monitor.py:453), and that DSN carries the
+# live Postgres password. Telegram is not a secret store, so the password is
+# stripped before the line leaves this process.
+_DSN_CREDENTIAL = re.compile(r"(?P<prefix>[a-zA-Z][\w+.-]*://[^\s:/@]+:)[^\s@]*@")
+
+
+def _redact(text: str) -> str:
+    return _DSN_CREDENTIAL.sub(r"\g<prefix>***@", text)
+
+
 def _last_error_line(log_tail: str) -> str:
     errors = [
         line.strip() for line in log_tail.splitlines()
         if line.strip().startswith("ERROR")
     ]
-    return errors[-1] if errors else ""
+    return _redact(errors[-1]) if errors else ""
 
 
 def render_alert(
