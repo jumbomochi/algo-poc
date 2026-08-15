@@ -21,6 +21,7 @@ from shared.models import (
 )
 from shared.order_ledger import OrderLedger
 from shared.schemas.messages import (
+    AlertMessage,
     ApprovedOrderMessage,
     FillMessage,
     KillMessage,
@@ -106,6 +107,7 @@ def seed_approved_intent(
     symbol: str = "AAPL",
     con_id: int = 265598,
     portfolio: str = "momentum",
+    action: str = "BUY",
 ):
     proposal = SimpleNamespace(
         recommendation_id=recommendation_id,
@@ -116,7 +118,7 @@ def seed_approved_intent(
         symbol=symbol,
         exchange="SMART",
         currency="USD",
-        action="BUY",
+        action=action,
         quantity=50,
         limit_price=150.0,
         order_type="LMT",
@@ -1277,6 +1279,304 @@ class TestApprovedOrderProcessing:
 
         mock_redis.publish.assert_not_called()
         assert order in runner._pending_orders.values()
+
+
+class TestHaltGate:
+    """KAN-12: execution reads the durable halt latch before submitting.
+
+    The gate blocks exposure-INCREASING orders only — a halt is exactly when
+    the risk service publishes liquidation sells, so blocking those would
+    block the system's own emergency flatten.
+    """
+
+    @staticmethod
+    def _halt(session, *, mode: str = "paper") -> None:
+        from shared.halt_state import HaltStateRepository
+
+        HaltStateRepository(session).record_halt(
+            mode=mode,
+            source="kill",
+            reason="test halt",
+            triggered_by="test",
+            now=BROKER_TIME,
+        )
+        session.commit()
+
+    @pytest.mark.asyncio
+    async def test_halted_buy_is_durably_rejected(
+        self, durable_runner, ledger_session, mock_order_manager
+    ):
+        """Design test #23: halted buy → SUBMISSION_FAILED reason='halted'."""
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, recommendation_id="rec-1")
+        self._halt(ledger_session)
+
+        await runner.process_approved_order(
+            make_approved_order(recommendation_id="rec-1", action="buy")
+        )
+
+        mock_order_manager.submit_entry.assert_not_awaited()
+        intent = ledger.get("rec-1")
+        assert intent.status == OrderStatus.SUBMISSION_FAILED.value
+        assert intent.reason == "halted"
+
+    @pytest.mark.asyncio
+    async def test_halted_buy_is_acked_and_never_dead_lettered(
+        self, durable_runner, ledger_session, mock_redis, mock_order_manager
+    ):
+        """Design test #9: durably rejected AND acked — absent from the DLQ,
+        so it is not redelivered via the PEL."""
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, recommendation_id="rec-1")
+        self._halt(ledger_session)
+        mock_redis.send_to_dead_letter = AsyncMock()
+        order = make_approved_order(recommendation_id="rec-1", action="buy")
+        mock_redis.read_group = AsyncMock(
+            return_value=[
+                SimpleNamespace(message_id="5-0", data=order.to_stream_dict())
+            ]
+        )
+
+        await runner._consume_and_process(
+            "stream:approved_orders",
+            ApprovedOrderMessage.from_stream_dict,
+            runner.process_approved_order,
+            count=1,
+            block_ms=0,
+        )
+
+        mock_order_manager.submit_entry.assert_not_awaited()
+        mock_redis.send_to_dead_letter.assert_not_awaited()
+        mock_redis.ack.assert_awaited_once_with(
+            "stream:approved_orders", "execution_service", "5-0"
+        )
+
+    @pytest.mark.asyncio
+    async def test_halted_risk_reducing_sell_still_submits(
+        self, durable_runner, ledger_session, mock_order_manager
+    ):
+        """Design test #23: a ledger-backed risk-reducing sell submits during a
+        halt — the emergency flatten must not be blocked by the gate."""
+        runner, ledger = durable_runner
+        seed_approved_intent(
+            ledger, recommendation_id="exit-1", action="SELL"
+        )
+        self._halt(ledger_session)
+
+        await runner.process_approved_order(
+            make_approved_order(
+                recommendation_id="exit-1",
+                action="sell",
+                order_type="market",
+                limit_price=None,
+            )
+        )
+
+        mock_order_manager.submit_exit.assert_awaited_once_with(
+            ticker="AAPL", quantity=50, recommendation_id="exit-1"
+        )
+        assert ledger.get("exit-1").status == OrderStatus.SUBMITTED.value
+
+    @pytest.mark.asyncio
+    async def test_unhalted_buy_submits_unchanged(
+        self, durable_runner, mock_order_manager
+    ):
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, recommendation_id="rec-1")
+
+        await runner.process_approved_order(
+            make_approved_order(recommendation_id="rec-1", action="buy")
+        )
+
+        mock_order_manager.submit_entry.assert_awaited_once()
+        assert ledger.get("rec-1").status == OrderStatus.SUBMITTED.value
+
+    @pytest.mark.asyncio
+    async def test_pel_replay_on_restart_is_gated(
+        self, durable_runner, ledger_session, mock_redis, mock_order_manager
+    ):
+        """Design test #10: restart with halted PEL entries → all buys
+        rejected, none submitted. The replay path is gated, not just the loop."""
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, recommendation_id="rec-1")
+        seed_approved_intent(
+            ledger, recommendation_id="rec-2", symbol="MSFT", con_id=272093
+        )
+        self._halt(ledger_session)
+        replayed = [
+            SimpleNamespace(
+                message_id=f"{i}-0",
+                data=make_approved_order(
+                    recommendation_id=rec, action="buy"
+                ).to_stream_dict(),
+            )
+            for i, rec in enumerate(("rec-1", "rec-2"), start=1)
+        ]
+        mock_redis.drain_pending = AsyncMock(
+            side_effect=[replayed, []]
+        )
+        mock_redis.send_to_dead_letter = AsyncMock()
+
+        await runner.setup()
+
+        mock_order_manager.submit_entry.assert_not_awaited()
+        mock_redis.send_to_dead_letter.assert_not_awaited()
+        for rec in ("rec-1", "rec-2"):
+            assert ledger.get(rec).status == OrderStatus.SUBMISSION_FAILED.value
+
+    @pytest.mark.asyncio
+    async def test_cleared_halt_does_not_resurrect_rejected_orders(
+        self, durable_runner, ledger_session, mock_order_manager
+    ):
+        """Design test #12: no zombie resubmission after the halt clears."""
+        from shared.halt_state import HaltStateRepository
+
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, recommendation_id="rec-1")
+        self._halt(ledger_session)
+        order = make_approved_order(recommendation_id="rec-1", action="buy")
+        await runner.process_approved_order(order)
+
+        HaltStateRepository(ledger_session).clear_halt(
+            mode="paper", cleared_by="operator", now=BROKER_TIME
+        )
+        ledger_session.commit()
+
+        await runner.process_approved_order(order)
+
+        mock_order_manager.submit_entry.assert_not_awaited()
+        assert ledger.get("rec-1").status == OrderStatus.SUBMISSION_FAILED.value
+
+    @pytest.mark.asyncio
+    async def test_gate_is_inert_without_a_ledger(
+        self, runner, mock_order_manager
+    ):
+        """AC7: no ledger injected → no session to read, gate stays out of the
+        way rather than failing closed on a system that has no halt table."""
+        assert runner._halt_store is None
+
+        await runner.process_approved_order(
+            make_approved_order(action="buy")
+        )
+
+        mock_order_manager.submit_entry.assert_awaited_once()
+
+
+class TestHaltLookupFailure:
+    """KAN-12 / design test #24: an unreadable halt latch is its own state —
+    neither halted nor clear. Retain, retry with backoff, page separately."""
+
+    @pytest.fixture()
+    def failing_halt_runner(self, durable_runner, monkeypatch):
+        runner, ledger = durable_runner
+        calls: list[str] = []
+
+        def boom(*, mode: str):
+            calls.append(mode)
+            raise RuntimeError("connection refused")
+
+        monkeypatch.setattr(runner._halt_store, "load_active_halt", boom)
+        seed_approved_intent(ledger, recommendation_id="rec-1")
+        return runner, ledger, calls
+
+    @pytest.mark.asyncio
+    async def test_message_is_retained_not_acked_and_not_dead_lettered(
+        self, failing_halt_runner, mock_redis, mock_order_manager
+    ):
+        runner, _ledger, _calls = failing_halt_runner
+        mock_redis.send_to_dead_letter = AsyncMock()
+        order = make_approved_order(recommendation_id="rec-1", action="buy")
+        mock_redis.read_group = AsyncMock(
+            return_value=[
+                SimpleNamespace(message_id="7-0", data=order.to_stream_dict())
+            ]
+        )
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            await runner._consume_and_process(
+                "stream:approved_orders",
+                ApprovedOrderMessage.from_stream_dict,
+                runner.process_approved_order,
+                count=1,
+                block_ms=0,
+            )
+
+        mock_order_manager.submit_entry.assert_not_awaited()
+        mock_redis.ack.assert_not_awaited()
+        mock_redis.send_to_dead_letter.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_lookup_is_retried_with_backoff(self, failing_halt_runner):
+        from services.execution.runner import (
+            HALT_LOOKUP_RETRY_BACKOFF_SECONDS,
+            HaltStateUnavailable,
+        )
+
+        runner, _ledger, calls = failing_halt_runner
+        sleep = AsyncMock()
+
+        with patch("asyncio.sleep", new=sleep):
+            with pytest.raises(HaltStateUnavailable):
+                await runner.process_approved_order(
+                    make_approved_order(recommendation_id="rec-1", action="buy")
+                )
+
+        assert len(calls) == len(HALT_LOOKUP_RETRY_BACKOFF_SECONDS) + 1
+        assert [c.args[0] for c in sleep.await_args_list] == list(
+            HALT_LOOKUP_RETRY_BACKOFF_SECONDS
+        )
+
+    @pytest.mark.asyncio
+    async def test_unable_to_determine_halt_state_is_paged(
+        self, failing_halt_runner, mock_redis
+    ):
+        runner, _ledger, _calls = failing_halt_runner
+        order = make_approved_order(recommendation_id="rec-1", action="buy")
+        mock_redis.read_group = AsyncMock(
+            return_value=[
+                SimpleNamespace(message_id="7-0", data=order.to_stream_dict())
+            ]
+        )
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            await runner._consume_and_process(
+                "stream:approved_orders",
+                ApprovedOrderMessage.from_stream_dict,
+                runner.process_approved_order,
+                count=1,
+                block_ms=0,
+            )
+
+        alerts = [
+            AlertMessage.from_stream_dict(c.args[1])
+            for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert [a.event_type for a in alerts] == ["halt_state_unavailable"]
+        assert alerts[0].priority == "critical"
+        assert "unable to determine halt state" in alerts[0].message.lower()
+
+    @pytest.mark.asyncio
+    async def test_pel_replay_retains_on_lookup_failure(
+        self, failing_halt_runner, mock_redis
+    ):
+        runner, _ledger, _calls = failing_halt_runner
+        mock_redis.send_to_dead_letter = AsyncMock()
+        mock_redis.drain_pending = AsyncMock(side_effect=[
+            [SimpleNamespace(
+                message_id="8-0",
+                data=make_approved_order(
+                    recommendation_id="rec-1", action="buy"
+                ).to_stream_dict(),
+            )],
+            [],
+        ])
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            await runner.setup()
+
+        mock_redis.ack.assert_not_awaited()
+        mock_redis.send_to_dead_letter.assert_not_awaited()
 
 
 class TestKillHandling:
