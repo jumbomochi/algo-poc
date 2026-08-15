@@ -1,10 +1,11 @@
 # Broker-Stop Prototype Spike (DUN551088)
 
-**Status (2026-08-15): Q1 (partial), Q3, Q4 and Q5 answered from a live run on
-DUN551088. Q2 — the go/no-go — is NOT answered, so the recommendation is
-currently NO-GO for KAN-19.** The trigger half of Q1 is a deliberate open gap.
-Every finding quotes an observed record. Nothing here is inferred from IB
-documentation and presented as evidence.
+**Status (2026-08-15): COMPLETE — the recommendation is GO for KAN-19.** All
+five questions were exercised on DUN551088; the one deliberate gap is the
+trigger half of Q1, deferred to KAN-20's drill for the reason recorded there.
+The account was left flat of spike artifacts. Every finding quotes an observed
+record; nothing here is inferred from IB documentation and presented as
+evidence.
 
 The readiness design's decision D16 makes broker-native GTC stops the *primary*
 stop-loss protection: an order resting at IB survives Redis, Postgres, Docker,
@@ -182,23 +183,34 @@ rather than smoothed over.
 
 ### Q2 — Persistence across a Gateway restart — **the go/no-go**
 
-`NOT ANSWERED.` The first attempt was void and is recorded here so it is not
-mistaken for evidence: the IBC nightly restart is confirmed in
-`~/ibc/logs/ibc-3.23.0_GATEWAY-10.43_Wednesday.txt:1264` ("Restart in progress"
-at `2026-08-14 23:55:00:710`, back up by `23:55:11`), but the operator confirmed
-the stop was placed **after** it. The order resting at `00:02:33` had therefore
-never been through a restart. The IBC log records GUI events only, not API
-orders, so placement time cannot be recovered from the logs — it has to be
-tracked at run time.
+**GO. The GTC stop survives a full Gateway process restart.**
 
-Re-run needs a deliberate restart while the stop is resting:
-`launchctl kickstart -k "gui/$(id -u)/local.ibc-gateway"`, then `observe`.
+- Restart: `launchctl kickstart -k gui/$(id -u)/local.ibc-gateway` at
+  **2026-08-15 10:08:04**. This was a process restart, not a reconnect — IBC
+  opened a **new log file** (`ibc-3.23.0_GATEWAY-10.43_Saturday.txt`, login and
+  config replayed at `10:08:04:446-869`), so the previous Gateway process and
+  everything in its memory are gone.
+- Observed ~90 seconds later, unchanged in every field: `permId 1404141834`,
+  `orderId 5`, `orderType STP`, `auxPrice 84.87`, `tif GTC`,
+  `status PreSubmitted`, `whyHeld trigger`. Present in **both**
+  `openTrades()` and `reqAllOpenOrders()`.
 
-This question is load-bearing for a second reason, see Q3: the order rests in
-`PreSubmitted`/`whyHeld: trigger`, i.e. held rather than working at the
-exchange. Surviving a Gateway restart is what proves it is held **at IB**, not
-in Gateway process memory — and therefore that it survives host failure too.
-Without that, D16's central claim does not hold.
+This settles the load-bearing question. The order rests
+`PreSubmitted`/`whyHeld: trigger` — held rather than working at the exchange —
+and surviving a process restart is what proves it is held **at IB**, not in
+Gateway memory. D16's claim stands: the stop survives Redis, Postgres, Docker
+and the host.
+
+**A second result falls out of the same dump, and it is the one that makes
+KAN-19 buildable.** After the restart, client 118 saw its own stop through
+plain `openTrades()` — the call `IBExecutor.find_order_by_ref` uses
+(`ib_executor.py:509`) — while client 128 could not see it at all (Q4). Open
+orders are bound to the **placing** `clientId` and that binding survives the
+restart. So the execution service, reconnecting as `config.ib.client_id`, will
+recover its own stops through the existing recovery path with no new machinery.
+The cross-client blindness in Q4 is therefore not a blocker; it is a constraint:
+place stops from the execution client and everything works, place them from
+anywhere else and nothing does.
 
 ### Q3 — Visibility
 
@@ -218,8 +230,26 @@ anticipated by the issue:
    IB's sentinel for "unset", not a real percentage. A verifier that reads it
    without a sentinel check computes a nonsense trail level.
 
+The harness's own gap report, verbatim — nine populated fields the reader drops:
+
+```json
+{"kan18-spike-CIBR": ["permId", "clientId", "orderRef", "orderType",
+                      "auxPrice", "tif", "transmit", "trailStopPrice",
+                      "trailingPercent"]}
+```
+
+Two of those are more than verifier inputs:
+
+- **`permId`** is the durable identity. `orderId` is client-scoped and reused;
+  `permId 1404141834` was stable across the restart and is unique account-wide.
+  KAN-19 should persist `permId` on the `OrderIntent`, not just `ib_order_id`.
+- **`clientId`** tells you whether the kill path can reach the order at all
+  (Q4). A verifier that reads it can alert on a stop the execution service does
+  not own, instead of silently trusting coverage it cannot cancel.
+
 Fields `BrokerOpenOrder` needs for KAN-20: `order_type`, `aux_price`, `tif`,
-`order_ref`, and `why_held` (to distinguish held-pending-trigger from working).
+`order_ref`, `perm_id`, `client_id`, and `why_held` (to distinguish
+held-pending-trigger from working).
 
 ### Q4 — Interaction with cancel-all
 
@@ -235,6 +265,19 @@ called the production `find_order_by_ref`:
 `find_order_by_ref` returns `null` because it scans only its own session's
 `openTrades()` (`ib_executor.py:506-509`), so `IBExecutor.cancel_order` would
 no-op (`:655-666`) and `OrderManager.cancel_all_orders` never reaches the order.
+
+**Driven end-to-end through the production objects, the kill path's cancel-all
+is a complete no-op against the stop:**
+
+```
+OrderManager tracks 0 spike order(s): []
+cancel_all_orders() returned  ->  []
+resting spike stops AFTER cancel_all_orders()  ->  still resting, unchanged
+```
+
+Not a partial failure, not a logged error — the order is simply invisible, so
+the kill completes "successfully" with stop coverage fully intact on positions
+it has just flattened.
 
 The consequence stands as recorded in fact (a) and is now observed, not
 inferred: **a stop placed by any client other than the execution service's own
@@ -298,14 +341,11 @@ it means IB adjusted the price and KAN-20's drift check must tolerate it.
 
 ## Go/no-go for KAN-19
 
-**NO-GO until Q2 is answered.** Persistence across a Gateway restart is the
-property D16 rests on, and it has not been tested — the first attempt was void
-(see Q2). Until a stop is observed surviving a deliberate restart, KAN-19 should
-not start: if a `PreSubmitted`/`whyHeld: trigger` stop turns out to be held in
-Gateway process memory rather than at IB, "protection that survives Redis,
-Postgres, Docker and the host" is false and the design needs revisiting.
-
-Everything below stands regardless of how Q2 resolves.
+**GO.** The load-bearing property holds: a GTC stop survived a full Gateway
+process restart unchanged (Q2), so it is held at IB and protects through
+Redis, Postgres, Docker and host failure exactly as D16 claims. Two conditions
+attach — stops must be placed by the execution client, and they must be
+ledgered — and both are consequences of observed behaviour, not preferences.
 
 | Decision | Recommendation | Why |
 |---|---|---|
@@ -315,10 +355,20 @@ Everything below stands regardless of how Q2 resolves.
 | Reading stops back | extend `BrokerOpenOrder` with `order_type`, `aux_price`, `tif`, `order_ref`, `why_held` | Q3: today's reader cannot distinguish a stop from a working limit. Guard `trailingPercent` against IB's `DBL_MAX` sentinel and do not treat `trailStopPrice` as proof of a trailing stop |
 | Sizing hook | IPS § 6 `stop_loss_trailing_pct` off the high-water mark, whole shares, residue reported | matches the existing rule; `stop_coverage` already models the truncation |
 | `ApprovedOrderMessage.order_type` | extend to include `"stop"` rather than bypassing the message path | bypassing leaves the order unledgered, and fact (b) shows an unledgered broker order fails reconciliation and disables entries — the ledger entry is not optional bookkeeping, it is what keeps the book reconcilable |
-| Who places the stop | the execution service's own `IBExecutor` client | fact (a): an order placed by any other client is invisible to `find_order_by_ref`, uncancellable by the kill path, and unrecoverable across an execution restart |
-| Kill-path handling (KAN-20) | cancel stops **explicitly and first**, before liquidating | otherwise a stop resting on a just-flattened position sells short on trigger |
+| Who places the stop | the execution service's own `IBExecutor` client — **mandatory, not stylistic** | Q4: from any other client the order is invisible to `find_order_by_ref` and `cancel_all_orders` is a proven no-op against it. Q2: from its own client, recovery through the existing `openTrades()` path works unchanged across a Gateway restart |
+| Durable identity | persist `permId`, not just `ib_order_id` | Q3: `orderId` is client-scoped and reused; `permId` was stable across the restart and is unique account-wide |
+| Kill-path handling (KAN-20) | cancel stops **explicitly and first**, before liquidating | Q4: otherwise the kill reports success with stop coverage intact on positions it just flattened, and the orphaned stop sells short on trigger |
 
 ---
+
+## Cleanup (AC6)
+
+`cleanup --apply` cancelled the single spike order at 2026-08-15 10:10; the
+re-read returned an empty list and the account is flat of spike artifacts. The
+`order_missing_in_db` discrepancy that disabled entries on the 08-15 04:15 run
+clears with it — the next run should report `reconciliation: ok; entries:
+enabled` again, and that is worth confirming in
+`~/ibc/logs/paper_trading_20260816.log` rather than assumed.
 
 ## Rollback
 
