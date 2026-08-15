@@ -27,7 +27,7 @@ from scripts.run_paper import (
 from services.risk_management.engine import RiskEngine
 from services.execution.reconciliation import ReconciliationResult
 from shared.broker_state import BrokerAccountSnapshot, BrokerOpenOrder, BrokerPosition
-from shared.models import ExecutionFill, OrderStatus
+from shared.models import ExecutionFill, OrderIntent, OrderStatus
 from shared.models.base import Base
 from shared.models.portfolio import Position
 from shared.order_ledger import OrderLedger
@@ -886,6 +886,82 @@ def test_zero_broker_holding_suppresses_sell_signal(state):
     )
 
     assert signals == []
+
+
+def test_outbox_replay_ignores_approved_risk_exit(state):
+    """KAN-4 AC2: the outbox owns PROPOSED intents only.
+
+    A risk-side kill exit is APPROVED and already on stream:approved_orders.
+    The replay must not select it — its sell-guard would otherwise CANCEL a
+    pending liquidation ("no uncovered broker holding") or supersede it with a
+    capped clone onto stream:recommendations, behind execution's back.
+    """
+    class FakeRedis:
+        def __init__(self):
+            self.payloads = []
+
+        def xadd(self, stream, payload):
+            self.payloads.append(payload)
+
+    ledger = OrderLedger(state._session)
+    ledger.create_intent(
+        SimpleNamespace(
+            recommendation_id="liq-paper-AAPL-1786104000",
+            account_id="DUTEST",
+            mode="paper",
+            portfolio="momentum",
+            con_id=265598,
+            symbol="AAPL",
+            exchange="SMART",
+            currency="USD",
+            action="SELL",
+            quantity=10,
+            limit_price=None,
+            order_type="MKT",
+        )
+    )
+    ledger.transition("liq-paper-AAPL-1786104000", OrderStatus.APPROVED)
+    state._session.commit()
+
+    # Broker shows no uncovered holding: the sell-guard would cancel a
+    # PROPOSED intent outright.
+    snapshot = BrokerAccountSnapshot(
+        account_id="DUTEST",
+        mode="paper",
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=13_500,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=10_000,
+        settled_cash_trading=10_000,
+        fx_source="test",
+        fx_captured_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
+        positions={},
+    )
+    redis = FakeRedis()
+
+    assert (
+        publish_unpublished_intents(
+            state._session,
+            redis,
+            account_id="DUTEST",
+            entries_allowed=False,
+            broker_snapshot=snapshot,
+        )
+        == 0
+    )
+
+    assert redis.payloads == []
+    intent = ledger.get("liq-paper-AAPL-1786104000")
+    assert intent.status == OrderStatus.APPROVED.value
+    assert intent.published_at is None
+    # ... and no capped clone was minted behind execution's back.
+    assert (
+        state._session.query(OrderIntent)
+        .filter(OrderIntent.recommendation_id.like("%-capped-%"))
+        .count()
+        == 0
+    )
 
 
 def test_outage_replay_revalidates_and_replaces_oversized_sell(state):

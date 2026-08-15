@@ -1063,6 +1063,98 @@ class TestDurableExecutionIdentity:
         assert ledger.active_reservations("momentum") == 0
 
 
+class TestKillExitCrossesToExecution:
+    """KAN-4: a risk-side kill exit must survive the whole hop to execution.
+
+    Risk publishes the exit; execution's record_submission does
+    APPROVED->SUBMITTED. If risk left the intent at PROPOSED, that transition
+    is illegal and raises *after* the IB order is already live.
+    """
+
+    @pytest.mark.asyncio
+    async def test_kill_exit_submits_and_attributes_fill(
+        self, mock_config, mock_redis, mock_order_manager, ledger_session
+    ):
+        from unittest.mock import MagicMock as _MagicMock
+
+        from services.risk_management.runner import RiskServiceRunner
+        from shared.config import CurrencyConfig, RiskConfig
+        from shared.models import Position
+        from shared.schemas.messages import ApprovedOrderMessage as _Approved
+
+        ledger_session.add(Position(
+            account_id="DUN551088",
+            ticker="AAPL",
+            portfolio="momentum",
+            con_id=265598,
+            exchange="SMART",
+            currency="USD",
+            quantity=10.0,
+            avg_entry_price=100,
+            current_price=100,
+            peak_price=100,
+            highest_price_since_entry=100,
+            opened_at=BROKER_TIME,
+            status="open",
+        ))
+        ledger_session.commit()
+
+        risk_config = _MagicMock(spec=AppConfig)
+        risk_config.mode = "paper"
+        risk_config.risk = RiskConfig()
+        risk_config.currency = CurrencyConfig()
+        risk_redis = AsyncMock()
+        risk_redis.publish = AsyncMock(return_value="msg-1")
+        risk_redis.stream_length = AsyncMock(return_value=0)
+        ledger = OrderLedger(ledger_session)
+        risk_runner = RiskServiceRunner(
+            config=risk_config,
+            redis_client=risk_redis,
+            db_session=ledger_session,
+            order_ledger=ledger,
+        )
+
+        await risk_runner.process_kill(KillMessage(
+            timestamp=BROKER_TIME,
+            triggered_by="test",
+            reason="kill exit crosses to execution",
+        ))
+        ledger_session.rollback()
+
+        (exit_order,) = [
+            _Approved.from_stream_dict(c.args[1])
+            for c in risk_redis.publish.call_args_list
+            if c.args[0] == "stream:approved_orders"
+        ]
+        exit_id = exit_order.recommendation_id
+
+        execution_runner = ExecutionServiceRunner(
+            config=mock_config,
+            redis_client=mock_redis,
+            order_manager=mock_order_manager,
+            order_ledger=ledger,
+        )
+        await execution_runner.process_approved_order(exit_order)  # must not raise
+
+        intent = ledger.get(exit_id)
+        assert intent.status == OrderStatus.SUBMITTED.value
+        assert intent.ib_order_id == "order-002"
+        ledger_session.rollback()
+
+        await execution_runner.handle_ib_fill(make_durable_fill_info(
+            execution_id="exec-kill-1",
+            order_id="order-002",
+            quantity=10.0,
+        ) | {"side": "sell", "order_done": True})
+
+        fills = [
+            FillMessage.from_stream_dict(c.args[1])
+            for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:fills"
+        ]
+        assert [f.recommendation_id for f in fills] == [exit_id]
+
+
 class TestApprovedOrderProcessing:
     @pytest.mark.asyncio
     async def test_process_buy_approved_order(
