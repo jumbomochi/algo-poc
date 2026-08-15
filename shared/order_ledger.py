@@ -93,6 +93,31 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _unpublished_exit_clause():
+    """An exit the risk service committed but never got onto the stream.
+
+    Risk approves its own exits and then publishes them, so an APPROVED SELL
+    with no ``published_at`` is an intent nothing downstream has ever seen: a
+    crash in that window leaves it there forever. It is deliberately narrower
+    than "nonterminal and unpublished":
+
+    * ``APPROVED`` only — a PROPOSED unpublished sell belongs to run_paper's
+      recommendation outbox, which publishes it to ``stream:recommendations``;
+      republishing that to execution would place an order risk never approved.
+    * ``SUBMITTED``/``PARTIALLY_FILLED`` are excluded because the broker already
+      has them — the publish landed and only the bookkeeping was lost.
+
+    Used from both ends: :meth:`OrderLedger.unpublished_exit_intents` selects
+    this set to re-publish, and :meth:`OrderLedger.nonterminal_sell_exists`
+    subtracts it so an orphan cannot masquerade as an exit in flight.
+    """
+    return and_(
+        func.upper(OrderIntent.action) == "SELL",
+        OrderIntent.status == OrderStatus.APPROVED.value,
+        OrderIntent.published_at.is_(None),
+    )
+
+
 class OrderLedger:
     """Transaction-neutral repository for the durable order lifecycle."""
 
@@ -362,6 +387,7 @@ class OrderLedger:
         account_id: str | None,
         portfolio: str | None,
         con_id: int | None,
+        exclude_unpublished_exits: bool = False,
     ) -> bool:
         """True if an unfinished SELL intent exists for this identity scope.
 
@@ -374,17 +400,41 @@ class OrderLedger:
         :func:`shared.liquidation.load_liquidation_targets` aggregates by — and
         deliberately not by ``kind``: a plain non-exit sell blocks a stop-loss
         just as an outstanding stop-loss does.
+
+        ``exclude_unpublished_exits`` (KAN-8) drops the orphan class described
+        in :func:`_unpublished_exit_clause` from the answer. An intent that was
+        never published is not in flight — nothing downstream has it — so
+        counting it as one mutes the ticker's stop-loss permanently.
         """
-        stmt = select(
-            exists().where(
-                OrderIntent.account_id == account_id,
-                OrderIntent.portfolio == portfolio,
-                OrderIntent.con_id == con_id,
-                func.upper(OrderIntent.action) == "SELL",
-                OrderIntent.status.in_(NONTERMINAL_STATUSES),
-            )
-        )
+        conditions = [
+            OrderIntent.account_id == account_id,
+            OrderIntent.portfolio == portfolio,
+            OrderIntent.con_id == con_id,
+            func.upper(OrderIntent.action) == "SELL",
+            OrderIntent.status.in_(NONTERMINAL_STATUSES),
+        ]
+        if exclude_unpublished_exits:
+            conditions.append(~_unpublished_exit_clause())
+        stmt = select(exists().where(*conditions))
         return bool(self.session.scalar(stmt))
+
+    def unpublished_exit_intents(
+        self, *, mode: str | None = None
+    ) -> list[OrderIntent]:
+        """Committed-but-never-published risk exits, oldest first.
+
+        See :func:`_unpublished_exit_clause` for what qualifies. The risk
+        service re-publishes these at the top of every periodic scan; the
+        deterministic recommendation id makes a downstream replay a no-op.
+        """
+        stmt = (
+            select(OrderIntent)
+            .where(_unpublished_exit_clause())
+            .order_by(OrderIntent.id)
+        )
+        if mode is not None:
+            stmt = stmt.where(OrderIntent.mode == mode)
+        return list(self.session.scalars(stmt))
 
     def count_intents_with_id_prefix(self, prefix: str) -> int:
         """How many intents already carry a recommendation id under ``prefix``.

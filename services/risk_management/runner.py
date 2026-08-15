@@ -213,6 +213,16 @@ class RiskServiceRunner:
         # every scan — only a fresh backlog or a growing one does.
         self._dlq_alerted_depth: dict[str, int] = {}
 
+        # Exit intents the previous scan had to re-publish (KAN-8). One
+        # re-publish is a recovered crash and needs nobody; the same id needing
+        # it again means the publish is not sticking, which pages. Both sets are
+        # in-process, so a service that crash-loops between scans never sees a
+        # repeat — the durable half of that is left to KAN-9's re-fire ledger.
+        self._republished_exit_ids: set[str] = set()
+        # Orphans already escalated as too old to re-publish, so a row nobody
+        # has cleared does not re-page every scan.
+        self._stale_orphan_ids: set[str] = set()
+
     async def setup(self) -> None:
         """Create consumer groups and replay pending messages.
 
@@ -597,6 +607,27 @@ class RiskServiceRunner:
             APPROVED_ORDERS_STREAM,
             order.to_stream_dict(),
         )
+        if self._order_ledger is not None:
+            # Keeps the KAN-8 invariant honest on the entry path too: an
+            # APPROVED sell with published_at NULL means "orphan". Usually a
+            # no-op, because run_paper's outbox marks the row when it publishes
+            # the recommendation; it is load-bearing for the window where that
+            # publish landed but its mark did not.
+            #
+            # Never fatal. The order is already on the stream, so raising here
+            # would dead-letter a recommendation that was in fact processed
+            # (see the ack comment in _consume_and_process for the same
+            # reasoning). An unmarked row is recovered by the next sweep.
+            try:
+                self._order_ledger.mark_published(rec.recommendation_id)
+                self._order_ledger.session.commit()
+            except Exception:
+                self._order_ledger.session.rollback()
+                self._logger.exception(
+                    "Could not mark an approved order published; the periodic "
+                    "sweep will reconcile it",
+                    recommendation_id=rec.recommendation_id,
+                )
 
         self._logger.info(
             "Approved order published",
@@ -1158,6 +1189,11 @@ class RiskServiceRunner:
             account_id=target.get("account_id"),
             portfolio=target.get("portfolio"),
             con_id=target.get("con_id"),
+            # KAN-8: an exit that was committed but never published is not in
+            # flight — it is waiting for the re-publish sweep that ran at the
+            # top of this scan. Counting it as in-flight is what muted the
+            # ticker.
+            exclude_unpublished_exits=True,
         )
         self._order_ledger.session.rollback()
         return pending
@@ -1281,10 +1317,12 @@ class RiskServiceRunner:
             IB fill -> FILLED (terminal; a later breach may exit again, seq+1)
 
         Everything above the publish happens in one transaction, so an exit is
-        either backed by an APPROVED intent or not published at all. What is
-        *not* covered here: a crash between APPROVED and the publish leaves the
-        intent nonterminal and the suppression rule then blocks re-emission —
-        re-publishing that orphan is KAN-8.
+        either backed by an APPROVED intent or not published at all. A crash
+        between the APPROVED commit and the publish leaves an orphan: KAN-8
+        closed that by marking ``published_at`` after the publish
+        (:meth:`_publish_approved_exit`), re-publishing anything unmarked at the
+        top of the next scan (:meth:`_republish_unpublished_exits`), and
+        teaching the suppression rule below to ignore the unpublished.
 
         ``suppress_if_pending`` turns on the first branch, for the recurring
         controls (stop-loss, passive trim) that re-evaluate the same breach
@@ -1414,7 +1452,7 @@ class RiskServiceRunner:
                 else risk_adjustments
             ),
         )
-        await self._redis.publish(APPROVED_ORDERS_STREAM, order.to_stream_dict())
+        await self._publish_approved_exit(order)
         self._logger.info(
             "Liquidation order published",
             kind=kind,
@@ -1423,6 +1461,178 @@ class RiskServiceRunner:
             recommendation_id=exit_id,
         )
         return True
+
+    async def _publish_approved_exit(self, order: ApprovedOrderMessage) -> None:
+        """Put an already-APPROVED exit on the stream and record that it went.
+
+        THE publish site for risk-side sells — both the emitter and the
+        re-publish sweep go through here, so there is one place where "on the
+        stream" and ``published_at`` are kept in step.
+
+        The order of the two statements is the whole point (KAN-8). Publishing
+        first and marking second means a crash in between leaves an intent that
+        looks unpublished but is not: the next sweep re-publishes it, execution
+        recognises the id and no-ops, and the mark finally lands. Marking first
+        would produce the opposite, unrecoverable orphan — an intent the ledger
+        swears is published that execution never saw and no sweep will revisit.
+        """
+        await self._redis.publish(APPROVED_ORDERS_STREAM, order.to_stream_dict())
+        if self._order_ledger is None:
+            return
+        self._order_ledger.mark_published(order.recommendation_id)
+        self._order_ledger.session.commit()
+
+    async def _republish_unpublished_exits(self) -> None:
+        """Re-publish exits that were committed but never reached the stream.
+
+        Runs at the top of every periodic scan, before any breach is evaluated,
+        because the suppression rule downstream needs the answer to "is an exit
+        in flight?" to be true or false — not "yes, but nobody has it".
+
+        Only exits approved *today* are re-published. An exit is a decision
+        about a price that has since moved on: re-publishing one approved days
+        ago would fire a stale stop-loss at today's market, and if the position
+        was flattened by hand in the meantime the fill goes short. Older
+        orphans are escalated instead (:meth:`_alert_stale_orphans`) and left
+        inert — they still do not suppress, so today's breach gets a fresh,
+        correctly-sized exit rather than a stale one.
+
+        Fail-fast on purpose: if a publish raises, the exception propagates and
+        aborts the whole scan (``maybe_run_periodic_checks`` logs it and the
+        service carries on). Swallowing it and continuing to the breach
+        evaluation would be the dangerous option — the orphan would no longer
+        suppress, so the stop-loss would mint a *second* exit intent for the
+        same shares, and both would sell once the stream came back.
+        """
+        if self._order_ledger is None:
+            return
+        orphans = self._order_ledger.unpublished_exit_intents(
+            mode=self._config.mode
+        )
+        today = self._trading_date()
+        cutoff = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+        pending: list[tuple[str, ApprovedOrderMessage]] = []
+        stale: list[dict[str, Any]] = []
+        for intent in orphans:
+            if self._approved_before(intent, cutoff):
+                stale.append(
+                    {
+                        "recommendation_id": intent.recommendation_id,
+                        "ticker": intent.symbol,
+                        "quantity": float(intent.requested_quantity),
+                    }
+                )
+                continue
+            pending.append(
+                (
+                    intent.recommendation_id,
+                    ApprovedOrderMessage(
+                        ticker=intent.symbol,
+                        timestamp=datetime.now(timezone.utc),
+                        action=intent.action.lower(),
+                        quantity=float(intent.requested_quantity),
+                        # Always market: the clause selects SELLs only, every
+                        # risk exit is created MKT, and execution routes every
+                        # non-buy through submit_exit as a market order anyway.
+                        order_type="market",
+                        limit_price=None,
+                        recommendation_id=intent.recommendation_id,
+                        # The original risk_adjustments are not persisted, and
+                        # execution reads none of them (they are operator-facing
+                        # provenance). Say plainly what this message is instead
+                        # of guessing which control minted it.
+                        risk_adjustments={
+                            "republished": True,
+                            "reason": intent.reason or "unpublished exit intent",
+                        },
+                        portfolio=intent.portfolio,
+                    ),
+                )
+            )
+        self._order_ledger.session.rollback()
+
+        await self._alert_stale_orphans(stale)
+
+        if not pending:
+            self._republished_exit_ids = set()
+            return
+
+        repeated = sorted(
+            self._republished_exit_ids.intersection(exit_id for exit_id, _ in pending)
+        )
+        self._republished_exit_ids = {exit_id for exit_id, _ in pending}
+        # Alert *before* the publishes, not after. The failure this names —
+        # publishes that are not sticking — is exactly the one where the loop
+        # below raises, so an alert underneath it would never be reached and
+        # a permanently broken sweep would page nobody.
+        if repeated:
+            await self._publish_alert(
+                event_type="exit_republish_repeated",
+                priority="high",
+                message=(
+                    "Exit intents needed re-publishing on two consecutive "
+                    f"scans: {', '.join(repeated)} — publishes are not "
+                    "sticking, manual investigation required"
+                ),
+                context={"recommendation_ids": repeated},
+            )
+        for exit_id, order in pending:
+            self._logger.warning(
+                "Re-publishing an exit intent that was never published",
+                ticker=order.ticker,
+                quantity=order.quantity,
+                recommendation_id=exit_id,
+            )
+            await self._publish_approved_exit(order)
+
+    @staticmethod
+    def _approved_before(intent: OrderIntent, cutoff: datetime) -> bool:
+        """True when this intent was approved before ``cutoff``.
+
+        A missing ``approved_at`` (pre-KAN-4 rows) counts as before: an exit
+        that cannot be dated is exactly the one not to fire automatically.
+        Sqlite hands back naive datetimes for a ``DateTime(timezone=True)``
+        column, so normalise to UTC before comparing.
+        """
+        approved_at = intent.approved_at
+        if approved_at is None:
+            return True
+        if approved_at.tzinfo is None:
+            approved_at = approved_at.replace(tzinfo=timezone.utc)
+        return approved_at < cutoff
+
+    async def _alert_stale_orphans(self, stale: list[dict[str, Any]]) -> None:
+        """Escalate orphaned exits too old to fire, once per intent.
+
+        These are the rows the sweep deliberately will not publish. They need a
+        human — flatten by hand, or terminalise the intent — so they alert at
+        critical, but only when newly seen: an orphan nobody has cleared would
+        otherwise re-page every scan, which is how alerts get muted.
+        """
+        fresh = [
+            row
+            for row in stale
+            if row["recommendation_id"] not in self._stale_orphan_ids
+        ]
+        self._stale_orphan_ids = {row["recommendation_id"] for row in stale}
+        if not fresh:
+            return
+        names = ", ".join(
+            f"{row['ticker']} ({row['recommendation_id']})" for row in fresh
+        )
+        self._logger.critical(
+            "Unpublished exit intents are too old to re-publish",
+            recommendation_ids=[row["recommendation_id"] for row in fresh],
+        )
+        await self._publish_alert(
+            event_type="exit_orphan_stale",
+            priority="critical",
+            message=(
+                f"Exit intents approved before today were never published: {names} "
+                "— too old to fire automatically, manual action required"
+            ),
+            context={"orphans": fresh},
+        )
 
     async def run_passive_scan(self) -> None:
         """Run passive breach monitoring scan.
@@ -1583,6 +1793,10 @@ class RiskServiceRunner:
         # after the admin clear endpoint has cleared it in the DB.
         self._kill_switch.sync_from_store()
         self._refresh_portfolio_from_db()
+        # Recover orphaned exits before evaluating anything new: an intent that
+        # is committed but unpublished neither reaches execution nor suppresses,
+        # so the sweep has to settle it before the breach checks read the ledger.
+        await self._republish_unpublished_exits()
         await self.run_stop_loss_check()
         await self.run_passive_scan()
         await self._emit_drawdown_gauge()
