@@ -50,6 +50,15 @@ telegram() {
 
 echo "$(ts): Starting weekly backtest refresh" >> "$LOG_FILE"
 
+# Drift guard: warn loudly if this deployed copy has fallen behind the repo
+# canonical. The 2026-08-11 cold-boot auth failure was a stale ~/ibc copy still
+# using the pre-T3 default DB password. Warn-only — a legitimately newer
+# deployed copy must not block the run. Resync with deploy/launchd/deploy.sh.
+CANON="$ALGO_DIR/deploy/launchd/$(basename "$0")"
+if [ -f "$CANON" ] && ! cmp -s "$0" "$CANON"; then
+    echo "$(date): WARNING - $(basename "$0") differs from repo canonical ($CANON); run deploy/launchd/deploy.sh to resync" >> "$LOG_FILE"
+fi
+
 if ! nc -z 127.0.0.1 7497 2>/dev/null; then
     echo "$(ts): ERROR - IB Gateway not reachable on 7497" >> "$LOG_FILE"
     telegram "❌ Weekly backtest refresh SKIPPED: IB Gateway not reachable on 7497."

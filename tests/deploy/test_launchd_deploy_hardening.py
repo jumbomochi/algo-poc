@@ -19,9 +19,52 @@ DEPLOY_DIR = Path("deploy/launchd")
 DEPLOY_SCRIPT = DEPLOY_DIR / "deploy.sh"
 RUN_PAPER = DEPLOY_DIR / "run_paper.sh"
 RUN_DIVERGENCE = DEPLOY_DIR / "run_divergence.sh"
+RUN_PIPELINE_REPORT = DEPLOY_DIR / "run_pipeline_report.sh"
+RUN_DB_BACKUP = DEPLOY_DIR / "run_db_backup.sh"
+RUN_BACKTEST_REFRESH = DEPLOY_DIR / "run_backtest_refresh.sh"
+GATEWAY_WATCHDOG = DEPLOY_DIR / "gateway_watchdog.sh"
 PAPER_PLIST = DEPLOY_DIR / "local.algo-paper-trading.plist"
 
-WRAPPERS = (RUN_PAPER, RUN_DIVERGENCE)
+# Every wrapper deploy.sh copies to ~/ibc — i.e. every .sh that is *executed*
+# from the deployed location and can therefore drift from the repo. secrets.sh
+# and deadman.sh are excluded because they are sourced by path from the repo and
+# deploy.sh deliberately refuses to copy them (deploy.sh:78-85).
+WRAPPERS = (
+    RUN_PAPER,
+    RUN_DIVERGENCE,
+    RUN_PIPELINE_REPORT,
+    RUN_DB_BACKUP,
+    RUN_BACKTEST_REFRESH,
+    GATEWAY_WATCHDOG,
+)
+
+# Only the two jobs that talk to the docker stack / IB Gateway on a cold boot.
+PORT_WAITING_WRAPPERS = (RUN_PAPER, RUN_DIVERGENCE)
+
+# Every launchd job definition. A rebuilt machine gets its wiring back only
+# from tracked files, so the set is enumerated rather than globbed — see
+# test_every_plist_is_version_controlled.
+PLISTS = (
+    DEPLOY_DIR / "local.algo-backtest-refresh.plist",
+    DEPLOY_DIR / "local.algo-db-backup.plist",
+    DEPLOY_DIR / "local.algo-divergence-monitor.plist",
+    DEPLOY_DIR / "local.algo-gateway-watchdog.plist",
+    PAPER_PLIST,
+    DEPLOY_DIR / "local.algo-pipeline-report.plist",
+)
+
+
+def _is_git_tracked(path: Path, cwd: Path | None = None) -> bool:
+    """True iff `path` is in git's index — which is what "version controlled"
+    actually means. `Path.exists()` is not a substitute: an untracked file that
+    happens to be on this machine's disk passes exists() and is still lost on a
+    rebuild.
+    """
+    res = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "--", str(path)],
+        capture_output=True, text=True, cwd=str(cwd) if cwd else None,
+    )
+    return res.returncode == 0
 
 
 def test_deploy_script_exists_and_is_executable():
@@ -38,10 +81,36 @@ def test_deploy_script_exists_and_is_executable():
     assert not executed, f"deploy.sh must only print launchctl commands, never run them: {executed}"
 
 
-def test_paper_trading_plist_is_version_controlled():
-    # A machine rebuild restores wiring only for tracked files; this plist was
-    # previously live-only. deploy.sh can only sync what is in the repo.
-    assert PAPER_PLIST.exists(), "local.algo-paper-trading.plist must be tracked in the repo"
+def test_git_tracked_check_can_tell_tracked_from_merely_present(tmp_path):
+    """The assertion below is only worth anything if it can fail.
+
+    Its predecessor asserted `.exists()` under a message that said "tracked",
+    so `git rm --cached` would have left it green while destroying the property
+    it exists to protect. This pins the distinction on a throwaway repo, where
+    both files are present on disk and only one is in the index.
+    """
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True, timeout=60)
+    tracked = tmp_path / "tracked.plist"
+    tracked.write_text("<plist/>")
+    untracked = tmp_path / "untracked.plist"
+    untracked.write_text("<plist/>")
+    subprocess.run(["git", "add", "tracked.plist"], cwd=tmp_path, check=True, timeout=60)
+
+    assert tracked.exists() and untracked.exists(), "exists() cannot separate these"
+    assert _is_git_tracked(tracked, cwd=tmp_path)
+    assert not _is_git_tracked(untracked, cwd=tmp_path)
+
+
+def test_every_plist_is_version_controlled():
+    # A machine rebuild restores wiring only for tracked files; the paper plist
+    # was previously live-only. deploy.sh can only sync what is in the repo, and
+    # the property is identical for all six jobs.
+    on_disk = {p.name for p in DEPLOY_DIR.glob("*.plist")}
+    assert on_disk == {p.name for p in PLISTS}, (
+        f"plist set changed; add it to PLISTS so it is covered too: {on_disk}"
+    )
+    for plist in PLISTS:
+        assert _is_git_tracked(plist), f"{plist.name} must be tracked in the repo"
     assert "run_paper.sh" in PAPER_PLIST.read_text()
 
 
@@ -55,8 +124,63 @@ def test_wrappers_have_a_drift_guard():
         assert 'cmp -s "$0" "$CANON"' in text, f"{wrapper} drift check is not comparing to the canonical"
 
 
+def _run_deployed_copy(tmp_path, *, drifted: bool) -> str:
+    """Run a *deployed* copy of run_paper.sh with the repo as its canonical, and
+    return the log it wrote.
+
+    run_paper.sh is the one wrapper that can be driven end-to-end safely: the
+    `security` stub guarantees no credential resolves, so it aborts long before
+    it could place an order. The guard runs before that abort.
+    """
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    deployed = tmp_path / RUN_PAPER.name
+    body = RUN_PAPER.read_text()
+    if drifted:
+        body += "\n# a hand edit on the deployed copy\n"
+    deployed.write_text(body)
+    deployed.chmod(0o755)
+
+    security_stub = tmp_path / "security-stub"
+    security_stub.write_text("#!/bin/bash\necho 'could not be found' >&2\nexit 44\n")
+    security_stub.chmod(0o755)
+    # Without this the failure path raises a real desktop notification on the
+    # developer's machine every time this test runs.
+    osascript_stub = tmp_path / "osascript-stub"
+    osascript_stub.write_text("#!/bin/bash\nexit 0\n")
+    osascript_stub.chmod(0o755)
+
+    env = dict(
+        os.environ,
+        HOME=str(fake_home),
+        ALGO_DIR=str(Path.cwd()),
+        ALGO_SECURITY_BIN=str(security_stub),
+        ALGO_OSASCRIPT_BIN=str(osascript_stub),
+        ALGO_KEYCHAIN_SERVICE="algo-poc-absent-test-service",
+    )
+    res = subprocess.run(
+        [str(deployed)], capture_output=True, text=True, timeout=120, env=env, cwd=Path.cwd(),
+    )
+    assert res.returncode != 0, "wrapper should abort when no credential resolves"
+    logs = list((fake_home / "ibc" / "logs").glob("paper_trading_*.log"))
+    assert logs, "wrapper wrote no log"
+    return logs[0].read_text()
+
+
+def test_drift_guard_warns_when_the_deployed_copy_differs(tmp_path):
+    log = _run_deployed_copy(tmp_path, drifted=True)
+    assert "differs from repo canonical" in log, log
+
+
+def test_drift_guard_is_silent_when_the_deployed_copy_matches(tmp_path):
+    # A legitimately in-sync copy must not cry wolf, or the warning stops
+    # meaning anything on the day it fires for real.
+    log = _run_deployed_copy(tmp_path, drifted=False)
+    assert "differs from repo canonical" not in log, log
+
+
 def test_wrappers_wait_for_ports_instead_of_failing_on_first_probe():
-    for wrapper in WRAPPERS:
+    for wrapper in PORT_WAITING_WRAPPERS:
         text = wrapper.read_text()
         assert "wait_for_port()" in text, f"{wrapper} must define the bounded wait helper"
         assert "wait_for_port 127.0.0.1 55432" in text, f"{wrapper} should wait for the paper DB"
