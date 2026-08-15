@@ -9,6 +9,12 @@ Usage:
     python scripts/run_paper.py --init            # Initialize fresh state
     python scripts/run_paper.py --status           # Print current positions
     python scripts/run_paper.py                    # Daily signal run (requires IB)
+
+    # Epoch drill: books into a synthetic sleeve the graded readers exclude, so
+    # a drill's real fills never enter the evidence record. The six graded
+    # sleeves are not evaluated at all on a tagged run.
+    # See docs/operations/drill-evidence-isolation.md.
+    python scripts/run_paper.py --portfolio-tag __drill__ --portfolio-tag-capital 500
 """
 
 from __future__ import annotations
@@ -79,6 +85,7 @@ from shared.observability import DEFAULT_TRADING_METRICS
 from services.execution.ib_account import IBAccountReader
 from services.execution.reconciliation import ReconciliationResult
 from shared.logging import get_logger
+from shared.universe import DRILL_PORTFOLIO, is_excluded_portfolio
 
 if TYPE_CHECKING:
     from research.shadow import CandidateObserver
@@ -266,6 +273,67 @@ def build_portfolios(
     return portfolios
 
 
+DRILL_BASE_SLEEVE = "momentum"
+
+
+def build_drill_portfolio(
+    tag: str,
+    capital: float,
+    bars_by_ticker: dict[str, list[dict]],
+    portfolio_context: PortfolioContext | None = None,
+) -> PortfolioConfig:
+    """Build the single sleeve a ``--portfolio-tag`` run trades.
+
+    Drills need a sleeve that reliably opens a position and then exits it (the
+    synthetic stop-loss drill), so this mirrors the ``momentum`` sleeve's
+    parameters over the same liquid universe — but under the tag's own name, so
+    its positions, cash, and pending orders are the tag's and never a graded
+    sleeve's. The crash-entry freeze is deliberately *not* applied: a drill must
+    be able to place its order on any trading day, and its results are excluded
+    from the evidence record either way (see
+    docs/operations/drill-evidence-isolation.md).
+    """
+    return PortfolioConfig(
+        name=tag,
+        capital=capital,
+        signals_fn=make_momentum_signals_fn(
+            bars_by_ticker=bars_by_ticker,
+            top_n=5,
+            lookback_days=126,
+            position_size_pct=0.12,
+            initial_capital=capital,
+            trailing_stop_pct=0.10,
+            bear_tickers=BEAR_TICKERS,
+            portfolio_context=portfolio_context,
+        ),
+        risk_engine=RiskEngine(
+            position_entry_limit_pct=12.0,
+            sector_concentration_pct=30.0,
+            total_exposure_limit_pct=150.0,
+            max_lots_per_ticker=1,
+        ),
+    )
+
+
+def ensure_tagged_portfolio(
+    state: PaperTradingState,
+    session: Session,
+    tag: str,
+    capital: float,
+) -> bool:
+    """Fund the tagged sleeve if it has no PortfolioConfig row yet.
+
+    Returns True when a row was created. Funding is explicit rather than
+    derived from CAPITAL_ALLOCATIONS: a drill sleeve is not part of the graded
+    split and must not shrink it. An existing row is left alone — re-running a
+    drill must not silently top its cash back up.
+    """
+    if tag in state.get_portfolio_names():
+        return False
+    PaperTradingState.create_new({tag: capital}, session)
+    return True
+
+
 def build_portfolio_contexts(
     state: PaperTradingState,
     session: Session,
@@ -273,10 +341,16 @@ def build_portfolio_contexts(
     *,
     sleeve_budgets: Mapping[str, float] | None = None,
     account_id: str | None = None,
+    portfolio_names: list[str] | None = None,
 ) -> dict[str, PortfolioContext]:
-    """Build per-sleeve strategy state before creating signal factories."""
+    """Build per-sleeve strategy state before creating signal factories.
+
+    ``portfolio_names`` defaults to the six graded sleeves. A ``--portfolio-tag``
+    run passes just the tag, so no graded sleeve's state is hydrated at all.
+    """
     ledger = OrderLedger(session)
     pending_orders = ledger.load_pending_orders(account_id=account_id)
+    names = list(portfolio_names or CAPITAL_ALLOCATIONS)
     budgets = dict(sleeve_budgets or {})
     if not budgets:
         if capital is None:
@@ -292,7 +366,7 @@ def build_portfolio_contexts(
             reserved_notional=ledger.active_reservations(name, account_id=account_id),
             account_id=account_id,
         )
-        for name in CAPITAL_ALLOCATIONS
+        for name in names
     }
 
 
@@ -523,10 +597,17 @@ def run_daily(
     minimum_commission_usd: float,
     minimum_settled_usd_reserve: float,
     candidate_observer: CandidateObserver | None = None,
+    record_aggregate: bool = True,
 ) -> list[dict]:
     """Run one daily cycle: generate signals for all portfolios.
 
     Returns list of signals generated (for logging/review).
+
+    ``record_aggregate`` writes the "_aggregate" rollup snapshot. A tagged
+    (drill) run passes False: it fetches only the drill sleeve's universe, so
+    graded positions outside that universe would be marked at cost
+    (``compute_equity`` falls back to ``avg_entry_price``) and the rollup would
+    record an equity figure that was never true.
     """
     signals_generated: list[dict] = []
     accepted_buy_notional: dict[str, float] = {}
@@ -712,16 +793,21 @@ def run_daily(
         market_value = equity - cash
         state.record_equity_snapshot(name, today, equity, cash, market_value)
 
-    # Record aggregate equity snapshot
-    total_equity = 0.0
-    total_cash = 0.0
-    for name in state.get_portfolio_names():
-        total_equity += state.compute_equity(name, current_prices)
-        total_cash += state.get_cash(name)
-    total_market_value = total_equity - total_cash
-    state.record_equity_snapshot(
-        "_aggregate", today, total_equity, total_cash, total_market_value
-    )
+    # Record aggregate equity snapshot. Synthetic portfolios (the "__drill__"
+    # tag) are excluded: the rollup is the graded book's NAV, and a drill's
+    # funding would inflate it.
+    if record_aggregate:
+        total_equity = 0.0
+        total_cash = 0.0
+        for name in state.get_portfolio_names():
+            if is_excluded_portfolio(name):
+                continue
+            total_equity += state.compute_equity(name, current_prices)
+            total_cash += state.get_cash(name)
+        total_market_value = total_equity - total_cash
+        state.record_equity_snapshot(
+            "_aggregate", today, total_equity, total_cash, total_market_value
+        )
 
     return signals_generated
 
@@ -1025,7 +1111,49 @@ def _parser(default_db_url: str, default_redis_url: str) -> argparse.ArgumentPar
         action="store_true",
         help="Record observational factor snapshots for raw buy candidates",
     )
+    parser.add_argument(
+        "--portfolio-tag",
+        default=None,
+        help=(
+            f"Book this run into a synthetic sleeve instead of the six graded "
+            f"ones (e.g. {DRILL_PORTFOLIO} for an epoch drill). Only names the "
+            f"graded readers already exclude are accepted — a name without the "
+            f"'_' prefix is refused so a typo cannot pollute the book."
+        ),
+    )
+    parser.add_argument(
+        "--portfolio-tag-capital",
+        type=float,
+        default=None,
+        help="Capital to fund a new --portfolio-tag sleeve with (required with it)",
+    )
     return parser
+
+
+def validate_portfolio_tag(tag: str | None, tag_capital: float | None) -> str | None:
+    """Return the validated tag, or raise ValueError explaining the refusal.
+
+    The direction of this check is the whole point and is easy to get backwards:
+    a tag is accepted **only if** it is a name the graded readers already
+    exclude. ``--portfolio-tag momentum`` would write real fills into a graded
+    sleeve, so it is refused before anything touches the database.
+    """
+    if tag is None:
+        return None
+    if not is_excluded_portfolio(tag):
+        raise ValueError(
+            f"Refusing --portfolio-tag '{tag}': a tagged run books real fills, "
+            f"and only portfolios excluded from the evidence record may receive "
+            f"them. Use a name starting with '_' (e.g. {DRILL_PORTFOLIO}). "
+            f"See docs/operations/drill-evidence-isolation.md."
+        )
+    if tag_capital is None or tag_capital <= 0:
+        raise ValueError(
+            f"Refusing --portfolio-tag '{tag}': --portfolio-tag-capital is "
+            f"required and must be positive, so the drill sleeve is funded "
+            f"explicitly rather than borrowing a graded sleeve's budget."
+        )
+    return tag
 
 
 def _create_research_shadow(
@@ -1088,6 +1216,15 @@ def main():
         default_redis_url = "redis://localhost:6379/0"
 
     args = _parser(default_db_url, default_redis_url).parse_args()
+
+    # Validated before the database is opened, so a refused tag writes nothing.
+    try:
+        portfolio_tag = validate_portfolio_tag(
+            args.portfolio_tag, args.portfolio_tag_capital
+        )
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        sys.exit(2)
 
     session = make_db_session(args.db_url)
 
@@ -1156,6 +1293,18 @@ def main():
     print(f"Paper Trading Daily Run - {date.today()}")
     print("State loaded from database")
 
+    if portfolio_tag is not None:
+        created = ensure_tagged_portfolio(
+            state, session, portfolio_tag, args.portfolio_tag_capital
+        )
+        session.commit()
+        print(
+            f"Tagged run: trading '{portfolio_tag}' only "
+            f"({'funded with' if created else 'existing sleeve, requested'} "
+            f"${args.portfolio_tag_capital:,.2f}). The six graded sleeves are "
+            f"not evaluated and their books are untouched."
+        )
+
     # Broker truth is the first input to a daily run. Reconciliation and the
     # NAV-derived capital snapshot are committed before signal evaluation.
     broker_snapshot = asyncio.run(
@@ -1194,8 +1343,10 @@ def main():
         f"entries: {'disabled' if entries_disabled else 'enabled'}"
     )
 
-    # Fetch bars from IB
-    all_tickers = get_union_universe(list(CAPITAL_ALLOCATIONS.keys()))
+    # Fetch bars from IB. A tagged run only needs the drill sleeve's universe.
+    all_tickers = get_union_universe(
+        [DRILL_BASE_SLEEVE] if portfolio_tag else list(CAPITAL_ALLOCATIONS.keys())
+    )
     print(f"\nFetching bars for {len(all_tickers)} tickers ({args.years} year)...")
     bars_by_ticker = fetch_bars_from_ib(
         tickers=all_tickers,
@@ -1219,22 +1370,41 @@ def main():
 
     # Hydrate durable positions and pending broker orders before factory
     # creation so restarts preserve strategy exit state.
-    portfolio_contexts = build_portfolio_contexts(
-        state,
-        session,
-        sleeve_budgets=preparation.capital.sleeve_budgets,
-        account_id=broker_snapshot.account_id,
-    )
+    # A tagged run hydrates and trades the tag alone: the graded sleeves are
+    # untouched by construction, not by filtering downstream.
+    if portfolio_tag is not None:
+        portfolio_contexts = build_portfolio_contexts(
+            state,
+            session,
+            sleeve_budgets={portfolio_tag: args.portfolio_tag_capital},
+            account_id=broker_snapshot.account_id,
+            portfolio_names=[portfolio_tag],
+        )
+        portfolios = {
+            portfolio_tag: build_drill_portfolio(
+                tag=portfolio_tag,
+                capital=args.portfolio_tag_capital,
+                bars_by_ticker=bars_by_ticker,
+                portfolio_context=portfolio_contexts[portfolio_tag],
+            )
+        }
+    else:
+        portfolio_contexts = build_portfolio_contexts(
+            state,
+            session,
+            sleeve_budgets=preparation.capital.sleeve_budgets,
+            account_id=broker_snapshot.account_id,
+        )
 
-    # Build portfolios
-    portfolios = build_portfolios(
-        capital=preparation.capital.deployable_capital,
-        bars_by_ticker=bars_by_ticker,
-        regime_by_date=regime_by_date,
-        fundamentals_lookup=fundamentals_lookup,
-        earnings_lookup=earnings_lookup,
-        portfolio_contexts=portfolio_contexts,
-    )
+        # Build portfolios
+        portfolios = build_portfolios(
+            capital=preparation.capital.deployable_capital,
+            bars_by_ticker=bars_by_ticker,
+            regime_by_date=regime_by_date,
+            fundamentals_lookup=fundamentals_lookup,
+            earnings_lookup=earnings_lookup,
+            portfolio_contexts=portfolio_contexts,
+        )
 
     # Signal evaluation never projects fills.  Actual IB executions are the
     # only input allowed to mutate durable cash and positions.
@@ -1276,6 +1446,7 @@ def main():
                 _config.currency.minimum_settled_usd_reserve
             ),
             candidate_observer=candidate_observer,
+            record_aggregate=portfolio_tag is None,
         )
         if args.publish and signals:
             contracts = resolve_contract_details_from_ib(

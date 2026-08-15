@@ -31,6 +31,8 @@ from scripts.paper_state import PaperTradingState
 from shared.models.base import Base
 from shared.models.equity_snapshot import EquitySnapshot
 from shared.models.portfolio import Trade
+from shared.models.portfolio_config import PortfolioConfig
+from shared.universe import DRILL_PORTFOLIO
 
 
 @pytest.fixture
@@ -378,3 +380,144 @@ def test_wrapper_documents_and_branches_on_every_exit_code():
     script = _Path("deploy/launchd/run_divergence.sh").read_text()
     assert f"{EXIT_BASELINE_NOT_COMPARABLE} = " in script  # contract comment
     assert f"    {EXIT_BASELINE_NOT_COMPARABLE})" in script  # case branch
+
+
+# ---------------------------------------------------------------------------
+# Drill / synthetic portfolio exclusion (KAN-24)
+# ---------------------------------------------------------------------------
+
+
+def _seed_drill_sleeve(session: Session) -> None:
+    """Add a funded __drill__ sleeve with its own equity history.
+
+    A drill needs cash, so it needs a PortfolioConfig row — which means
+    get_portfolio_names() returns it and the monitor sees it.
+    """
+    now = datetime.now(timezone.utc)
+    session.add(PortfolioConfig(
+        portfolio=DRILL_PORTFOLIO, capital=500.0, cash=500.0,
+        created_at=now, updated_at=now,
+    ))
+    base = date(2026, 5, 19)
+    value = 500.0
+    for i in range(7):
+        session.add(EquitySnapshot(
+            portfolio=DRILL_PORTFOLIO,
+            date=date.fromordinal(base.toordinal() + i),
+            equity=value, cash=value, market_value=0.0, created_at=now,
+        ))
+        value *= 0.98  # a losing drill: would breach if it were ever scored
+    session.flush()
+
+
+def _write_backtest_json_with_drill_sleeve(tmp_path: Path) -> Path:
+    """Backtest JSON that *does* contain a __drill__ sleeve.
+
+    This is what makes the exclusion testable. Today the monitor happens to skip
+    a drill sleeve via the "not present in backtest" branch; with a same-named
+    baseline sleeve present that incidental protection disappears and only an
+    explicit filter keeps the drill out of the scoring.
+    """
+    path = _write_backtest_json(tmp_path)
+    data = json.loads(path.read_text())
+    dates = data["portfolios"]["momentum"]["dates"]
+    data["portfolios"][DRILL_PORTFOLIO] = {
+        "config": {"capital": 500.0},
+        "trades": [],
+        "portfolio_values": [500.0] * (len(dates) + 1),
+        "dates": dates,
+        "metrics": {"total_return": 0.0},
+    }
+    path.write_text(json.dumps(data))
+    return path
+
+
+def test_monitor_skips_drill_portfolio_even_when_it_is_scoreable(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """AC3: __drill__ is skipped explicitly, with a logged reason.
+
+    Both halves matter: the drill is present in the DB *and* in the baseline, so
+    it is fully scoreable — and it must still never appear in a report.
+    """
+    from scripts import divergence_monitor
+
+    db_path = tmp_path / "paper.db"
+    db_url = f"sqlite:///{db_path}"
+    engine = create_engine(db_url)
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    _seed_state(session)
+    _seed_drill_sleeve(session)
+    session.commit()
+    session.close()
+
+    bt_path = _write_backtest_json_with_drill_sleeve(tmp_path)
+    report_path = tmp_path / "divergence.json"
+    monkeypatch.setattr(divergence_monitor.sys, "argv", [
+        "divergence_monitor.py",
+        "--backtest", str(bt_path),
+        "--db-url", db_url,
+        "--window", "5",
+        "--output", str(report_path),
+    ])
+
+    divergence_monitor.main()
+
+    out = capsys.readouterr().out
+    assert f"Skipping '{DRILL_PORTFOLIO}'" in out
+    assert "excluded portfolio" in out
+    assert "drill-evidence-isolation.md" in out
+
+    scored = {p["portfolio"] for p in json.loads(report_path.read_text())["reports"]}
+    assert DRILL_PORTFOLIO not in scored
+    assert "momentum" in scored
+
+
+def _run_monitor(tmp_path: Path, monkeypatch, *, name: str, with_drill: bool) -> dict:
+    """Run main() against a fresh DB and return the parsed JSON report."""
+    from scripts import divergence_monitor
+
+    db_url = f"sqlite:///{tmp_path / (name + '.db')}"
+    engine = create_engine(db_url)
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    _seed_state(session)
+    if with_drill:
+        _seed_drill_sleeve(session)
+    session.commit()
+    session.close()
+
+    report_path = tmp_path / f"divergence_{name}.json"
+    monkeypatch.setattr(divergence_monitor.sys, "argv", [
+        "divergence_monitor.py",
+        "--backtest", str(_write_backtest_json_with_drill_sleeve(tmp_path)),
+        "--db-url", db_url,
+        "--window", "5",
+        "--output", str(report_path),
+    ])
+    divergence_monitor.main()
+    return json.loads(report_path.read_text())
+
+
+def test_drill_equity_is_absent_from_the_aggregate_report(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """The aggregate is the graded book's — adding a drill must change nothing.
+
+    The seeded drill loses 2%/day, so if its series reached the aggregate the
+    numbers would move. Comparing the two runs asserts exclusion end to end
+    rather than re-deriving the expected figure.
+    """
+    without = _run_monitor(tmp_path, monkeypatch, name="graded", with_drill=False)
+    with_drill = _run_monitor(tmp_path, monkeypatch, name="drilled", with_drill=True)
+    capsys.readouterr()
+
+    def _aggregate(payload: dict) -> dict:
+        agg = next(r for r in payload["reports"] if r["portfolio"] == "AGGREGATE")
+        return {k: v for k, v in agg.items() if k != "notes"}
+
+    assert _aggregate(with_drill) == _aggregate(without)
+    assert {r["portfolio"] for r in with_drill["reports"]} == {
+        r["portfolio"] for r in without["reports"]
+    }

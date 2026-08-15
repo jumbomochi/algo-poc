@@ -8,10 +8,13 @@ import pytest
 
 from shared.universe import (
     ACTIVE_SLEEVES,
+    DRILL_PORTFOLIO,
+    EXCLUDED_PORTFOLIO_PREFIX,
     UNIVERSE_REGISTRY,
     MembershipCalendar,
     contract_conid_for,
     get_union_universe,
+    is_excluded_portfolio,
     make_stock_contract,
     resolve_watchlist,
 )
@@ -199,3 +202,26 @@ class TestMembershipCalendar:
             }
         )
         assert cal.contains("AAPL", date(2015, 3, 1)) is True
+
+
+class TestExcludedPortfolios:
+    """Synthetic portfolios must be identifiable from one predicate.
+
+    Drills place real paper orders and take real fills, so their rows land in
+    the same tables the go-live gate reads. The exclusion contract for every
+    reader lives in docs/operations/drill-evidence-isolation.md.
+    """
+
+    def test_synthetic_names_are_excluded(self):
+        assert is_excluded_portfolio(DRILL_PORTFOLIO) is True
+        assert is_excluded_portfolio("_aggregate") is True
+        assert is_excluded_portfolio("__liquidation__") is True
+        assert is_excluded_portfolio("_smoke") is True
+
+    def test_every_graded_sleeve_is_not_excluded(self):
+        for sleeve in ACTIVE_SLEEVES:
+            assert is_excluded_portfolio(sleeve) is False, sleeve
+
+    def test_drill_tag_uses_the_established_prefix(self):
+        """A second mechanism would silently bypass the three existing filters."""
+        assert DRILL_PORTFOLIO.startswith(EXCLUDED_PORTFOLIO_PREFIX)
