@@ -1101,48 +1101,89 @@ class RiskServiceRunner:
     async def _emit_liquidation_exit(
         self, pos: dict[str, Any], *, epoch: int, reason: str
     ) -> bool:
-        """Create the deterministic exit intent (idempotent) and publish it.
+        """Kill/breaker path: flatten one position through the shared emitter.
+
+        Caller #1 of :meth:`_emit_ledgered_exit`. The deterministic id makes a
+        replay a no-op; the id scheme itself is unchanged here (KAN-6 revisits
+        it), and the default ``risk_adjustments`` keep the published payload
+        byte-identical to what shipped before the extraction.
+        """
+        return await self._emit_ledgered_exit(
+            "liq",
+            pos,
+            exit_id=self._liquidation_exit_id(pos["ticker"], epoch),
+            reason=reason,
+        )
+
+    async def _emit_ledgered_exit(
+        self,
+        kind: str,
+        target: dict[str, Any],
+        *,
+        exit_id: str,
+        reason: str,
+        quantity: float | None = None,
+        risk_adjustments: dict[str, Any] | None = None,
+    ) -> bool:
+        """Create an APPROVED ledger intent for a risk-side exit and publish it.
+
+        THE single publish site for every risk-side sell. Adding another
+        ``self._redis.publish(APPROVED_ORDERS_STREAM, ...)`` anywhere in this
+        class is the bug this method exists to prevent: an order published
+        without a backing intent is rejected by execution (its first act on an
+        approved order is a ledger lookup) and dead-letters silently, which is
+        how stop-loss sells went unexecuted for weeks.
+
+        ``kind`` (``"liq"``/``"stop-loss"``/``"passive-trim"``) names the
+        mechanism in the logs and in the unroutable alert, so an operator can
+        tell which control could not route. ``quantity`` defaults to flattening
+        the whole target; a partial exit (passive trim) passes its own.
 
         Returns True when an exit was published. The ledger intent is what lets
         execution actually place the sell (a synthetic id with no intent is
-        rejected), and the deterministic id makes a replay a no-op.
+        rejected), and a deterministic id makes a replay a no-op.
         """
-        quantity = pos["quantity"]
+        if quantity is None:
+            quantity = target["quantity"]
         if quantity is None or quantity <= 0:
             return False
-        exit_id = self._liquidation_exit_id(pos["ticker"], epoch)
 
         # With a ledger, a missing con_id means we cannot create the backing
         # intent, so execution would reject the exit — the position would go
         # silently un-liquidated while the summary alert claimed success. Flag it
         # for manual action instead of publishing a doomed order.
-        if self._order_ledger is not None and pos.get("con_id") is None:
+        if self._order_ledger is not None and target.get("con_id") is None:
             self._logger.critical(
                 "Cannot auto-liquidate position: missing con_id",
-                ticker=pos["ticker"],
+                kind=kind,
+                ticker=target["ticker"],
                 quantity=quantity,
             )
             await self._publish_alert(
                 event_type="liquidation_unroutable",
                 priority="critical",
                 message=(
-                    f"Cannot auto-liquidate {pos['ticker']} ({quantity}): missing "
+                    f"Cannot auto-liquidate {target['ticker']} ({quantity}): missing "
                     "con_id — manual action required"
                 ),
-                context={"ticker": pos["ticker"], "quantity": quantity},
+                context={
+                    "kind": kind,
+                    "ticker": target["ticker"],
+                    "quantity": quantity,
+                },
             )
             return False
 
-        if self._order_ledger is not None and pos.get("con_id") is not None:
+        if self._order_ledger is not None and target.get("con_id") is not None:
             proposal = SimpleNamespace(
                 recommendation_id=exit_id,
-                account_id=pos["account_id"] or "",
+                account_id=target["account_id"] or "",
                 mode=self._config.mode,
-                portfolio=pos["portfolio"] or "__liquidation__",
-                con_id=pos["con_id"],
-                symbol=pos["ticker"],
-                exchange=pos["exchange"] or "SMART",
-                currency=pos["currency"] or "USD",
+                portfolio=target["portfolio"] or "__liquidation__",
+                con_id=target["con_id"],
+                symbol=target["ticker"],
+                exchange=target["exchange"] or "SMART",
+                currency=target["currency"] or "USD",
                 action="SELL",
                 quantity=quantity,
                 limit_price=None,
@@ -1170,7 +1211,8 @@ class RiskServiceRunner:
                 self._order_ledger.session.rollback()
                 self._logger.critical(
                     "Cannot auto-liquidate position: exit intent conflicts",
-                    ticker=pos["ticker"],
+                    kind=kind,
+                    ticker=target["ticker"],
                     quantity=quantity,
                     recommendation_id=exit_id,
                 )
@@ -1178,12 +1220,13 @@ class RiskServiceRunner:
                     event_type="liquidation_unroutable",
                     priority="critical",
                     message=(
-                        f"Cannot auto-liquidate {pos['ticker']} ({quantity}): "
+                        f"Cannot auto-liquidate {target['ticker']} ({quantity}): "
                         "exit intent conflicts on economics — manual action "
                         "required"
                     ),
                     context={
-                        "ticker": pos["ticker"],
+                        "kind": kind,
+                        "ticker": target["ticker"],
                         "quantity": quantity,
                         "recommendation_id": exit_id,
                     },
@@ -1194,19 +1237,24 @@ class RiskServiceRunner:
                 raise
 
         order = ApprovedOrderMessage(
-            ticker=pos["ticker"],
+            ticker=target["ticker"],
             timestamp=datetime.now(timezone.utc),
             action="sell",
             quantity=quantity,
             order_type="market",
             limit_price=None,
             recommendation_id=exit_id,
-            risk_adjustments={"kill_switch": True, "reason": reason},
+            risk_adjustments=(
+                {"kill_switch": True, "reason": reason}
+                if risk_adjustments is None
+                else risk_adjustments
+            ),
         )
         await self._redis.publish(APPROVED_ORDERS_STREAM, order.to_stream_dict())
         self._logger.info(
             "Liquidation order published",
-            ticker=pos["ticker"],
+            kind=kind,
+            ticker=target["ticker"],
             quantity=quantity,
             recommendation_id=exit_id,
         )
