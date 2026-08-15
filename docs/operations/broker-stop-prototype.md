@@ -1,9 +1,10 @@
 # Broker-Stop Prototype Spike (DUN551088)
 
 **Status (2026-08-15): Q1 (partial), Q3, Q4 and Q5 answered from a live run on
-DUN551088; Q2 awaits one confirmation; the trigger half of Q1 is a deliberate
-open gap.** Every finding quotes an observed record. Nothing here is inferred
-from IB documentation and presented as evidence.
+DUN551088. Q2 — the go/no-go — is NOT answered, so the recommendation is
+currently NO-GO for KAN-19.** The trigger half of Q1 is a deliberate open gap.
+Every finding quotes an observed record. Nothing here is inferred from IB
+documentation and presented as evidence.
 
 The readiness design's decision D16 makes broker-native GTC stops the *primary*
 stop-loss protection: an order resting at IB survives Redis, Postgres, Docker,
@@ -181,17 +182,17 @@ rather than smoothed over.
 
 ### Q2 — Persistence across a Gateway restart — **the go/no-go**
 
-`AWAITING ONE CONFIRMATION` — the restart itself is verified; the placement time
-is not.
+`NOT ANSWERED.` The first attempt was void and is recorded here so it is not
+mistaken for evidence: the IBC nightly restart is confirmed in
+`~/ibc/logs/ibc-3.23.0_GATEWAY-10.43_Wednesday.txt:1264` ("Restart in progress"
+at `2026-08-14 23:55:00:710`, back up by `23:55:11`), but the operator confirmed
+the stop was placed **after** it. The order resting at `00:02:33` had therefore
+never been through a restart. The IBC log records GUI events only, not API
+orders, so placement time cannot be recovered from the logs — it has to be
+tracked at run time.
 
-- Restart: IBC nightly auto-restart, **confirmed** in
-  `~/ibc/logs/ibc-3.23.0_GATEWAY-10.43_Wednesday.txt:1264` — "Restart in
-  progress" dialog at `2026-08-14 23:55:00:710`, back up by `23:55:11`.
-- The stop was observed **still resting** afterwards at `00:02:33`, unchanged,
-  with `permId 1404141834` and `status: PreSubmitted`.
-- Outstanding: whether `place --apply` ran **before** 23:55:00. The IBC log
-  records GUI events only, not API orders, so placement time cannot be recovered
-  from it. If the order predates the restart, Q2 is a **GO**.
+Re-run needs a deliberate restart while the stop is resting:
+`launchctl kickstart -k "gui/$(id -u)/local.ibc-gateway"`, then `observe`.
 
 This question is load-bearing for a second reason, see Q3: the order rests in
 `PreSubmitted`/`whyHeld: trigger`, i.e. held rather than working at the
@@ -272,6 +273,20 @@ Three, all recorded above rather than smoothed over:
    flattened book.
 3. **An unledgered resting stop disables new entries** (fact (b)) — which
    removes "stops bypass the message path" as an option for KAN-19.
+   **Confirmed on the live pipeline, unintentionally.** The spike stop was left
+   resting across the 2026-08-15 04:15 paper run, and the before/after is clean:
+
+   | Run | Result |
+   |---|---|
+   | `paper_trading_20260814.log` (no spike stop) | `reconciliation: ok; entries: enabled` |
+   | `paper_trading_20260815.log` (spike stop resting) | `reconciliation: major; entries: disabled` |
+
+   The only change between the two runs is the resting stop. The 08-15 run
+   still completed (04:21) and wrote its snapshot, so this cost no gate
+   evidence — but no entries were permitted that morning. This is the strongest
+   single argument that KAN-19 must ledger its stops: shipping broker stops
+   without a matching `OrderIntent` would disable entries permanently, every
+   day, for every covered position.
 
 A fourth, smaller: the resting stop's `auxPrice` is `84.87` where the dry-run
 planned `84.88`. The reference close is taken from an intraday partial daily
@@ -283,12 +298,14 @@ it means IB adjusted the price and KAN-20's drift check must tolerate it.
 
 ## Go/no-go for KAN-19
 
-**Leaning GO, pending the one Q2 confirmation.** The stop was observed resting
-after a verified Gateway restart; what is unconfirmed is only whether it was
-placed before that restart. If it was, the "primary protection" claim holds and
-KAN-19 is clear to build. If it was placed after, the persistence test is void
-and must be re-run before KAN-19 starts — everything else below stands either
-way.
+**NO-GO until Q2 is answered.** Persistence across a Gateway restart is the
+property D16 rests on, and it has not been tested — the first attempt was void
+(see Q2). Until a stop is observed surviving a deliberate restart, KAN-19 should
+not start: if a `PreSubmitted`/`whyHeld: trigger` stop turns out to be held in
+Gateway process memory rather than at IB, "protection that survives Redis,
+Postgres, Docker and the host" is false and the design needs revisiting.
+
+Everything below stands regardless of how Q2 resolves.
 
 | Decision | Recommendation | Why |
 |---|---|---|
