@@ -1,7 +1,8 @@
 """The single publish site for risk-side exits (KAN-5).
 
-Every risk-side sell must be published by :meth:`_emit_ledgered_exit` and by
-nothing else. An order published without a backing ledger intent is rejected by
+Every risk-side sell must go out through the emitter's own publish site
+(:meth:`_publish_approved_exit` since KAN-8) and through nothing else. An order
+published without a backing ledger intent is rejected by
 execution and dead-letters silently — the failure mode that left stop-loss sells
 unexecuted for weeks. These tests pin the emitter's contract so the callers
 added in KAN-7 inherit a method already proven identical to what shipped.
@@ -11,7 +12,7 @@ from __future__ import annotations
 
 import ast
 import inspect
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -19,11 +20,19 @@ import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
+from services.execution.runner import ExecutionServiceRunner
 from services.risk_management import runner as runner_module
 from services.risk_management.runner import RiskServiceRunner
-from shared.config import AppConfig, CurrencyConfig, RiskConfig
+from shared.config import (
+    AppConfig,
+    CurrencyConfig,
+    ExecutionConfig,
+    IBConfig,
+    RiskConfig,
+)
 from shared.models import Base, OrderIntent, OrderStatus, Position
 from shared.order_ledger import OrderLedger
+from shared.schemas.messages import ApprovedOrderMessage
 
 # The entry path publishes approved *buys* from an intent risk itself approved
 # a few lines earlier (_persist_risk_approval). It is not an exit and is out of
@@ -160,6 +169,35 @@ def db_runner(mock_config, mock_redis):
     return runner, ledger, session
 
 
+@pytest.fixture()
+def execution_runner(db_runner, mock_redis):
+    """A real execution service sharing the risk runner's ledger.
+
+    The redelivery guard being asserted lives in
+    :meth:`ExecutionServiceRunner.process_approved_order` and reads the ledger,
+    so a mock would prove nothing — the two services have to share a session.
+    """
+    _runner, ledger, _session = db_runner
+    config = MagicMock(spec=AppConfig)
+    config.mode = "paper"
+    config.execution = ExecutionConfig()
+    config.ib = IBConfig()
+    config.risk = RiskConfig()
+    order_manager = AsyncMock()
+    order_manager.submit_entry = AsyncMock(return_value="order-001")
+    order_manager.submit_exit = AsyncMock(return_value="order-002")
+    order_manager.open_orders = {}
+    return (
+        ExecutionServiceRunner(
+            config=config,
+            redis_client=mock_redis,
+            order_manager=order_manager,
+            order_ledger=ledger,
+        ),
+        order_manager,
+    )
+
+
 def test_emit_ledgered_exit_is_the_only_exit_publish_site():
     """Exactly one exit publish site, and it is the emitter.
 
@@ -167,13 +205,18 @@ def test_emit_ledgered_exit_is_the_only_exit_publish_site():
     passive-trim now route through the emitter, so the assertion holds for the
     first time. It stays as a live test because the regression it catches —
     someone adding a second, unbacked publish — is the original P0.
+
+    KAN-8 pushed the raw ``redis.publish`` one level down into
+    ``_publish_approved_exit`` so the emitter and the re-publish sweep share the
+    publish-then-mark ordering. The invariant is unchanged and now stricter:
+    one place in the class puts a sell on stream:approved_orders.
     """
     exit_sites = {
         method: count
         for method, count in _approved_order_publish_sites().items()
         if method != ENTRY_PATH_PUBLISHER
     }
-    assert exit_sites == {"_emit_ledgered_exit": 1}
+    assert exit_sites == {"_publish_approved_exit": 1}
 
 
 class TestKillPathIsUnchanged:
@@ -657,3 +700,334 @@ class TestExitsFanOutPerSleeve:
         (order,) = _published_orders(mock_redis)
         assert float(order["quantity"]) == pytest.approx(30.0)
         assert {i.portfolio for i in _intents(session)} == {"momentum", "quality"}
+
+
+class _PublishCrash(RuntimeError):
+    """Stands in for the process dying between the commit and the publish."""
+
+
+def _crash_on_exit_publish(mock_redis):
+    """Make the next ``stream:approved_orders`` publish blow up.
+
+    The real failure is a SIGKILL between ``session.commit()`` and the
+    ``await self._redis.publish(...)`` one line below it. A raising publish
+    leaves the process in the same *durable* state — the intent is committed,
+    the message never reached the stream — which is the only state the next
+    scan can observe.
+    """
+    original = mock_redis.publish
+
+    async def crashing(stream, payload):
+        if stream == "stream:approved_orders":
+            raise _PublishCrash("process died before the publish landed")
+        return await original(stream, payload)
+
+    mock_redis.publish = AsyncMock(side_effect=crashing)
+    return original
+
+
+async def _orphan_a_stop_loss(runner, mock_redis) -> str:
+    """Drive one stop-loss breach through a crashing publish.
+
+    Returns the recommendation id of the intent left committed-but-unpublished.
+    """
+    _breaching(runner)
+    original = _crash_on_exit_publish(mock_redis)
+    with pytest.raises(_PublishCrash):
+        await runner.run_stop_loss_check()
+    mock_redis.publish = original
+    session = runner._order_ledger.session
+    session.rollback()
+    (intent,) = _intents(session)
+    return intent.recommendation_id
+
+
+class TestOrphanProofPublication:
+    """KAN-8: a crash between persist and publish must not mute a ticker.
+
+    Before this, the emitter committed an APPROVED exit and *then* published.
+    A crash in that window left a nonterminal intent nobody would ever act on,
+    and KAN-7's suppression rule read it as "an exit is already in flight" — so
+    the ticker's stop-loss stayed muted until a human noticed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_crash_between_persist_and_publish_leaves_an_orphan(
+        self, db_runner, mock_redis
+    ):
+        """The precondition every other test here builds on (AC 4, second half):
+        the intent is committed and APPROVED, and published_at stays NULL."""
+        runner, ledger, session = db_runner
+
+        exit_id = await _orphan_a_stop_loss(runner, mock_redis)
+
+        intent = ledger.get(exit_id)
+        assert intent.status == OrderStatus.APPROVED.value
+        assert intent.published_at is None
+        assert _published_orders(mock_redis) == []
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_the_next_scan_republishes_the_orphan_under_the_same_id(
+        self, db_runner, mock_redis
+    ):
+        """AC 1 / design test #3: the periodic scan recovers the orphan itself.
+
+        Same id, so a downstream replay is a no-op — and no second intent, which
+        is what a "re-emit" (rather than a re-publish) would have produced."""
+        runner, ledger, session = db_runner
+        exit_id = await _orphan_a_stop_loss(runner, mock_redis)
+
+        await runner.run_periodic_risk_checks()
+
+        (order,) = _published_orders(mock_redis)
+        assert order["recommendation_id"] == exit_id
+        assert [i.recommendation_id for i in _intents(session)] == [exit_id]
+        assert ledger.get(exit_id).published_at is not None
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_a_downstream_replay_of_the_republished_exit_is_a_no_op(
+        self, db_runner, mock_redis, execution_runner
+    ):
+        """AC 1 (downstream half): if the original publish *did* land and only
+        the mark_published was lost, execution sees the same order twice. Its
+        opening ledger lookup must swallow the second one — one broker order."""
+        runner, ledger, session = db_runner
+        exit_id = await _orphan_a_stop_loss(runner, mock_redis)
+        execution, order_manager = execution_runner
+
+        await runner.run_periodic_risk_checks()
+        (payload,) = _published_orders(mock_redis)
+        order = ApprovedOrderMessage.from_stream_dict(payload)
+
+        await execution.process_approved_order(order)
+        await execution.process_approved_order(order)
+
+        assert order_manager.submit_exit.await_count == 1
+        session.rollback()
+        assert ledger.get(exit_id).status == OrderStatus.SUBMITTED.value
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_an_unpublished_exit_does_not_suppress(self, db_runner, mock_redis):
+        """AC 2, the crux. An unpublished intent means "publish me", not "an
+        exit is already working" — getting this backwards reinstates the mute."""
+        runner, _ledger, session = db_runner
+        await _orphan_a_stop_loss(runner, mock_redis)
+
+        assert runner._has_pending_sell(_target()) is False
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_a_published_exit_still_suppresses(self, db_runner, mock_redis):
+        """AC 3: KAN-7's rule is preserved for the published case — that intent
+        really is in flight, and a second sell would oversell on the first fill."""
+        runner, _ledger, session = db_runner
+        _breaching(runner)
+        await runner.run_stop_loss_check()
+
+        assert runner._has_pending_sell(_target()) is True
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_an_unpublished_proposed_sell_still_suppresses(
+        self, db_runner, mock_redis
+    ):
+        """The narrowing is scoped to *risk's own* APPROVED exits. A PROPOSED
+        sell with published_at NULL belongs to run_paper's recommendation
+        outbox, which will publish it to stream:recommendations — treating it as
+        an orphan here would publish an unapproved order to execution."""
+        runner, ledger, session = db_runner
+        ledger.create_intent(
+            SimpleNamespace(
+                recommendation_id="sleeve-2026-08-16-momentum-AAPL-sell",
+                account_id="DUTEST",
+                mode="paper",
+                portfolio="momentum",
+                con_id=111,
+                symbol="AAPL",
+                exchange="SMART",
+                currency="USD",
+                action="SELL",
+                quantity=10.0,
+                limit_price=None,
+                order_type="MKT",
+            )
+        )
+        session.commit()
+
+        assert runner._has_pending_sell(_target()) is True
+        await runner._republish_unpublished_exits()
+
+        assert _published_orders(mock_redis) == []
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_a_terminal_intent_is_never_republished(self, db_runner, mock_redis):
+        """AC 6: published_at is not the test — the lifecycle is. An orphan that
+        somebody flattened by hand (or that execution filled before the mark
+        landed) must not be sold a second time."""
+        runner, ledger, session = db_runner
+        exit_id = await _orphan_a_stop_loss(runner, mock_redis)
+        ledger.transition(exit_id, OrderStatus.SUBMITTED)
+        ledger.transition(exit_id, OrderStatus.FILLED)
+        session.commit()
+        assert ledger.get(exit_id).published_at is None
+        session.rollback()
+
+        await runner._republish_unpublished_exits()
+
+        assert _published_orders(mock_redis) == []
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_published_at_is_set_on_a_successful_emit(
+        self, db_runner, mock_redis
+    ):
+        """AC 4, first half: the emitter marks the intent published *after* the
+        publish returns, so the column means what the sweep assumes it means."""
+        runner, ledger, session = db_runner
+
+        await runner._emit_ledgered_exit(
+            "liq", _target(), exit_id="liq-paper-AAPL-1", reason="emergency"
+        )
+
+        assert ledger.get("liq-paper-AAPL-1").published_at is not None
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_a_second_consecutive_republish_alerts_and_the_first_does_not(
+        self, db_runner, mock_redis
+    ):
+        """AC 5: one re-publish is a recovered crash and needs no operator. The
+        same intent needing it again next scan means publishes are not sticking
+        — that is a broken pipe, and it pages."""
+        runner, ledger, session = db_runner
+        exit_id = await _orphan_a_stop_loss(runner, mock_redis)
+
+        await runner._republish_unpublished_exits()
+        assert [a for a in _alerts(mock_redis) if "exit_republish_repeated" in a] == []
+
+        # published_at did not stick — the failure mode the alert exists for.
+        ledger.get(exit_id).published_at = None
+        session.commit()
+        await runner._republish_unpublished_exits()
+
+        repeated = [a for a in _alerts(mock_redis) if "exit_republish_repeated" in a]
+        assert len(repeated) == 1
+        assert exit_id in repeated[0]
+        assert "high" in repeated[0]
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_the_repeat_alert_fires_when_the_publish_itself_keeps_failing(
+        self, db_runner, mock_redis
+    ):
+        """AC 5, the case the alert actually exists for.
+
+        "Publishes are not sticking" usually means the publish is *raising*, and
+        the sweep is fail-fast — so an alert emitted after the publish loop
+        would never be reached and a permanently dead sweep would page nobody.
+        """
+        runner, _ledger, session = db_runner
+        exit_id = await _orphan_a_stop_loss(runner, mock_redis)
+        _crash_on_exit_publish(mock_redis)
+
+        for _ in range(2):
+            with pytest.raises(_PublishCrash):
+                await runner._republish_unpublished_exits()
+
+        repeated = [a for a in _alerts(mock_redis) if "exit_republish_repeated" in a]
+        assert len(repeated) == 1
+        assert exit_id in repeated[0]
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_a_submitted_exit_is_neither_republished_nor_unsuppressed(
+        self, db_runner, mock_redis
+    ):
+        """The other half of the crash window: the publish landed and only the
+        mark was lost, so execution already has the order. Re-publishing is
+        pointless and — far worse — letting it stop suppressing would put a
+        second sell against shares the broker is already selling."""
+        runner, ledger, session = db_runner
+        exit_id = await _orphan_a_stop_loss(runner, mock_redis)
+        ledger.transition(exit_id, OrderStatus.SUBMITTED)
+        session.commit()
+        assert ledger.get(exit_id).published_at is None
+        session.rollback()
+
+        await runner._republish_unpublished_exits()
+
+        assert _published_orders(mock_redis) == []
+        assert runner._has_pending_sell(_target()) is True
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_an_exit_approved_before_today_is_escalated_not_republished(
+        self, db_runner, mock_redis
+    ):
+        """An exit is a decision about a price that has since moved on.
+
+        Every exit intent predating KAN-8 has published_at NULL — nothing ever
+        wrote that column on the risk side — so an unbounded sweep would fire
+        days-old stop-losses at today's market on the first scan after deploy,
+        against positions that may have been flattened by hand since.
+        """
+        runner, ledger, session = db_runner
+        exit_id = await _orphan_a_stop_loss(runner, mock_redis)
+        ledger.get(exit_id).approved_at = datetime.now(timezone.utc) - timedelta(
+            days=3
+        )
+        session.commit()
+
+        await runner._republish_unpublished_exits()
+
+        assert _published_orders(mock_redis) == []
+        stale = [a for a in _alerts(mock_redis) if "exit_orphan_stale" in a]
+        assert len(stale) == 1
+        assert exit_id in stale[0]
+        assert "critical" in stale[0]
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_a_stale_orphan_alerts_once_not_every_scan(
+        self, db_runner, mock_redis
+    ):
+        """Nobody can clear it inside a scan interval, and an alert that repeats
+        every 30 minutes is an alert that gets muted."""
+        runner, ledger, session = db_runner
+        exit_id = await _orphan_a_stop_loss(runner, mock_redis)
+        ledger.get(exit_id).approved_at = datetime.now(timezone.utc) - timedelta(
+            days=3
+        )
+        session.commit()
+
+        for _ in range(3):
+            await runner._republish_unpublished_exits()
+
+        assert len([a for a in _alerts(mock_redis) if "exit_orphan_stale" in a]) == 1
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_a_stale_orphan_still_does_not_suppress_a_fresh_breach(
+        self, db_runner, mock_redis
+    ):
+        """Leaving the stale row inert must not re-create the mute this story
+        exists to remove: today's breach gets its own correctly-sized exit."""
+        runner, ledger, session = db_runner
+        stale_id = await _orphan_a_stop_loss(runner, mock_redis)
+        ledger.get(stale_id).approved_at = datetime.now(timezone.utc) - timedelta(
+            days=3
+        )
+        session.commit()
+        _breaching(runner)
+
+        await runner._republish_unpublished_exits()
+        await runner.run_stop_loss_check()
+
+        (order,) = _published_orders(mock_redis)
+        assert order["recommendation_id"] != stale_id
+        assert float(order["quantity"]) == pytest.approx(10.0)
+        session.rollback()

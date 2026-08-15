@@ -1634,6 +1634,52 @@ class TestDurableRiskLifecycle:
         )
 
     @pytest.mark.asyncio
+    async def test_an_approved_entry_order_is_marked_published(
+        self, sleeve_sell_case, mock_redis
+    ):
+        """KAN-8's invariant has to hold on the entry path too.
+
+        The orphan predicate is "APPROVED sell with published_at NULL". If the
+        entry path never marked its own publishes, every sleeve exit would look
+        like an orphan and the periodic sweep would re-publish orders that
+        already went out.
+        """
+        runner, ledger, rec = sleeve_sell_case(
+            momentum_quantity=5,
+            quality_quantity=5,
+            requested_quantity=5,
+        )
+
+        await runner.process_recommendation(rec)
+
+        assert ledger.get("sell-current").published_at is not None
+        assert ledger.unpublished_exit_intents(mode="paper") == []
+
+    @pytest.mark.asyncio
+    async def test_a_failed_publish_mark_does_not_dead_letter_the_order(
+        self, sleeve_sell_case, mock_redis
+    ):
+        """The order is already on the stream by then. Raising would dead-letter
+        a recommendation that was in fact processed — the same trap the ack path
+        in _consume_and_process is written to avoid — and the sweep reconciles
+        the unmarked row on the next scan anyway."""
+        runner, ledger, rec = sleeve_sell_case(
+            momentum_quantity=5,
+            quality_quantity=5,
+            requested_quantity=5,
+        )
+        with patch.object(
+            ledger, "mark_published", side_effect=RuntimeError("db went away")
+        ):
+            await runner.process_recommendation(rec)  # must not raise
+
+        assert any(
+            call.args[0] == "stream:approved_orders"
+            for call in mock_redis.publish.call_args_list
+        )
+        assert ledger.get("sell-current").status == OrderStatus.APPROVED.value
+
+    @pytest.mark.asyncio
     async def test_refresh_risk_state_resolves_null_position_sectors(
         self, sleeve_sell_case
     ):
