@@ -6,6 +6,7 @@ per-portfolio capital/cash via SQLAlchemy models.
 """
 from __future__ import annotations
 
+import math
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -16,6 +17,60 @@ from backtest.portfolio_context import HeldPosition, PendingOrder, PortfolioCont
 from shared.models.portfolio import Position, Trade
 from shared.models.equity_snapshot import EquitySnapshot
 from shared.models.portfolio_config import PortfolioConfig
+
+# The eight currency-qualified columns on ``equity_snapshots``. NULL on every
+# row written before KAN-44, and on any row written without an FX rate.
+CURRENCY_COLUMNS: tuple[str, ...] = (
+    "base_currency",
+    "trading_currency",
+    "equity_trading",
+    "cash_trading",
+    "market_value_trading",
+    "fx_base_per_trading",
+    "equity_base",
+    "valuation_at",
+)
+
+
+def _currency_context(
+    equity: float,
+    cash: float,
+    market_value: float,
+    *,
+    base_currency: str | None,
+    trading_currency: str | None,
+    fx_base_per_trading: float | None,
+    valuation_at: datetime | None,
+) -> dict[str, Any]:
+    """Derive the eight currency columns, or all-NULL when no rate is given.
+
+    A malformed rate raises rather than falling back to NULL: a silently
+    unstamped row is indistinguishable from a legacy one, and the gap would
+    only surface on gate day.
+    """
+    if fx_base_per_trading is None:
+        return dict.fromkeys(CURRENCY_COLUMNS, None)
+    if not math.isfinite(fx_base_per_trading) or fx_base_per_trading <= 0:
+        raise ValueError(
+            f"fx_base_per_trading must be finite and positive, "
+            f"got {fx_base_per_trading!r}"
+        )
+    if not base_currency or not trading_currency:
+        raise ValueError(
+            "base_currency and trading_currency are required when "
+            "fx_base_per_trading is supplied — a rate without the pair it "
+            "converts between is not interpretable"
+        )
+    return {
+        "base_currency": base_currency,
+        "trading_currency": trading_currency,
+        "equity_trading": equity,
+        "cash_trading": cash,
+        "market_value_trading": market_value,
+        "fx_base_per_trading": fx_base_per_trading,
+        "equity_base": equity * fx_base_per_trading,
+        "valuation_at": valuation_at or datetime.now(timezone.utc),
+    }
 
 
 class PaperTradingState:
@@ -339,8 +394,37 @@ class PaperTradingState:
         equity: float,
         cash: float,
         market_value: float,
+        *,
+        base_currency: str | None = None,
+        trading_currency: str | None = None,
+        fx_base_per_trading: float | None = None,
+        valuation_at: datetime | None = None,
     ) -> None:
-        """Record (or update) an equity snapshot for a portfolio on a date."""
+        """Record (or update) an equity snapshot for a portfolio on a date.
+
+        ``equity``/``cash``/``market_value`` are denominated in the trading
+        currency (USD): sleeve budgets and bar prices are both USD. Supplying
+        ``fx_base_per_trading`` (base per one unit of trading currency, e.g.
+        SGD per USD) stamps that currency context onto the row so the D16
+        drawdown bound — "measured on USD NAV" — is a checkable claim rather
+        than an assumption. Without a rate the eight currency-qualified
+        columns stay NULL and the behaviour is exactly as it was before, so
+        no existing caller changes.
+
+        The currency columns are rewritten on every update, including being
+        cleared when no rate is supplied: a fresh equity figure sitting beside
+        a stale rate would be internally inconsistent and indistinguishable
+        from a correctly-stamped row.
+        """
+        currency = _currency_context(
+            equity,
+            cash,
+            market_value,
+            base_currency=base_currency,
+            trading_currency=trading_currency,
+            fx_base_per_trading=fx_base_per_trading,
+            valuation_at=valuation_at,
+        )
         now = datetime.now(timezone.utc)
         existing = self._session.execute(
             select(EquitySnapshot).where(
@@ -354,6 +438,8 @@ class PaperTradingState:
             existing.cash = cash
             existing.market_value = market_value
             existing.created_at = now
+            for column, value in currency.items():
+                setattr(existing, column, value)
         else:
             snap = EquitySnapshot(
                 portfolio=portfolio,
@@ -362,6 +448,7 @@ class PaperTradingState:
                 cash=cash,
                 market_value=market_value,
                 created_at=now,
+                **currency,
             )
             self._session.add(snap)
 
@@ -499,7 +586,12 @@ class PaperTradingState:
         ]
 
     def get_equity_history(self, portfolio: str) -> list[dict]:
-        """Return equity snapshots for a portfolio."""
+        """Return equity snapshots for a portfolio.
+
+        The currency context is carried through as-is — ``None`` on rows
+        written without an FX rate — so a reader can tell whether a drawdown
+        computed from this series is denominated or merely assumed.
+        """
         rows = self._session.execute(
             select(EquitySnapshot)
             .where(EquitySnapshot.portfolio == portfolio)
@@ -512,6 +604,7 @@ class PaperTradingState:
                 "equity": s.equity,
                 "cash": s.cash,
                 "market_value": s.market_value,
+                **{name: getattr(s, name) for name in CURRENCY_COLUMNS},
             }
             for s in rows
         ]
