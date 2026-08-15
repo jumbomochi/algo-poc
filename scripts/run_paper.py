@@ -599,6 +599,7 @@ def run_daily(
     minimum_settled_usd_reserve: float,
     candidate_observer: CandidateObserver | None = None,
     record_aggregate: bool = True,
+    capital: CapitalBudget | None = None,
 ) -> list[dict]:
     """Run one daily cycle: generate signals for all portfolios.
 
@@ -609,8 +610,26 @@ def run_daily(
     graded positions outside that universe would be marked at cost
     (``compute_equity`` falls back to ``avg_entry_price``) and the rollup would
     record an equity figure that was never true.
+
+    ``capital`` supplies the currency context stamped onto every equity
+    snapshot. It is the same budget the funding check already consumes, so
+    the FX rate costs no extra IB call and introduces no new failure mode.
+    When it is absent (a bare test harness) the currency columns stay NULL,
+    which is what every row before KAN-44 looks like.
     """
     signals_generated: list[dict] = []
+    currency_context: dict[str, Any] = (
+        {
+            "base_currency": capital.base_currency,
+            "trading_currency": capital.trading_currency,
+            "fx_base_per_trading": capital.fx_base_per_trading,
+            # The instant IB quoted the rate, which is also the instant the
+            # broker snapshot this run is marked against was captured.
+            "valuation_at": capital.fx_captured_at,
+        }
+        if capital is not None
+        else {}
+    )
     accepted_buy_notional: dict[str, float] = {}
     accepted_account_buy_reservations_usd = 0.0
     remaining_sell_quantity = dict(sell_availability or {})
@@ -792,7 +811,9 @@ def run_daily(
         equity = state.compute_equity(name, current_prices)
         cash = state.get_cash(name)
         market_value = equity - cash
-        state.record_equity_snapshot(name, today, equity, cash, market_value)
+        state.record_equity_snapshot(
+            name, today, equity, cash, market_value, **currency_context
+        )
 
     # Record aggregate equity snapshot. Synthetic portfolios (the "__drill__"
     # tag) are excluded: the rollup is the graded book's NAV, and a drill's
@@ -807,7 +828,12 @@ def run_daily(
             total_cash += state.get_cash(name)
         total_market_value = total_equity - total_cash
         state.record_equity_snapshot(
-            "_aggregate", today, total_equity, total_cash, total_market_value
+            "_aggregate",
+            today,
+            total_equity,
+            total_cash,
+            total_market_value,
+            **currency_context,
         )
 
     return signals_generated
@@ -1455,6 +1481,7 @@ def main():
             ),
             candidate_observer=candidate_observer,
             record_aggregate=portfolio_tag is None,
+            capital=preparation.capital,
         )
         if args.publish and signals:
             contracts = resolve_contract_details_from_ib(
