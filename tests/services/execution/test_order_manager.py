@@ -172,3 +172,47 @@ class TestOrderManager:
         order_info = mgr.open_orders["order-001"]
         assert order_info["ticker"] == "AAPL"
         assert order_info["quantity"] == 50
+
+
+class TestBrokerOrderPassthrough:
+    """KAN-13: the post-halt sweep needs a broker-wide view, not this
+    process's own open_orders."""
+
+    @staticmethod
+    def _manager(executor):
+        return OrderManager(
+            executor=executor,
+            redis_client=AsyncMock(),
+            db_session=MagicMock(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_open_broker_orders_delegates_to_the_executor(self):
+        executor = AsyncMock()
+        executor.list_open_orders = AsyncMock(return_value=["order"])
+        mgr = self._manager(executor)
+
+        assert await mgr.list_open_broker_orders() == ["order"]
+        executor.list_open_orders.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cancel_broker_order_drops_local_tracking_on_success(self):
+        executor = AsyncMock()
+        executor.cancel_broker_order = AsyncMock(return_value=True)
+        mgr = self._manager(executor)
+        mgr.open_orders["77"] = {"ticker": "AAPL"}
+
+        assert await mgr.cancel_broker_order("77") is True
+        assert "77" not in mgr.open_orders
+
+    @pytest.mark.asyncio
+    async def test_failed_cancel_keeps_the_order_tracked(self):
+        """A failed cancel is still live at IB; forgetting it would stop the
+        next attempt from retrying."""
+        executor = AsyncMock()
+        executor.cancel_broker_order = AsyncMock(return_value=False)
+        mgr = self._manager(executor)
+        mgr.open_orders["77"] = {"ticker": "AAPL"}
+
+        assert await mgr.cancel_broker_order("77") is False
+        assert "77" in mgr.open_orders

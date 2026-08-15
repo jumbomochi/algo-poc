@@ -426,6 +426,26 @@ class OrderManager:
             ),
         )
 
+    async def list_open_broker_orders(self) -> list[Any]:
+        """Every order live at the broker, with its stable ``orderRef``.
+
+        Not ``self.open_orders``: that is this process's own view, and the
+        post-halt sweep exists precisely for an order the process does not
+        know it placed.
+        """
+        return list(await self._executor.list_open_orders())
+
+    async def cancel_broker_order(self, order_id: str) -> bool:
+        """Cancel one live broker order, tracked locally or not.
+
+        Local tracking is dropped only on a submitted cancel, matching
+        :meth:`cancel_all_orders` — a failed cancel is still live at IB.
+        """
+        cancelled = await self._executor.cancel_broker_order(order_id)
+        if cancelled:
+            self.open_orders.pop(order_id, None)
+        return cancelled
+
     async def cancel_all_orders(self) -> list[str]:
         """Cancel all open orders.
 

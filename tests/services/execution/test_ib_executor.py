@@ -283,3 +283,85 @@ async def test_reconnect_warns_about_orders_absent_after_outage():
     assert executor._logger.warning.called
     warned_ids = executor._logger.warning.call_args.kwargs.get("order_ids")
     assert warned_ids == ["9"]
+
+
+def make_open_trade(
+    order_id: int = 77,
+    *,
+    order_ref: str = "rec-1",
+    action: str = "BUY",
+    symbol: str = "AAPL",
+    quantity: float = 50.0,
+    account: str | None = "DUN551088",
+):
+    return SimpleNamespace(
+        order=SimpleNamespace(
+            orderId=order_id,
+            orderRef=order_ref,
+            action=action,
+            totalQuantity=quantity,
+            account=account,
+        ),
+        contract=SimpleNamespace(symbol=symbol),
+        commissionReportEvent=Event(),
+        statusEvent=Event(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_open_orders_exposes_the_order_ref():
+    """KAN-13: the post-halt sweep identifies a raced order only by its
+    orderRef, which the account snapshot's BrokerOpenOrder does not carry."""
+    executor = IBExecutor("h", 7497, 1)
+    executor._ib = MagicMock()
+    executor._ib.openTrades.return_value = [make_open_trade()]
+
+    orders = await executor.list_open_orders()
+
+    assert [(o.order_id, o.order_ref, o.action, o.ticker) for o in orders] == [
+        ("77", "rec-1", "BUY", "AAPL")
+    ]
+    assert orders[0].quantity == 50.0
+    assert orders[0].account_id == "DUN551088"
+
+
+@pytest.mark.asyncio
+async def test_list_open_orders_does_not_bind_callbacks_to_foreign_orders():
+    """An order returned here may belong to another client id or a manual TWS
+    session; wiring our fill/status handlers onto it would corrupt attribution."""
+    executor = IBExecutor("h", 7497, 1)
+    executor.set_fill_handler(AsyncMock())
+    executor.set_order_status_handler(AsyncMock())
+    executor._ib = MagicMock()
+    trade = make_open_trade(order_id=1234, order_ref="manual-tws")
+    executor._ib.openTrades.return_value = [trade]
+
+    await executor.list_open_orders()
+
+    assert executor._trades == {}
+    assert trade.statusEvent.callbacks == []
+    assert trade.commissionReportEvent.callbacks == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_broker_order_cancels_an_untracked_live_order():
+    """After a restart _trades is empty while the order is still working at
+    IB — a halt-safety path cannot depend on in-process memory."""
+    executor = IBExecutor("h", 7497, 1)
+    executor._ib = MagicMock()
+    trade = make_open_trade(order_id=77)
+    executor._ib.openTrades.return_value = [trade]
+
+    assert await executor.cancel_broker_order("77") is True
+
+    executor._ib.cancelOrder.assert_called_once_with(trade.order)
+
+
+@pytest.mark.asyncio
+async def test_cancel_broker_order_reports_an_order_not_open_at_ib():
+    executor = IBExecutor("h", 7497, 1)
+    executor._ib = MagicMock()
+    executor._ib.openTrades.return_value = []
+
+    assert await executor.cancel_broker_order("77") is False
+    executor._ib.cancelOrder.assert_not_called()

@@ -77,6 +77,8 @@ def mock_order_manager():
     mgr.submit_exit = AsyncMock(return_value="order-002")
     mgr.open_orders = {}
     mgr.cancel_all_orders = AsyncMock()
+    mgr.list_open_broker_orders = AsyncMock(return_value=[])
+    mgr.cancel_broker_order = AsyncMock(return_value=True)
     return mgr
 
 
@@ -1708,6 +1710,241 @@ class TestUnfilledSweepDriver:
         runner._order_manager.sweep_unfilled_orders = AsyncMock()
         assert await runner.maybe_run_unfilled_sweep(now=1000.0) is False
         runner._order_manager.sweep_unfilled_orders.assert_not_awaited()
+
+
+class TestPostHaltSweep:
+    """KAN-13: a post-halt reconcile sweep on its own timer.
+
+    KAN-12's pre-submit check narrows the window between "halt lands" and
+    "order reaches IB" but cannot close it. In that window the order is live
+    at the broker and may have no ib_order_id in the ledger at all, so only an
+    account-wide orderRef scan can find it.
+    """
+
+    @staticmethod
+    def _halt(session, *, mode: str = "paper") -> None:
+        from shared.halt_state import HaltStateRepository
+
+        HaltStateRepository(session).record_halt(
+            mode=mode,
+            source="kill",
+            reason="test halt",
+            triggered_by="test",
+            now=BROKER_TIME,
+        )
+        session.commit()
+
+    @staticmethod
+    def _broker_order(
+        order_id: str = "77",
+        order_ref: str = "rec-1",
+        action: str = "BUY",
+        ticker: str = "AAPL",
+        quantity: float = 50.0,
+    ):
+        from services.execution.ib_executor import OpenBrokerOrder
+
+        return OpenBrokerOrder(
+            order_id=order_id,
+            order_ref=order_ref,
+            action=action,
+            ticker=ticker,
+            quantity=quantity,
+            account_id="DUN551088",
+        )
+
+    @pytest.mark.asyncio
+    async def test_raced_order_is_cancelled_by_the_sweep(
+        self, durable_runner, ledger_session, mock_order_manager
+    ):
+        """Design test #11: the buy slipped past the pre-submit check and
+        reached IB; the sweep cancels it."""
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, recommendation_id="rec-1", ib_order_id="77")
+        self._halt(ledger_session)
+        mock_order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[self._broker_order()]
+        )
+
+        assert await runner.maybe_run_halt_sweep(now=1000.0) is True
+
+        mock_order_manager.cancel_broker_order.assert_awaited_once_with("77")
+
+    @pytest.mark.asyncio
+    async def test_sweep_fires_without_a_market_calendar(
+        self, durable_runner, ledger_session, mock_order_manager
+    ):
+        """Design test #13: independence from the calendar-gated unfilled
+        sweep, which silently no-ops when _market_calendar is unset. This is
+        the test that distinguishes the story from a shortcut."""
+        runner, ledger = durable_runner
+        runner._market_calendar = None
+        seed_approved_intent(ledger, recommendation_id="rec-1", ib_order_id="77")
+        self._halt(ledger_session)
+        mock_order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[self._broker_order()]
+        )
+
+        assert await runner.maybe_run_halt_sweep(now=1000.0) is True
+        mock_order_manager.cancel_broker_order.assert_awaited_once_with("77")
+
+    @pytest.mark.asyncio
+    async def test_orderref_only_order_is_discovered_and_cancelled(
+        self, durable_runner, ledger_session, mock_order_manager
+    ):
+        """Design test #25: the crash-window order — live at the broker, no
+        ib_order_id in the ledger, so invisible to any ledger-keyed lookup.
+        The sweep finds it by orderRef, stamps the broker id so the coming
+        Cancelled callback is attributable, and cancels."""
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, recommendation_id="rec-1")
+        assert ledger.get("rec-1").ib_order_id is None
+        ledger.session.rollback()
+        self._halt(ledger_session)
+        mock_order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[self._broker_order(order_id="99", order_ref="rec-1")]
+        )
+
+        await runner.maybe_run_halt_sweep(now=1000.0)
+
+        mock_order_manager.cancel_broker_order.assert_awaited_once_with("99")
+        intent = ledger.get("rec-1")
+        assert intent.ib_order_id == "99"
+        assert intent.status == OrderStatus.SUBMITTED.value
+        ledger.session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_sells_are_never_cancelled_during_a_halt(
+        self, durable_runner, ledger_session, mock_order_manager, mock_redis
+    ):
+        """Part of design test #23: cancelling the emergency flatten during a
+        halt is the one catastrophic outcome, so sells are exempt — the
+        ledgered stop/exit and the kill liquidation that has no intent alike."""
+        runner, ledger = durable_runner
+        seed_approved_intent(
+            ledger, recommendation_id="exit-1", action="SELL", ib_order_id="55"
+        )
+        self._halt(ledger_session)
+        mock_order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[
+                self._broker_order(
+                    order_id="55", order_ref="exit-1", action="SELL"
+                ),
+                self._broker_order(
+                    order_id="56",
+                    order_ref="liq-paper-AAPL-1754568000",
+                    action="SELL",
+                ),
+            ]
+        )
+
+        await runner.maybe_run_halt_sweep(now=1000.0)
+
+        mock_order_manager.cancel_broker_order.assert_not_awaited()
+        assert [
+            AlertMessage.from_stream_dict(c.args[1]).event_type
+            for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ] == []
+
+    @pytest.mark.asyncio
+    async def test_unknown_orderref_is_alerted_not_cancelled(
+        self, durable_runner, ledger_session, mock_order_manager, mock_redis
+    ):
+        """AC5: the ref may belong to another client id or a manual TWS
+        order. Cancelling someone else's order silently is worse than
+        reporting it."""
+        runner, _ledger = durable_runner
+        self._halt(ledger_session)
+        mock_order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[
+                self._broker_order(order_id="1234", order_ref="manual-tws")
+            ]
+        )
+
+        await runner.maybe_run_halt_sweep(now=1000.0)
+
+        mock_order_manager.cancel_broker_order.assert_not_awaited()
+        alerts = [
+            AlertMessage.from_stream_dict(c.args[1])
+            for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert [a.event_type for a in alerts] == ["halt_sweep_unknown_order"]
+        assert alerts[0].context["order_id"] == "1234"
+
+    @pytest.mark.asyncio
+    async def test_sweep_is_a_no_op_when_not_halted(
+        self, durable_runner, mock_order_manager
+    ):
+        """AC6: loop iterations with no halt produce no broker calls."""
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, recommendation_id="rec-1", ib_order_id="77")
+
+        for tick in range(3):
+            assert await runner.maybe_run_halt_sweep(now=1000.0 + tick) is False
+
+        mock_order_manager.list_open_broker_orders.assert_not_awaited()
+        mock_order_manager.cancel_broker_order.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_sweep_repeats_on_its_own_interval_while_halted(
+        self, durable_runner, ledger_session, mock_order_manager
+    ):
+        """Fires immediately when the halt is first seen, then periodically —
+        an order placed after the first pass is still caught."""
+        from services.execution.runner import HALT_SWEEP_INTERVAL_SECONDS
+
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, recommendation_id="rec-1", ib_order_id="77")
+        self._halt(ledger_session)
+        interval = HALT_SWEEP_INTERVAL_SECONDS
+        mock_order_manager.list_open_broker_orders = AsyncMock(return_value=[])
+
+        assert await runner.maybe_run_halt_sweep(now=1000.0) is True
+        assert await runner.maybe_run_halt_sweep(now=1000.0 + interval - 1) is False
+        assert await runner.maybe_run_halt_sweep(now=1000.0 + interval + 1) is True
+        assert mock_order_manager.list_open_broker_orders.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_repeated_sweeps_do_not_re_page_for_the_same_order(
+        self, durable_runner, ledger_session, mock_order_manager, mock_redis
+    ):
+        """A cancel is asynchronous at IB, so the same order can still be open
+        on the next pass. Retry the cancel, but page only once."""
+        from services.execution.runner import HALT_SWEEP_INTERVAL_SECONDS
+
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, recommendation_id="rec-1", ib_order_id="77")
+        self._halt(ledger_session)
+        mock_order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[self._broker_order()]
+        )
+
+        await runner.maybe_run_halt_sweep(now=1000.0)
+        await runner.maybe_run_halt_sweep(
+            now=1000.0 + HALT_SWEEP_INTERVAL_SECONDS + 1
+        )
+
+        assert mock_order_manager.cancel_broker_order.await_count == 2
+        alerts = [
+            AlertMessage.from_stream_dict(c.args[1])
+            for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+        assert [a.event_type for a in alerts] == ["halt_sweep_order_cancelled"]
+
+    @pytest.mark.asyncio
+    async def test_sweep_is_inert_without_a_ledger(
+        self, runner, mock_order_manager
+    ):
+        """No ledger injected means no halt latch to read — same inertness as
+        the KAN-12 gate, rather than failing closed on a system that has no
+        halt table."""
+        assert runner._halt_store is None
+
+        assert await runner.maybe_run_halt_sweep(now=1000.0) is False
+        mock_order_manager.list_open_broker_orders.assert_not_awaited()
 
 
 class TestOrderStatusGuards:

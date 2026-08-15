@@ -4,6 +4,7 @@ import asyncio
 import math
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
 
@@ -37,6 +38,24 @@ def _commission_in_usd(
         if math.isfinite(fx_base_per_trading) and fx_base_per_trading > 0:
             return amount / fx_base_per_trading
     return None
+
+
+@dataclass(frozen=True)
+class OpenBrokerOrder:
+    """One order live at the broker, carrying its stable ``orderRef``.
+
+    Deliberately distinct from :class:`~services.execution.ib_account.
+    BrokerOpenOrder`, which reads the account snapshot and does not capture
+    ``orderRef``. The post-halt sweep can only identify an order that never
+    reached the ledger by its ref, so it needs this view.
+    """
+
+    order_id: str
+    order_ref: str
+    action: str
+    ticker: str
+    quantity: float
+    account_id: str | None = None
 
 
 @runtime_checkable
@@ -76,6 +95,14 @@ class IBExecutorProtocol(Protocol):
         self, recommendation_id: str, expected_order_id: str
     ) -> bool | None:
         """Restore callbacks; false means completed, None means missing."""
+        ...
+
+    async def list_open_orders(self) -> list[OpenBrokerOrder]:
+        """Enumerate every order live at the broker, with its orderRef."""
+        ...
+
+    async def cancel_broker_order(self, order_id: str) -> bool:
+        """Cancel a live broker order, tracked by this process or not."""
         ...
 
 
@@ -556,6 +583,63 @@ class IBExecutor:
             if str(getattr(trade.order, "orderRef", "")) == recommendation_id:
                 return str(trade.order.orderId)
         return None
+
+    async def list_open_orders(self) -> list[OpenBrokerOrder]:
+        """Enumerate every order live at the broker, with its ``orderRef``.
+
+        Account-wide and ledger-independent on purpose: the post-halt sweep
+        exists to find an order whose broker id never reached the ledger, so
+        no ledger-keyed lookup can see it. Nothing is registered as a tracked
+        trade here — an order returned by this call may belong to another
+        client id or to a manual TWS session, and binding our fill/status
+        callbacks to someone else's order would corrupt attribution.
+        """
+        await self._ensure_connected()
+        orders: list[OpenBrokerOrder] = []
+        for trade in list(self._ib.openTrades()):
+            order = trade.order
+            orders.append(
+                OpenBrokerOrder(
+                    order_id=str(order.orderId),
+                    order_ref=str(getattr(order, "orderRef", "") or ""),
+                    action=str(getattr(order, "action", "") or "").upper(),
+                    ticker=str(getattr(trade.contract, "symbol", "") or ""),
+                    quantity=float(getattr(order, "totalQuantity", 0.0) or 0.0),
+                    account_id=(
+                        str(getattr(order, "account", "") or "") or None
+                    ),
+                )
+            )
+        return orders
+
+    async def cancel_broker_order(self, order_id: str) -> bool:
+        """Cancel an order that is live at IB, tracked by this process or not.
+
+        :meth:`cancel_order` can only cancel what this process placed — after
+        a restart ``_trades`` is empty while the order is still working at the
+        broker. A halt-safety path cannot depend on in-process memory, so this
+        falls back to the order object IB itself reports as open.
+        """
+        await self._ensure_connected()
+        trade = self._trades.get(order_id)
+        if trade is None:
+            trade = next(
+                (
+                    open_trade
+                    for open_trade in self._ib.openTrades()
+                    if str(open_trade.order.orderId) == str(order_id)
+                ),
+                None,
+            )
+        if trade is None:
+            self._logger.warning(
+                "Cancel requested for an order not open at IB",
+                order_id=order_id,
+            )
+            return False
+        self._ib.cancelOrder(trade.order)
+        self._logger.info("Order cancel requested", order_id=order_id)
+        return True
 
     async def restore_order_by_ref(
         self, recommendation_id: str, expected_order_id: str
