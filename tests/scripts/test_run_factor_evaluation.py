@@ -36,3 +36,30 @@ def test_cli_writes_run_card_with_all_factors(tmp_path):
     card = json.loads(cards[0].read_text())
     assert set(card["evaluation"]["factors"]) == {
         "price_momentum_126d", "high_52w", "low_volatility_63d", "liquidity_20d"}
+
+
+def test_run_card_records_the_declared_trial_count(tmp_path):
+    from research.evaluation.trial_registry import declared_trial_count
+
+    bars_path = tmp_path / "bars.json"
+    _write_bars(bars_path)
+    out_dir = tmp_path / "out"
+    main([
+        "--bars-from-json", str(bars_path), "--output-dir", str(out_dir),
+        "--horizon", "5", "--outer-folds", "3", "--inner-folds", "2", "--min-names", "3",
+    ])
+    card = json.loads(next(out_dir.glob("factor_evaluation_*.json")).read_text())
+    assert card["config"]["n_trials"] == declared_trial_count()
+
+
+def test_cli_can_override_the_declared_trial_count(tmp_path):
+    bars_path = tmp_path / "bars.json"
+    _write_bars(bars_path)
+    out_dir = tmp_path / "out"
+    main([
+        "--bars-from-json", str(bars_path), "--output-dir", str(out_dir),
+        "--horizon", "5", "--outer-folds", "3", "--inner-folds", "2", "--min-names", "3",
+        "--n-trials", "64",
+    ])
+    card = json.loads(next(out_dir.glob("factor_evaluation_*.json")).read_text())
+    assert card["config"]["n_trials"] == 64

@@ -1,0 +1,15 @@
+{
+  "note": "Pre-registered holdout splits (KAN-38). A split is written down here BEFORE it is looked at, and research/evaluation/holdout.py records its single evaluation in the `evaluations` list below. Commit the burn when it happens: a holdout whose use is not in git is a holdout on the honour system. `registered_at` is caller-supplied and therefore backdatable -- the evidence of record is this file's git commit date, not the field. Key order matches holdout.py's writer so recording a burn produces a minimal diff.",
+  "version": 1,
+  "splits": [
+    {
+      "split_id": "incumbent_sleeves_2026",
+      "holdout_start": "2026-06-01",
+      "horizon": 21,
+      "embargo": 21,
+      "registered_at": "2026-08-16T00:00:00+00:00",
+      "note": "Formal edge evaluation of the six incumbent sleeves (KAN-40, direction doc D10). The six-sleeve set was fixed on 2026-05-26 when mean_reversion and short_term_mr were dropped, so no bar from 2026-06-01 onward was part of the search that produced it. TWO LIMITS. (1) Registered 2026-08-16, after the window opened: this is out-of-SEARCH-sample, not out-of-sight-sample -- the paper book ran over it and was watched daily. (2) Valid for the six sleeves ONLY. The native factor catalog was specified 2026-08-02, inside the window, so spending this split on a factor evaluation would be contaminated; register a separate split with a later boundary for that. The window is short and grows with every trading day; report its length alongside the result."
+    }
+  ],
+  "evaluations": []
+}
