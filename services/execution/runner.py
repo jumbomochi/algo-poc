@@ -36,6 +36,11 @@ CONSUMER_NAME = "execution_worker_1"
 # HaltStateUnavailable — it never degrades into "assume clear".
 HALT_LOOKUP_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 2.0, 4.0)
 
+# Cadence of the post-halt reconcile sweep while a halt is active. The sweep
+# fires immediately the first time a halt is seen, so this only bounds how
+# long an order placed *after* that first pass can sit live at the broker.
+HALT_SWEEP_INTERVAL_SECONDS: float = 30.0
+
 
 class HaltStateUnavailable(RuntimeError):
     """The durable halt latch could not be read.
@@ -50,6 +55,18 @@ class HaltStateUnavailable(RuntimeError):
 class PendingOrderAttribution:
     recommendation_id: str
     portfolio: str | None
+
+
+@dataclass(frozen=True)
+class HaltSweepAction:
+    """What the post-halt sweep decided about one live broker order."""
+
+    order_id: str
+    order_ref: str
+    ticker: str
+    quantity: float
+    cancel: bool
+    record_submission: bool
 
 
 @dataclass(frozen=True)
@@ -121,6 +138,15 @@ class ExecutionServiceRunner:
         )
         self._last_sweep_at: float | None = None
         self._market_calendar: Any = None
+
+        # Post-halt reconcile sweep (KAN-13). Its own timer, and deliberately
+        # NOT sharing the unfilled sweep's calendar gate: that sweep returns
+        # False whenever `_market_calendar` is unset, and a halt-safety path
+        # must not inherit a known "silently does nothing" failure mode.
+        self._last_halt_sweep_at: float | None = None
+        # (order_id, event_type) already alerted during the current halt —
+        # the sweep re-runs every interval and must not re-page each pass.
+        self._halt_sweep_alerted: set[tuple[str, str]] = set()
 
     async def setup(self) -> None:
         """Create consumer groups and replay pending messages.
@@ -917,6 +943,219 @@ class ExecutionServiceRunner:
         )
         return True
 
+    async def maybe_run_halt_sweep(self, now: float) -> bool:
+        """Run the post-halt reconcile sweep while a halt is active.
+
+        ``now`` is a monotonic timestamp (seconds). Returns True when the
+        sweep ran.
+
+        KAN-12's pre-submit check narrows the window between "halt lands" and
+        "order reaches IB" but cannot close it: the halt can activate after
+        the check and before ``placeOrder`` returns. In that window an order
+        is live at the broker and, until ``record_submission`` commits, has no
+        ``ib_order_id`` in the ledger — invisible to every ledger-keyed
+        lookup. This sweep exists to find and cancel exactly that order.
+
+        Independent of ``_market_calendar`` by design; see
+        ``_last_halt_sweep_at``. Between halts it makes no broker call at all,
+        so the steady-state cost is one halt-latch read per loop iteration.
+        """
+        store = self._halt_store
+        if store is None:
+            return False
+        if await self._load_active_halt(store) is None:
+            # Not halted. Reset so the next halt gets an immediate sweep
+            # instead of waiting out an interval left over from the last one.
+            self._last_halt_sweep_at = None
+            self._halt_sweep_alerted.clear()
+            return False
+        last = self._last_halt_sweep_at
+        if last is not None and (now - last) < HALT_SWEEP_INTERVAL_SECONDS:
+            return False
+        self._last_halt_sweep_at = now
+        await self._sweep_orders_open_during_halt()
+        return True
+
+    async def _sweep_orders_open_during_halt(self) -> None:
+        """Cancel exposure-increasing orders that are live during a halt."""
+        broker_orders = await self._order_manager.list_open_broker_orders()
+        for action in self._plan_halt_sweep(broker_orders):
+            if not action.cancel:
+                self._logger.error(
+                    "Halt sweep found a buy matching no order intent",
+                    order_id=action.order_id,
+                    order_ref=action.order_ref,
+                    ticker=action.ticker,
+                )
+                await self._alert_halt_sweep_once(
+                    action.order_id,
+                    event_type="halt_sweep_unknown_order",
+                    priority="high",
+                    message=(
+                        f"System halted — buy order {action.order_id} "
+                        f"(ref {action.order_ref!r}) is live at the broker but "
+                        "matches no order intent; left alone for the operator"
+                    ),
+                    context={
+                        "order_id": action.order_id,
+                        "order_ref": action.order_ref,
+                        "ticker": action.ticker,
+                    },
+                )
+                continue
+
+            if action.record_submission:
+                # Close the exact visibility hole this sweep exists for: the
+                # broker id never reached the ledger, so the Cancelled
+                # callback that follows would be unattributable and the intent
+                # would strand in APPROVED holding its reservation forever.
+                self._record_raced_submission(action)
+
+            self._logger.critical(
+                "Halt sweep cancelling an order live during a halt",
+                order_id=action.order_id,
+                order_ref=action.order_ref,
+                ticker=action.ticker,
+            )
+            cancelled = await self._order_manager.cancel_broker_order(
+                action.order_id
+            )
+            if cancelled:
+                await self._alert_halt_sweep_once(
+                    action.order_id,
+                    event_type="halt_sweep_order_cancelled",
+                    priority="high",
+                    message=(
+                        f"System halted — cancelled buy {action.quantity} "
+                        f"{action.ticker} (order {action.order_id}) that "
+                        "reached the broker inside the halt race window"
+                    ),
+                    context={
+                        "order_id": action.order_id,
+                        "order_ref": action.order_ref,
+                        "ticker": action.ticker,
+                    },
+                )
+                continue
+            # Still live at IB. Retried on the next pass; the alert fires once
+            # so a wedged cancel does not page every interval.
+            await self._alert_halt_sweep_once(
+                action.order_id,
+                event_type="halt_sweep_cancel_failed",
+                priority="critical",
+                message=(
+                    f"System halted — could NOT cancel buy order "
+                    f"{action.order_id} ({action.ticker}); it may still be "
+                    "working at the broker"
+                ),
+                context={
+                    "order_id": action.order_id,
+                    "order_ref": action.order_ref,
+                    "ticker": action.ticker,
+                },
+            )
+
+    def _plan_halt_sweep(self, broker_orders: Any) -> list[HaltSweepAction]:
+        """Classify each live broker order into cancel / alert / leave alone.
+
+        Synchronous on purpose: every ledger read finishes and the shared
+        session's transaction is closed before the caller awaits anything on
+        it.
+
+        Sells are exempt whatever the ledger says. A halt is exactly when the
+        risk service publishes liquidation sells, and execution's own kill
+        path submits exits that never get an intent — cancelling the emergency
+        flatten is the one catastrophic outcome available here, so direction
+        is checked before identity (same reasoning as KAN-12's gate).
+        """
+        actions: list[HaltSweepAction] = []
+        try:
+            for broker_order in broker_orders or ():
+                order_id = str(getattr(broker_order, "order_id", "") or "")
+                order_ref = str(getattr(broker_order, "order_ref", "") or "")
+                ticker = str(getattr(broker_order, "ticker", "") or "")
+                quantity = float(
+                    getattr(broker_order, "quantity", 0.0) or 0.0
+                )
+                action = str(
+                    getattr(broker_order, "action", "") or ""
+                ).upper()
+                if action != "BUY":
+                    self._logger.info(
+                        "Halt sweep leaving a risk-reducing sell alone",
+                        order_id=order_id,
+                        order_ref=order_ref,
+                        ticker=ticker,
+                    )
+                    continue
+                intent = self._intent_for_ref(order_ref)
+                actions.append(
+                    HaltSweepAction(
+                        order_id=order_id,
+                        order_ref=order_ref,
+                        ticker=ticker or getattr(intent, "symbol", "") or "",
+                        quantity=quantity,
+                        cancel=intent is not None,
+                        record_submission=(
+                            intent is not None
+                            and intent.ib_order_id is None
+                            and intent.status == OrderStatus.APPROVED.value
+                        ),
+                    )
+                )
+        finally:
+            if self._order_ledger is not None:
+                self._order_ledger.session.rollback()
+        return actions
+
+    def _intent_for_ref(self, order_ref: str):
+        """Map a broker ``orderRef`` back to its intent, or None."""
+        if self._order_ledger is None or not order_ref:
+            return None
+        try:
+            return self._order_ledger.get(order_ref)
+        except OrderIntentNotFound:
+            return None
+
+    def _record_raced_submission(self, action: HaltSweepAction) -> None:
+        """Stamp a raced order's broker id onto its APPROVED intent."""
+        if self._order_ledger is None:
+            return
+        try:
+            self._order_ledger.record_submission(
+                action.order_ref, action.order_id
+            )
+            self._commit_ledger()
+        except Exception:
+            self._order_ledger.session.rollback()
+            self._logger.exception(
+                "Halt sweep could not record a raced broker order id; "
+                "cancelling anyway",
+                order_id=action.order_id,
+                order_ref=action.order_ref,
+            )
+
+    async def _alert_halt_sweep_once(
+        self,
+        order_id: str,
+        *,
+        event_type: str,
+        priority: str,
+        message: str,
+        context: dict[str, Any],
+    ) -> None:
+        """Publish a sweep alert at most once per order per halt."""
+        key = (order_id, event_type)
+        if key in self._halt_sweep_alerted:
+            return
+        self._halt_sweep_alerted.add(key)
+        await self._publish_alert(
+            event_type=event_type,
+            priority=priority,
+            message=message,
+            context=context,
+        )
+
     async def shutdown(self) -> None:
         """Graceful shutdown: cancel all open orders to avoid orphans."""
         self._logger.info("Execution service shutting down")
@@ -951,6 +1190,18 @@ class ExecutionServiceRunner:
                     )
                 except Exception:
                     self._logger.exception("Unfilled-order sweep failed; continuing")
+                # Post-halt reconcile sweep — its own timer, no calendar
+                # dependency. Also best-effort: a sweep failure (including an
+                # unreadable halt latch) must not tear down the loop that
+                # still has to process liquidation sells.
+                try:
+                    await self.maybe_run_halt_sweep(
+                        asyncio.get_running_loop().time()
+                    )
+                except Exception:
+                    self._logger.exception(
+                        "Post-halt order sweep failed; continuing"
+                    )
 
                 await self._consume_and_process(
                     APPROVED_ORDERS_STREAM,
