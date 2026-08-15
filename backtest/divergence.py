@@ -24,6 +24,7 @@ from backtest.costs import (
     DEFAULT_SLIPPAGE_BPS,
     CostModel,
 )
+from backtest.membership import COVERAGE_BLOCKED, COVERAGE_MISSING, COVERAGE_OK
 
 # Thresholds tuned to be quiet during normal operation but loud when something
 # real is breaking. Tuned for a 30-day rolling window; tighten for shorter windows.
@@ -60,12 +61,13 @@ class ExecutionModel:
     commission_per_share: float = ASSUMED_COMMISSION_PER_SHARE
     commission_minimum: float = DEFAULT_COMMISSION_MINIMUM
     point_in_time_universe: bool = False
+    coverage_state: str = COVERAGE_MISSING
 
     @property
     def is_like_for_like(self) -> bool:
         """Whether live performance can be fairly compared to this baseline.
 
-        Requires all three:
+        Requires all four:
 
         - **next-open fills** — a same-bar backtest fills entries at the
           decision day's low and exits at that day's open, which live cannot do;
@@ -75,11 +77,17 @@ class ExecutionModel:
           traded names *because* they went on to survive. Since
           ``--universe-snapshots`` is opt-in, this is the assumption most likely
           to be quietly missing from an otherwise-modernised re-run.
+        - **measured universe coverage within the floor** — a point-in-time
+          universe whose delisted names could not be priced is survivorship
+          bias again, just further down the pipe. ``BLOCKED`` means measured
+          and too lossy; ``MISSING`` means never measured, which is not a pass
+          (see :mod:`backtest.membership`).
         """
         return (
             self.fill_model == NEXT_OPEN_FILL_MODEL
             and self.commission_minimum > 0
             and self.point_in_time_universe
+            and self.coverage_state == COVERAGE_OK
         )
 
     def unmet_requirements(self) -> list[str]:
@@ -95,6 +103,17 @@ class ExecutionModel:
             reasons.append(
                 "static present-day universe (survivorship-biased); re-run with "
                 "--universe-snapshots"
+            )
+        if self.coverage_state == COVERAGE_BLOCKED:
+            reasons.append(
+                "universe coverage below the floor (BLOCKED): too much of the "
+                "point-in-time membership could not be priced, so the delisted "
+                "names are missing from the result"
+            )
+        elif self.coverage_state != COVERAGE_OK:
+            reasons.append(
+                "universe coverage was never measured (MISSING); re-run the "
+                "baseline with --universe-snapshots so it records one"
             )
         return reasons
 
@@ -112,7 +131,9 @@ LEGACY_EXECUTION_MODEL = ExecutionModel(
 # What a fully-rebaselined run of this repo's backtest produces. Used only when
 # a caller supplies no model at all; anything parsed from a config fails safe.
 DEFAULT_EXECUTION_MODEL = ExecutionModel(
-    fill_model=NEXT_OPEN_FILL_MODEL, point_in_time_universe=True
+    fill_model=NEXT_OPEN_FILL_MODEL,
+    point_in_time_universe=True,
+    coverage_state=COVERAGE_OK,
 )
 
 
@@ -121,12 +142,19 @@ def execution_model_from_backtest_config(config: Mapping | None) -> ExecutionMod
 
     Anything a backtest does not declare is assumed to be the unsafe value: a
     backtest with no ``fill_model`` predates the rebaseline and is treated as
-    same-bar, and one with no ``point_in_time_universe`` flag is treated as
-    survivorship-biased. Absence is never read as a pass.
+    same-bar, one with no ``point_in_time_universe`` flag is treated as
+    survivorship-biased, and one with no ``coverage`` block never measured how
+    much of its universe it could price. Absence is never read as a pass.
     """
     if not config:
         return LEGACY_EXECUTION_MODEL
     fill_model = str(config.get("fill_model") or SAME_BAR_FILL_MODEL)
+    coverage = config.get("coverage")
+    coverage_state = (
+        str(coverage.get("state") or COVERAGE_MISSING)
+        if isinstance(coverage, Mapping)
+        else COVERAGE_MISSING
+    )
     return ExecutionModel(
         fill_model=fill_model,
         slippage_bps=float(config.get("slippage_bps", ASSUMED_SLIPPAGE_BPS)),
@@ -135,6 +163,7 @@ def execution_model_from_backtest_config(config: Mapping | None) -> ExecutionMod
         ),
         commission_minimum=float(config.get("commission_minimum", 0.0)),
         point_in_time_universe=bool(config.get("point_in_time_universe", False)),
+        coverage_state=coverage_state,
     )
 
 

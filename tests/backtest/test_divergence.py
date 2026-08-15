@@ -30,6 +30,7 @@ from backtest.divergence import (
     slippage_bps,
     window_return,
 )
+from backtest.membership import COVERAGE_BLOCKED, COVERAGE_MISSING, COVERAGE_OK
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +441,7 @@ class TestExecutionModel:
             commission_per_share=0.005,
             commission_minimum=1.0,
             point_in_time_universe=True,
+            coverage_state=COVERAGE_OK,
         )
         assert model.is_like_for_like is True
 
@@ -476,6 +478,7 @@ class TestExecutionModel:
             "commission_per_share": 0.007,
             "commission_minimum": 1.0,
             "point_in_time_universe": True,
+            "coverage": {"state": COVERAGE_OK},
         })
         assert model.fill_model == NEXT_OPEN_FILL_MODEL
         assert model.slippage_bps == pytest.approx(15.0)
@@ -530,6 +533,7 @@ class TestBuildReportBaselineComparability:
             commission_per_share=0.005,
             commission_minimum=1.0,
             point_in_time_universe=True,
+            coverage_state=COVERAGE_OK,
         )
         report = build_report(
             "momentum",
@@ -616,6 +620,7 @@ class TestSurvivorshipBiasedBaselineIsNotComparable:
             commission_per_share=0.005,
             commission_minimum=1.0,
             point_in_time_universe=True,
+            coverage_state=COVERAGE_OK,
         )
         kwargs.update(overrides)
         return ExecutionModel(**kwargs)
@@ -639,6 +644,7 @@ class TestSurvivorshipBiasedBaselineIsNotComparable:
             "fill_model": NEXT_OPEN_FILL_MODEL,
             "commission_minimum": 1.0,
             "point_in_time_universe": True,
+            "coverage": {"state": COVERAGE_OK},
         })
         assert model.is_like_for_like is True
 
@@ -660,3 +666,88 @@ class TestSurvivorshipBiasedBaselineIsNotComparable:
         assert report.baseline_comparable is False
         assert report.status == "NO_DATA"
         assert any("survivorship" in note.lower() for note in report.notes)
+
+
+class TestCoverageFloorIsPartOfComparability:
+    """A point-in-time universe you cannot price is survivorship bias again.
+
+    Story KAN-22 / direction doc D14. The names whose bars fail to pull are
+    disproportionately the delistings, so an unbounded exclusion rate rebuilds
+    exactly the bias `--universe-snapshots` was added to remove — one pipe
+    stage later, where nothing was looking.
+    """
+
+    def _model(self, **overrides):
+        kwargs = dict(
+            fill_model=NEXT_OPEN_FILL_MODEL,
+            slippage_bps=10.0,
+            commission_per_share=0.005,
+            commission_minimum=1.0,
+            point_in_time_universe=True,
+            coverage_state=COVERAGE_OK,
+        )
+        kwargs.update(overrides)
+        return ExecutionModel(**kwargs)
+
+    def test_blocked_coverage_is_not_comparable(self):
+        assert self._model(coverage_state=COVERAGE_BLOCKED).is_like_for_like is False
+
+    def test_unmeasured_coverage_is_not_comparable(self):
+        assert self._model(coverage_state=COVERAGE_MISSING).is_like_for_like is False
+
+    def test_default_field_value_fails_safe(self):
+        """A model built without thinking about coverage must not claim it."""
+        bare = ExecutionModel(fill_model=NEXT_OPEN_FILL_MODEL, commission_minimum=1.0)
+        assert bare.coverage_state == COVERAGE_MISSING
+
+    def test_full_coverage_does_not_block_an_otherwise_good_baseline(self):
+        """Regression guard: the new requirement only ever subtracts."""
+        assert self._model().is_like_for_like is True
+
+    def test_unmet_requirements_names_coverage_in_both_failing_states(self):
+        blocked = self._model(coverage_state=COVERAGE_BLOCKED).unmet_requirements()
+        missing = self._model(coverage_state=COVERAGE_MISSING).unmet_requirements()
+
+        assert any("coverage" in reason.lower() for reason in blocked)
+        assert any(COVERAGE_BLOCKED in reason for reason in blocked)
+        assert any("coverage" in reason.lower() for reason in missing)
+        assert any(COVERAGE_MISSING in reason for reason in missing)
+        # A good baseline says nothing about coverage at all.
+        assert self._model().unmet_requirements() == []
+
+    def test_config_without_a_coverage_block_reads_as_missing(self):
+        model = execution_model_from_backtest_config({
+            "fill_model": NEXT_OPEN_FILL_MODEL,
+            "commission_minimum": 1.0,
+            "point_in_time_universe": True,
+        })
+        assert model.coverage_state == COVERAGE_MISSING
+        assert model.is_like_for_like is False
+
+    def test_config_carries_the_blocked_state_through(self):
+        model = execution_model_from_backtest_config({
+            "fill_model": NEXT_OPEN_FILL_MODEL,
+            "commission_minimum": 1.0,
+            "point_in_time_universe": True,
+            "coverage": {
+                "state": COVERAGE_BLOCKED,
+                "excluded_pct": 8.4,
+                "total_membership_days": 1000,
+            },
+        })
+        assert model.coverage_state == COVERAGE_BLOCKED
+        assert model.is_like_for_like is False
+
+    def test_report_forces_no_data_for_a_blocked_coverage_baseline(self):
+        start = date(2026, 5, 1)
+        report = build_report(
+            "momentum",
+            _equity_series(start, 10, 0.001),
+            _equity_series(start, 10, 0.001),
+            trades=[],
+            window_days=10,
+            execution_model=self._model(coverage_state=COVERAGE_BLOCKED),
+        )
+        assert report.baseline_comparable is False
+        assert report.status == "NO_DATA"
+        assert any("coverage" in note.lower() for note in report.notes)

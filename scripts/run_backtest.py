@@ -51,8 +51,14 @@ from backtest.costs import (
 )
 from backtest.divergence import NEXT_OPEN_FILL_MODEL
 from backtest.feature_extractor import enrich_trades
+from backtest.membership import (
+    COVERAGE_BLOCKED,
+    CoverageReport,
+    measure_coverage,
+    priced_days_from_bars,
+)
 from backtest.metrics import BacktestMetrics
-from backtest.runner import BacktestResult, BacktestRunner
+from backtest.runner import BacktestResult, BacktestRunner, collect_sorted_dates
 from backtest.simulator import SimulatedExecutor
 from services.risk_management.engine import RiskEngine
 
@@ -178,14 +184,20 @@ def build_base_config(
     replacement_score_margin: float,
     portfolio_capitals: dict[str, float],
     point_in_time_universe: bool,
+    coverage: CoverageReport | None = None,
 ) -> dict:
     """Provenance block saved with the results.
 
     The execution model is declared explicitly so ``scripts/divergence_monitor``
     can tell whether these numbers are a like-for-like baseline for live
     trading, instead of assuming they are (finding 4.6).
+
+    ``coverage`` is omitted entirely when the run had no membership calendar to
+    measure against. Writing a zeroed block instead would make an unmeasured
+    run indistinguishable from a fully-covered one — absence has to stay
+    visible, because the reader treats it as unsafe.
     """
-    return {
+    config = {
         "tickers": all_tickers,
         "years": years,
         "initial_capital": capital,
@@ -196,6 +208,9 @@ def build_base_config(
         "portfolios": portfolio_capitals,
         **cost_model.to_dict(),
     }
+    if coverage is not None:
+        config["coverage"] = coverage.to_dict()
+    return config
 
 
 def fetch_bars_from_ib(
@@ -2218,6 +2233,36 @@ def main():
     total_bars = sum(len(v) for v in bars_by_ticker.values())
     print(f"\nTotal bars loaded: {total_bars:,} across {len(bars_by_ticker)} tickers")
 
+    # Measure how much of the point-in-time universe these bars can actually
+    # price. Names that cannot be priced are skipped by the runner, and the
+    # ones that go missing are disproportionately the delistings — so an
+    # unmeasured exclusion rate is survivorship bias re-entering after the
+    # point-in-time universe supposedly removed it (direction doc D14).
+    coverage: CoverageReport | None = None
+    if membership is not None:
+        coverage = measure_coverage(
+            membership,
+            sessions=collect_sorted_dates(bars_by_ticker),
+            priced_tickers=priced_days_from_bars(bars_by_ticker),
+        )
+        print(
+            f"  Universe coverage: {100 - coverage.excluded_pct:.2f}% of "
+            f"{coverage.total_membership_days:,} membership-days priceable "
+            f"({coverage.state}, floor {coverage.floor_pct:.1f}% excluded)"
+        )
+        if coverage.state == COVERAGE_BLOCKED:
+            worst = sorted(
+                coverage.excluded_tickers.items(),
+                key=lambda kv: kv[1],
+                reverse=True,
+            )[:10]
+            print(
+                "  WARNING: coverage is BLOCKED — this baseline is NOT "
+                "like-for-like and the divergence monitor will refuse it. "
+                "Worst exclusions: "
+                + ", ".join(f"{t} ({d}d)" for t, d in worst)
+            )
+
     # Load cached fundamentals and earnings data
     fundamentals_cache = load_fundamentals_cache("data/cache/fundamentals.json")
     earnings_cache = load_earnings_cache("data/cache/earnings.json")
@@ -2516,6 +2561,7 @@ def main():
         replacement_score_margin=args.replacement_score_margin,
         portfolio_capitals={name: pc.capital for name, pc in portfolios.items()},
         point_in_time_universe=membership is not None,
+        coverage=coverage,
     )
     if args.ml_filter:
         base_config["ml_filter"] = {
