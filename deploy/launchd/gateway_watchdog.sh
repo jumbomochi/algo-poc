@@ -64,6 +64,15 @@ telegram() {
         -d chat_id="$chat" --data-urlencode text="$1" >/dev/null 2>&1 || true
 }
 
+# Drift guard: warn loudly if this deployed copy has fallen behind the repo
+# canonical. The 2026-08-11 cold-boot auth failure was a stale ~/ibc copy still
+# using the pre-T3 default DB password. Warn-only — a legitimately newer
+# deployed copy must not block the run. Resync with deploy/launchd/deploy.sh.
+CANON="$ALGO_DIR/deploy/launchd/$(basename "$0")"
+if [ -f "$CANON" ] && ! cmp -s "$0" "$CANON"; then
+    echo "$(date): WARNING - $(basename "$0") differs from repo canonical ($CANON); run deploy/launchd/deploy.sh to resync" >> "$LOG_FILE"
+fi
+
 if nc -z -G 3 127.0.0.1 "$PORT" 2>/dev/null; then
     # Up — clear pending strikes. Only log/alert on a state change.
     if [ -f "$MARKER" ] || [ -f "$AUTH_MARKER" ]; then

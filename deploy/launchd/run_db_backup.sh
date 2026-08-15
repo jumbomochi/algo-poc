@@ -63,6 +63,15 @@ fail() {
 mkdir -p "$BACKUP_DIR" "$LOG_DIR"
 echo "$(ts): Starting daily paper-DB backup" >> "$LOG_FILE"
 
+# Drift guard: warn loudly if this deployed copy has fallen behind the repo
+# canonical. The 2026-08-11 cold-boot auth failure was a stale ~/ibc copy still
+# using the pre-T3 default DB password. Warn-only — a legitimately newer
+# deployed copy must not block the run. Resync with deploy/launchd/deploy.sh.
+CANON="$ALGO_DIR/deploy/launchd/$(basename "$0")"
+if [ -f "$CANON" ] && ! cmp -s "$0" "$CANON"; then
+    echo "$(date): WARNING - $(basename "$0") differs from repo canonical ($CANON); run deploy/launchd/deploy.sh to resync" >> "$LOG_FILE"
+fi
+
 # The DB lives in the docker volume; if the container is down there is nothing
 # to dump from and the RPO guarantee is at risk — alert, don't silently skip.
 docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true \
