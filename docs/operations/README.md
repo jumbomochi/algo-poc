@@ -6,6 +6,7 @@ Entry point for operational documentation.
 
 - `go-live-checklist.md` — Paper-to-live promotion gates
 - `rollback-playbook.md` — Time-bound rollback procedure
+- `container-deploy.md` — Putting merged code into the risk/execution containers: build, `--force-recreate`, image-hash proof, retag rollback, cold-reboot check (KAN-17)
 - `divergence-monitor.md` — Daily live-vs-backtest divergence check (scripts/divergence_monitor.py)
 - `backtest-baseline.md` — Regenerating the headline backtest: point-in-time universe, next-open fills, real costs
 - `api-security.md` — TLS, secrets, auth lockout, dependency scanning, schema/model integrity (T9)
