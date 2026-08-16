@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
@@ -7,6 +9,12 @@ from typing import Any, Literal
 from shared.logging import get_logger
 
 logger = get_logger("order_manager")
+
+# How long :meth:`OrderManager.cancel_working_orders` waits for IB to take a
+# cancel off its book. One entry per retry; the book is checked once
+# immediately, so an already-dead order costs nothing. Bounded on purpose —
+# the caller is an emergency sell, and waiting forever is its own failure.
+CANCEL_ACK_BACKOFF_SECONDS: tuple[float, ...] = (0.5, 1.0, 2.0)
 
 
 @dataclass
@@ -62,6 +70,9 @@ class OrderManager:
 
         # Open orders: maps order_id -> order info dict
         self.open_orders: dict[str, dict[str, Any]] = {}
+
+        # Overridable so tests do not sleep out the real schedule.
+        self._cancel_ack_backoff = CANCEL_ACK_BACKOFF_SECONDS
 
     async def submit_entry(
         self,
@@ -445,6 +456,70 @@ class OrderManager:
         if cancelled:
             self.open_orders.pop(order_id, None)
         return cancelled
+
+    async def cancel_working_orders(
+        self, orders: Sequence[tuple[str, str]]
+    ) -> list[str]:
+        """Cancel each ``(order_id, order_ref)`` and wait until IB agrees.
+
+        Returns the refs still live once the wait is exhausted — empty means
+        every one of them is off the broker's book.
+
+        The confirmation is the point (KAN-10). ``cancelOrder`` only *requests*
+        a cancel; a BUY that fills between the request and the sell is the
+        exact race the oversell guard exists to close, so the caller must not
+        size anything off a request that has merely been sent. IB's own open
+        orders decide, matched by ``orderRef`` — the one identifier that
+        survives a restart, which is when a working order is least likely to
+        be tracked in ``open_orders``.
+
+        The book settles it, not the request: a ``False`` (IB does not list the
+        order) and even a raising cancel are both fine if the ref is gone
+        afterwards, because gone is the state being asked for. What leaves a
+        ref unconfirmed is a book that still lists it, or one that cannot be
+        read at all — the disconnect case, where nothing can be confirmed and
+        so nothing is.
+        """
+        pending = {str(order_ref) for _, order_ref in orders}
+        if not pending:
+            return []
+
+        for order_id, order_ref in orders:
+            try:
+                await self.cancel_broker_order(str(order_id))
+            except Exception:
+                self._logger.exception(
+                    "Failed to request cancel of a working order",
+                    order_id=order_id,
+                    order_ref=order_ref,
+                )
+
+        for attempt, delay in enumerate((0.0, *self._cancel_ack_backoff)):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                live = {
+                    str(order.order_ref)
+                    for order in await self.list_open_broker_orders()
+                }
+            except Exception:
+                self._logger.exception(
+                    "Could not read open broker orders to confirm a cancel",
+                    attempt=attempt,
+                )
+                continue
+            pending &= live
+            if not pending:
+                return []
+
+        self._logger.error(
+            "Working orders still live after cancel", order_refs=sorted(pending)
+        )
+        return sorted(pending)
+
+    async def broker_position(self, con_id: int) -> float:
+        """Net quantity the broker reports held for ``con_id``."""
+        return await self._executor.broker_position(con_id)
 
     async def cancel_all_orders(self) -> list[str]:
         """Cancel all open orders.

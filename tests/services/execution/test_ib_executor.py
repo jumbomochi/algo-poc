@@ -365,3 +365,64 @@ async def test_cancel_broker_order_reports_an_order_not_open_at_ib():
 
     assert await executor.cancel_broker_order("77") is False
     executor._ib.cancelOrder.assert_not_called()
+
+
+def make_position(
+    *,
+    con_id: int = 265598,
+    quantity: float = 12.0,
+    account: str = "DUN551088",
+    sec_type: str = "STK",
+):
+    return SimpleNamespace(
+        account=account,
+        position=quantity,
+        contract=SimpleNamespace(conId=con_id, secType=sec_type, symbol="AAPL"),
+    )
+
+
+def make_position_executor(positions, *, account_id="DUN551088"):
+    executor = IBExecutor("h", 7497, 1, account_id=account_id)
+    executor._ib = MagicMock()
+    executor._ib.reqPositionsAsync = AsyncMock(return_value=positions)
+    return executor
+
+
+@pytest.mark.asyncio
+async def test_broker_position_reports_the_held_quantity():
+    """KAN-10: the broker is authoritative on what can be sold — the ledger's
+    view of a position lags every fill that has not been projected yet."""
+    executor = make_position_executor([make_position(quantity=12.0)])
+
+    assert await executor.broker_position(265598) == 12.0
+
+
+@pytest.mark.asyncio
+async def test_broker_position_is_zero_for_a_contract_not_held():
+    executor = make_position_executor([make_position(con_id=999999)])
+
+    assert await executor.broker_position(265598) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_broker_position_ignores_other_accounts():
+    """A single Gateway session can report positions for more than one
+    account; counting a foreign one would license a sell this account cannot
+    cover."""
+    executor = make_position_executor(
+        [make_position(account="DU00000", quantity=50.0)]
+    )
+
+    assert await executor.broker_position(265598) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_broker_position_without_a_configured_account_sums_what_ib_reports():
+    """The account is pinned in production (KAN-11); with none configured the
+    executor cannot filter, so it reports what the session shows rather than
+    silently answering zero."""
+    executor = make_position_executor(
+        [make_position(account="DU00000", quantity=4.0)], account_id=None
+    )
+
+    assert await executor.broker_position(265598) == 4.0
