@@ -100,16 +100,36 @@ both the snapshot file and `shared/historical_sectors.py` from the same
 revisions. Every snapshot records the exact `revid` and revision timestamp it
 came from in the file's `revisions` block, so the file is reproducible and can
 be audited line-by-line against Wikipedia. Consecutive quarters with identical
-membership are collapsed (a snapshot is effective *until the next one*), which
-is why the file has fewer snapshots than quarters in the window.
+membership are collapsed (a snapshot is effective *until the next one*); in
+practice membership has changed every single quarter of this window, so the
+current file has one snapshot per quarter and the collapse never fires.
 
-Two honest limits on this source, both of which are fine for a divergence
-baseline and are **not** fine for attribution or an index-replication claim:
+Four honest limits on this source. All are fine for a divergence baseline and
+**none** of them are fine for attribution or an index-replication claim:
 
 - Wikipedia lags real index changes by days, so an entry/exit date is accurate
   to roughly a week rather than to the session.
 - Quarterly cadence bounds how long a departed name stays tradable (or a new
   member stays invisible) at one quarter.
+- **Ticker renames read as a removal plus an addition.** A constituents table
+  has no way to say "this is the same company under a new symbol", so the
+  calendar sees the old symbol leave and a new one join — and the backtest
+  liquidates the position at the next open with `exit_reason: universe_removal`
+  and books a fabricated round-trip. `TICKER_ALIASES` in the generator
+  canonicalises the renames that intersect `CONTRACT_CONID_OVERRIDES`
+  (`MRSH`→`MMC`, `FISV`→`FI`), because those two would otherwise be handed to
+  IB under the one spelling that has no conId pin — the names the override
+  exists to rescue would be exactly the ones it missed. Other renames in the
+  window are left as-is; each costs one phantom round-trip in a single name.
+- **Recycled tickers can resolve to the wrong company.** `make_stock_contract`
+  builds `Stock(ticker, "SMART", "USD")`, so a symbol later reassigned to a
+  different issuer (`GAS`, `MON`, `RAI`, `ETFC`, `WYN`, `Q` all appear in this
+  window) resolves at IB to whoever holds it *today*. That returns bars, so
+  `coverage.excluded_tickers` — which only catches names with *zero* bars —
+  never fires, and a foreign price series is merged into the baseline silently.
+  Pinning conIds in the snapshot envelope would close this; it is not done yet.
+  When reviewing a regenerated baseline, sanity-check that each delisted name's
+  last bar date is near its membership exit rather than near today.
 
 If you later buy a vendor history, point `--output` at the same path and keep
 the envelope shape; nothing downstream needs to change.
@@ -129,6 +149,14 @@ delisted names:
    consults it last, so the curated map still wins for anything currently
    traded. `tests/shared/test_universe.py` fails if a regenerated snapshot ever
    introduces a name with no sector.
+
+   **This changes live risk behaviour, not just the backtest.**
+   `lookup_sector` feeds the risk service, the position loader and the
+   portfolio projector. Any *currently held* name outside the curated top-100
+   moves from the `Unknown` pseudo-bucket into a real sector, which changes
+   which entries `sector_concentration_pct` rejects — that is the intended fix,
+   but it lands the moment the containers are rebuilt, so watch the first
+   session's rejections after deploying.
 
    **Known divergence:** the curated `SECTOR_MAP` labels `TGT` *Consumer
    Discretionary*; S&P reclassified Target to *Consumer Staples* in 2023 and
@@ -214,7 +242,25 @@ rebaselined one and revert the monitor to exit 3 — undoing the rebaseline
 within a week, silently. Producing nothing is strictly better.
 
 Exit codes: `1` = IB Gateway unreachable, `2` = membership snapshot missing,
-otherwise the backtest's own code.
+`124` = exceeded the deadline and was killed, otherwise the backtest's own code.
+
+**The job got roughly six times bigger.** `resolve_backtest_universe` returns
+the 140-ticker sleeve union without a membership calendar and ~830 names with
+one, and `run_backtest.py` issues one historical-data request per ticker-year —
+so `--years 10` goes from ~1,400 requests to ~8,300. Against IB's pacing limits
+that is hours, not minutes. The wrapper therefore bounds the run at
+`ALGO_REFRESH_TIMEOUT_SECONDS` (default 6h) and kills it past that, alerting on
+exit 124, so a runaway 05:00 SGT job cannot still be contending for the gateway
+when the next day's 04:15 paper run starts. (There is no clientId collision —
+the backtest uses 10, `run_paper` 58/59 — but they share one pacing budget.)
+Record the measured wall-clock of the first full PIT run here and re-tune the
+deadline if 6h turns out to be tight.
+
+**This does not take effect until you redeploy.** `local.algo-backtest-refresh.plist`
+runs `~/ibc/run_backtest_refresh.sh`, a deployed copy — merging the repo change
+does nothing to Tuesday's job until `deploy/launchd/deploy.sh` runs. Until then
+the job still omits `--universe-snapshots` and still has no snapshot guard; the
+wrapper's drift check only writes a WARNING line into the log.
 
 ### Names IB cannot price
 

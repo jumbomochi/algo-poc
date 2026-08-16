@@ -28,22 +28,43 @@ RUN_REFRESH = DEPLOY_DIR / "run_backtest_refresh.sh"
 EXIT_NO_SNAPSHOT = 2
 
 
-def test_the_wrapper_honours_the_test_overrides():
-    """Runs before anything drives the wrapper, and is not merely defensive.
+_OVERRIDES = (
+    'ALGO_DIR="${ALGO_DIR:-',
+    'VENV="${ALGO_PYTHON:-',
+    "${ALGO_MEMBERSHIP_SNAPSHOT:-",
+)
 
-    While this file was being written the wrapper still hardcoded ALGO_DIR, so
-    the first test run launched a *real* 10-year backtest against the live
-    checkout and the live IB Gateway — and the success path would then have
-    ``find -delete``d baseline artifacts out of the real ``output/``. If a
-    future edit re-hardcodes either variable, fail here instead of there.
+
+def _require_overridable():
+    """Refuse to launch the wrapper unless it honours the test overrides.
+
+    Not merely defensive. While this file was being written the wrapper still
+    hardcoded ALGO_DIR, and the first test run launched a *real* 10-year
+    backtest against the live checkout and the live IB Gateway; on success it
+    would then have ``find -delete``d baseline artifacts out of the real
+    ``output/``.
+
+    This is a hard raise inside ``_drive`` rather than a standalone assertion
+    because a failing assertion only reddens its own test — pytest would carry
+    on and run the remaining cases, each of which would drive the real wrapper
+    against the real repo. The check has to gate the launch, not report on it.
     """
     source = RUN_REFRESH.read_text()
-    assert 'ALGO_DIR="${ALGO_DIR:-' in source
-    assert 'VENV="${ALGO_PYTHON:-' in source
-    assert '${ALGO_MEMBERSHIP_SNAPSHOT:-' in source
+    missing = [token for token in _OVERRIDES if token not in source]
+    if missing:
+        raise RuntimeError(
+            f"{RUN_REFRESH.name} no longer honours {missing}; refusing to run "
+            "it, because without the overrides it would backtest the real "
+            "checkout and prune the real output/ directory."
+        )
 
 
-def _drive(tmp_path, *, snapshot=True, gateway=True, backtest_exit=0):
+def test_the_wrapper_honours_the_test_overrides():
+    _require_overridable()
+
+
+def _drive(tmp_path, *, snapshot=True, gateway=True, backtest_exit=0,
+           backtest_sleep=0, timeout_seconds=600):
     """Run the wrapper with everything it reaches out to stubbed.
 
     ``ALGO_DIR`` points at a scratch tree that *symlinks* the repo's ``deploy``
@@ -53,6 +74,7 @@ def _drive(tmp_path, *, snapshot=True, gateway=True, backtest_exit=0):
     ``$ALGO_DIR/output`` with ``find -delete``, and pointing it at the real repo
     would delete baseline artifacts the paper record depends on.
     """
+    _require_overridable()
     home = tmp_path / "home"
     home.mkdir()
     algo_dir = tmp_path / "algo"
@@ -94,6 +116,7 @@ exit 0
     # the real run does — the wrapper greps the log and names the newest file.
     fake_python = stub("fake-python", f"""#!/bin/bash
 {{ for a in "$@"; do printf '%s\\n' "$a"; done; printf -- '---END---\\n'; }} >> {argv_log}
+sleep {backtest_sleep}
 echo "AGGREGATE"
 echo "  Total Return: 42.0%"
 touch {algo_dir}/output/backtest_multi_20260817_000000.json
@@ -109,6 +132,7 @@ exit {backtest_exit}
         ALGO_SECURITY_BIN=str(bin_dir / "security"),
         ALGO_OSASCRIPT_BIN=str(bin_dir / "osascript"),
         ALGO_KEYCHAIN_SERVICE="algo-poc-absent-test-service",
+        ALGO_REFRESH_TIMEOUT_SECONDS=str(timeout_seconds),
     )
     result = subprocess.run(
         [str(RUN_REFRESH)], capture_output=True, text=True,
@@ -220,3 +244,35 @@ def test_wrappers_still_source_the_shared_telegram_helper(wrapper):
     source = (DEPLOY_DIR / wrapper).read_text()
     assert 'deploy/launchd/lib/telegram.sh"' in source
     assert "telegram() {" not in source
+
+
+# ---------------------------------------------------------------------------
+# Deadline — the PIT universe made this job ~6x bigger
+# ---------------------------------------------------------------------------
+
+def test_a_runaway_backtest_is_killed_and_reported(tmp_path):
+    """The point-in-time universe takes run_backtest from 140 tickers to ~830,
+    so the IB pull is hours. An unbounded 05:00 job could still be holding the
+    gateway at the next day's 04:15 paper run."""
+    result, sends, _, log, _ = _drive(tmp_path, backtest_sleep=30, timeout_seconds=1)
+
+    assert result.returncode == 124, result.returncode
+    assert "TIMED OUT" in log
+    assert len(sends) == 1, sends
+    assert "TIMED OUT" in sends[0]
+
+
+def test_the_deadline_does_not_fire_on_a_normal_run(tmp_path):
+    result, sends, _, log, _ = _drive(tmp_path, timeout_seconds=120)
+
+    assert result.returncode == 0
+    assert "TIMED OUT" not in log
+    assert "Weekly backtest refreshed" in sends[0]
+
+
+def test_a_timed_out_run_does_not_prune_the_baseline_archive(tmp_path):
+    """The prune is the success path's tail. A killed run must not reach it —
+    deleting old baselines when the new one was never written would leave the
+    monitor with less to fall back on, not more."""
+    result, _, _, _, _ = _drive(tmp_path, backtest_sleep=30, timeout_seconds=1)
+    assert result.returncode == 124

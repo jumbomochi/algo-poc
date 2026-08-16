@@ -12,6 +12,7 @@ import pytest
 
 from scripts.ops.build_membership_snapshot import (
     GICS_TO_REPO_SECTOR,
+    TICKER_ALIASES as GICS_ALIAS_TARGETS,
     build_envelope,
     normalize_symbol,
     parse_constituents,
@@ -285,3 +286,62 @@ def test_sector_conflicts_reports_disagreement_without_resolving_it():
 
 def test_sector_conflicts_ignores_names_outside_the_curated_map():
     assert sector_conflicts({"ETFC": "Financials"}, {"AAPL": "Technology"}) == {}
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups: date arithmetic, bounds, aliases, end-snapshot retention
+# ---------------------------------------------------------------------------
+
+def test_snapshot_dates_survives_a_start_day_past_the_shortest_month():
+    """Jan 31 + 3 months is not April 31. Naive date() arithmetic raises."""
+    days = snapshot_dates(date(2015, 1, 31), date(2015, 8, 1))
+    assert days[0] == date(2015, 1, 31)
+    assert date(2015, 4, 30) in days
+    assert days == sorted(days)
+
+
+def test_snapshot_dates_rejects_a_cadence_that_would_never_advance():
+    with pytest.raises(ValueError, match="at least 1"):
+        snapshot_dates(date(2015, 1, 1), date(2016, 1, 1), months=0)
+
+
+def test_snapshot_dates_rejects_a_backwards_window():
+    with pytest.raises(ValueError, match="before start"):
+        snapshot_dates(date(2016, 1, 1), date(2015, 1, 1))
+
+
+def test_parse_constituents_rejects_an_implausibly_large_table():
+    """A vandalised or doubled table must not become a snapshot."""
+    with pytest.raises(ValueError, match="expected at most"):
+        parse_constituents(_MODERN_PAGE, maximum_rows=1)
+
+
+def test_a_rename_is_canonicalised_to_the_repo_spelling():
+    """MRSH/FISV have no CONTRACT_CONID_OVERRIDES entry; MMC/FI do. Left
+    un-aliased, the two names the conId pin exists to rescue are the two it
+    would miss, and the rename reads as an index removal."""
+    assert normalize_symbol("MRSH") == "MMC"
+    assert normalize_symbol("FISV") == "FI"
+
+
+def test_aliases_target_the_spellings_the_repo_actually_pins():
+    from shared.universe import CONTRACT_CONID_OVERRIDES
+
+    for source, target in GICS_ALIAS_TARGETS.items():
+        assert target in CONTRACT_CONID_OVERRIDES, (
+            f"alias {source}->{target} does not point at a conId-pinned name"
+        )
+
+
+def test_build_envelope_keeps_the_final_snapshot_even_when_it_repeats():
+    """Collapsing the last observation would leave last_snapshot_date short of
+    the window end — the file would read as stale to AC1's coverage check."""
+    env = build_envelope(
+        [
+            _obs(date(2015, 1, 1), {"AAPL": "Technology"}, revid=1),
+            _obs(date(2015, 4, 1), {"AAPL": "Technology"}, revid=2),
+            _obs(date(2015, 7, 1), {"AAPL": "Technology"}, revid=3),
+        ],
+        generated_at=date(2026, 8, 17),
+    )
+    assert list(env["snapshots"]) == ["2015-01-01", "2015-07-01"]

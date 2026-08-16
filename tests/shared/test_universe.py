@@ -344,3 +344,86 @@ class TestCommittedMembershipSnapshot:
         tickers = set(calendar.all_tickers())
         assert "BRK B" in tickers
         assert "BRK-B" not in tickers and "BRK.B" not in tickers
+
+    def test_the_generated_module_matches_the_snapshot_it_came_from(self):
+        """I5 — the pair must be regenerated together.
+
+        Without this, editing one file by hand or regenerating only one passes
+        CI, because the AC2 test asks "does every ticker have *a* sector" and
+        both files are produced by the same parse: any ticker the parser
+        invents also gets a sector, so that test cannot fail on a parse defect.
+        This one compares the two artifacts against each other instead.
+        """
+        from shared.historical_sectors import HISTORICAL_SECTOR_MAP
+        from shared.universe import SECTOR_MAP
+
+        payload = json.loads((REPO_ROOT / self.SNAPSHOT).read_text())
+        expected = {
+            t: s for t, s in payload["sectors"].items() if t not in SECTOR_MAP
+        }
+        assert HISTORICAL_SECTOR_MAP == expected, (
+            "shared/historical_sectors.py is out of sync with "
+            f"{self.SNAPSHOT}; re-run scripts/ops/build_membership_snapshot.py"
+        )
+
+    def test_every_snapshot_ticker_has_a_sector_recorded_in_the_envelope(self):
+        payload = json.loads((REPO_ROOT / self.SNAPSHOT).read_text())
+        in_snapshots = {t for members in payload["snapshots"].values() for t in members}
+        assert in_snapshots <= set(payload["sectors"])
+
+    def test_conid_pinned_names_use_the_repo_spelling(self, calendar):
+        """C2 — a rename must not smuggle a name past CONTRACT_CONID_OVERRIDES.
+
+        MMC and FI are pinned by conId because the IB gateway cannot resolve
+        them by symbol (2026-08-09 stale-contract incident). Wikipedia carries
+        the post-rename spellings MRSH and FISV, which have no override — so
+        without aliasing, the two names the override exists to rescue are
+        exactly the two it would miss.
+        """
+        from shared.universe import CONTRACT_CONID_OVERRIDES
+
+        tickers = set(calendar.all_tickers())
+        for pinned in CONTRACT_CONID_OVERRIDES:
+            assert pinned in tickers, f"{pinned} missing from the PIT universe"
+        for alias in ("MRSH", "FISV"):
+            assert alias not in tickers, (
+                f"{alias} is an un-aliased rename of a conId-pinned name; add "
+                "it to TICKER_ALIASES and regenerate"
+            )
+
+    def test_a_conid_pinned_name_is_contiguous_across_its_rename(self, calendar):
+        """The rename must read as one continuous membership, not a removal.
+
+        A gap would make the backtest liquidate at the next open with
+        exit_reason: universe_removal and book a fabricated round-trip.
+        """
+        payload = json.loads((REPO_ROOT / self.SNAPSHOT).read_text())
+        days = list(payload["snapshots"])
+        present = [d for d in days if "MMC" in payload["snapshots"][d]]
+        first, last = days.index(present[0]), days.index(present[-1])
+        assert len(present) == last - first + 1, (
+            "MMC's membership is not contiguous — the MRSH rename is being "
+            "read as an index removal and re-addition"
+        )
+
+
+class TestSectorPrecedence:
+    def test_the_curated_map_is_consulted_before_the_generated_one(self, monkeypatch):
+        """Precedence for real, not just key-disjointness.
+
+        The disjointness test would still pass if lookup_sector consulted
+        HISTORICAL_SECTOR_MAP first; this fails in that case. It matters
+        because the curated label decides how a currently-held name is bucketed
+        by the live sector-concentration limit.
+        """
+        import shared.universe as u
+
+        monkeypatch.setitem(u.SECTOR_MAP, "ZZZDUP", "Energy")
+        monkeypatch.setitem(u.HISTORICAL_SECTOR_MAP, "ZZZDUP", "Utilities")
+        assert u.lookup_sector("ZZZDUP") == "Energy"
+
+    def test_the_generated_map_still_covers_names_the_curated_one_lacks(self, monkeypatch):
+        import shared.universe as u
+
+        monkeypatch.setitem(u.HISTORICAL_SECTOR_MAP, "ZZZONLY", "Utilities")
+        assert u.lookup_sector("ZZZONLY") == "Utilities"

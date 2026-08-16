@@ -38,6 +38,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import re
 import sys
@@ -47,7 +48,8 @@ import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from html import unescape
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -62,8 +64,34 @@ DEFAULT_SECTOR_MODULE = "shared/historical_sectors.py"
 DEFAULT_START = date(2015, 1, 1)
 
 #: The S&P 500 has had 500-ish members throughout the window. A parse that
-#: yields far fewer has read the wrong table or a mid-edit revision.
+#: yields a count outside this band has read the wrong table, a mid-edit
+#: revision, or a vandalised one with the rows doubled.
 MINIMUM_CONSTITUENTS = 400
+MAXIMUM_CONSTITUENTS = 600
+
+#: Ticker renames, mapped to the spelling the rest of the repo uses.
+#:
+#: Wikipedia records a rename the only way a constituents table can: the old
+#: symbol vanishes and the new one appears in the next revision. Left alone the
+#: MembershipCalendar reads that as an index removal — the backtest liquidates
+#: the position at the next open with ``exit_reason: universe_removal`` and
+#: books a fabricated round-trip — followed by an unrelated company joining.
+#:
+#: These two matter beyond the phantom trade. ``CONTRACT_CONID_OVERRIDES`` pins
+#: IB conIds for ``MMC`` and ``FI`` precisely because the gateway cannot
+#: resolve them by symbol (the 2026-08-09 stale-contract incident). A snapshot
+#: carrying ``MRSH``/``FISV`` instead would hand IB the one spelling with no
+#: override — the names the override exists to rescue would be exactly the ones
+#: it misses. Canonicalising to the repo spelling also prices the *whole*
+#: history correctly, because a conId is stable across a ticker change.
+#:
+#: Not exhaustive, and deliberately so: this covers the renames that intersect
+#: the conId overrides. Other renames in the window still read as a round-trip;
+#: see the rename note in docs/operations/backtest-baseline.md.
+TICKER_ALIASES: dict[str, str] = {
+    "MRSH": "MMC",   # Marsh & McLennan
+    "FISV": "FI",    # Fiserv
+}
 
 #: GICS sector names as Wikipedia writes them -> the labels already in use in
 #: ``shared.universe.SECTOR_MAP``. Deliberately exhaustive and strict: a GICS
@@ -113,7 +141,8 @@ def normalize_symbol(symbol: str) -> str:
     spelling prices at IB as nothing and lands in the coverage exclusions.
     """
     cleaned = symbol.replace(" ", " ").replace("­", "").strip()
-    return cleaned.replace(".", " ").replace("-", " ").upper()
+    canonical = cleaned.replace(".", " ").replace("-", " ").upper()
+    return TICKER_ALIASES.get(canonical, canonical)
 
 
 def repo_sector(gics: str) -> str:
@@ -143,7 +172,9 @@ def _cell_text(cell: str) -> str:
     return unescape(_TAG_RE.sub("", cell)).replace(" ", " ").strip()
 
 
-def parse_constituents(html: str, minimum_rows: int = 0) -> dict[str, str]:
+def parse_constituents(
+    html: str, minimum_rows: int = 0, maximum_rows: int | None = None
+) -> dict[str, str]:
     """Read ``{ticker: gics_sector}`` out of a rendered revision of the article.
 
     Selects the table by its header cells rather than by position or id, because
@@ -181,6 +212,12 @@ def parse_constituents(html: str, minimum_rows: int = 0) -> dict[str, str]:
                 f"{minimum_rows}); the revision is probably mid-edit — pick a "
                 "different date or widen the search"
             )
+        if maximum_rows is not None and len(parsed) > maximum_rows:
+            raise ValueError(
+                f"{len(parsed)} constituents parsed (expected at most "
+                f"{maximum_rows}); the revision is probably vandalised or the "
+                "table doubled — inspect it before trusting this snapshot"
+            )
         return parsed
 
     raise ValueError(
@@ -198,15 +235,28 @@ def snapshot_dates(start: date, end: date, months: int = 3) -> list[date]:
     """
     if end < start:
         raise ValueError(f"end {end} is before start {start}")
+    if months < 1:
+        raise ValueError(f"months must be at least 1, got {months}")
     days: list[date] = []
-    cursor = start
-    while cursor <= end:
+    step = 0
+    while True:
+        # Stepped from ``start`` rather than accumulated, so a start day past
+        # the 28th cannot overflow into an invalid date (Jan 31 + 3 months).
+        # The day is clamped to the target month's length instead.
+        total = start.month - 1 + months * step
+        year, month = start.year + total // 12, total % 12 + 1
+        cursor = date(year, month, min(start.day, _days_in_month(year, month)))
+        if cursor > end:
+            break
         days.append(cursor)
-        month = cursor.month - 1 + months
-        cursor = date(cursor.year + month // 12, month % 12 + 1, cursor.day)
-    if days[-1] != end:
+        step += 1
+    if not days or days[-1] != end:
         days.append(end)
     return days
+
+
+def _days_in_month(year: int, month: int) -> int:
+    return calendar.monthrange(year, month)[1]
 
 
 def build_envelope(
@@ -226,11 +276,16 @@ def build_envelope(
     revisions: dict[str, dict[str, Any]] = {}
     sectors: dict[str, str] = {}
     previous: frozenset[str] | None = None
+    last_index = len(observations) - 1
 
-    for obs in observations:
+    for position, obs in enumerate(observations):
         members = frozenset(obs["members"])
         sectors.update(obs["members"])
-        if members == previous:
+        # The final observation is always kept even when it repeats the one
+        # before it. Collapsing it would leave last_snapshot_date short of the
+        # window's end, which is the AC1 coverage assertion — the file would
+        # still be correct in meaning but would read as stale.
+        if members == previous and position != last_index:
             continue
         previous = members
         key = obs["requested"].isoformat()
@@ -360,6 +415,7 @@ def collect_observations(
     days: Iterable[date],
     *,
     minimum_rows: int = MINIMUM_CONSTITUENTS,
+    maximum_rows: int | None = MAXIMUM_CONSTITUENTS,
     pause_seconds: float = 0.5,
     log=print,
 ) -> list[dict[str, Any]]:
@@ -367,7 +423,11 @@ def collect_observations(
     observations: list[dict[str, Any]] = []
     for day in days:
         revid, timestamp = revision_at(day)
-        members = parse_constituents(revision_html(revid), minimum_rows=minimum_rows)
+        members = parse_constituents(
+            revision_html(revid),
+            minimum_rows=minimum_rows,
+            maximum_rows=maximum_rows,
+        )
         observations.append(
             {
                 "requested": day,
@@ -445,8 +505,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         render_sector_module(
             envelope["sectors"],
             SECTOR_MAP,
-            generated_at=envelope["generated_at"]
-            and date.fromisoformat(envelope["generated_at"]),
+            generated_at=date.fromisoformat(envelope["generated_at"]),
             start=start,
             snapshots=len(snaps),
         )
