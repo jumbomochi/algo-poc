@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Disabled</key>
+	<false/>
+	<key>Label</key>
+	<string>local.algo-evidence-digest</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/huiliang/ibc/run_evidence_digest.sh</string>
+	</array>
+	<key>StandardErrorPath</key>
+	<string>/Users/huiliang/ibc/logs/evidence-digest-launchd.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/huiliang/ibc/logs/evidence-digest-launchd.log</string>
+	<!-- Monday 08:00 SGT: after the week's last session has settled and before
+	     the operator's week starts, so the digest is waiting rather than
+	     arriving mid-morning. Reads only this host's own database, so unlike
+	     the backtest refresh it does not care that IBKR's data farms are dead
+	     Sunday-Monday. -->
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Weekday</key>
+		<integer>1</integer>
+		<key>Hour</key>
+		<integer>8</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+</dict>
+</plist>
