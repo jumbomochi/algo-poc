@@ -119,6 +119,11 @@ if [ "$DB_REV" != "$HEAD_REV" ]; then
     exit 1
 fi
 
+# This log is per-day and appended to, so a manual catch-up run shares the file
+# with the morning's. Remember where this run starts: the failure branch below
+# classifies the fault from the log, and must read only its own output.
+LOG_LINES_BEFORE_RUN=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
+
 "$VENV" scripts/run_paper.py --publish --no-entries-disabled >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
 
@@ -128,8 +133,19 @@ echo "$(date): Paper trading run completed (exit code: $EXIT_CODE)" >> "$LOG_FIL
 # the 2026-08-13/14 aborts were written to this log and to the 04:52 pipeline
 # report, and still went unnoticed for two days because nothing pushed.
 if [ "$EXIT_CODE" != "0" ]; then
-    algo_alert_local "paper run FAILED (exit $EXIT_CODE) — see $LOG_FILE"
-    telegram "🚨 Paper trading run FAILED (exit $EXIT_CODE). No signals committed today. See $LOG_FILE"
+    # KAN-31 gave a nonzero exit a second meaning: the book committed but the
+    # publish to the pipeline failed, so no orders reached risk or execution.
+    # "No signals committed today" is false in that case, and a false alert
+    # sends the operator hunting the wrong fault — so the detail is read out of
+    # the log rather than asserted.
+    if tail -n "+$((LOG_LINES_BEFORE_RUN + 1))" "$LOG_FILE" 2>/dev/null \
+        | grep -q "WARNING: publish to pipeline failed"; then
+        DETAIL="Book committed, but no orders reached risk/execution; intents replay next run."
+    else
+        DETAIL="No signals committed today."
+    fi
+    algo_alert_local "paper run FAILED (exit $EXIT_CODE) — $DETAIL see $LOG_FILE"
+    telegram "🚨 Paper trading run FAILED (exit $EXIT_CODE). $DETAIL See $LOG_FILE"
 fi
 
 # KAN-15: tell the OUTSIDE world the run happened. Every alert above this line
@@ -141,6 +157,12 @@ fi
 # Deliberately AFTER the failure alerts and deliberately incapable of failing
 # (see deploy/launchd/deadman.sh) — this reports on the run, it must never be
 # able to change its outcome.
+#
+# KAN-31 note: a publish failure now exits nonzero, so it withholds the ping and
+# the external check pages ~26h later with its documented meaning of "the
+# wrapper never ran". That is knowingly imprecise and knowingly kept: the run
+# put no orders in front of the broker, which is the class of silence this
+# switch exists to break. The local alert above carries the accurate diagnosis.
 algo_deadman_ping "$EXIT_CODE"
 echo "$(date): dead-man switch: $ALGO_DEADMAN_STATUS" >> "$LOG_FILE"
 

@@ -1,14 +1,24 @@
-"""KAN-30: the morning digest reports fills, rejections, and halt state.
+"""The morning pipeline report: what the operator is told about a paper run.
 
-Two layers, mirroring KAN-43's split: the pure summariser
-(``scripts/ops/pipeline_report_summary.py``), driven against a real database
-so the counts are proven to come from ``execution_fills`` / ``order_intents``
-rather than from grepping a log; and the launchd wrapper driven end-to-end
-with ``curl`` stubbed, so the assertion is on the message actually sent.
+Two subjects share this module because they are one operator-facing surface.
+
+KAN-30 — the pure summariser (``scripts/ops/pipeline_report_summary.py``),
+driven against a real database so the counts are proven to come from
+``execution_fills`` / ``order_intents`` rather than from grepping a log; and the
+launchd wrapper driven end-to-end with ``curl`` stubbed, so the assertion is on
+the message actually sent.
+
+KAN-31 — the status branch inside ``run_pipeline_report.sh``, which decides the
+Telegram line by grepping the paper log for ``exit code: 0``. That grep became
+load-bearing when a publish failure started writing ``exit code: 1``: it is what
+turns a silent, order-less run into "❌ paper run FAILED". The block is extracted
+from the real script and run in bash, so this exercises the shipped code rather
+than a paraphrase of it.
 """
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -403,3 +413,153 @@ def test_an_unreadable_database_degrades_to_a_marker_not_a_false_all_clear(tmp_p
     assert "halt: clear" not in msg
     assert "unknown" in msg.lower()
     assert "paper run" in msg
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+REPORT_SCRIPT = REPO_ROOT / "deploy/launchd/run_pipeline_report.sh"
+
+# The `if grep -q "exit code: 0" ... fi` block, lifted verbatim.
+_STATUS_BLOCK = re.compile(
+    r'^if grep -q "exit code: 0".*?^fi$', re.MULTILINE | re.DOTALL
+)
+
+
+def status_block() -> str:
+    match = _STATUS_BLOCK.search(REPORT_SCRIPT.read_text())
+    assert match, "run_pipeline_report.sh no longer has a RUN_STATUS grep block"
+    return match.group(0)
+
+
+def run_status(paper_log: Path | str) -> str:
+    """Execute the script's own status block against a fixture log."""
+    script = f'PAPER_LOG="{paper_log}"\n{status_block()}\nprintf %s "$RUN_STATUS"'
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+LOG_TEMPLATE = (
+    "Sun Aug 16 04:15:02 +08 2026: Starting paper trading run\n"
+    "1 signals generated\n"
+    "State committed to database\n"
+    "WARNING: publish to pipeline failed (Error 111 connecting to redis:6379); "
+    "intents remain replayable\n"
+    "Sun Aug 16 04:17:44 +08 2026: Paper trading run completed (exit code: {code})\n"
+)
+
+
+@pytest.fixture
+def paper_log(tmp_path):
+    def write(code: int) -> Path:
+        path = tmp_path / "paper_trading_20260816.log"
+        path.write_text(LOG_TEMPLATE.format(code=code))
+        return path
+
+    return write
+
+
+def test_a_publish_failure_reports_the_run_as_failed(paper_log):
+    """AC4: exit code 1 in the log ⇒ the Telegram digest says FAILED."""
+    assert run_status(paper_log(1)) == "❌ paper run FAILED"
+
+
+def test_a_clean_run_still_reports_ok(paper_log):
+    assert run_status(paper_log(0)) == "✅ paper run OK"
+
+
+def test_a_missing_log_reports_missing(tmp_path):
+    """The job never ran at all — distinct from a run that failed."""
+    assert run_status(tmp_path / "absent.log") == "❌ paper run MISSING"
+
+
+# ---------------------------------------------------------------------------
+# The wrapper's own failure alert must not assert something false
+# ---------------------------------------------------------------------------
+
+PAPER_WRAPPER = REPO_ROOT / "deploy/launchd/run_paper.sh"
+
+# The `if [ "$EXIT_CODE" != "0" ]; then ... fi` alert block, lifted verbatim.
+_FAILURE_BLOCK = re.compile(
+    r'^if \[ "\$EXIT_CODE" != "0" \]; then.*?^fi$', re.MULTILINE | re.DOTALL
+)
+
+
+def failure_alerts(
+    exit_code: int, log_body: str, tmp_path: Path, *, lines_before_run: int = 0
+) -> str:
+    """Run the wrapper's failure-alert block with the delivery calls stubbed."""
+    match = _FAILURE_BLOCK.search(PAPER_WRAPPER.read_text())
+    assert match, "run_paper.sh no longer has an EXIT_CODE failure-alert block"
+
+    log = tmp_path / "paper_trading_20260816.log"
+    log.write_text(log_body)
+    script = (
+        'algo_alert_local() { printf "local: %s\\n" "$1"; }\n'
+        'telegram() { printf "telegram: %s\\n" "$1"; }\n'
+        f"EXIT_CODE={exit_code}\nLOG_LINES_BEFORE_RUN={lines_before_run}\n"
+        f'LOG_FILE="{log}"\n{match.group(0)}\n'
+    )
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def test_a_publish_failure_is_not_reported_as_an_uncommitted_book(tmp_path):
+    """KAN-31 makes exit 1 mean two different things. The alert must not claim
+    "No signals committed today" when the book committed and only the publish
+    failed — that sends the operator hunting the wrong fault."""
+    out = failure_alerts(1, LOG_TEMPLATE.format(code=1), tmp_path)
+
+    assert "No signals committed today" not in out
+    assert "no orders reached risk/execution" in out
+    assert out.count("exit 1") == 2, "both the local and Telegram paths must fire"
+
+
+def test_a_run_that_committed_nothing_still_says_so(tmp_path):
+    """The pre-KAN-31 meaning of a nonzero exit is unchanged."""
+    log = (
+        "Sun Aug 16 04:15:02 +08 2026: Starting paper trading run\n"
+        "ERROR: No data fetched. Is IB Gateway running?\n"
+        "Sun Aug 16 04:15:44 +08 2026: Paper trading run completed (exit code: 1)\n"
+    )
+
+    out = failure_alerts(1, log, tmp_path)
+
+    assert "No signals committed today" in out
+
+
+def test_a_rerun_does_not_inherit_the_mornings_diagnosis(tmp_path):
+    """The log is per-day and appended to. A manual catch-up run that dies for
+    an unrelated reason must be classified on its OWN output, not on the
+    publish failure still sitting above it in the same file."""
+    morning = LOG_TEMPLATE.format(code=1)
+    rerun = (
+        "Sun Aug 16 10:28:03 +08 2026: Starting paper trading run\n"
+        "ERROR: No data fetched. Is IB Gateway running?\n"
+        "Sun Aug 16 10:28:51 +08 2026: Paper trading run completed (exit code: 1)\n"
+    )
+
+    out = failure_alerts(
+        1, morning + rerun, tmp_path, lines_before_run=len(morning.splitlines())
+    )
+
+    assert "No signals committed today" in out
+    assert "no orders reached risk/execution" not in out
+
+
+def test_a_clean_run_raises_no_failure_alert(tmp_path):
+    assert failure_alerts(0, LOG_TEMPLATE.format(code=0), tmp_path) == ""
+
+
+def test_the_wrapper_records_the_log_length_before_the_run(tmp_path):
+    """The classification above is only honest if the offset is captured before
+    the python process appends anything."""
+    body = PAPER_WRAPPER.read_text()
+    offset_at = body.index("LOG_LINES_BEFORE_RUN=")
+    run_at = body.index('"$VENV" scripts/run_paper.py')
+
+    assert offset_at < run_at
