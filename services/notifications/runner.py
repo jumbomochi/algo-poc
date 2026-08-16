@@ -3,10 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
 from services.notifications.dispatcher import NotificationDispatcher
 from shared.config import AppConfig
 from shared.heartbeat import write_heartbeat
 from shared.logging import get_logger
+from shared.models.alerts import AlertRecord
 from shared.redis_client import RedisStreamClient, StreamMessage
 from shared.schemas.messages import AlertMessage
 
@@ -31,12 +35,20 @@ class NotificationsServiceRunner:
         config: AppConfig,
         redis_client: RedisStreamClient,
         dispatcher: NotificationDispatcher,
+        db_session: Session | None = None,
     ) -> None:
         self._config = config
         self._redis = redis_client
         self._dispatcher = dispatcher
+        self._db = db_session
         self._logger = logger
         self._running = False
+        if db_session is None:
+            self._logger.warning(
+                "No database session configured; alerts will be delivered but "
+                "not recorded, and the go-live reliability gate will report "
+                "its evidence as unavailable"
+            )
 
     async def setup(self) -> None:
         """Create consumer group and replay pending alerts.
@@ -69,6 +81,9 @@ class NotificationsServiceRunner:
         """
         try:
             alert = AlertMessage.from_stream_dict(message.data)
+            # Recorded before dispatch: an alert no channel could deliver is
+            # exactly the one the reliability gate must be able to see.
+            self._record(alert, message.message_id)
             await self._dispatcher.dispatch(alert)
             await self._redis.ack(ALERTS_STREAM, CONSUMER_GROUP, message.message_id)
             self._logger.info(
@@ -89,6 +104,53 @@ class NotificationsServiceRunner:
             # re-drained + re-DLQ'd on every restart (finding 3.4).
             await self._redis.ack(
                 ALERTS_STREAM, CONSUMER_GROUP, message.message_id
+            )
+
+    def _record(self, alert: AlertMessage, message_id: str) -> None:
+        """Persist one alert as durable evidence for the go-live gate.
+
+        The database is deliberately NOT on the delivery path: a write failure
+        is logged and swallowed so a sick database can never stop a critical
+        alert from reaching a human.  Re-delivery of the same stream id is a
+        replay of one incident, not a second one, so it is skipped.
+        """
+        if self._db is None:
+            return
+        try:
+            already = self._db.scalar(
+                select(AlertRecord.id).where(AlertRecord.message_id == message_id)
+            )
+            if already is not None:
+                # The SELECT autobegan a transaction. Returning without ending
+                # it would leave this long-lived session idle-in-transaction,
+                # holding a snapshot open until the next alert arrives.
+                self._db.rollback()
+                return
+            self._db.add(
+                AlertRecord(
+                    message_id=message_id,
+                    event_type=alert.event_type,
+                    priority=alert.priority,
+                    message=alert.message,
+                    context=alert.context,
+                    raised_at=alert.timestamp,
+                    recorded_at=datetime.now(timezone.utc),
+                )
+            )
+            self._db.commit()
+        except Exception:
+            # Best-effort: a dead connection makes rollback() raise too, and an
+            # exception escaping here would dead-letter the alert *undelivered*
+            # — the exact opposite of this method's contract, happening exactly
+            # when the database is sick.
+            try:
+                self._db.rollback()
+            except Exception:
+                self._logger.exception("Alert-record rollback failed")
+            self._logger.exception(
+                "Failed to record alert; delivery continues",
+                message_id=message_id,
+                event_type=alert.event_type,
             )
 
     async def health_check(self) -> dict[str, Any]:
@@ -144,6 +206,8 @@ if __name__ == "__main__":
 
     async def main() -> None:
         import redis.asyncio as aioredis
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
 
         from services.notifications.channels import (
             EmailChannel,
@@ -178,9 +242,20 @@ if __name__ == "__main__":
             sms=SMSChannel() if config.notifications.sms_enabled else None,
             telegram=telegram,
         )
+        # Alerts are recorded as durable evidence for the go-live reliability
+        # gate; the write is off the delivery path, so a DB outage degrades the
+        # evidence rather than the alerting.
+        engine = create_engine(config.database.url)
+        db_session = sessionmaker(bind=engine)()
         runner = NotificationsServiceRunner(
-            config=config, redis_client=redis_client, dispatcher=dispatcher
+            config=config,
+            redis_client=redis_client,
+            dispatcher=dispatcher,
+            db_session=db_session,
         )
-        await runner.run()
+        try:
+            await runner.run()
+        finally:
+            db_session.close()
 
     asyncio.run(main())

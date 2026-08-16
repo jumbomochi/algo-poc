@@ -2737,8 +2737,10 @@ Define objective gates for promotion from paper to live trading. Live mode is bl
 - **Backtest regression:** latest backtest run with current model passes all metric thresholds (Sharpe, drawdown, win rate within tolerance of baseline).
 
 **Promotion workflow:**
-1. Run `scripts/ops/go_live_gate.py --from paper --to live`.
-2. Script validates metrics from PostgreSQL/audit logs and writes a signed report to `docs/operations/reports/`.
+1. Run `python -m scripts.ops.go_live_gate` (add `--json` for the review
+   record). It exits 0 only when all eight gates pass.
+2. Script validates metrics from PostgreSQL and prints the report; capture
+   `--json` output into the gate-day review record.
 3. Require two-person approval recorded in `go-live-checklist.md` (operator + reviewer).
 4. Apply `ALGO_MODE=live` only after checklist sign-off.
 

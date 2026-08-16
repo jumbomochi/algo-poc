@@ -1,3 +1,4 @@
+from shared.models.alerts import AlertRecord
 from shared.models.audit import AuditLog
 from shared.models.base import Base
 from shared.models.currency import CurrencyConversion
@@ -31,6 +32,7 @@ from shared.models.signals import SignalRecord
 from shared.models.system_halt import SystemHaltState
 
 __all__ = [
+    "AlertRecord",
     "AuditLog",
     "Base",
     "CapitalAdjustment",
