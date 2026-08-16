@@ -22,6 +22,7 @@ RUN_DIVERGENCE = DEPLOY_DIR / "run_divergence.sh"
 RUN_PIPELINE_REPORT = DEPLOY_DIR / "run_pipeline_report.sh"
 RUN_DB_BACKUP = DEPLOY_DIR / "run_db_backup.sh"
 RUN_BACKTEST_REFRESH = DEPLOY_DIR / "run_backtest_refresh.sh"
+RUN_EVIDENCE_DIGEST = DEPLOY_DIR / "run_evidence_digest.sh"
 GATEWAY_WATCHDOG = DEPLOY_DIR / "gateway_watchdog.sh"
 PAPER_PLIST = DEPLOY_DIR / "local.algo-paper-trading.plist"
 
@@ -35,6 +36,7 @@ WRAPPERS = (
     RUN_PIPELINE_REPORT,
     RUN_DB_BACKUP,
     RUN_BACKTEST_REFRESH,
+    RUN_EVIDENCE_DIGEST,
     GATEWAY_WATCHDOG,
 )
 
@@ -48,6 +50,7 @@ PLISTS = (
     DEPLOY_DIR / "local.algo-backtest-refresh.plist",
     DEPLOY_DIR / "local.algo-db-backup.plist",
     DEPLOY_DIR / "local.algo-divergence-monitor.plist",
+    DEPLOY_DIR / "local.algo-evidence-digest.plist",
     DEPLOY_DIR / "local.algo-gateway-watchdog.plist",
     PAPER_PLIST,
     DEPLOY_DIR / "local.algo-pipeline-report.plist",
