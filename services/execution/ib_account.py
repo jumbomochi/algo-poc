@@ -20,6 +20,31 @@ async def _resolve(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
 
 
+def _optional_str(value: Any) -> str | None:
+    """A reported string, or None when IB left the field empty."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _optional_float(value: Any) -> float | None:
+    """A reported price, or None when IB reports its "unset" sentinel.
+
+    IB fills numeric order fields it has no value for with ``DBL_MAX`` rather
+    than leaving them absent (observed on ``trailingPercent`` during the KAN-18
+    spike). Read literally that is a price of 1.8e308, so anything not finite
+    is reported as absent.
+    """
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
 def _matching_rows(
     rows: list[Any],
     *,
@@ -188,6 +213,9 @@ class IBAccountReader:
                 total_quantity=float(order.totalQuantity),
                 filled_quantity=float(getattr(order_status, "filled", 0.0)),
                 status=str(order_status.status),
+                order_type=_optional_str(getattr(order, "orderType", None)),
+                aux_price=_optional_float(getattr(order, "auxPrice", None)),
+                tif=_optional_str(getattr(order, "tif", None)),
             )
 
         return BrokerAccountSnapshot(

@@ -74,6 +74,10 @@ NONTERMINAL_STATUSES = tuple(
     status.value for status in OrderStatus if status not in TERMINAL_STATUSES
 )
 
+# ``order_type`` of a protective stop resting at the broker (KAN-19). The
+# column is String(20) with no constraint, so the ledger already holds it.
+BROKER_STOP_ORDER_TYPE = "stop"
+
 IMMUTABLE_ECONOMIC_FIELDS = (
     "account_id",
     "mode",
@@ -516,6 +520,30 @@ class OrderLedger:
         if mode is not None:
             stmt = stmt.where(OrderIntent.mode == mode)
         return list(self.session.scalars(stmt))
+
+    def open_stop_quantity(
+        self, account_id: str, portfolio: str, con_id: int
+    ) -> float:
+        """Shares still protected by resting stops on one position (KAN-19).
+
+        The unfilled remainder, not the placed quantity: a stop that has
+        already sold half the position protects only the other half. Terminal
+        stops are excluded for the same reason — a cancelled or filled stop
+        rests at IB no longer, so the position it named is uncovered again.
+
+        Scoped to ``{account, portfolio, con_id}`` because that is the grain a
+        position is held at; a stop on another sleeve's shares of the same
+        contract is not this position's protection.
+        """
+        unfilled = OrderIntent.requested_quantity - OrderIntent.filled_quantity
+        stmt = select(func.coalesce(func.sum(unfilled), 0.0)).where(
+            OrderIntent.account_id == account_id,
+            OrderIntent.portfolio == portfolio,
+            OrderIntent.con_id == con_id,
+            func.lower(OrderIntent.order_type) == BROKER_STOP_ORDER_TYPE,
+            OrderIntent.status.in_(NONTERMINAL_STATUSES),
+        )
+        return float(self.session.scalar(stmt) or 0.0)
 
     def count_intents_with_id_prefix(self, prefix: str) -> int:
         """How many intents already carry a recommendation id under ``prefix``.

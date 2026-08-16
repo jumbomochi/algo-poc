@@ -361,6 +361,58 @@ ledgered — and both are consequences of observed behaviour, not preferences.
 
 ---
 
+## What KAN-19 did with each recommendation (added 2026-08-16)
+
+Every row above is implemented as recommended, with two deliberate departures:
+
+**`ApprovedOrderMessage.order_type` was not extended.** The recommendation and
+the reason behind it come apart on inspection: what reconciliation compares a
+broker order against is the **ledger** (`reconcile_paper.py:299-318` reads
+`OrderIntent` rows), not the stream. KAN-19 therefore writes the `OrderIntent`
+directly — `order_type="stop"`, which `String(20)` already permits — and stops
+never touch `stream:approved_orders`. The property the recommendation was
+protecting (an unledgered stop disables entries) is fully preserved; what is
+avoided is putting a protective order that rests for weeks through a pipeline
+whose lifecycle (`SUBMITTED → FILLED`) describes a one-shot trade intent.
+
+**`permId` is not persisted yet.** It needs a migration and a column on
+`order_intents`, and its consumer is the verification reader KAN-20 builds.
+Recorded there rather than done here. Until then a resting stop is keyed by
+`ib_order_id`, which is client-scoped and reused — safe while the placing
+client is also the only reader, which is the case today.
+
+### Kill-path and exit-path interaction (KAN-19 AC7)
+
+**The kill path is handled.** Stops are placed through `OrderManager.submit_stop`
+and tracked in `open_orders`, so `cancel_all_orders()` — which `process_kill`
+already runs *before* liquidating — cancels them along with everything else.
+Q4's failure mode was a stop placed from a *foreign* client, which cancel-all
+provably cannot see; placing from the execution client closes it. Pinned by
+`test_the_kill_cancels_the_stop_before_it_liquidates`.
+
+**The ordinary exit path is deferred to KAN-20, and this is the note.** A
+full-coverage resting stop is, to `outstanding_sell_quantity`, a working sell
+for the whole position. The KAN-10 oversell guard subtracts working sells from
+the broker position, so a flattening exit sizes to zero and is **refused with
+an alert** rather than submitted. That is the safe half of the behaviour — two
+live sells against the same 21 shares is exactly how a long-only account ends
+up short — but it means that **with `broker_stops_enabled: true`, a stopped
+position cannot be exited by the software path**.
+
+Making the exit cancel the stop first (then confirm it off the broker's book,
+as `_cancel_working_buys` already does for working buys) is *adjustment*, which
+KAN-20 owns. This is a hard precondition on KAN-33 flipping the flag: the flag
+must not be turned on before KAN-20 lands. Pinned by
+`test_a_resting_stop_makes_an_exit_refuse_rather_than_oversell`.
+
+One more consequence of the same ledger row, for KAN-20's attention:
+`nonterminal_sell_exists` will also see the resting stop and suppress the
+risk service's software stop-loss re-fires for that position. Suppression is
+arguably correct while the broker stop is genuinely covering the position —
+but it is a behaviour change that arrives with the flag, not a no-op.
+
+---
+
 ## Cleanup (AC6)
 
 `cleanup --apply` cancelled the single spike order at 2026-08-15 10:10; the
