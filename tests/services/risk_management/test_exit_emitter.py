@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import ast
 import inspect
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -30,8 +30,9 @@ from shared.config import (
     IBConfig,
     RiskConfig,
 )
+from shared.liquidation import exit_intent_id
 from shared.models import Base, OrderIntent, OrderStatus, Position
-from shared.order_ledger import OrderLedger
+from shared.order_ledger import TERMINAL_STATUSES, OrderLedger
 from shared.schemas.messages import ApprovedOrderMessage
 
 # The entry path publishes approved *buys* from an intent risk itself approved
@@ -1031,3 +1032,313 @@ class TestOrphanProofPublication:
         assert order["recommendation_id"] != stale_id
         assert float(order["quantity"]) == pytest.approx(10.0)
         session.rollback()
+
+
+TERMINAL_WITHOUT_FILL = (
+    OrderStatus.RISK_REJECTED,
+    OrderStatus.SUBMISSION_FAILED,
+    OrderStatus.CANCELLED,
+    OrderStatus.EXPIRED,
+)
+
+
+def _prior_exit(
+    session,
+    *,
+    status: OrderStatus,
+    seq: int = 0,
+    kind: str = "stop-loss",
+    requested: float = 10.0,
+    filled: float = 0.0,
+    trading_date: date | None = None,
+    published: bool = True,
+) -> str:
+    """A prior exit attempt on the fixture's AAPL / momentum / 111 scope.
+
+    Written straight to the ledger rather than driven through the emitter: the
+    four terminal-without-fill statuses are reached from execution-side events
+    (a rejection, a cancel, a day order expiring), and RISK_REJECTED is not even
+    legal from APPROVED — the states are the fixture, not the thing under test.
+    """
+    exit_id = exit_intent_id(
+        kind,
+        "DUTEST",
+        "momentum",
+        111,
+        trading_date or datetime.now(timezone.utc).date(),
+        seq,
+    )
+    now = datetime.now(timezone.utc)
+    session.add(
+        OrderIntent(
+            recommendation_id=exit_id,
+            account_id="DUTEST",
+            mode="paper",
+            portfolio="momentum",
+            con_id=111,
+            symbol="AAPL",
+            exchange="SMART",
+            currency="USD",
+            action="SELL",
+            requested_quantity=requested,
+            limit_price=None,
+            order_type="MKT",
+            reserved_notional=0.0,
+            filled_quantity=filled,
+            status=status.value,
+            created_at=now,
+            updated_at=now,
+            approved_at=now,
+            published_at=now if published else None,
+            terminal_at=now if status in TERMINAL_STATUSES else None,
+        )
+    )
+    session.commit()
+    return exit_id
+
+
+def _set_position(session, quantity: float) -> None:
+    """Move the book — the projector's job in production."""
+    session.scalars(select(Position)).one().quantity = quantity
+    session.commit()
+
+
+class TestReFireAndReSize:
+    """KAN-9: one exit at a time, and the next one sized to what is left.
+
+    A breach does not resolve because we published once — the exit can be
+    rejected, cancelled, or expire as a day order, and a partial fill leaves a
+    position still breaching. Without these rules the system either stacks
+    duplicate sells or gives up after one failed attempt.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_partially_filled_prior_exit_re_fires_for_the_remainder(
+        self, db_runner, mock_redis
+    ):
+        """AC 1 / design test #5: 40 of 100 filled, then cancelled → the re-fire
+        asks for 60. Asking for 100 again is how a stop-loss goes short."""
+        runner, _ledger, session = db_runner
+        _set_position(session, 100.0)
+        prior = _prior_exit(
+            session, status=OrderStatus.CANCELLED, requested=100.0, filled=40.0
+        )
+        _breaching(runner, quantity=100.0)
+
+        await runner.run_stop_loss_check()
+
+        (order,) = _published_orders(mock_redis)
+        assert float(order["quantity"]) == pytest.approx(60.0)
+        assert order["recommendation_id"] != prior
+        assert order["recommendation_id"].endswith("-1")
+
+    @pytest.mark.asyncio
+    async def test_the_re_fire_never_requests_more_than_is_still_held(
+        self, db_runner, mock_redis
+    ):
+        """AC 7: the operator flattened most of it by hand between scans. The
+        remainder of the failed attempt is 10, but only 4 shares exist."""
+        runner, _ledger, session = db_runner
+        _prior_exit(session, status=OrderStatus.EXPIRED, requested=10.0)
+        _set_position(session, 4.0)
+        _breaching(runner, quantity=4.0)
+
+        await runner.run_stop_loss_check()
+
+        (order,) = _published_orders(mock_redis)
+        assert float(order["quantity"]) == pytest.approx(4.0)
+
+    @pytest.mark.parametrize("status", TERMINAL_WITHOUT_FILL)
+    @pytest.mark.asyncio
+    async def test_a_terminal_without_fill_attempt_re_fires_exactly_once(
+        self, db_runner, mock_redis, status
+    ):
+        """AC 3: each of the four terminal-without-fill statuses is a failed
+        attempt, so the breach gets one more exit — and only one, because that
+        exit is then in flight."""
+        runner, _ledger, session = db_runner
+        prior = _prior_exit(session, status=status)
+        _breaching(runner)
+
+        for _ in range(3):
+            await runner.run_stop_loss_check()
+
+        ids = [i.recommendation_id for i in _intents(session)]
+        assert ids == [prior, f"{prior[:-1]}1"]
+        assert len(_published_orders(mock_redis)) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_full_fill_leaves_no_remainder_to_re_fire(
+        self, db_runner, mock_redis
+    ):
+        """AC 3, the other half: a fully filled exit is a finished exit. What
+        makes it finished is the shares being gone, so nothing is re-fired."""
+        runner, _ledger, session = db_runner
+        prior = _prior_exit(
+            session, status=OrderStatus.FILLED, requested=10.0, filled=10.0
+        )
+        _set_position(session, 0.0)
+        _breaching(runner)
+
+        await runner.run_stop_loss_check()
+
+        assert _published_orders(mock_redis) == []
+        assert [i.recommendation_id for i in _intents(session)] == [prior]
+
+    @pytest.mark.asyncio
+    async def test_a_full_fill_closes_the_episode_rather_than_capping_the_next(
+        self, db_runner, mock_redis
+    ):
+        """The boundary between AC 3 and KAN-7's shipped behaviour.
+
+        A filled exit has a remainder of zero, but that zero belongs to the
+        closed episode — it must not cap a *later* breach on shares held again.
+        Re-entry is a normal day: the sleeve buys back in and the trailing stop
+        can trigger a second time before the date rolls.
+        """
+        runner, _ledger, session = db_runner
+        _prior_exit(session, status=OrderStatus.FILLED, requested=10.0, filled=10.0)
+        _breaching(runner)
+
+        await runner.run_stop_loss_check()
+
+        (order,) = _published_orders(mock_redis)
+        assert float(order["quantity"]) == pytest.approx(10.0)
+        assert order["recommendation_id"].endswith("-1")
+
+    @pytest.mark.asyncio
+    async def test_a_nonterminal_prior_attempt_re_fires_nothing(
+        self, db_runner, mock_redis
+    ):
+        """AC 4: an attempt still in flight is the one exit allowed to exist.
+        A partial fill is not a failure — it is an order still working."""
+        runner, _ledger, session = db_runner
+        prior = _prior_exit(
+            session,
+            status=OrderStatus.PARTIALLY_FILLED,
+            requested=10.0,
+            filled=4.0,
+        )
+        _breaching(runner)
+
+        await runner.run_stop_loss_check()
+
+        assert _published_orders(mock_redis) == []
+        assert [i.recommendation_id for i in _intents(session)] == [prior]
+
+    @pytest.mark.asyncio
+    async def test_seq_is_stable_while_the_prior_attempt_is_in_flight(
+        self, db_runner, mock_redis
+    ):
+        """AC 5: the id of the next exit does not move under a working order, so
+        a re-emit anywhere in the pipeline converges on the same intent instead
+        of minting a second one against the same shares."""
+        runner, ledger, session = db_runner
+        _breaching(runner)
+        await runner.run_stop_loss_check()
+        working = _intents(session)[0].recommendation_id
+
+        assert runner._plan_exit("stop-loss", _target()).exit_id == working
+        ledger.transition(working, OrderStatus.SUBMITTED)
+        session.commit()
+        assert runner._plan_exit("stop-loss", _target()).exit_id == working
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_seq_increments_once_the_prior_attempt_is_terminal(
+        self, db_runner, mock_redis
+    ):
+        """AC 5, the other edge: a terminal row must not be written to again —
+        create_intent would raise ConflictingOrderIntent on any re-size — so the
+        next attempt needs its own id."""
+        runner, ledger, session = db_runner
+        _breaching(runner)
+        await runner.run_stop_loss_check()
+        first = _intents(session)[0].recommendation_id
+        ledger.transition(first, OrderStatus.SUBMITTED)
+        ledger.transition(first, OrderStatus.EXPIRED)
+        session.commit()
+
+        assert runner._plan_exit("stop-loss", _target()).exit_id == f"{first[:-1]}1"
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_consecutive_trading_dates_get_distinct_ids(
+        self, db_runner, mock_redis
+    ):
+        """AC 2 / design test #6: the same scope breaching two days running.
+        Yesterday's terminal intent is a row that can never be written to again,
+        so today's exit must not land on its id."""
+        runner, _ledger, session = db_runner
+        yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
+        prior = _prior_exit(
+            session, status=OrderStatus.CANCELLED, trading_date=yesterday
+        )
+        _breaching(runner)
+
+        await runner.run_stop_loss_check()
+
+        (order,) = _published_orders(mock_redis)
+        assert order["recommendation_id"] != prior
+        assert order["recommendation_id"].endswith(
+            f"{datetime.now(timezone.utc).date().isoformat()}-0"
+        )
+        assert float(order["quantity"]) == pytest.approx(10.0)
+
+    @pytest.mark.asyncio
+    async def test_an_orphan_is_adopted_rather_than_duplicated(
+        self, db_runner, mock_redis
+    ):
+        """AC 4 with KAN-8: an exit committed but never published is not in
+        flight, so it does not suppress — and the re-fire rule must not turn
+        that into a second intent. Same id, same shares, one row."""
+        runner, ledger, session = db_runner
+        orphan = await _orphan_a_stop_loss(runner, mock_redis)
+
+        await runner.run_stop_loss_check()
+
+        (order,) = _published_orders(mock_redis)
+        assert order["recommendation_id"] == orphan
+        assert [i.recommendation_id for i in _intents(session)] == [orphan]
+        assert ledger.get(orphan).published_at is not None
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_a_persistent_breach_re_fires_only_after_a_terminal_attempt(
+        self, db_runner, mock_redis
+    ):
+        """AC 6 / success criterion 2, end to end.
+
+        One breach, many scans: the exit is submitted, partially fills, gets
+        cancelled with 4 of 10 done, and only then does the next attempt go out
+        — for the 6 shares that are left, never for 10.
+
+        The book still reads 10 at that point, because the fill is projected
+        asynchronously and the scan does not wait for it. The ledger is what
+        knows 4 are already sold.
+        """
+        runner, ledger, session = db_runner
+        _breaching(runner)
+
+        await runner.run_stop_loss_check()
+        first = _intents(session)[0].recommendation_id
+        ledger.transition(first, OrderStatus.SUBMITTED)
+        session.commit()
+        await runner.run_stop_loss_check()
+
+        ledger.transition(first, OrderStatus.PARTIALLY_FILLED)
+        ledger.get(first).filled_quantity = 4.0
+        session.commit()
+        await runner.run_stop_loss_check()
+        assert [i.recommendation_id for i in _intents(session)] == [first]
+
+        ledger.transition(first, OrderStatus.CANCELLED)
+        session.commit()
+        await runner.run_stop_loss_check()
+        await runner.run_stop_loss_check()
+
+        intents = _intents(session)
+        assert [i.recommendation_id for i in intents] == [first, f"{first[:-1]}1"]
+        assert float(intents[1].requested_quantity) == pytest.approx(6.0)
+        nonterminal = [i for i in intents if OrderStatus(i.status) not in TERMINAL_STATUSES]
+        assert len(nonterminal) == 1
