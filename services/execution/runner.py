@@ -41,6 +41,47 @@ HALT_LOOKUP_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 2.0, 4.0)
 # long an order placed *after* that first pass can sit live at the broker.
 HALT_SWEEP_INTERVAL_SECONDS: float = 30.0
 
+# What marks a sell on ``stream:approved_orders`` as a risk-side exit, and so
+# subject to the oversell guard (KAN-10) — one key per control that risk's
+# exit emitter can publish. An ordinary sleeve sell carries none of them: it is
+# sized on the recommendation path and is out of scope by design, and
+# cancelling a working BUY under a routine rotation would be a behaviour change
+# nobody asked for.
+#
+# Two things keep the cross-service coupling honest. The stronger one is that
+# risk's single emitter *defaults* to ``kill_switch``, so an exit that passes
+# no adjustments at all is still labelled. The other is
+# tests/services/risk_management/test_exit_emitter.py, which parses the risk
+# service for every ``risk_adjustments={...}`` literal it publishes and fails
+# if one carries no key listed here — literals only, so a future control that
+# builds its adjustments in a variable would slip past it. An unguarded
+# risk-side sell is logged either way (see :meth:`_guards_oversell`).
+RISK_EXIT_ADJUSTMENT_KEYS: frozenset[str] = frozenset(
+    {"kill_switch", "stop_loss", "passive_trim", "republished"}
+)
+
+# The subset that flattens a position rather than shaving it. Only these
+# cancel working BUYs: a passive trim is a rebalance back to the soft target,
+# a few shares against a position that stays open, so cancelling an unrelated
+# sleeve's entry under it would destroy a legitimate order to no purpose. The
+# quantity cap still applies to every risk exit.
+FLATTENING_EXIT_ADJUSTMENT_KEYS: frozenset[str] = (
+    RISK_EXIT_ADJUSTMENT_KEYS - {"passive_trim"}
+)
+
+# Backoff between attempts to read the broker's position, mirroring
+# HALT_LOOKUP_RETRY_BACKOFF_SECONDS. The first attempt is not delayed. A
+# dropped API socket is routine on this Gateway, and one transient reconnect
+# race must not be enough to refuse an emergency flatten.
+BROKER_POSITION_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 2.0)
+
+# Quantities are floats (IBKR Share Slices), so every comparison the guard
+# makes needs slack: a broker read of 49.9999 against a 50-share exit would
+# otherwise "cap" to 49.9999, which whole-share truncation then places as 49 —
+# an emergency flatten that leaves a share behind. Same value the risk service
+# uses for the same reason.
+EXIT_QUANTITY_EPSILON = 1e-6
+
 
 class HaltStateUnavailable(RuntimeError):
     """The durable halt latch could not be read.
@@ -408,6 +449,13 @@ class ExecutionServiceRunner:
         )
 
         order_id: str
+        quantity = order.quantity
+        # Identity scope of this order, read while the ledger is open below and
+        # used by the oversell guard — the broker holds one position per
+        # {account, conId}, and neither field is on the stream message.
+        account_id: str | None = None
+        con_id: int | None = None
+        ledger_quantity: float | None = None
 
         from services.execution.ib_executor import OrderSkippedError
 
@@ -432,6 +480,8 @@ class ExecutionServiceRunner:
                 )
                 self._order_ledger.session.rollback()
                 return
+            account_id, con_id = intent.account_id, intent.con_id
+            ledger_quantity = float(intent.requested_quantity)
             # `get()` starts a read transaction. Broker submission is an
             # await point and IB callbacks use this same service-owned
             # session, so end the read before yielding control.
@@ -443,18 +493,33 @@ class ExecutionServiceRunner:
         if await self._rejected_as_halted(order):
             return
 
+        # Oversell guard — see :meth:`_apply_oversell_guard`. After the halt
+        # gate and immediately before submission: it reads the broker, and the
+        # answer is only worth having if nothing else can intervene after it.
+        cap_reason: str | None = None
+        if self._guards_oversell(order, con_id=con_id):
+            guarded = await self._apply_oversell_guard(
+                order,
+                account_id=account_id,
+                con_id=con_id,
+                ledger_quantity=ledger_quantity,
+            )
+            if guarded is None:
+                return
+            quantity, cap_reason = guarded
+
         try:
             if order.action == "buy":
                 order_id = await self._order_manager.submit_entry(
                     ticker=order.ticker,
-                    quantity=order.quantity,
+                    quantity=quantity,
                     limit_price=order.limit_price,
                     recommendation_id=order.recommendation_id,
                 )
             else:
                 order_id = await self._order_manager.submit_exit(
                     ticker=order.ticker,
-                    quantity=order.quantity,
+                    quantity=quantity,
                     recommendation_id=order.recommendation_id,
                 )
         except OrderSkippedError as exc:
@@ -490,7 +555,7 @@ class ExecutionServiceRunner:
         if self._order_ledger is not None:
             try:
                 intent = self._order_ledger.record_submission(
-                    order.recommendation_id, order_id
+                    order.recommendation_id, order_id, reason=cap_reason
                 )
                 portfolio = intent.portfolio
                 self._commit_ledger()
@@ -525,6 +590,352 @@ class ExecutionServiceRunner:
             order_id=order_id,
             ticker=order.ticker,
             action=order.action,
+        )
+
+    def _guards_oversell(
+        self, order: ApprovedOrderMessage, *, con_id: int | None
+    ) -> bool:
+        """Whether the oversell guard applies to this order.
+
+        Risk-side sells only (see :data:`RISK_EXIT_ADJUSTMENT_KEYS`), and only
+        when everything the guard needs is present: a ledger to find working
+        BUYs in, the contract they would be working on, and an order manager
+        that can reach the broker. The last is the same ``getattr(type(...))``
+        probe used for ``restore_broker_tracking`` — an embedding without a
+        real broker (tests, backtests) keeps the pre-guard behaviour rather
+        than failing on a call that cannot be made. It is logged, because a
+        safety control that quietly does not run is the failure mode this
+        whole tranche of work exists to remove.
+        """
+        if order.action != "sell":
+            return False
+        if not RISK_EXIT_ADJUSTMENT_KEYS.intersection(order.risk_adjustments or {}):
+            return False
+        if self._order_ledger is None or con_id is None:
+            missing = "ledger" if self._order_ledger is None else "con_id"
+        elif getattr(type(self._order_manager), "broker_position", None) is None:
+            missing = "broker access"
+        else:
+            return True
+        self._logger.warning(
+            "Risk-side sell not guarded against overselling",
+            ticker=order.ticker,
+            quantity=order.quantity,
+            recommendation_id=order.recommendation_id,
+            missing=missing,
+        )
+        return False
+
+    async def _apply_oversell_guard(
+        self,
+        order: ApprovedOrderMessage,
+        *,
+        account_id: str | None,
+        con_id: int | None,
+        ledger_quantity: float | None,
+    ) -> tuple[float, str | None] | None:
+        """Make a risk-side sell safe to place, or refuse to place it.
+
+        Returns ``(quantity, reason)`` to submit, or None when nothing should
+        be submitted — in which case the intent has already been terminalised
+        and, where it matters, an alert raised.
+
+        Position projection is asynchronous, so the book's view of a holding
+        lags the broker's. Sizing an exit off that lag is how an account whose
+        entire strategy is unlevered long-only ends up short — during the one
+        incident where attention is elsewhere::
+
+            flattening exit (kill / stop-loss)?
+                   |  yes — a trim shaves a position that stays open, so it
+                   |  caps but never cancels anything
+                   v
+            working BUYs for {account, con_id}
+                   |
+                   +-- submitted --> cancel at IB, confirm off the book
+                   +-- approved, never submitted --> SUBMISSION_FAILED
+                   |        (its message is still on the stream; without this
+                   |         it reaches IB moments after the flatten)
+                   v  cancel unconfirmed --> refuse (never sell into an
+                   |                         unresolved working BUY)
+            broker position for con_id  (retried on a backoff)
+                   |
+                   +-- unreadable --> refuse
+                   v
+            available = broker position - sells already working
+                   |
+                   +-- <= 0 --> refuse
+                   v
+            sell min(published, ledger requested, available)
+
+        Refusing means SUBMISSION_FAILED plus an alert, NOT leaving the message
+        in the PEL. The PEL is only re-read by :meth:`setup`, so a retained
+        exit would sit there until the service restarts — and while it sat, its
+        intent would stay non-terminal, which is precisely what
+        ``nonterminal_sell_exists`` reads to suppress the *next* stop-loss for
+        the position. Retaining would mute the control it is protecting. A
+        terminal intent instead lets risk re-fire at ``seq + 1`` on its next
+        scan (KAN-9), which is the self-healing path this service already had
+        before the guard existed.
+
+        Subtracting the sells already working is what makes the cap true rather
+        than approximately true: a broker position is not reduced by an
+        unfilled sell, so a kill stacked on a working stop-loss would otherwise
+        see the full position twice and sell it twice. The kill path
+        deliberately does not suppress on a pending sell (it must flatten the
+        whole book), so that stacking is a designed-for case, not a rare one.
+        """
+        ledger = self._order_ledger
+        assert ledger is not None  # guaranteed by _guards_oversell
+
+        if FLATTENING_EXIT_ADJUSTMENT_KEYS.intersection(
+            order.risk_adjustments or {}
+        ):
+            unconfirmed = await self._cancel_working_buys(
+                order, account_id=account_id, con_id=con_id
+            )
+            if unconfirmed:
+                await self._refuse_exit(
+                    order,
+                    reason=(
+                        "oversell guard: working buys still live ("
+                        + ", ".join(unconfirmed)
+                        + ")"
+                    ),
+                    event_type="oversell_guard_cancel_failed",
+                    message=(
+                        f"Exit {order.recommendation_id} not submitted: could "
+                        f"not cancel working buys on {order.ticker} "
+                        f"({', '.join(unconfirmed)})"
+                    ),
+                    context={
+                        "ticker": order.ticker,
+                        "con_id": con_id,
+                        "order_refs": unconfirmed,
+                    },
+                )
+                return None
+
+        broker_quantity = await self._read_broker_position(con_id)
+        if broker_quantity is None:
+            await self._refuse_exit(
+                order,
+                reason=(
+                    f"oversell guard: broker position for {order.ticker} "
+                    "could not be read"
+                ),
+                event_type="oversell_guard_position_unavailable",
+                message=(
+                    f"Exit {order.recommendation_id} not submitted: the broker "
+                    f"position for {order.ticker} could not be read"
+                ),
+                context={"ticker": order.ticker, "con_id": con_id},
+            )
+            return None
+
+        try:
+            working_sells = ledger.outstanding_sell_quantity(
+                account_id=account_id,
+                con_id=con_id,
+                exclude_recommendation_id=order.recommendation_id,
+            )
+        finally:
+            ledger.session.rollback()
+        available = broker_quantity - working_sells
+
+        if broker_quantity <= EXIT_QUANTITY_EPSILON:
+            self._logger.critical(
+                "Exit not submitted: broker reports no position",
+                ticker=order.ticker,
+                con_id=con_id,
+                book_quantity=order.quantity,
+                recommendation_id=order.recommendation_id,
+            )
+            await self._refuse_exit(
+                order,
+                reason=(
+                    f"oversell guard: broker holds none of {order.ticker} "
+                    f"(con_id {con_id}) but the book expected {order.quantity}"
+                ),
+                event_type="oversell_guard_no_position",
+                message=(
+                    f"Exit {order.recommendation_id} not submitted: broker "
+                    f"holds no {order.ticker} while the book expected "
+                    f"{order.quantity} — reconciliation required"
+                ),
+                context={
+                    "ticker": order.ticker,
+                    "con_id": con_id,
+                    "book_quantity": order.quantity,
+                },
+            )
+            return None
+
+        if available <= EXIT_QUANTITY_EPSILON:
+            # Not a fault: sells already working cover the whole position, so
+            # this exit has nothing left to sell. Alerting would page for the
+            # guard doing its job — and a kill flattening a book of positions
+            # that each already have a stop-loss working would page per name.
+            self._logger.warning(
+                "Exit not submitted: outstanding sells already cover the position",
+                ticker=order.ticker,
+                con_id=con_id,
+                broker_quantity=broker_quantity,
+                working_sells=working_sells,
+                recommendation_id=order.recommendation_id,
+            )
+            await self._refuse_exit(
+                order,
+                reason=(
+                    f"oversell guard: {working_sells} already working against "
+                    f"the {broker_quantity} the broker holds"
+                ),
+            )
+            return None
+
+        requested = order.quantity
+        if ledger_quantity is not None:
+            requested = min(requested, ledger_quantity)
+        if available < requested - EXIT_QUANTITY_EPSILON:
+            self._logger.warning(
+                "Exit capped to what the broker can cover",
+                ticker=order.ticker,
+                con_id=con_id,
+                book_quantity=order.quantity,
+                broker_quantity=broker_quantity,
+                working_sells=working_sells,
+                placed_quantity=available,
+                recommendation_id=order.recommendation_id,
+            )
+            return available, (
+                f"oversell guard: capped {requested} to {available} "
+                f"({broker_quantity} held, {working_sells} already selling)"
+            )
+
+        return requested, None
+
+    async def _cancel_working_buys(
+        self,
+        order: ApprovedOrderMessage,
+        *,
+        account_id: str | None,
+        con_id: int | None,
+    ) -> list[str]:
+        """Take every working BUY on the contract off the table.
+
+        Returns the refs that are still live afterwards — empty means the
+        contract is clear. An APPROVED intent has no broker order to cancel
+        but its message is still on ``stream:approved_orders``; terminalising
+        it is what stops it reaching IB moments after the flatten (the same
+        race, one message later), and the terminal check at the top of
+        :meth:`process_approved_order` is what makes that stick.
+        """
+        ledger = self._order_ledger
+        assert ledger is not None
+
+        try:
+            working: list[tuple[str, str]] = []
+            for intent in ledger.active_buy_intents(
+                account_id=account_id, con_id=con_id
+            ):
+                if intent.ib_order_id is None:
+                    ledger.transition(
+                        intent.recommendation_id,
+                        OrderStatus.SUBMISSION_FAILED,
+                        reason=(
+                            "oversell guard: cancelled ahead of exit "
+                            f"{order.recommendation_id}"
+                        ),
+                    )
+                else:
+                    working.append(
+                        (str(intent.ib_order_id), intent.recommendation_id)
+                    )
+            self._commit_ledger()
+        except Exception:
+            ledger.session.rollback()
+            raise
+
+        if working:
+            self._logger.warning(
+                "Cancelling working buys before an exit",
+                ticker=order.ticker,
+                con_id=con_id,
+                order_refs=[ref for _, ref in working],
+                recommendation_id=order.recommendation_id,
+            )
+        unconfirmed = await self._order_manager.cancel_working_orders(working)
+        if unconfirmed:
+            self._logger.critical(
+                "Working buys still live; holding back the exit",
+                ticker=order.ticker,
+                con_id=con_id,
+                order_refs=unconfirmed,
+                recommendation_id=order.recommendation_id,
+            )
+        return unconfirmed
+
+    async def _read_broker_position(self, con_id: int | None) -> float | None:
+        """Broker-held quantity for ``con_id``, or None if it cannot be read.
+
+        Retried on :data:`BROKER_POSITION_RETRY_BACKOFF_SECONDS` for the same
+        reason the halt latch is: this Gateway drops API sockets routinely, and
+        a single transient reconnect race must not be enough to refuse an
+        emergency flatten.
+        """
+        attempts = len(BROKER_POSITION_RETRY_BACKOFF_SECONDS) + 1
+        for attempt in range(attempts):
+            try:
+                return float(
+                    await self._order_manager.broker_position(con_id)
+                )
+            except Exception as exc:
+                self._logger.warning(
+                    "Broker position read failed",
+                    con_id=con_id,
+                    attempt=attempt + 1,
+                    of=attempts,
+                    error=str(exc),
+                )
+                if attempt < len(BROKER_POSITION_RETRY_BACKOFF_SECONDS):
+                    await asyncio.sleep(
+                        BROKER_POSITION_RETRY_BACKOFF_SECONDS[attempt]
+                    )
+        return None
+
+    async def _refuse_exit(
+        self,
+        order: ApprovedOrderMessage,
+        *,
+        reason: str,
+        event_type: str | None = None,
+        message: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        """Terminalise an exit the guard will not place, and page if it is a
+        fault. See :meth:`_apply_oversell_guard` for why this terminalises
+        rather than retaining the message."""
+        ledger = self._order_ledger
+        assert ledger is not None
+        try:
+            ledger.transition(
+                order.recommendation_id,
+                OrderStatus.SUBMISSION_FAILED,
+                reason=reason,
+            )
+            self._commit_ledger()
+        except Exception:
+            ledger.session.rollback()
+            raise
+        if event_type is None or message is None:
+            return
+        await self._publish_alert(
+            event_type=event_type,
+            priority="critical",
+            message=message,
+            context={
+                **(context or {}),
+                "recommendation_id": order.recommendation_id,
+            },
         )
 
     async def handle_ib_fill(self, fill_info: dict[str, Any]) -> None:
