@@ -1,4 +1,4 @@
-"""KAN-31 AC4: the daily digest's run status, executed as the operator sees it.
+"""KAN-31 AC4: what the operator is told about a paper run, executed as bash.
 
 ``run_pipeline_report.sh`` decides the Telegram line by grepping the paper log
 for ``exit code: 0``. That was already true before KAN-31 — what changed is that
@@ -76,3 +76,62 @@ def test_a_clean_run_still_reports_ok(paper_log):
 def test_a_missing_log_reports_missing(tmp_path):
     """The job never ran at all — distinct from a run that failed."""
     assert run_status(tmp_path / "absent.log") == "❌ paper run MISSING"
+
+
+# ---------------------------------------------------------------------------
+# The wrapper's own failure alert must not assert something false
+# ---------------------------------------------------------------------------
+
+PAPER_WRAPPER = REPO_ROOT / "deploy/launchd/run_paper.sh"
+
+# The `if [ "$EXIT_CODE" != "0" ]; then ... fi` alert block, lifted verbatim.
+_FAILURE_BLOCK = re.compile(
+    r'^if \[ "\$EXIT_CODE" != "0" \]; then.*?^fi$', re.MULTILINE | re.DOTALL
+)
+
+
+def failure_alerts(exit_code: int, log_body: str, tmp_path: Path) -> str:
+    """Run the wrapper's failure-alert block with the delivery calls stubbed."""
+    match = _FAILURE_BLOCK.search(PAPER_WRAPPER.read_text())
+    assert match, "run_paper.sh no longer has an EXIT_CODE failure-alert block"
+
+    log = tmp_path / "paper_trading_20260816.log"
+    log.write_text(log_body)
+    script = (
+        'algo_alert_local() { printf "local: %s\\n" "$1"; }\n'
+        'telegram() { printf "telegram: %s\\n" "$1"; }\n'
+        f'EXIT_CODE={exit_code}\nLOG_FILE="{log}"\n{match.group(0)}\n'
+    )
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def test_a_publish_failure_is_not_reported_as_an_uncommitted_book(tmp_path):
+    """KAN-31 makes exit 1 mean two different things. The alert must not claim
+    "No signals committed today" when the book committed and only the publish
+    failed — that sends the operator hunting the wrong fault."""
+    out = failure_alerts(1, LOG_TEMPLATE.format(code=1), tmp_path)
+
+    assert "No signals committed today" not in out
+    assert "no orders reached risk/execution" in out
+    assert out.count("exit 1") == 2, "both the local and Telegram paths must fire"
+
+
+def test_a_run_that_committed_nothing_still_says_so(tmp_path):
+    """The pre-KAN-31 meaning of a nonzero exit is unchanged."""
+    log = (
+        "Sun Aug 16 04:15:02 +08 2026: Starting paper trading run\n"
+        "ERROR: No data fetched. Is IB Gateway running?\n"
+        "Sun Aug 16 04:15:44 +08 2026: Paper trading run completed (exit code: 1)\n"
+    )
+
+    out = failure_alerts(1, log, tmp_path)
+
+    assert "No signals committed today" in out
+
+
+def test_a_clean_run_raises_no_failure_alert(tmp_path):
+    assert failure_alerts(0, LOG_TEMPLATE.format(code=0), tmp_path) == ""
