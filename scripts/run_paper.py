@@ -1014,10 +1014,14 @@ ALERTS_STREAM = "stream:alerts"
 # contain '@' or whitespace. Over-redacting is the safe direction.
 _DSN_CREDENTIAL = re.compile(r"(?P<prefix>[a-zA-Z][\w+.-]*://[^\s/@]*:).*@")
 
-# The alert is emitted while Redis is, by hypothesis, sick. A server that
-# accepts the socket but never answers would otherwise hold the 04:15 job open
-# past its window — the alert is best-effort, so it is bounded rather than
-# patient.
+# Both legs talk to a server that is, by hypothesis, sick — a half-open Redis
+# that accepts the socket and never answers would otherwise hold the 04:15 job
+# open past its window, which is the silent-stall failure class KAN-16 was
+# about. The publish leg gets the more generous read timeout because it does
+# real work (one xadd per intent) and a spurious cut there costs a trading day;
+# the alert is a single write and best-effort, so it is bounded tightly.
+PUBLISH_CONNECT_TIMEOUT_SECONDS = 10
+PUBLISH_SOCKET_TIMEOUT_SECONDS = 30
 ALERT_SOCKET_TIMEOUT_SECONDS = 5
 
 
@@ -1037,10 +1041,11 @@ def emit_publish_failure_alert(
 ) -> bool:
     """Page the operator that the day's orders never reached the pipeline.
 
-    Best-effort and deliberately silent on failure: the usual cause of a failed
-    publish is Redis being unreachable, which takes this path down with it. The
-    guaranteed signal is the nonzero exit code, which the launchd wrapper turns
-    into a Telegram message without touching the network.
+    Best-effort by construction: the usual cause of a failed publish is Redis
+    being unreachable, which takes this path down with it. A failure here is
+    logged and swallowed — never raised — because the guaranteed signal is the
+    nonzero exit code, which the launchd wrapper turns into a Telegram message
+    without touching the network.
     """
     from shared.schemas.messages import AlertMessage
 
@@ -1068,7 +1073,10 @@ def emit_publish_failure_alert(
             conn.close()
         return True
     except Exception as alert_error:
-        print(f"WARNING: could not raise the publish-failure alert ({alert_error})")
+        print(
+            "WARNING: could not raise the publish-failure alert "
+            f"({_redact(str(alert_error))})"
+        )
         return False
 
 
@@ -1088,23 +1096,37 @@ def publish_bridge(
     a warning and exited 0, so the daily digest called an order-less day a
     success.
     """
+    conn = None
     try:
-        conn = _redis_from_url(redis_url)
-        try:
-            count = publish_unpublished_intents(
-                session,
-                conn,
-                account_id=account_id,
-                entries_allowed=entries_allowed,
-                broker_snapshot=broker_snapshot,
-            )
-        finally:
-            conn.close()
+        conn = _redis_from_url(
+            redis_url,
+            socket_connect_timeout=PUBLISH_CONNECT_TIMEOUT_SECONDS,
+            socket_timeout=PUBLISH_SOCKET_TIMEOUT_SECONDS,
+        )
+        count = publish_unpublished_intents(
+            session,
+            conn,
+            account_id=account_id,
+            entries_allowed=entries_allowed,
+            broker_snapshot=broker_snapshot,
+        )
     except Exception as e:
         session.rollback()
-        print(f"WARNING: publish to pipeline failed ({e}); intents remain replayable")
+        print(
+            f"WARNING: publish to pipeline failed ({_redact(str(e))}); "
+            "intents remain replayable"
+        )
         emit_publish_failure_alert(redis_url, e, account_id=account_id)
         return 1
+    finally:
+        # Outside the guard on purpose: by the time the connection is closed
+        # every intent has already been xadd'd and committed, so a hiccup here
+        # must not turn a delivered day into a red one — or page for it.
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception as close_error:
+                print(f"WARNING: closing the Redis connection failed ({close_error})")
     print(f"{count} recommendations published to stream:recommendations")
     return 0
 
@@ -1336,7 +1358,9 @@ def _create_research_shadow(
         return None, None
 
 
-def main():
+def main() -> int | None:
+    """Run the CLI. The return value IS the process exit code (see the entry
+    point below); ``None`` from an early path means success."""
     # Load defaults from config (may fail if config file missing, that's OK)
     try:
         _config = load_config("config/default.yaml")

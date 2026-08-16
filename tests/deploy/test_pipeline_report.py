@@ -90,7 +90,9 @@ _FAILURE_BLOCK = re.compile(
 )
 
 
-def failure_alerts(exit_code: int, log_body: str, tmp_path: Path) -> str:
+def failure_alerts(
+    exit_code: int, log_body: str, tmp_path: Path, *, lines_before_run: int = 0
+) -> str:
     """Run the wrapper's failure-alert block with the delivery calls stubbed."""
     match = _FAILURE_BLOCK.search(PAPER_WRAPPER.read_text())
     assert match, "run_paper.sh no longer has an EXIT_CODE failure-alert block"
@@ -100,7 +102,8 @@ def failure_alerts(exit_code: int, log_body: str, tmp_path: Path) -> str:
     script = (
         'algo_alert_local() { printf "local: %s\\n" "$1"; }\n'
         'telegram() { printf "telegram: %s\\n" "$1"; }\n'
-        f'EXIT_CODE={exit_code}\nLOG_FILE="{log}"\n{match.group(0)}\n'
+        f"EXIT_CODE={exit_code}\nLOG_LINES_BEFORE_RUN={lines_before_run}\n"
+        f'LOG_FILE="{log}"\n{match.group(0)}\n'
     )
     result = subprocess.run(
         ["bash", "-c", script], capture_output=True, text=True, timeout=30
@@ -133,5 +136,34 @@ def test_a_run_that_committed_nothing_still_says_so(tmp_path):
     assert "No signals committed today" in out
 
 
+def test_a_rerun_does_not_inherit_the_mornings_diagnosis(tmp_path):
+    """The log is per-day and appended to. A manual catch-up run that dies for
+    an unrelated reason must be classified on its OWN output, not on the
+    publish failure still sitting above it in the same file."""
+    morning = LOG_TEMPLATE.format(code=1)
+    rerun = (
+        "Sun Aug 16 10:28:03 +08 2026: Starting paper trading run\n"
+        "ERROR: No data fetched. Is IB Gateway running?\n"
+        "Sun Aug 16 10:28:51 +08 2026: Paper trading run completed (exit code: 1)\n"
+    )
+
+    out = failure_alerts(
+        1, morning + rerun, tmp_path, lines_before_run=len(morning.splitlines())
+    )
+
+    assert "No signals committed today" in out
+    assert "no orders reached risk/execution" not in out
+
+
 def test_a_clean_run_raises_no_failure_alert(tmp_path):
     assert failure_alerts(0, LOG_TEMPLATE.format(code=0), tmp_path) == ""
+
+
+def test_the_wrapper_records_the_log_length_before_the_run(tmp_path):
+    """The classification above is only honest if the offset is captured before
+    the python process appends anything."""
+    body = PAPER_WRAPPER.read_text()
+    offset_at = body.index("LOG_LINES_BEFORE_RUN=")
+    run_at = body.index('"$VENV" scripts/run_paper.py')
+
+    assert offset_at < run_at

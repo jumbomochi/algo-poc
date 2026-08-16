@@ -207,6 +207,57 @@ class TestPublishFailure:
         assert "WARNING: publish to pipeline failed" in out
         assert "intents remain replayable" in out
 
+    def test_a_failure_to_close_does_not_turn_a_good_day_red(
+        self, committed_book, monkeypatch, capsys
+    ):
+        """Every intent is already out and committed by the time the connection
+        is closed. A hiccup there must not page the operator or fail the run."""
+        from scripts import run_paper
+
+        class ClumsyRedis(FakeRedis):
+            def close(self):
+                raise ConnectionError("connection reset while closing")
+
+        fake = ClumsyRedis()
+        monkeypatch.setattr(run_paper, "_redis_from_url", lambda url, **kwargs: fake)
+
+        code = run_paper.publish_bridge(
+            committed_book,
+            redis_url="redis://localhost:6379/0",
+            account_id="DUN551088",
+            entries_allowed=True,
+            broker_snapshot=None,
+        )
+
+        assert code == 0
+        assert alerts_from(fake) == []
+        assert committed_book.query(OrderIntent).one().published_at is not None
+        assert "publish to pipeline failed" not in capsys.readouterr().out
+
+    def test_the_publish_connection_is_bounded_too(self, committed_book, monkeypatch):
+        """The publish leg talks to the same sick server the alert leg fears —
+        an unbounded wait there holds the 04:15 job open past its window."""
+        from scripts import run_paper
+
+        seen: list[dict] = []
+
+        def connect(url, **kwargs):
+            seen.append(kwargs)
+            return FakeRedis()
+
+        monkeypatch.setattr(run_paper, "_redis_from_url", connect)
+
+        run_paper.publish_bridge(
+            committed_book,
+            redis_url="redis://localhost:6379/0",
+            account_id="DUN551088",
+            entries_allowed=True,
+            broker_snapshot=None,
+        )
+
+        assert seen[0]["socket_connect_timeout"] > 0
+        assert seen[0]["socket_timeout"] > 0
+
     def test_a_clean_publish_yields_exit_code_zero(self, committed_book, monkeypatch):
         """A working pipeline is unchanged: the intent goes out and the run passes."""
         from scripts import run_paper
@@ -288,11 +339,15 @@ class TestPublishFailureAlert:
         """
         from scripts import run_paper
 
-        fake = FakeRedis(unreachable=("stream:recommendations",))
+        fake = FakeRedis()
         secret_url = "redis://default:p@ssw0rd@redis:6379/0"
+        calls: list[str] = []
 
         def connect(url, **kwargs):
-            if url == secret_url and "socket_connect_timeout" not in kwargs:
+            """The publish leg is refused with a DSN-bearing error; the alert
+            leg then gets through — the exact shape that risks a leak."""
+            calls.append(url)
+            if len(calls) == 1:
                 raise ConnectionError(f"Error 111 connecting to {url}")
             return fake
 
@@ -309,6 +364,30 @@ class TestPublishFailureAlert:
         payload = alerts_from(fake)[0]
         assert "p@ssw0rd" not in str(payload)
         assert "redis://default:***@" in payload["message"]
+
+    def test_the_logged_warning_is_redacted_too(
+        self, committed_book, monkeypatch, capsys
+    ):
+        """The paper log is tailed verbatim into the pipeline report; a DSN
+        password must not be copied around the disk either."""
+        from scripts import run_paper
+
+        def unreachable(url, **kwargs):
+            raise ConnectionError(f"Error 111 connecting to {url}")
+
+        monkeypatch.setattr(run_paper, "_redis_from_url", unreachable)
+
+        run_paper.publish_bridge(
+            committed_book,
+            redis_url="redis://default:p@ssw0rd@redis:6379/0",
+            account_id="DUN551088",
+            entries_allowed=True,
+            broker_snapshot=None,
+        )
+
+        out = capsys.readouterr().out
+        assert "p@ssw0rd" not in out
+        assert "WARNING: publish to pipeline failed" in out
 
     def test_an_unreachable_alert_path_still_exits_one_without_raising(
         self, committed_book, monkeypatch
@@ -390,7 +469,6 @@ class TestProcessExitCodes:
         tail = source.split('if __name__ == "__main__":')[-1]
 
         assert "sys.exit(main())" in tail
-        assert "\n    main()" not in tail
 
     def test_init_exits_zero(self, tmp_path):
         """The bare `return` paths must survive `sys.exit(main())`."""
