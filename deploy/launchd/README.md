@@ -329,6 +329,25 @@ alert can silently cost paper-record days, so *no morning message = something
 is wrong*. Replaces the ad-hoc scratchpad watcher that did not survive
 reboots.
 
+The message leads with the facts that come from the database rather than from
+log text (KAN-30), because a grep count can report a healthy number of orders
+while the pipeline never received one, and a halt leaves no line in the paper
+log at all:
+
+```
+halt: clear · fills:2 · rejected: risk 1 / broker 0 | ✅ paper run OK | divergence: Divergence monitor OK | 2 resting orders | today's snapshot ✓
+🛑 HALT (circuit_breaker): drawdown -6.2% over 3 days · fills:0 · rejected: risk 0 / broker 0 | ...
+```
+
+An active halt leads the line, so it cannot be missed at the end of one.
+Fills are `execution_fills` rows and rejections are `order_intents` in
+`RISK_REJECTED` / `SUBMISSION_FAILED`, both counted since local midnight and
+rendered by `scripts/ops/pipeline_report_summary.py`. If that read fails the
+segment becomes `⚠️ halt/fills/rejections UNKNOWN (DB read failed)` and the
+message is still sent — a reassuring `halt: clear` the job cannot substantiate
+would be worse than admitting it does not know. The BUY/SELL/SKIP greps remain
+in the log body for diagnosis.
+
 - **Logs:** `~/ibc/logs/pipeline_report_YYYYMMDD.log` (pruned after 30 days),
   launchd stdout/stderr to `~/ibc/logs/pipeline-report-launchd.log`.
 - **launchd scripts and PATH:** any job script that calls the `docker` CLI
