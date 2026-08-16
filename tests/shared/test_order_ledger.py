@@ -228,3 +228,54 @@ class TestExitSuppressionQueries:
             "stop-loss-DU-thematic_momentum-1-x-"
         ) == 1
         assert ledger.count_intents_with_id_prefix("stop-loss-DU-") == 2
+
+    def test_latest_in_a_family_is_the_most_recent_attempt(self, session):
+        """KAN-9: the re-fire decision is made against the *last* attempt on the
+        scope — an earlier, already-terminal one says nothing about whether a
+        sell is working now."""
+        ledger = OrderLedger(session)
+        ledger.create_intent(make_proposal("stop-loss-DU-momentum-1-x-0"))
+        ledger.create_intent(make_proposal("stop-loss-DU-momentum-1-x-1"))
+        ledger.create_intent(make_proposal("stop-loss-DU-quality-1-x-0"))
+
+        latest = ledger.latest_intent_with_id_prefix("stop-loss-DU-momentum-1-x-")
+
+        assert latest.recommendation_id == "stop-loss-DU-momentum-1-x-1"
+
+    def test_latest_in_an_empty_family_is_none(self, session):
+        """No prior attempt is the ordinary case — a first breach."""
+        ledger = OrderLedger(session)
+        ledger.create_intent(make_proposal("stop-loss-DU-momentum-1-x-0"))
+
+        assert (
+            ledger.latest_intent_with_id_prefix("stop-loss-DU-quality-1-x-") is None
+        )
+
+    def test_latest_can_be_scoped_to_one_mode(self, session):
+        """The re-publish sweep only ever sees intents in the running mode, so
+        the re-fire decision must be made over the same set — otherwise a row
+        the sweep cannot act on decides whether an exit is in flight."""
+        ledger = OrderLedger(session)
+        ledger.create_intent(make_proposal("stop-loss-DU-momentum-1-x-0"))
+        live = ledger.create_intent(make_proposal("stop-loss-DU-momentum-1-x-1"))
+        live.mode = "live"
+        session.flush()
+
+        latest = ledger.latest_intent_with_id_prefix(
+            "stop-loss-DU-momentum-1-x-", mode="paper"
+        )
+
+        assert latest.recommendation_id == "stop-loss-DU-momentum-1-x-0"
+
+    def test_latest_escapes_like_wildcards(self, session):
+        """Same trap as the count: `_` is a LIKE wildcard and sleeve names carry
+        one, so `thematic_momentum` must not adopt `thematicXmomentum`'s row."""
+        ledger = OrderLedger(session)
+        ledger.create_intent(make_proposal("stop-loss-DU-thematic_momentum-1-x-0"))
+        ledger.create_intent(make_proposal("stop-loss-DU-thematicXmomentum-1-x-1"))
+
+        latest = ledger.latest_intent_with_id_prefix(
+            "stop-loss-DU-thematic_momentum-1-x-"
+        )
+
+        assert latest.recommendation_id == "stop-loss-DU-thematic_momentum-1-x-0"

@@ -445,15 +445,53 @@ class OrderLedger:
         (a post-fill re-entry that breaches again the same day) gets its own id
         instead of colliding with the filled one.
         """
-        escaped = (
-            prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        )
         stmt = (
             select(func.count())
             .select_from(OrderIntent)
-            .where(OrderIntent.recommendation_id.like(f"{escaped}%", escape="\\"))
+            .where(self._id_prefix_clause(prefix))
         )
         return int(self.session.scalar(stmt) or 0)
+
+    def latest_intent_with_id_prefix(
+        self, prefix: str, *, mode: str | None = None
+    ) -> OrderIntent | None:
+        """The most recent intent in an id family, or None if it has none.
+
+        The re-fire decision (KAN-9) is made against the *last* attempt on the
+        scope: whether it is still in flight, and how much of it went unfilled.
+        An earlier, already-terminal sibling answers neither question, so the
+        newest row — highest ``id``, which is also highest ``seq`` because that
+        is the order they are minted in — is the one that decides.
+
+        ``mode`` scopes the answer to one book, matching
+        :meth:`unpublished_exit_intents`: an intent the re-publish sweep cannot
+        act on must not be the one that says an exit is in flight. The count
+        that mints the next ``seq`` stays unscoped on purpose — ids are unique
+        across the whole table, so a free sequence number has to be free in
+        every mode.
+        """
+        stmt = (
+            select(OrderIntent)
+            .where(self._id_prefix_clause(prefix))
+            .order_by(OrderIntent.id.desc())
+            .limit(1)
+        )
+        if mode is not None:
+            stmt = stmt.where(OrderIntent.mode == mode)
+        return self.session.scalar(stmt)
+
+    @staticmethod
+    def _id_prefix_clause(prefix: str):
+        """LIKE clause for one exit-id family.
+
+        Sleeve names contain underscores (``thematic_momentum``) and ``_`` is a
+        single-character LIKE wildcard, so the prefix is escaped or one sleeve's
+        exits answer for another's.
+        """
+        escaped = (
+            prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        return OrderIntent.recommendation_id.like(f"{escaped}%", escape="\\")
 
     def load_pending_orders(
         self, *, account_id: str | None = None
