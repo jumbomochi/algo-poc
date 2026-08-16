@@ -16,6 +16,10 @@ logger = get_logger("order_manager")
 # the caller is an emergency sell, and waiting forever is its own failure.
 CANCEL_ACK_BACKOFF_SECONDS: tuple[float, ...] = (0.5, 1.0, 2.0)
 
+# Order types the unfilled-limit sweep must not touch: neither has a limit to
+# reprice, and neither should be cancelled for still being open.
+_SWEEP_EXEMPT_ORDER_TYPES = frozenset({"market", "stop"})
+
 
 @dataclass
 class OrderAction:
@@ -210,6 +214,87 @@ class OrderManager:
 
         return order_id
 
+    async def submit_stop(
+        self,
+        ticker: str,
+        quantity: float,
+        stop_price: float,
+        recommendation_id: str,
+        *,
+        tif: str = "GTC",
+        outside_rth: bool = False,
+    ) -> str:
+        """Place a protective stop that rests at the broker (KAN-19).
+
+        Tracked in :attr:`open_orders` deliberately. The spike (KAN-18)
+        confirmed end-to-end that :meth:`cancel_all_orders` cannot reach a stop
+        it does not know about: the kill would then complete "successfully"
+        while leaving protective sells resting against positions it had just
+        flattened, and each one sells short when triggered. Tracking the stop
+        here is what puts it inside the kill's cancel-all, before liquidation.
+
+        Marked ``order_type="stop"`` so the unfilled-order sweep leaves it
+        alone — resting unfilled for weeks is what a GTC stop is *for*.
+        """
+        if recommendation_id in self._submitted:
+            self._logger.info(
+                "Duplicate stop submission blocked",
+                recommendation_id=recommendation_id,
+                existing_order_id=self._submitted[recommendation_id],
+            )
+            return self._submitted[recommendation_id]
+
+        recovered = await self._executor.find_order_by_ref(recommendation_id)
+        if isinstance(recovered, (str, int)):
+            order_id = str(recovered)
+            self._recovered.add(recommendation_id)
+        else:
+            order_id = await self._executor.submit_stop_order(
+                ticker,
+                quantity,
+                stop_price,
+                recommendation_id=recommendation_id,
+                tif=tif,
+                outside_rth=outside_rth,
+            )
+
+        self._submitted[recommendation_id] = order_id
+
+        now = datetime.now(timezone.utc)
+        self.open_orders[order_id] = {
+            "ticker": ticker,
+            "quantity": quantity,
+            "limit_price": None,
+            "stop_price": stop_price,
+            "placed_at": now,
+            "last_repriced_at": now,
+            "reprice_count": 0,
+            "recommendation_id": recommendation_id,
+            "order_type": "stop",
+        }
+
+        self._logger.info(
+            "Stop order submitted",
+            order_id=order_id,
+            ticker=ticker,
+            quantity=quantity,
+            stop_price=stop_price,
+            tif=tif,
+            recommendation_id=recommendation_id,
+        )
+
+        return order_id
+
+    async def find_stop_order(self, recommendation_id: str) -> str | None:
+        """The broker order id resting under this ref, if IB has one.
+
+        Used to tell "the stop never reached IB" from "it reached IB and then
+        something else failed" — the difference between re-placing and
+        double-covering a position.
+        """
+        found = await self._executor.find_order_by_ref(recommendation_id)
+        return str(found) if isinstance(found, (str, int)) else None
+
     def restore_submission(
         self,
         recommendation_id: str,
@@ -218,10 +303,18 @@ class OrderManager:
         ticker: str,
         quantity: float,
         limit_price: float | None,
+        order_type: str | None = None,
     ) -> None:
-        """Restore durable idempotency/open-order state after a restart."""
-        self._submitted[recommendation_id] = order_id
-        self.open_orders.setdefault(order_id, {
+        """Restore durable idempotency/open-order state after a restart.
+
+        ``order_type`` carries the ledger's own word for what the order is. It
+        matters for a resting stop (KAN-19): restored without it, the order
+        looks like an unfilled limit to :meth:`check_unfilled_orders`, which
+        cancels it at the next close — the protection would survive the
+        Gateway restart it is designed to survive, then be cancelled by our
+        own housekeeping.
+        """
+        restored = {
             "ticker": ticker,
             "quantity": quantity,
             "limit_price": limit_price,
@@ -229,7 +322,11 @@ class OrderManager:
             "last_repriced_at": datetime.now(timezone.utc),
             "reprice_count": 0,
             "recommendation_id": recommendation_id,
-        })
+        }
+        if order_type is not None:
+            restored["order_type"] = order_type
+        self._submitted[recommendation_id] = order_id
+        self.open_orders.setdefault(order_id, restored)
 
     async def restore_broker_tracking(self) -> None:
         """Reattach executor callbacks for submissions loaded from the DB."""
@@ -286,7 +383,14 @@ class OrderManager:
         for order_id, info in self.open_orders.items():
             # Market orders (e.g. exits/liquidations) fill at once and have no
             # limit to reprice; the unfilled-limit sweep must leave them alone.
-            if info.get("order_type") == "market":
+            # Nor may it touch a resting stop (KAN-19): sitting unfilled for
+            # weeks is what a GTC stop is for, and the close-approaching rule
+            # below would cancel overnight protection every afternoon.
+            #
+            # Listed explicitly rather than skipping "anything that is not a
+            # limit": restore_submission writes open_orders entries with no
+            # order_type at all, and those must keep being swept.
+            if info.get("order_type") in _SWEEP_EXEMPT_ORDER_TYPES:
                 continue
             ticker = info["ticker"]
             next_close = market_calendar.get_next_market_close(now)
@@ -521,14 +625,28 @@ class OrderManager:
         """Net quantity the broker reports held for ``con_id``."""
         return await self._executor.broker_position(con_id)
 
-    async def cancel_all_orders(self) -> list[str]:
+    async def cancel_all_orders(
+        self, *, include_stops: bool = True
+    ) -> list[str]:
         """Cancel all open orders.
+
+        ``include_stops`` is the difference between a kill and a shutdown. A
+        kill flattens the book, so a protective stop left resting would sell
+        short against a position that is already gone — it must go. A graceful
+        shutdown ends *our* participation, not IB's: a GTC stop is precisely
+        the protection meant to outlive this process, and cancelling it on
+        every deploy would invert the point of placing it (KAN-19).
 
         Returns:
             List of cancelled order IDs.
         """
         cancelled = []
         for order_id in list(self.open_orders.keys()):
+            if (
+                not include_stops
+                and self.open_orders[order_id].get("order_type") == "stop"
+            ):
+                continue
             try:
                 await self._executor.cancel_order(order_id)
                 cancelled.append(order_id)
@@ -541,9 +659,13 @@ class OrderManager:
                 self._logger.exception(
                     "Failed to cancel order", order_id=order_id
                 )
-        if self.open_orders:
+        stranded = [
+            order_id
+            for order_id, info in self.open_orders.items()
+            if include_stops or info.get("order_type") != "stop"
+        ]
+        if stranded:
             self._logger.error(
-                "Orders remain open after cancel-all",
-                remaining=list(self.open_orders.keys()),
+                "Orders remain open after cancel-all", remaining=stranded
             )
         return cancelled

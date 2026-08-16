@@ -25,6 +25,13 @@ class BrokerOpenOrder:
     total_quantity: float
     filled_quantity: float
     status: str
+    # What kind of order this actually is (KAN-19). Without these three a
+    # reader cannot tell a resting protective stop from a working entry, which
+    # is the question KAN-20's verification has to answer. Optional so every
+    # existing construction still builds, and None where IB did not report it.
+    order_type: str | None = None
+    aux_price: float | None = None
+    tif: str | None = None
 
     @property
     def remaining_quantity(self) -> float:

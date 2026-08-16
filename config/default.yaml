@@ -88,6 +88,15 @@ execution:
   max_reprice_attempts: 3
   order_submission_lag_seconds: 5  # simulated lag for backtest
   fractional_orders: false  # IBKR paper API rejects fractional (10243/10244); whole-share rounding applies
+  # Broker-native protective stops (KAN-19). OFF until the epoch-v2 boundary
+  # (KAN-33): with the flag off, behaviour is identical to before the feature
+  # existed. Turning it off does NOT cancel stops already resting at IB —
+  # those must be cancelled at the broker or they are left orphaned.
+  # Requires ib.account_id to be set — a protective stop must name the
+  # account it protects, or the backfill walks every account's positions.
+  broker_stops_enabled: false
+  broker_stops_tif: GTC           # survives a Gateway restart (KAN-18 spike)
+  broker_stops_outside_rth: false # false = dormant outside RTH; gaps uncovered
 
 ib:
   host: "127.0.0.1"

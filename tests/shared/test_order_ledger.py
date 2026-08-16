@@ -434,3 +434,91 @@ class TestOutstandingSellQuantity:
         assert ledger.outstanding_sell_quantity(
             account_id="DU12345", con_id=265598
         ) == pytest.approx(25.0)
+
+
+# --- KAN-19: broker stop coverage -------------------------------------------
+
+
+def make_stop_proposal(
+    recommendation_id: str,
+    *,
+    quantity: float = 21,
+    con_id: int = 265598,
+    portfolio: str = "momentum",
+):
+    return SimpleNamespace(
+        recommendation_id=recommendation_id,
+        account_id="DU12345",
+        mode="paper",
+        portfolio=portfolio,
+        con_id=con_id,
+        symbol="AAPL",
+        exchange="SMART",
+        currency="USD",
+        action="SELL",
+        quantity=quantity,
+        limit_price=None,
+        order_type="stop",
+    )
+
+
+def _submit(ledger, proposal):
+    ledger.create_intent(proposal)
+    ledger.transition(proposal.recommendation_id, OrderStatus.APPROVED)
+    return ledger.record_submission(proposal.recommendation_id, "ib-1")
+
+
+def test_open_stop_quantity_counts_a_resting_stop(session):
+    ledger = OrderLedger(session)
+    _submit(ledger, make_stop_proposal("stop-1"))
+
+    covered = ledger.open_stop_quantity("DU12345", "momentum", 265598)
+
+    assert covered == pytest.approx(21.0)
+
+
+def test_open_stop_quantity_ignores_non_stop_orders(session):
+    """A working entry is not protection."""
+    ledger = OrderLedger(session)
+    _submit(ledger, make_proposal("buy-1", quantity=21))
+
+    assert ledger.open_stop_quantity("DU12345", "momentum", 265598) == 0.0
+
+
+def test_open_stop_quantity_ignores_a_terminal_stop(session):
+    """A cancelled stop protects nothing, so the position reads as uncovered."""
+    ledger = OrderLedger(session)
+    _submit(ledger, make_stop_proposal("stop-1"))
+    ledger.transition("stop-1", OrderStatus.CANCELLED)
+
+    assert ledger.open_stop_quantity("DU12345", "momentum", 265598) == 0.0
+
+
+def test_open_stop_quantity_is_scoped_to_the_contract_and_sleeve(session):
+    ledger = OrderLedger(session)
+    _submit(ledger, make_stop_proposal("stop-1"))
+
+    assert ledger.open_stop_quantity("DU12345", "momentum", 999999) == 0.0
+    assert ledger.open_stop_quantity("DU12345", "other_sleeve", 265598) == 0.0
+    assert ledger.open_stop_quantity("DU99999", "momentum", 265598) == 0.0
+
+
+def test_open_stop_quantity_counts_only_the_unfilled_remainder(session):
+    """A half-filled stop only still protects the half it has not sold."""
+    ledger = OrderLedger(session)
+    intent = _submit(ledger, make_stop_proposal("stop-1", quantity=21))
+    intent.filled_quantity = 9.0
+    ledger.transition("stop-1", OrderStatus.PARTIALLY_FILLED)
+
+    assert ledger.open_stop_quantity("DU12345", "momentum", 265598) == pytest.approx(12.0)
+
+
+def test_open_stop_quantity_sums_several_stops_on_one_position(session):
+    """Coverage added in two placements still totals the held quantity."""
+    ledger = OrderLedger(session)
+    _submit(ledger, make_stop_proposal("stop-1", quantity=12))
+    ledger.create_intent(make_stop_proposal("stop-2", quantity=9))
+    ledger.transition("stop-2", OrderStatus.APPROVED)
+    ledger.record_submission("stop-2", "ib-2")
+
+    assert ledger.open_stop_quantity("DU12345", "momentum", 265598) == pytest.approx(21.0)

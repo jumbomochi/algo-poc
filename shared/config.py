@@ -38,6 +38,23 @@ class ExecutionConfig(BaseModel):
     # orders that round to zero. Flip true once trading an account whose
     # fractional permission is verified to work via the API.
     fractional_orders: bool = False
+    # Broker-native protective stops (KAN-19). Default OFF: with the flag off
+    # behaviour is byte-identical to before the feature existed, which is what
+    # makes it safe to merge ahead of the epoch-v2 boundary (KAN-33) where it
+    # gets turned on.
+    #
+    # Turning it OFF does NOT remove stops already resting at IB — they must be
+    # cancelled at the broker, or the account keeps orphan protective orders no
+    # code knows about.
+    broker_stops_enabled: bool = False
+    # GTC is the property the design rests on: the KAN-18 spike watched a GTC
+    # stop survive a Gateway process restart with every field intact.
+    broker_stops_tif: str = "GTC"
+    # IB's default (false) leaves the stop dormant outside regular hours, so an
+    # overnight gap is uncovered until the open. True arms it outside RTH at
+    # the cost of triggering on thin extended-hours prints. Set deliberately —
+    # the spike found this is the one property "resting at IB" does not buy.
+    broker_stops_outside_rth: bool = False
 
 
 class SignalStalenessConfig(BaseModel):

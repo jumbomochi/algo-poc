@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from services.execution.broker_stops import BrokerStopManager
 from shared.config import AppConfig
 from shared.halt_state import HaltStateRepository
 from shared.heartbeat import write_heartbeat
@@ -12,6 +13,7 @@ from shared.liquidation import liquidation_exit_id
 from shared.logging import get_logger
 from shared.models import OrderStatus
 from shared.order_ledger import (
+    BROKER_STOP_ORDER_TYPE,
     TERMINAL_STATUSES,
     OrderIntentNotFound,
     OrderLedger,
@@ -189,6 +191,36 @@ class ExecutionServiceRunner:
         # the sweep re-runs every interval and must not re-page each pass.
         self._halt_sweep_alerted: set[tuple[str, str]] = set()
 
+        # Broker-native protective stops (KAN-19). Needs the ledger: an
+        # unledgered resting stop reads as a `major` reconciliation divergence
+        # and disables entries for the session, so without durability there is
+        # no safe way to place one.
+        self._broker_stops: BrokerStopManager | None = None
+        if order_ledger is not None and config.execution.broker_stops_enabled:
+            if config.ib.account_id is None:
+                # Unpinned, the startup backfill would walk every open position
+                # in the database — including another account's — and place
+                # protective sells for shares this session does not hold. The
+                # ledger would record the position's account while IB stamped
+                # the session's, which reconciliation reads as a mismatch and
+                # answers by disabling entries.
+                raise ValueError(
+                    "broker_stops_enabled requires ib.account_id to be set: "
+                    "protective stops must name the account they protect"
+                )
+            self._broker_stops = BrokerStopManager(
+                order_manager=order_manager,
+                order_ledger=order_ledger,
+                mode=config.mode,
+                account_id=config.ib.account_id,
+                trailing_pct=config.risk.stop_loss_trailing_pct,
+                enabled=True,
+                tif=config.execution.broker_stops_tif,
+                outside_rth=config.execution.broker_stops_outside_rth,
+                whole_shares=not config.execution.fractional_orders,
+                on_placement_failed=self._alert_stop_not_placed,
+            )
+
     async def setup(self) -> None:
         """Create consumer groups and replay pending messages.
 
@@ -251,6 +283,10 @@ class ExecutionServiceRunner:
                 await self._redis.send_to_dead_letter(KILLS_STREAM, msg, str(exc))
                 await self._redis.ack(KILLS_STREAM, CONSUMER_GROUP, msg.message_id)
 
+        # After the replay, so a position opened by a replayed order is covered
+        # by the same pass rather than waiting for the next restart.
+        await self.backfill_broker_stops()
+
         if pending_orders or pending_kills:
             self._logger.warning(
                 "Replayed pending messages from a prior crash",
@@ -282,6 +318,16 @@ class ExecutionServiceRunner:
                     ticker=intent.symbol,
                     quantity=intent.requested_quantity,
                     limit_price=intent.limit_price,
+                    # Only for a stop. Risk stamps every exit "market", and
+                    # passing that through would newly exempt restored exits
+                    # from the unfilled sweep — a behaviour change in a path
+                    # this feature is not supposed to touch (KAN-19 AC4).
+                    order_type=(
+                        intent.order_type
+                        if str(intent.order_type).lower()
+                        == BROKER_STOP_ORDER_TYPE
+                        else None
+                    ),
                 )
         self._order_ledger.session.rollback()
 
@@ -1066,7 +1112,128 @@ class ExecutionServiceRunner:
         if fill_info.get("order_done"):
             self._pending_orders.pop(order_id, None)
             self._order_manager.open_orders.pop(order_id, None)
+
+        # A newly-opened or topped-up position is unprotected until a stop
+        # rests against it, so place one here rather than on a later timer.
+        if fill.side.lower() == "buy":
+            await self._cover_position_with_stop(fill_info, attribution, local_effect)
         return local_effect
+
+    async def _cover_position_with_stop(
+        self,
+        fill_info: dict[str, Any],
+        attribution: Any,
+        local_effect: LocalFillEffect | None,
+    ) -> None:
+        """Bring the position this buy fill grew up to full stop coverage.
+
+        Never allowed to disturb the fill: the fill is a fact IB already
+        recorded, and losing it because a protective order was refused would
+        trade a real accounting error for a hypothetical one. The failure is
+        logged and paged instead (see ``_alert_stop_not_placed``).
+        """
+        if self._broker_stops is None or local_effect is None:
+            return
+        con_id = fill_info.get("con_id")
+        if con_id is None:
+            return
+        try:
+            await self._broker_stops.ensure_coverage(
+                account_id=local_effect.account_id,
+                portfolio=local_effect.portfolio,
+                con_id=int(con_id),
+                symbol=local_effect.ticker,
+                exchange=fill_info.get("exchange"),
+                currency=fill_info.get("currency"),
+                quantity=self._held_after_fill(local_effect, int(con_id)),
+                # The high since entry, which for a fill that just set a new
+                # high is the fill itself. Backfill re-reads the stored high.
+                reference_price=float(fill_info["fill_price"]),
+            )
+        except Exception:
+            # Roll back first: a half-applied ledger transaction on this
+            # shared session poisons every IB callback that follows.
+            self._order_ledger.session.rollback()
+            self._logger.exception(
+                "Protective stop placement failed after a fill",
+                ticker=local_effect.ticker,
+                con_id=con_id,
+            )
+
+    def _held_after_fill(
+        self, local_effect: LocalFillEffect, con_id: int
+    ) -> float:
+        """Shares held for this ``{account, portfolio, con_id}`` right now.
+
+        The durable position plus every local fill the projector has not
+        applied yet — the same overlay :meth:`_reconcile_managed_positions`
+        uses. Sizing off the session's fills alone would under-cover a position
+        opened before this process started; sizing off the durable row alone
+        would under-cover one opened seconds ago.
+        """
+        # Drop the fills the projector has already folded into the durable
+        # book. Without this the same shares are counted twice — once by the
+        # Position row, once by the local effect that produced it — and the
+        # stop placed for the difference over-covers the position, which sells
+        # the account short when it triggers.
+        self._drop_projected_fill_effects()
+        key = (local_effect.account_id, local_effect.portfolio, local_effect.ticker)
+        durable = self._broker_stops.durable_quantity(
+            local_effect.account_id, local_effect.portfolio, con_id
+        )
+        unprojected = sum(
+            effect.quantity_delta
+            for effect in self._local_fill_effects.values()
+            if (effect.account_id, effect.portfolio, effect.ticker) == key
+        )
+        return durable + unprojected + local_effect.quantity_delta
+
+    def _drop_projected_fill_effects(self) -> None:
+        """Forget local fills the durable book now accounts for.
+
+        Also what keeps ``_local_fill_effects`` from growing without bound in
+        a long-lived process: until now only the duplicate-fill and kill paths
+        ever pruned it.
+        """
+        if self._order_ledger is None or not self._local_fill_effects:
+            return
+        try:
+            projected = self._order_ledger.projected_execution_keys(
+                self._local_fill_effects
+            )
+        except Exception:
+            self._logger.exception(
+                "Could not read which fills the projector has applied"
+            )
+            return
+        finally:
+            self._order_ledger.session.rollback()
+        for execution_key in projected:
+            self._local_fill_effects.pop(execution_key, None)
+
+    async def _alert_stop_not_placed(self, **context: Any) -> None:
+        """Page: a position is open with no protective stop resting on it."""
+        await self._publish_alert(
+            event_type="broker_stop_not_placed",
+            priority="critical",
+            message=(
+                f"Protective stop not placed for {context.get('symbol')} — "
+                f"{context.get('quantity')} shares are unprotected at the "
+                f"broker: {context.get('reason')}"
+            ),
+            context={key: str(value) for key, value in context.items()},
+        )
+
+    async def backfill_broker_stops(self) -> list[str]:
+        """Cover every open position that has no resting stop (KAN-19 AC2)."""
+        if self._broker_stops is None:
+            return []
+        try:
+            return await self._broker_stops.backfill_open_positions()
+        except Exception:
+            self._order_ledger.session.rollback()
+            self._logger.exception("Broker stop backfill failed")
+            return []
 
     def _reconcile_managed_positions(self) -> None:
         """Overlay unprojected local fills on durable managed positions."""
@@ -1568,10 +1735,16 @@ class ExecutionServiceRunner:
         )
 
     async def shutdown(self) -> None:
-        """Graceful shutdown: cancel all open orders to avoid orphans."""
+        """Graceful shutdown: cancel our working orders, leave stops resting.
+
+        A GTC stop is the protection designed to outlive this process — the
+        KAN-18 spike confirmed one survives a Gateway restart — so cancelling
+        them on every deploy would invert the point of placing them. Working
+        entries and exits still go, because those *are* ours to orphan.
+        """
         self._logger.info("Execution service shutting down")
         self._running = False
-        await self._order_manager.cancel_all_orders()
+        await self._order_manager.cancel_all_orders(include_stops=False)
         self._logger.info("Execution service shutdown complete — no orphaned orders")
 
     async def run(self) -> None:

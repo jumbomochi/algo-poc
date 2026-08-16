@@ -81,6 +81,19 @@ class IBExecutorProtocol(Protocol):
         """Submit a market order and return the order ID."""
         ...
 
+    async def submit_stop_order(
+        self,
+        ticker: str,
+        quantity: float,
+        stop_price: float,
+        recommendation_id: str | None = None,
+        *,
+        tif: str = "GTC",
+        outside_rth: bool = False,
+    ) -> str:
+        """Submit a protective stop order and return the order ID."""
+        ...
+
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel an open order. Returns True if cancelled successfully."""
         ...
@@ -805,6 +818,58 @@ class IBExecutor:
             order_id=order_id,
             ticker=ticker,
             quantity=quantity,
+        )
+        return order_id
+
+    async def submit_stop_order(
+        self,
+        ticker: str,
+        quantity: float,
+        stop_price: float,
+        recommendation_id: str | None = None,
+        *,
+        tif: str = "GTC",
+        outside_rth: bool = False,
+    ) -> str:
+        """Submit a protective sell stop that rests at the broker (KAN-19).
+
+        A separate method rather than a parameter on the two above: both
+        hardcode their action, and the existing callers pin their signatures.
+
+        ``tif`` defaults to GTC because that is the property the whole design
+        rests on — the spike watched a GTC stop survive a Gateway process
+        restart unchanged, which makes it protection IB enforces when nothing
+        of ours is running.
+
+        ``outside_rth`` is an explicit parameter, not an inherited default,
+        because IB's default (false) leaves the stop *dormant* outside regular
+        hours: an overnight gap is uncovered until the open. The caller decides
+        what that exposure should be.
+        """
+        await self._ensure_connected()
+        quantity = self._effective_quantity(ticker, quantity)
+        from ib_insync import StopOrder
+
+        from shared.universe import make_stock_contract
+
+        contract = make_stock_contract(ticker)
+        order = StopOrder("SELL", quantity, stop_price, tif=tif)
+        order.outsideRth = outside_rth
+        if recommendation_id is not None:
+            order.orderRef = recommendation_id
+        self._stamp_account(order)
+        trade = self._ib.placeOrder(contract, order)
+        order_id = str(trade.order.orderId)
+        self._register_trade(order_id, trade, ticker=ticker, side="sell")
+
+        self._logger.info(
+            "Stop order submitted",
+            order_id=order_id,
+            ticker=ticker,
+            quantity=quantity,
+            stop_price=stop_price,
+            tif=tif,
+            outside_rth=outside_rth,
         )
         return order_id
 
