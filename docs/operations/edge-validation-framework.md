@@ -9,7 +9,8 @@ Scope note: most of this framework already existed before KAN-38. Deflated
 Sharpe, probabilistic Sharpe, Benjamini–Hochberg FDR, and purged/embargoed
 nested walk-forward live in `research/evaluation/` and are tested. KAN-38 added
 the two things that were missing — an explicit trial count and a pre-registered
-holdout — and wrote down the binding below. Parameter stability is KAN-39.
+holdout — and wrote down the binding below. KAN-39 added the last missing
+piece, parameter stability.
 
 ## What gate S and gate P require
 
@@ -18,7 +19,7 @@ holdout — and wrote down the binding below. Parameter stability is KAN-39.
 | Deflated Sharpe against the **declared** trial count | `research/evaluation/multiple_testing.py` `control(..., n_trials=)`, count from `research/trial_registry.json` | `passes_dsr` at the 0.95 default threshold |
 | Multiple-testing correction across the candidates in the run | `benjamini_hochberg` at `fdr_q` (default 0.10) | `passes_fdr` |
 | Performance on the **pre-registered** holdout | `research/evaluation/holdout.py` | Registered before the look; evaluated once |
-| Parameter stability | KAN-39 — not yet built | — |
+| Parameter stability | `research/evaluation/stability.py` `parameter_stability`, fed by `scripts/run_stability_sweep.py` | `is_plateau` true for every parameter swept |
 
 A candidate that clears the walk-forward but not the deflation has not shown
 edge; it has shown that a search of that size finds numbers like that by
@@ -167,6 +168,68 @@ not defended against.
     lives in the registration's note, and `evaluate()` will happily hand you
     the split for any purpose.
 
+## Parameter stability
+
+`research/evaluation/stability.py` plus `scripts/run_stability_sweep.py`.
+
+Deflation and the holdout both judge a single parameterization. Neither can see
+that the parameterization is the highest bump in a noisy surface. If the
+momentum sleeve earns a Sharpe of 2.0 at a 126-day lookback and 0.1 at 120 and
+132, the 126-day result is a fitting artifact — and testing that one point out
+of sample cannot reveal it, because that point is what was fitted.
+
+The check is split in two, because `research/` may not import `backtest` or
+`scripts` (`tests/research/test_architecture.py`):
+
+- `scripts/run_stability_sweep.py` replays one real sleeve once per grid point,
+  changing only the swept parameter, and writes a
+  `{parameter value → metric}` mapping file.
+- `parameter_stability()` reads that mapping and returns a `StabilityReport`.
+  It runs no backtest and opens no file — the verdict is provable arithmetic.
+
+The plateau criterion, pinned in code so it cannot be renegotiated per
+candidate:
+
+1. The neighborhood mean must be no more than `plateau_tolerance` (default
+   30%) below the center metric, as a fraction of the center's magnitude. The
+   boundary is inclusive.
+2. No neighbor may lose money while the center makes it — a parameter value one
+   step away that goes negative fails regardless of the mean.
+
+```
+python scripts/run_stability_sweep.py \
+    --sleeve momentum --parameter lookback_days \
+    --grid 100,113,126,139,152 --center 126 \
+    --bars-from-json data/cache/bars.json \
+    --universe-snapshots data/universe/sp500_snapshots.json \
+    --out output/stability/momentum-lookback_days.json
+```
+
+The grid must contain the shipped value and at least two neighbors; the driver
+refuses before spending a single backtest otherwise. Wall-clock cost is one
+full sleeve replay per grid point, so fetch the bars once
+(`run_backtest.py --bars-from-json` uses the same cache format) rather than
+hitting IB per run.
+
+Pass `--universe-snapshots`. Without it the sleeve ranks a present-day ticker
+list and every point on the surface is survivorship-inflated — the driver
+warns, and stamps `point_in_time_universe: false` on the artifact, but it will
+still run. A plateau measured on survivors is not evidence.
+
+Two things this deliberately does **not** do:
+
+- **It does not re-optimize.** Picking the parameter value with the best
+  stability report would be the same overfitting one level up.
+- **It does not claim profitability.** A sleeve that loses money at every point
+  on the grid is perfectly stable, and `is_plateau` will say so. Stability is a
+  necessary condition for the gate, never a sufficient one.
+
+Sleeves whose signal functions need more than bars (`thematic_momentum`,
+`quality_value`, `earnings_drift`, `tail_risk_hedge` need the regime series,
+the fundamentals cache or the earnings cache) are not wired into the driver
+yet. That is deliberate: a sweep run against a missing cache would silently
+measure a sleeve that never trades.
+
 ## Operator checklist for a promotion
 
 1. Confirm the registry entry for this candidate's search exists and is
@@ -175,6 +238,7 @@ not defended against.
    the run card's `config.n_trials`.
 3. Register the holdout split — before, not after.
 4. Spend the holdout once; commit the burn.
-5. Parameter stability (KAN-39) once it exists.
+5. Sweep each parameter the candidate ships and confirm every verdict is
+   `PLATEAU` — see "Parameter stability" below.
 6. Record all of it against the gate in the promotion pipeline
    (`../designs/project-direction.md` § Strategy Promotion Pipeline).
