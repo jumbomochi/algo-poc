@@ -27,10 +27,10 @@ The three rules encoded here (direction doc D11/D12/D15):
 This module is strictly read-only: it never writes, never commits, and never
 creates a session — callers pass one in.
 
-Intended second consumer: ``scripts/ops/go_live_gate.py``. It has no concrete
-``DataSourceProtocol`` implementation today, so there is nothing to wire yet;
-whoever implements that data source must import these functions rather than
-writing a second streak walk.
+Second consumer since KAN-42: ``scripts/ops/gate_data_source.py`` feeds the
+go-live checklist's drawdown gate from :func:`equity_series` and
+:func:`max_drawdown_pct` here, so the gate report and the epoch report cannot
+disagree about the same account.
 
 Currency note: ``max_drawdown_pct`` is computed on ``EquitySnapshot.equity``,
 which ``PaperState.record_equity_snapshot`` documents as denominated in the
@@ -42,6 +42,7 @@ relied on as the drawdown series; ``equity`` can.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 
@@ -79,6 +80,8 @@ __all__ = [
     "breach_streak",
     "current_epoch_state",
     "epoch_progress",
+    "equity_series",
+    "max_drawdown_pct",
     "scoring_floor_for",
 ]
 
@@ -508,14 +511,21 @@ def _round_trips(
     )
 
 
-def _equity_series(
-    session: Session, *, start: date, end: date, excluded_prefix: str
+def equity_series(
+    session: Session,
+    *,
+    start: date,
+    end: date,
+    excluded_prefix: str = EXCLUDED_PORTFOLIO_PREFIX,
 ) -> list[tuple[date, float, float]]:
     """Per-date ``(date, summed equity, summed market value)``, ascending.
 
     Summed across sleeves and excluding synthetic portfolios — the same shape
     ``shared/position_loader.py`` already uses for ``peak_nav``, so the two
     readers cannot disagree about what the account was worth.
+
+    Public because the go-live gate's drawdown check reads the same series
+    (KAN-42): two callers, one definition of what the account was worth.
     """
     rows = session.execute(
         select(
@@ -534,10 +544,19 @@ def _equity_series(
     return [(row[0], float(row[1] or 0.0), float(row[2] or 0.0)) for row in rows]
 
 
-def _max_drawdown_pct(series: list[tuple[date, float]]) -> float:
+def max_drawdown_pct(rows: Sequence[tuple[date, float, float]]) -> float:
+    """Worst peak-to-trough decline in the series, as a percentage (0-100).
+
+    Takes :func:`equity_series` rows directly. A zero or negative NAV is a data
+    fault, not a 100% drawdown, so those dates are dropped here rather than at
+    each call site — the go-live gate and the epoch report must not be able to
+    disagree about the same account (KAN-42 AC5).
+    """
     peak = 0.0
     worst = 0.0
-    for _, value in series:
+    for _, value, _market_value in rows:
+        if value <= 0:
+            continue
         peak = max(peak, value)
         if peak > 0:
             worst = max(worst, (peak - value) / peak * 100.0)
@@ -666,7 +685,7 @@ def epoch_progress(
     )
 
     equity_rows = (
-        _equity_series(
+        equity_series(
             session,
             start=start,
             end=effective_as_of,
@@ -691,7 +710,8 @@ def epoch_progress(
         exposed / sessions_elapsed * 100.0 if sessions_elapsed > 0 else 0.0
     )
 
-    # A zero or negative NAV is a data fault, not a 100% drawdown.
+    # A zero or negative NAV is a data fault, not a 100% drawdown. The
+    # arithmetic drops those dates itself; this only reports which.
     faulted = [day for day, equity, _ in equity_rows if equity <= 0]
     if faulted:
         blocking.append(
@@ -700,9 +720,7 @@ def epoch_progress(
             + ", ".join(str(day) for day in faulted)
             + "."
         )
-    max_drawdown = _max_drawdown_pct(
-        [(day, equity) for day, equity, _ in equity_rows if equity > 0]
-    )
+    max_drawdown = max_drawdown_pct(equity_rows)
     if sessions and not equity_rows:
         blocking.append(
             "No equity snapshots exist in the epoch window, so maximum "

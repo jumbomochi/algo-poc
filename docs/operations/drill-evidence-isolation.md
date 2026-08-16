@@ -45,22 +45,47 @@ Synthetic portfolios in use today:
 | `scripts/divergence_monitor.py` — aggregate report | live series + `trades` | ✅ | excluded names never enter `live_series_by_portfolio`, so they cannot reach `comparable` or the trade filter |
 | `deploy/launchd/run_pipeline_report.sh` — daily equity table | `equity_snapshots` | ✅ | `WHERE portfolio NOT LIKE '\_%'` |
 | `scripts/run_paper.py` — `_aggregate` rollup | `portfolio_config`, positions | ✅ | skips excluded names in the sum; suppressed entirely on a tagged run (see below) |
-| **`scripts/ops/go_live_gate.py`** | — | ⚠️ **OUTSTANDING** | See below |
+| `scripts/ops/gate_data_source.py` — go-live gates 1, 3, 4 | `equity_snapshots`, `order_intents`, `execution_fills` | ✅ | `~portfolio.startswith(EXCLUDED_PORTFOLIO_PREFIX, autoescape=True)`, including through the fills→intents join |
+| `scripts/ops/gate_data_source.py` — go-live gate 5 | `alert_records` | ⚠️ **cannot** | See below |
 
-### ⚠️ Outstanding: `scripts/ops/go_live_gate.py`
+### Closed 2026-08-16 (KAN-42): the gate data source
 
-`go_live_gate.py` has **no database access at all**. It declares a
-`DataSourceProtocol` and there is no concrete implementation of it anywhere in
-the repo, so there is nothing to add a filter to today.
+`go_live_gate.py` had no database access at all when this document was written
+— it declared a `DataSourceProtocol` with no implementation, so there was
+nothing to filter. `scripts/ops/gate_data_source.py` is that implementation, and
+every portfolio-scoped query it issues carries the exclusion predicate:
+the paper-start date, the drawdown series (via `shared/evidence_store`, which
+already excluded), the slippage join, and the failed-order ratio. Each is pinned
+by a test that seeds a `__drill__` row and asserts the gate's number does not
+move.
 
-**The requirement lands on whoever implements that data source:** every
-portfolio-scoped query it issues — round trips, exposure sessions, drawdown
-series, divergence verdicts — must exclude names for which
-`is_excluded_portfolio` is True. A gate data source that omits this filter will
-count drill trades as evidence and is not fit to gate capital.
+### ⚠️ Structural gap: gate 5 cannot be portfolio-scoped
 
-This is deliberately recorded as unimplemented rather than silently assumed
-handled.
+`alert_records` has **no portfolio column** — an alert is an event about the
+system, not about a sleeve — so the exclusion contract cannot reach gate 5.
+
+The practical consequence: a **`restart_halt` drill fires a real critical
+alert.** `services/risk_management/runner.py:1088-1092` publishes
+`kill_switch_activated` at `priority="critical"` on every kill or breaker,
+drill or not, and it is recorded like any other. Gate 5 will then report an
+unresolved critical for 14 days.
+
+**This is not a bug to route around.** The alert is genuine — the kill switch
+really did fire — and suppressing drill alerts would mean a drill no longer
+exercises the alerting path, which is the whole point of running one. The
+operator closes it explicitly instead:
+
+```bash
+python -m scripts.ops.resolve_alert --list
+python -m scripts.ops.resolve_alert --id <n> --resolved-by <name>
+```
+
+Resolving is a named human act and refuses to overwrite an earlier resolution,
+so the trail shows a person judged the drill's alert closed rather than a filter
+having hidden it.
+
+The `synthetic_stop` drill needs none of this: `stop_loss_triggered` publishes
+at `priority="high"`, which gate 5 does not count.
 
 ## Running a tagged (drill) run
 
