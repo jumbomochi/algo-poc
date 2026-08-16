@@ -196,6 +196,11 @@ class ExecutionServiceRunner:
         # and disables entries for the session, so without durability there is
         # no safe way to place one.
         self._broker_stops: BrokerStopManager | None = None
+        # The KAN-20 verification scan. Same cadence as the risk service's
+        # passive scan — that scan's stop-loss job is now this one, moved to
+        # the loop that actually holds the broker connection.
+        self._stop_verification_interval_seconds = 1800
+        self._last_stop_verification_at: float | None = None
         if order_ledger is not None and config.execution.broker_stops_enabled:
             if config.ib.account_id is None:
                 # Unpinned, the startup backfill would walk every open position
@@ -219,6 +224,10 @@ class ExecutionServiceRunner:
                 outside_rth=config.execution.broker_stops_outside_rth,
                 whole_shares=not config.execution.fractional_orders,
                 on_placement_failed=self._alert_stop_not_placed,
+                on_drift_detected=self._alert_stop_drift,
+            )
+            self._stop_verification_interval_seconds = max(
+                1, int(config.risk.passive_scan_interval_minutes) * 60
             )
 
     async def setup(self) -> None:
@@ -1224,6 +1233,63 @@ class ExecutionServiceRunner:
             context={key: str(value) for key, value in context.items()},
         )
 
+    async def _alert_stop_drift(self, drift: Any) -> None:
+        """Page: a resting stop no longer matches the intent describing it."""
+        await self._publish_alert(
+            event_type="broker_stop_drift",
+            priority="high",
+            message=(
+                f"Protective stop for {drift.symbol} has drifted from its "
+                f"ledger intent and was left as-is: {drift.reason}"
+            ),
+            context={
+                "symbol": drift.symbol,
+                "con_id": str(drift.con_id),
+                "order_id": drift.order_id,
+                "recommendation_id": drift.recommendation_id,
+                "expected_quantity": str(drift.expected_quantity),
+                "broker_quantity": str(drift.broker_quantity),
+                "expected_price": str(drift.expected_price),
+                "broker_price": str(drift.broker_price),
+            },
+        )
+
+    async def maybe_run_stop_verification(self, now: float) -> bool:
+        """Verify every position's broker stop when the scan interval elapses.
+
+        ``now`` is a monotonic timestamp (seconds). Inert with KAN-19's flag
+        off — there are no broker stops to verify, and the risk service's scan
+        keeps emitting software stop-loss exits exactly as before. Returns True
+        when the verification ran.
+        """
+        if self._broker_stops is None:
+            return False
+        last = self._last_stop_verification_at
+        if (
+            last is not None
+            and (now - last) < self._stop_verification_interval_seconds
+        ):
+            return False
+        self._last_stop_verification_at = now
+        try:
+            report = await self._broker_stops.verify_coverage()
+        except Exception:
+            # Best-effort, like every other sweep on this loop: a verification
+            # failure must not tear down the loop that still has to process
+            # fills and liquidation sells.
+            self._order_ledger.session.rollback()
+            self._logger.exception("Broker stop verification failed; continuing")
+            return True
+        if report.placed or report.cancelled or report.vanished or report.drifts:
+            self._logger.info(
+                "Broker stop verification adjusted resting protection",
+                placed=report.placed,
+                cancelled=report.cancelled,
+                vanished=report.vanished,
+                drifts=len(report.drifts),
+            )
+        return True
+
     async def backfill_broker_stops(self) -> list[str]:
         """Cover every open position that has no resting stop (KAN-19 AC2)."""
         if self._broker_stops is None:
@@ -1416,6 +1482,14 @@ class ExecutionServiceRunner:
     async def process_kill(self, kill_msg: KillMessage) -> None:
         """Process a kill event: cancel all open orders and liquidate positions.
 
+        Working orders go up front — a queued entry must not fill into a book
+        this is flattening. Protective stops do **not**: each position's stop
+        is cancelled immediately before that position's own liquidation sell
+        (KAN-20). Cancelling them all first strips protection from every
+        position at once and then flattens them one at a time, so a sell that
+        fails mid-loop leaves its position un-flattened *and* unprotected —
+        and so does every position still waiting behind it.
+
         Args:
             kill_msg: The kill message with reason and trigger info.
         """
@@ -1429,8 +1503,8 @@ class ExecutionServiceRunner:
             self._reconcile_managed_positions()
             positions_to_liquidate = dict(self._positions)
 
-        # Cancel all open orders
-        await self._order_manager.cancel_all_orders()
+        # Cancel every working order, leaving the stops resting for now.
+        await self._order_manager.cancel_all_orders(include_stops=False)
 
         # Deterministic per-kill epoch: exits for one kill converge on the same
         # ids across a replay and across the risk-side authoritative path, so we
@@ -1449,6 +1523,7 @@ class ExecutionServiceRunner:
                         recommendation_id=exit_id,
                     )
                     continue
+                await self._cancel_stops_before_liquidating(ticker)
                 await self._order_manager.submit_exit(
                     ticker=ticker,
                     quantity=quantity,
@@ -1469,6 +1544,11 @@ class ExecutionServiceRunner:
                     ticker=ticker,
                 )
 
+        # Sweep whatever the per-position path did not reach: a stop on a name
+        # the book no longer holds, or on one whose exit was already in flight.
+        # Either would rest against a flat position and sell short on trigger.
+        await self._order_manager.cancel_all_orders()
+
         # Always publish the critical alert — even on zero positions or partial
         # failure, the operator must learn the kill fired.
         alert = AlertMessage(
@@ -1483,6 +1563,27 @@ class ExecutionServiceRunner:
             },
         )
         await self._redis.publish(ALERTS_STREAM, alert.to_stream_dict())
+
+    async def _cancel_stops_before_liquidating(self, ticker: str) -> None:
+        """Clear this position's protective stops, moments before its sell.
+
+        A stop left resting while the liquidation sells the shares out from
+        under it becomes a short on trigger. Doing it here rather than in the
+        up-front cancel-all is what keeps the unprotected window to this one
+        position (KAN-20).
+        """
+        canceller = getattr(
+            self._order_manager, "cancel_stops_for_ticker", None
+        )
+        if canceller is None:
+            return
+        cancelled = await canceller(ticker)
+        if cancelled:
+            self._logger.info(
+                "Cancelled protective stops ahead of a liquidation sell",
+                ticker=ticker,
+                order_ids=cancelled,
+            )
 
     def _exit_already_in_flight(self, exit_id: str) -> bool:
         """True if an intent for this deterministic exit id is already submitted
@@ -1786,6 +1887,11 @@ class ExecutionServiceRunner:
                     self._logger.exception(
                         "Post-halt order sweep failed; continuing"
                     )
+                # Broker-stop verification (KAN-20) — the 30-minute scan that
+                # keeps a placed stop true. Guards its own failures internally.
+                await self.maybe_run_stop_verification(
+                    asyncio.get_running_loop().time()
+                )
 
                 await self._consume_and_process(
                     APPROVED_ORDERS_STREAM,

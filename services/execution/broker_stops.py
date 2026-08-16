@@ -18,17 +18,17 @@ Two properties this module exists to hold:
   quantity and never exceeds it. A partially-protected position is the failure
   mode this design is meant to remove.
 
-What this module does **not** do, all of it KAN-20's "verification and
-adjustment" and all of it a reason the flag stays off until KAN-20 lands:
+:meth:`BrokerStopManager.verify_coverage` (KAN-20) is what makes a placed stop
+*stay* protection. Run on the 30-minute scan, it holds each stop intent against
+what IB is actually resting and corrects the three ways they legitimately
+diverge — the order is gone, the position shrank, the trailing high rose. Any
+other disagreement between the broker and the ledger row describing it is a
+stop something changed outside this system; that is reported and left exactly
+as it is, because correcting it silently would erase the only evidence of
+whatever did it.
 
-* **The level is set once, not trailed.** The stop is priced from the high
-  known at placement and never revised, so as the high rises the resting stop
-  is looser than the IPS rule the risk engine evaluates. The two agree on the
-  day the stop is placed and drift apart after.
-* **Nothing reduces or cancels a stop when shares leave.** Coverage is only
-  ever brought *up*. A position sold outside this service — manually, from
-  TWS, by another client — leaves its stop resting, and the oversell guard is
-  what stands between that and a short.
+What this module still does **not** do:
+
 * **A resting stop blocks the software exit path.** To
   ``outstanding_sell_quantity`` a full-coverage stop is a working sell for the
   whole position, so the KAN-10 guard sizes a flattening exit to zero and
@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from sqlalchemy import func, select
@@ -53,6 +53,11 @@ from shared.order_ledger import BROKER_STOP_ORDER_TYPE, OrderLedger
 # Smallest price increment IB accepts for a US equity stop. A sub-penny
 # auxPrice is rejected outright, which would leave the position unprotected.
 _TICK = 0.01
+# Half a tick: two prices that round to the same cent are the same stop.
+_PRICE_EPSILON = _TICK / 2
+# Share counts are floats only because fractional accounts exist; this is float
+# noise, not a real difference in coverage.
+_QUANTITY_EPSILON = 1e-6
 
 
 def ips_stop_price(reference_price: float, trailing_pct: float) -> float:
@@ -91,6 +96,47 @@ class _PositionScope:
 
 
 @dataclass(frozen=True)
+class StopDrift:
+    """A resting stop that no longer matches the intent describing it.
+
+    Not one of the three benign divergences the verifier corrects: those are
+    the *expectation* moving away from a ledger the broker still agrees with.
+    This is the broker and the ledger disagreeing, which nothing in this
+    system does — so something outside it moved the order.
+    """
+
+    recommendation_id: str
+    order_id: str
+    symbol: str
+    con_id: int
+    expected_quantity: float
+    broker_quantity: float
+    expected_price: float | None
+    broker_price: float | None
+    reason: str
+
+
+@dataclass
+class StopVerification:
+    """What one verification pass changed, for the log and for the tests."""
+
+    placed: list[str] = field(default_factory=list)
+    cancelled: list[str] = field(default_factory=list)
+    vanished: list[str] = field(default_factory=list)
+    drifts: list[StopDrift] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _StopClaim:
+    """One ledger row's claim to be protecting shares right now."""
+
+    recommendation_id: str
+    order_id: str | None
+    quantity: float
+    stop_price: float | None
+
+
+@dataclass(frozen=True)
 class _StopProposal:
     """The shape :meth:`OrderLedger.create_intent` reads."""
 
@@ -124,6 +170,7 @@ class BrokerStopManager:
         outside_rth: bool = False,
         whole_shares: bool = True,
         on_placement_failed: Callable[..., Awaitable[None]] | None = None,
+        on_drift_detected: Callable[[StopDrift], Awaitable[None]] | None = None,
     ) -> None:
         self._order_manager = order_manager
         self._ledger = order_ledger
@@ -135,6 +182,7 @@ class BrokerStopManager:
         self._outside_rth = outside_rth
         self._whole_shares = whole_shares
         self._on_placement_failed = on_placement_failed
+        self._on_drift_detected = on_drift_detected
         self._logger = get_logger("broker_stops")
 
     @property
@@ -295,6 +343,286 @@ class BrokerStopManager:
             recommendation_id=proposal.recommendation_id,
         )
         return order_id
+
+    async def verify_coverage(self) -> StopVerification:
+        """Check every open position's stop against what IB is resting (KAN-20).
+
+        The scan that turns a placed stop into protection that stays true.
+        Three divergences are corrected in silence, because each has a known
+        and benign cause:
+
+        * the order is no longer at IB — a cancel-all reached further than
+          intended, or a Gateway restart dropped it. Recreated.
+        * the position is smaller than its coverage — shares left on a partial
+          fill. Resized, because the excess opens a short when it triggers.
+        * the trailing high has risen above the resting level. Re-levelled up,
+          never down.
+
+        Anything else is :class:`StopDrift`: reported, and left alone.
+        """
+        report = StopVerification()
+        if not self._enabled:
+            return report
+
+        try:
+            live = await self._live_stops_by_ref()
+        except Exception:
+            # Blind, not clear. Placing on the assumption that nothing rests
+            # would double-cover every position in the book.
+            self._logger.exception(
+                "Could not read resting stops from the broker; skipping "
+                "verification this cycle"
+            )
+            return report
+
+        for scope in self._open_position_scopes():
+            try:
+                await self._verify_scope(scope, live, report)
+            except Exception:
+                # One position's verification must not abandon the rest, and a
+                # half-applied ledger transaction on this shared session would
+                # poison every IB callback that follows.
+                self._ledger.session.rollback()
+                self._logger.exception(
+                    "Could not verify stop coverage for a position",
+                    symbol=scope.symbol,
+                    con_id=scope.con_id,
+                )
+        return report
+
+    async def _live_stops_by_ref(self) -> dict[str, Any]:
+        """Every order live at IB, keyed by the ref our intents are named for."""
+        orders = await self._order_manager.list_open_broker_orders()
+        return {
+            str(order.order_ref): order
+            for order in orders
+            if getattr(order, "order_ref", None)
+        }
+
+    async def _verify_scope(
+        self,
+        scope: _PositionScope,
+        live: dict[str, Any],
+        report: StopVerification,
+    ) -> None:
+        claims = self._stop_claims(scope)
+
+        resting: list[tuple[_StopClaim, Any]] = []
+        drifted = False
+        for claim in claims:
+            order = live.get(claim.recommendation_id)
+            if order is None:
+                self._release_vanished_stop(claim, scope, report)
+                continue
+            drift = self._drift(claim, order, scope)
+            if drift is not None:
+                report.drifts.append(drift)
+                await self._report_drift(drift)
+                drifted = True
+            resting.append((claim, order))
+
+        if drifted:
+            # Reported, not corrected — and the whole position is left alone,
+            # because re-placing around a stop somebody moved would destroy
+            # the state an operator has to look at to find out why.
+            return
+
+        covered = sum(self._broker_quantity(order) for _, order in resting)
+        desired_price = self._desired_stop_price(scope)
+
+        over_covered = covered > scope.quantity + _QUANTITY_EPSILON
+        under_levelled = desired_price is not None and any(
+            self._broker_price(order) is None
+            or self._broker_price(order) < desired_price - _PRICE_EPSILON
+            for _, order in resting
+        )
+        if over_covered or under_levelled:
+            # Cancel first, then re-place whole: IB has no modify path here,
+            # and ``ensure_coverage`` sizes against the ledger, so the old row
+            # has to be terminal before the replacement can be sized at all.
+            for claim, _ in resting:
+                await self._retire_stop(claim, scope, report)
+
+        order_id = await self.ensure_coverage(
+            account_id=scope.account_id,
+            portfolio=scope.portfolio,
+            con_id=scope.con_id,
+            symbol=scope.symbol,
+            exchange=scope.exchange,
+            currency=scope.currency,
+            quantity=scope.quantity,
+            reference_price=scope.highest_price_since_entry,
+        )
+        if order_id is not None:
+            report.placed.append(order_id)
+
+    def _stop_claims(self, scope: _PositionScope) -> list[_StopClaim]:
+        """The ledger rows claiming to protect this position, read and released."""
+        try:
+            return [
+                _StopClaim(
+                    recommendation_id=intent.recommendation_id,
+                    order_id=(
+                        str(intent.ib_order_id)
+                        if intent.ib_order_id is not None
+                        else None
+                    ),
+                    quantity=float(intent.requested_quantity)
+                    - float(intent.filled_quantity),
+                    stop_price=(
+                        float(intent.limit_price)
+                        if intent.limit_price is not None
+                        else None
+                    ),
+                )
+                for intent in self._ledger.open_stop_intents(
+                    scope.account_id, scope.portfolio, scope.con_id
+                )
+            ]
+        finally:
+            # Never hold a read transaction across the awaits that follow:
+            # this session is shared with the IB callbacks.
+            self._ledger.session.rollback()
+
+    def _release_vanished_stop(
+        self,
+        claim: _StopClaim,
+        scope: _PositionScope,
+        report: StopVerification,
+    ) -> None:
+        """Terminalise a stop that is no longer at IB, freeing its coverage.
+
+        Left alone, the row keeps counting toward ``open_stop_quantity``
+        forever: the position reads as fully protected while nothing rests
+        against it, and no later pass ever places a replacement. This is the
+        state AC1 exists to break, and terminalising is what breaks it.
+        """
+        if claim.order_id is None:
+            # Never bound to a broker order — that is
+            # ``_resume_unsubmitted_stops``'s row, not a vanished one.
+            return
+        self._ledger.transition(
+            claim.recommendation_id,
+            OrderStatus.CANCELLED,
+            reason="stop is no longer resting at the broker",
+        )
+        self._ledger.session.commit()
+        report.vanished.append(claim.recommendation_id)
+        self._logger.warning(
+            "Protective stop is gone from the broker; re-covering the position",
+            recommendation_id=claim.recommendation_id,
+            order_id=claim.order_id,
+            symbol=scope.symbol,
+            con_id=scope.con_id,
+        )
+
+    async def _retire_stop(
+        self,
+        claim: _StopClaim,
+        scope: _PositionScope,
+        report: StopVerification,
+    ) -> None:
+        """Cancel a stop at IB and terminalise its row, so it can be re-placed."""
+        if claim.order_id is None:
+            return
+        cancelled = await self._order_manager.cancel_broker_order(claim.order_id)
+        if not cancelled:
+            # Still live at IB. Terminalising anyway would free coverage the
+            # broker is still holding, and the replacement would double-cover
+            # the position — a short on trigger. Leave it for the next cycle.
+            self._logger.error(
+                "Could not cancel a stop for replacement; leaving it resting",
+                recommendation_id=claim.recommendation_id,
+                order_id=claim.order_id,
+                symbol=scope.symbol,
+            )
+            return
+        self._ledger.transition(
+            claim.recommendation_id,
+            OrderStatus.CANCELLED,
+            reason="replaced by a re-sized or re-levelled stop",
+        )
+        self._ledger.session.commit()
+        report.cancelled.append(claim.order_id)
+
+    def _desired_stop_price(self, scope: _PositionScope) -> float | None:
+        """The level the IPS rule wants right now, or None if it cannot be sized.
+
+        A reference price that cannot produce a stop is not silently ignored —
+        ``ensure_coverage`` reaches the same arithmetic below and pages.
+        """
+        try:
+            return ips_stop_price(
+                scope.highest_price_since_entry, self._trailing_pct
+            )
+        except ValueError:
+            return None
+
+    def _drift(
+        self, claim: _StopClaim, order: Any, scope: _PositionScope
+    ) -> StopDrift | None:
+        """The broker disagreeing with the ledger row that describes this stop."""
+        broker_quantity = self._broker_quantity(order)
+        broker_price = self._broker_price(order)
+
+        reasons: list[str] = []
+        if abs(broker_quantity - claim.quantity) > _QUANTITY_EPSILON:
+            reasons.append(
+                f"broker holds {broker_quantity} unfilled shares, "
+                f"the ledger records {claim.quantity}"
+            )
+        if claim.stop_price is not None and (
+            broker_price is None
+            or abs(broker_price - claim.stop_price) > _PRICE_EPSILON
+        ):
+            reasons.append(
+                f"broker stop level is {broker_price}, "
+                f"the ledger records {claim.stop_price}"
+            )
+        if not reasons:
+            return None
+        return StopDrift(
+            recommendation_id=claim.recommendation_id,
+            order_id=str(getattr(order, "order_id", claim.order_id or "")),
+            symbol=scope.symbol,
+            con_id=scope.con_id,
+            expected_quantity=claim.quantity,
+            broker_quantity=broker_quantity,
+            expected_price=claim.stop_price,
+            broker_price=broker_price,
+            reason="; ".join(reasons),
+        )
+
+    @staticmethod
+    def _broker_quantity(order: Any) -> float:
+        remaining = getattr(order, "remaining_quantity", None)
+        if remaining is None:
+            remaining = float(getattr(order, "quantity", 0.0) or 0.0) - float(
+                getattr(order, "filled_quantity", 0.0) or 0.0
+            )
+        return max(0.0, float(remaining))
+
+    @staticmethod
+    def _broker_price(order: Any) -> float | None:
+        price = getattr(order, "aux_price", None)
+        return None if price is None else float(price)
+
+    async def _report_drift(self, drift: StopDrift) -> None:
+        """Page: a resting stop was changed by something that is not us."""
+        self._logger.error(
+            "Protective stop has drifted from its ledger intent",
+            recommendation_id=drift.recommendation_id,
+            order_id=drift.order_id,
+            symbol=drift.symbol,
+            con_id=drift.con_id,
+            reason=drift.reason,
+        )
+        if self._on_drift_detected is None:
+            return
+        try:
+            await self._on_drift_detected(drift)
+        except Exception:
+            self._logger.exception("Could not alert on a drifting stop")
 
     def _placeable(self, shortfall: float) -> float:
         """The part of ``shortfall`` this account can actually be sold.

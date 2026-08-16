@@ -561,6 +561,35 @@ class OrderManager:
             self.open_orders.pop(order_id, None)
         return cancelled
 
+    async def cancel_stops_for_ticker(self, ticker: str) -> list[str]:
+        """Cancel the protective stops resting on one ticker (KAN-20).
+
+        The kill path's replacement for cancelling every stop up front. Doing
+        it per position, immediately before that position's liquidation sell,
+        bounds the unprotected window to the one name being flattened: a sell
+        that fails mid-loop no longer strips the protection off every position
+        behind it in the queue.
+        """
+        cancelled: list[str] = []
+        for order_id in [
+            order_id
+            for order_id, info in self.open_orders.items()
+            if info.get("order_type") == "stop" and info.get("ticker") == ticker
+        ]:
+            try:
+                if await self.cancel_broker_order(order_id):
+                    cancelled.append(order_id)
+            except Exception:
+                # A stop we could not cancel is still live at IB, so it stays
+                # tracked and the caller still liquidates — the pre-existing
+                # cancel-all behaved the same way. The log is the signal.
+                self._logger.exception(
+                    "Failed to cancel a protective stop before liquidation",
+                    order_id=order_id,
+                    ticker=ticker,
+                )
+        return cancelled
+
     async def cancel_working_orders(
         self, orders: Sequence[tuple[str, str]]
     ) -> list[str]:

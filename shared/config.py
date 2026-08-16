@@ -38,10 +38,12 @@ class ExecutionConfig(BaseModel):
     # orders that round to zero. Flip true once trading an account whose
     # fractional permission is verified to work via the API.
     fractional_orders: bool = False
-    # Broker-native protective stops (KAN-19). Default OFF: with the flag off
-    # behaviour is byte-identical to before the feature existed, which is what
-    # makes it safe to merge ahead of the epoch-v2 boundary (KAN-33) where it
-    # gets turned on.
+    # Broker-native protective stops (KAN-19) and the 30-minute scan that
+    # verifies them (KAN-20). Default OFF: with the flag off behaviour is
+    # byte-identical to before the feature existed — the verifier makes no
+    # broker call and the risk service's scan still emits software stop-loss
+    # exits — which is what makes it safe to merge ahead of the epoch-v2
+    # boundary (KAN-33) where it gets turned on.
     #
     # Turning it OFF does NOT remove stops already resting at IB — they must be
     # cancelled at the broker, or the account keeps orphan protective orders no

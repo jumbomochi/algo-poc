@@ -1,0 +1,609 @@
+"""KAN-20 — the 30-minute scan verifies the broker stop instead of emitting.
+
+A stop placed once is not protection. Positions shrink on partial fills, the
+trailing high rises, cancel-all reaches further than intended, and a Gateway
+restart can drop an order. What makes a resting stop *protection* is something
+that keeps checking it is still there, at the right size and the right price.
+
+The three adjustments below are benign by construction — missing, over-covered,
+under-levelled — and are corrected silently. Anything else is a stop somebody
+or something changed outside this system, and correcting that silently would
+hide whatever did it. Those are reported.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
+
+from services.execution.broker_stops import BrokerStopManager
+from services.execution.runner import ExecutionServiceRunner
+from shared.config import AppConfig, ExecutionConfig, IBConfig
+from shared.models import Base, OrderStatus, Position
+from shared.order_ledger import OrderLedger
+from shared.schemas.messages import KillMessage
+
+OPENED_AT = datetime(2026, 8, 16, 13, 30, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+def session():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db_session:
+        yield db_session
+
+
+def make_position(
+    *,
+    ticker: str = "AAPL",
+    con_id: int = 265598,
+    quantity: float = 100,
+    highest: float = 220.0,
+    account_id: str = "DUN551088",
+    portfolio: str = "momentum",
+) -> Position:
+    return Position(
+        account_id=account_id,
+        ticker=ticker,
+        portfolio=portfolio,
+        con_id=con_id,
+        exchange="SMART",
+        currency="USD",
+        quantity=quantity,
+        avg_entry_price=200.0,
+        current_price=highest,
+        peak_price=highest,
+        highest_price_since_entry=highest,
+        opened_at=OPENED_AT,
+        status="open",
+    )
+
+
+def resting(
+    *,
+    order_id: str = "4242",
+    order_ref: str,
+    quantity: float,
+    aux_price: float,
+    filled: float = 0.0,
+) -> SimpleNamespace:
+    """One stop as ``list_open_broker_orders`` reports it."""
+    return SimpleNamespace(
+        order_id=order_id,
+        order_ref=order_ref,
+        action="SELL",
+        ticker="AAPL",
+        quantity=quantity,
+        account_id="DUN551088",
+        order_type="STP",
+        aux_price=aux_price,
+        filled_quantity=filled,
+        remaining_quantity=max(0.0, quantity - filled),
+    )
+
+
+def make_manager(session, *, live=(), enabled=True, on_drift=None, **kwargs):
+    order_manager = AsyncMock()
+    order_manager.submit_stop = AsyncMock(return_value="9001")
+    order_manager.find_stop_order = AsyncMock(return_value=None)
+    order_manager.list_open_broker_orders = AsyncMock(return_value=list(live))
+    order_manager.cancel_broker_order = AsyncMock(return_value=True)
+    defaults = dict(
+        order_manager=order_manager,
+        order_ledger=OrderLedger(session),
+        mode="paper",
+        account_id="DUN551088",
+        trailing_pct=15.0,
+        enabled=enabled,
+        on_drift_detected=on_drift,
+    )
+    defaults.update(kwargs)
+    return BrokerStopManager(**defaults), order_manager
+
+
+async def seed_resting_stop(
+    manager: BrokerStopManager,
+    order_manager,
+    *,
+    quantity: float,
+    reference_price: float,
+    order_id: str = "4242",
+    con_id: int = 265598,
+) -> str:
+    """Place one stop through the real path so the ledger row is genuine."""
+    order_manager.submit_stop = AsyncMock(return_value=order_id)
+    await manager.ensure_coverage(
+        account_id="DUN551088",
+        portfolio="momentum",
+        con_id=con_id,
+        symbol="AAPL",
+        exchange="SMART",
+        currency="USD",
+        quantity=quantity,
+        reference_price=reference_price,
+    )
+    return order_manager.submit_stop.await_args.kwargs["recommendation_id"]
+
+
+class TestRecreatesAMissingStop:
+    """AC1 / design test #29a."""
+
+    async def test_a_stop_gone_from_ib_is_replaced_within_one_cycle(
+        self, session
+    ):
+        manager, order_manager = make_manager(session)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=220.0
+        )
+        # IB reports nothing resting: the stop was cancelled out of band.
+        order_manager.list_open_broker_orders = AsyncMock(return_value=[])
+        order_manager.submit_stop = AsyncMock(return_value="5150")
+
+        report = await manager.verify_coverage()
+
+        assert report.placed == ["5150"]
+        kwargs = order_manager.submit_stop.await_args.kwargs
+        assert kwargs["quantity"] == pytest.approx(100)
+        assert kwargs["stop_price"] == pytest.approx(187.0)
+
+    async def test_the_vanished_intent_is_terminalised_first(self, session):
+        """Otherwise it counts as coverage forever and nothing re-places it.
+
+        ``open_stop_quantity`` sums non-terminal stop intents. A stop that no
+        longer rests at IB but whose row is still SUBMITTED makes the position
+        read as fully protected — the exact state this scan exists to break.
+        """
+        manager, order_manager = make_manager(session)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        stop_id = await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=220.0
+        )
+        order_manager.list_open_broker_orders = AsyncMock(return_value=[])
+
+        report = await manager.verify_coverage()
+
+        assert report.vanished == [stop_id]
+        ledger = OrderLedger(session)
+        assert ledger.get(stop_id).status == OrderStatus.CANCELLED.value
+
+    async def test_a_stop_still_resting_is_left_alone(self, session):
+        manager, order_manager = make_manager(session)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        stop_id = await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=220.0
+        )
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[resting(order_ref=stop_id, quantity=100, aux_price=187.0)]
+        )
+        order_manager.submit_stop = AsyncMock(return_value="never")
+
+        report = await manager.verify_coverage()
+
+        assert report.placed == []
+        assert report.cancelled == []
+        order_manager.submit_stop.assert_not_awaited()
+
+
+class TestResizesAfterAPartialFill:
+    """AC2 / design test #29b.
+
+    A 100-share stop against 60 held shares does not merely over-protect: the
+    extra 40 open a short the moment it triggers.
+    """
+
+    async def test_the_stop_is_re_placed_at_the_remaining_quantity(
+        self, session
+    ):
+        manager, order_manager = make_manager(session)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        stop_id = await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=220.0
+        )
+        # 40 shares left the position outside this service.
+        position = session.scalars(select(Position)).one()
+        position.quantity = 60
+        session.commit()
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[resting(order_ref=stop_id, quantity=100, aux_price=187.0)]
+        )
+        order_manager.submit_stop = AsyncMock(return_value="5150")
+
+        report = await manager.verify_coverage()
+
+        assert report.cancelled == ["4242"]
+        order_manager.cancel_broker_order.assert_awaited_once_with("4242")
+        assert report.placed == ["5150"]
+        assert order_manager.submit_stop.await_args.kwargs[
+            "quantity"
+        ] == pytest.approx(60)
+
+    async def test_the_over_covering_intent_is_terminalised(self, session):
+        """A cancelled stop that still reads as coverage blocks the re-place."""
+        manager, order_manager = make_manager(session)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        stop_id = await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=220.0
+        )
+        position = session.scalars(select(Position)).one()
+        position.quantity = 60
+        session.commit()
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[resting(order_ref=stop_id, quantity=100, aux_price=187.0)]
+        )
+
+        await manager.verify_coverage()
+
+        ledger = OrderLedger(session)
+        assert ledger.get(stop_id).status == OrderStatus.CANCELLED.value
+        assert ledger.open_stop_quantity("DUN551088", "momentum", 265598) == 60
+
+
+class TestTrailingLevelAdvances:
+    """AC5 — and the half of AC5 that matters: it never moves down."""
+
+    async def test_a_new_high_re_levels_the_stop_upward(self, session):
+        manager, order_manager = make_manager(session)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        stop_id = await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=220.0
+        )
+        position = session.scalars(select(Position)).one()
+        position.highest_price_since_entry = 260.0
+        session.commit()
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[resting(order_ref=stop_id, quantity=100, aux_price=187.0)]
+        )
+        order_manager.submit_stop = AsyncMock(return_value="5150")
+
+        report = await manager.verify_coverage()
+
+        assert report.cancelled == ["4242"]
+        assert report.placed == ["5150"]
+        assert order_manager.submit_stop.await_args.kwargs[
+            "stop_price"
+        ] == pytest.approx(221.0)
+
+    async def test_a_lower_computed_level_never_loosens_a_resting_stop(
+        self, session
+    ):
+        """The stored high can only rise, but a bad mark must not lower a stop.
+
+        If the recorded high were ever corrected downward — a bad print backed
+        out, a manual edit — re-levelling on it would widen live protection.
+        The scan is allowed to tighten a stop and never to loosen one.
+        """
+        manager, order_manager = make_manager(session)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        stop_id = await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=260.0
+        )
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[resting(order_ref=stop_id, quantity=100, aux_price=221.0)]
+        )
+        order_manager.submit_stop = AsyncMock(return_value="never")
+
+        report = await manager.verify_coverage()
+
+        assert report.cancelled == []
+        assert report.placed == []
+        order_manager.cancel_broker_order.assert_not_awaited()
+
+
+class TestDriftIsReportedNotCorrected:
+    """AC3 / design test #29c.
+
+    Drift is the broker disagreeing with the ledger row that describes it —
+    someone modified the order outside this system. The three benign cases are
+    the *expectation* moving away from a ledger the broker still matches, and
+    those are corrected above without a word.
+    """
+
+    async def test_a_modified_stop_price_raises_an_alert(self, session):
+        drifts = []
+        manager, order_manager = make_manager(
+            session, on_drift=AsyncMock(side_effect=lambda d: drifts.append(d))
+        )
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        stop_id = await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=220.0
+        )
+        # Ledger says 187.00; IB is resting one at 150.00.
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[resting(order_ref=stop_id, quantity=100, aux_price=150.0)]
+        )
+
+        report = await manager.verify_coverage()
+
+        assert len(report.drifts) == 1
+        assert report.drifts[0].recommendation_id == stop_id
+        assert report.drifts[0].broker_price == pytest.approx(150.0)
+        assert report.drifts[0].expected_price == pytest.approx(187.0)
+        assert len(drifts) == 1
+
+    async def test_a_modified_stop_quantity_raises_an_alert(self, session):
+        manager, order_manager = make_manager(session)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        stop_id = await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=220.0
+        )
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[resting(order_ref=stop_id, quantity=75, aux_price=187.0)]
+        )
+
+        report = await manager.verify_coverage()
+
+        assert len(report.drifts) == 1
+        assert report.drifts[0].broker_quantity == pytest.approx(75)
+
+    async def test_a_drifting_stop_is_not_silently_re_placed(self, session):
+        """Correcting it would erase the evidence of whatever moved it."""
+        manager, order_manager = make_manager(session)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        stop_id = await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=220.0
+        )
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[resting(order_ref=stop_id, quantity=100, aux_price=150.0)]
+        )
+        order_manager.submit_stop = AsyncMock(return_value="never")
+
+        await manager.verify_coverage()
+
+        order_manager.cancel_broker_order.assert_not_awaited()
+        order_manager.submit_stop.assert_not_awaited()
+
+    async def test_the_three_benign_cases_do_not_alert(self, session):
+        """Missing, over-covered and under-levelled are all handled silently."""
+        manager, order_manager = make_manager(session)
+        session.add(make_position(quantity=60, highest=260.0))
+        session.commit()
+        stop_id = await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=220.0
+        )
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[resting(order_ref=stop_id, quantity=100, aux_price=187.0)]
+        )
+        order_manager.submit_stop = AsyncMock(return_value="5150")
+
+        report = await manager.verify_coverage()
+
+        assert report.drifts == []
+        assert report.placed == ["5150"]
+
+    async def test_a_partially_filled_stop_is_not_drift(self, session):
+        """IB reporting 40 of 100 filled is the stop working, not drifting."""
+        manager, order_manager = make_manager(session)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        stop_id = await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=220.0
+        )
+        ledger = OrderLedger(session)
+        ledger.transition(stop_id, OrderStatus.PARTIALLY_FILLED)
+        ledger.get(stop_id).filled_quantity = 40
+        session.commit()
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[
+                resting(
+                    order_ref=stop_id, quantity=100, aux_price=187.0, filled=40
+                )
+            ]
+        )
+
+        report = await manager.verify_coverage()
+
+        assert report.drifts == []
+
+
+class TestInertWithTheFlagOff:
+    """AC6 — the verifier does nothing until KAN-19's flag is on."""
+
+    async def test_verify_makes_no_broker_call(self, session):
+        manager, order_manager = make_manager(session, enabled=False)
+        session.add(make_position())
+        session.commit()
+
+        report = await manager.verify_coverage()
+
+        assert report.placed == []
+        assert report.drifts == []
+        order_manager.list_open_broker_orders.assert_not_awaited()
+
+
+def _config() -> AppConfig:
+    config = MagicMock(spec=AppConfig)
+    config.execution = ExecutionConfig()
+    config.ib = IBConfig()
+    config.mode = "paper"
+    config.risk = MagicMock()
+    config.risk.min_viable_fill_pct = 40.0
+    config.risk.passive_scan_interval_minutes = 30
+    config.risk.stop_loss_trailing_pct = 15.0
+    return config
+
+
+class TestTheScanDrivesTheVerifier:
+    """The 30-minute cadence, on the loop that owns the broker connection."""
+
+    def _runner(self, *, enabled: bool):
+        config = _config()
+        config.execution.broker_stops_enabled = enabled
+        config.ib.account_id = "DUN551088"
+        order_manager = AsyncMock()
+        order_manager.open_orders = {}
+        runner = ExecutionServiceRunner(
+            config=config,
+            redis_client=AsyncMock(),
+            order_manager=order_manager,
+            order_ledger=MagicMock(),
+        )
+        return runner
+
+    async def test_runs_on_the_first_call_then_waits_out_the_interval(self):
+        runner = self._runner(enabled=True)
+        runner._broker_stops.verify_coverage = AsyncMock()
+
+        assert await runner.maybe_run_stop_verification(0.0) is True
+        assert await runner.maybe_run_stop_verification(60.0) is False
+        assert await runner.maybe_run_stop_verification(1800.0) is True
+        assert runner._broker_stops.verify_coverage.await_count == 2
+
+    async def test_a_verifier_failure_never_tears_down_the_loop(self):
+        runner = self._runner(enabled=True)
+        runner._broker_stops.verify_coverage = AsyncMock(
+            side_effect=RuntimeError("IB went away")
+        )
+
+        assert await runner.maybe_run_stop_verification(0.0) is True
+
+    async def test_the_scan_is_inert_with_the_flag_off(self):
+        """AC6 — nothing runs, so nothing changes about the scan."""
+        runner = self._runner(enabled=False)
+
+        assert runner._broker_stops is None
+        assert await runner.maybe_run_stop_verification(0.0) is False
+
+
+class TestKillDoesNotOrphanStopCoverage:
+    """AC4 / design test #29d.
+
+    Cancel-all up front strips protection from every position at once, then
+    liquidates them one at a time. A sell that fails mid-loop leaves its
+    position both un-flattened and unprotected — and so does every position
+    after it. Cancelling each stop immediately before its own sell bounds the
+    unprotected window to the one position being flattened.
+    """
+
+    def _runner_with_two_positions(self, *, first_sell_fails: bool):
+        from services.execution.order_manager import OrderManager
+
+        config = _config()
+        executor = AsyncMock()
+        executor.cancel_order = AsyncMock(return_value=True)
+        order_manager = OrderManager(
+            executor=executor, redis_client=AsyncMock(), db_session=MagicMock()
+        )
+        now = datetime.now(timezone.utc)
+        for order_id, ticker in (("stop-A", "AAPL"), ("stop-B", "MSFT")):
+            order_manager.open_orders[order_id] = {
+                "ticker": ticker,
+                "quantity": 100,
+                "limit_price": None,
+                "stop_price": 187.0,
+                "placed_at": now,
+                "last_repriced_at": now,
+                "reprice_count": 0,
+                "recommendation_id": f"rec-{order_id}",
+                "order_type": "stop",
+            }
+        order_manager.open_orders["entry-C"] = {
+            "ticker": "NVDA",
+            "quantity": 10,
+            "limit_price": 500.0,
+            "placed_at": now,
+            "last_repriced_at": now,
+            "reprice_count": 0,
+            "recommendation_id": "rec-entry-C",
+            "order_type": "limit",
+        }
+
+        order = []
+
+        async def submit_exit(*, ticker, quantity, recommendation_id):
+            order.append(("sell", ticker))
+            if first_sell_fails and ticker == "AAPL":
+                raise RuntimeError("IB refused the liquidation")
+            return f"exit-{ticker}"
+
+        order_manager.submit_exit = submit_exit
+        original_cancel = order_manager.cancel_broker_order
+
+        async def cancel_broker_order(order_id):
+            order.append(("cancel", order_id))
+            return await original_cancel(order_id)
+
+        order_manager.cancel_broker_order = cancel_broker_order
+
+        runner = ExecutionServiceRunner(
+            config=config, redis_client=AsyncMock(), order_manager=order_manager
+        )
+        runner._positions = {"AAPL": 100, "MSFT": 50}
+        return runner, order_manager, order
+
+    def _kill(self) -> KillMessage:
+        return KillMessage(
+            timestamp=datetime(2026, 8, 17, 14, 0, tzinfo=timezone.utc),
+            reason="drawdown breach",
+            triggered_by="risk_management",
+        )
+
+    async def test_each_stop_is_cancelled_immediately_before_its_own_sell(self):
+        runner, _, sequence = self._runner_with_two_positions(
+            first_sell_fails=False
+        )
+
+        await runner.process_kill(self._kill())
+
+        assert sequence == [
+            ("cancel", "stop-A"),
+            ("sell", "AAPL"),
+            ("cancel", "stop-B"),
+            ("sell", "MSFT"),
+        ]
+
+    async def test_a_failed_first_sell_leaves_the_second_stop_resting(self):
+        runner, order_manager, sequence = self._runner_with_two_positions(
+            first_sell_fails=True
+        )
+
+        await runner.process_kill(self._kill())
+
+        # MSFT's stop was cancelled only when its own sell was attempted, and
+        # AAPL — whose sell failed — is the only position left unprotected.
+        assert sequence.index(("sell", "AAPL")) < sequence.index(
+            ("cancel", "stop-B")
+        )
+
+    async def test_working_non_stop_orders_still_go_up_front(self):
+        """A working entry must not fill into a book the kill is flattening."""
+        runner, order_manager, sequence = self._runner_with_two_positions(
+            first_sell_fails=False
+        )
+
+        await runner.process_kill(self._kill())
+
+        assert "entry-C" not in order_manager.open_orders
+        assert sequence[0] == ("cancel", "stop-A")
+
+    async def test_a_stop_on_a_position_with_no_shares_is_still_cancelled(self):
+        """Otherwise it rests against a flat book and sells short on trigger.
+
+        MSFT is not in the book, so the per-position path never reaches its
+        stop. The sweep after the liquidation loop is what catches it.
+        """
+        runner, order_manager, sequence = self._runner_with_two_positions(
+            first_sell_fails=False
+        )
+        runner._positions = {"AAPL": 100}
+
+        await runner.process_kill(self._kill())
+
+        assert sequence == [("cancel", "stop-A"), ("sell", "AAPL")]
+        assert order_manager.open_orders == {}

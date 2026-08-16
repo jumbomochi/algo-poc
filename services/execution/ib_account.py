@@ -9,6 +9,8 @@ from shared.broker_state import (
     BrokerAccountSnapshot,
     BrokerOpenOrder,
     BrokerPosition,
+    optional_float as _optional_float,
+    optional_str as _optional_str,
 )
 
 
@@ -18,31 +20,6 @@ class AccountValidationError(RuntimeError):
 
 async def _resolve(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
-
-
-def _optional_str(value: Any) -> str | None:
-    """A reported string, or None when IB left the field empty."""
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def _optional_float(value: Any) -> float | None:
-    """A reported price, or None when IB reports its "unset" sentinel.
-
-    IB fills numeric order fields it has no value for with ``DBL_MAX`` rather
-    than leaving them absent (observed on ``trailingPercent`` during the KAN-18
-    spike). Read literally that is a price of 1.8e308, so anything not finite
-    is reported as absent.
-    """
-    if value is None:
-        return None
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return None
-    return numeric if math.isfinite(numeric) else None
 
 
 def _matching_rows(

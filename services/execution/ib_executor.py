@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
 
+from shared.broker_state import optional_float, optional_str
 from shared.logging import get_logger
 
 logger = get_logger("ib_executor")
@@ -56,6 +57,18 @@ class OpenBrokerOrder:
     ticker: str
     quantity: float
     account_id: str | None = None
+    # What kind of order this is and where it triggers (KAN-20). The verifier
+    # has to tell a resting protective stop from a working entry, and compare
+    # the level IB is actually holding against the one the ledger recorded.
+    # Optional so every existing construction still builds.
+    order_type: str | None = None
+    aux_price: float | None = None
+    filled_quantity: float = 0.0
+
+    @property
+    def remaining_quantity(self) -> float:
+        """Shares this order can still sell — the coverage it actually gives."""
+        return max(0.0, self.quantity - self.filled_quantity)
 
 
 @runtime_checkable
@@ -624,6 +637,14 @@ class IBExecutor:
                     quantity=float(getattr(order, "totalQuantity", 0.0) or 0.0),
                     account_id=(
                         str(getattr(order, "account", "") or "") or None
+                    ),
+                    order_type=optional_str(getattr(order, "orderType", None)),
+                    aux_price=optional_float(getattr(order, "auxPrice", None)),
+                    filled_quantity=float(
+                        getattr(
+                            getattr(trade, "orderStatus", None), "filled", 0.0
+                        )
+                        or 0.0
                     ),
                 )
             )
