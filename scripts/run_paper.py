@@ -25,6 +25,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from copy import deepcopy
 from dataclasses import dataclass
@@ -1004,6 +1005,110 @@ def publish_unpublished_intents(
     return published
 
 
+ALERTS_STREAM = "stream:alerts"
+
+# A Redis connection error echoes the DSN, and the DSN carries the live
+# password. stream:alerts fans out to Telegram, which is not a secret store.
+# Same strip as scripts/ops/divergence_alert.py: greedy to the LAST '@',
+# because the password is whatever `secrets.sh` returned and may itself
+# contain '@' or whitespace. Over-redacting is the safe direction.
+_DSN_CREDENTIAL = re.compile(r"(?P<prefix>[a-zA-Z][\w+.-]*://[^\s/@]*:).*@")
+
+# The alert is emitted while Redis is, by hypothesis, sick. A server that
+# accepts the socket but never answers would otherwise hold the 04:15 job open
+# past its window — the alert is best-effort, so it is bounded rather than
+# patient.
+ALERT_SOCKET_TIMEOUT_SECONDS = 5
+
+
+def _redact(text: str) -> str:
+    return _DSN_CREDENTIAL.sub(r"\g<prefix>***@", text)
+
+
+def _redis_from_url(url: str, **kwargs: Any) -> Any:
+    """Single seam for every sync Redis connection this script opens."""
+    import redis as redis_sync
+
+    return redis_sync.Redis.from_url(url, **kwargs)
+
+
+def emit_publish_failure_alert(
+    redis_url: str, error: BaseException, *, account_id: str | None = None
+) -> bool:
+    """Page the operator that the day's orders never reached the pipeline.
+
+    Best-effort and deliberately silent on failure: the usual cause of a failed
+    publish is Redis being unreachable, which takes this path down with it. The
+    guaranteed signal is the nonzero exit code, which the launchd wrapper turns
+    into a Telegram message without touching the network.
+    """
+    from shared.schemas.messages import AlertMessage
+
+    message = _redact(
+        f"run_paper.py: publish to stream:recommendations failed ({error}). "
+        "The day's book is committed, but no orders reached risk or execution. "
+        "The intents remain replayable on the next run."
+    )
+    try:
+        conn = _redis_from_url(
+            redis_url,
+            socket_connect_timeout=ALERT_SOCKET_TIMEOUT_SECONDS,
+            socket_timeout=ALERT_SOCKET_TIMEOUT_SECONDS,
+        )
+        try:
+            alert = AlertMessage(
+                timestamp=datetime.now(timezone.utc),
+                event_type="publish_failed",
+                priority="high",
+                message=message,
+                context={"script": "run_paper.py", "account_id": account_id},
+            )
+            conn.xadd(ALERTS_STREAM, alert.to_stream_dict())
+        finally:
+            conn.close()
+        return True
+    except Exception as alert_error:
+        print(f"WARNING: could not raise the publish-failure alert ({alert_error})")
+        return False
+
+
+def publish_bridge(
+    session: Session,
+    *,
+    redis_url: str,
+    account_id: str | None,
+    entries_allowed: bool,
+    broker_snapshot: BrokerAccountSnapshot | None,
+) -> int:
+    """Replay the outbox to the service pipeline. Returns a process exit code.
+
+    Called after the DB commit on purpose (see the caller): a down pipeline must
+    never block the simulated book, which is the divergence benchmark. But
+    "must not block" is not "must not be reported" — before KAN-31 this printed
+    a warning and exited 0, so the daily digest called an order-less day a
+    success.
+    """
+    try:
+        conn = _redis_from_url(redis_url)
+        try:
+            count = publish_unpublished_intents(
+                session,
+                conn,
+                account_id=account_id,
+                entries_allowed=entries_allowed,
+                broker_snapshot=broker_snapshot,
+            )
+        finally:
+            conn.close()
+    except Exception as e:
+        session.rollback()
+        print(f"WARNING: publish to pipeline failed ({e}); intents remain replayable")
+        emit_publish_failure_alert(redis_url, e, account_id=account_id)
+        return 1
+    print(f"{count} recommendations published to stream:recommendations")
+    return 0
+
+
 async def read_broker_snapshot(
     *,
     host: str,
@@ -1523,29 +1628,22 @@ def main():
     # recommendations so risk gates them and execution places real IB paper
     # orders. Deliberately after the DB commit — the simulated book (the
     # divergence benchmark) is never blocked by the pipeline being down.
+    exit_code = 0
     if args.publish:
-        try:
-            import redis as redis_sync
-
-            conn = redis_sync.Redis.from_url(args.redis_url)
-            try:
-                count = publish_unpublished_intents(
-                    session,
-                    conn,
-                    account_id=broker_snapshot.account_id,
-                    entries_allowed=not entries_disabled,
-                    broker_snapshot=broker_snapshot,
-                )
-            finally:
-                conn.close()
-            print(f"{count} recommendations published to stream:recommendations")
-        except Exception as e:
-            session.rollback()
-            print(
-                f"WARNING: publish to pipeline failed ({e}); intents remain replayable"
-            )
+        exit_code = publish_bridge(
+            session,
+            redis_url=args.redis_url,
+            account_id=broker_snapshot.account_id,
+            entries_allowed=not entries_disabled,
+            broker_snapshot=broker_snapshot,
+        )
     session.close()
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    # main() returns the exit code; the bare `return` paths above yield None,
+    # which sys.exit treats as 0. The launchd wrapper alerts on any nonzero
+    # code, and run_pipeline_report.sh greps the log for "exit code: 0" — so
+    # this line is what stops a failed publish from reporting a green day.
+    sys.exit(main())
