@@ -20,7 +20,10 @@ import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
-from services.execution.runner import ExecutionServiceRunner
+from services.execution.runner import (
+    RISK_EXIT_ADJUSTMENT_KEYS,
+    ExecutionServiceRunner,
+)
 from services.risk_management import runner as runner_module
 from services.risk_management.runner import RiskServiceRunner
 from shared.config import (
@@ -1431,3 +1434,55 @@ class TestReFireAndReSize:
         assert float(order["quantity"]) == pytest.approx(10.0)
         assert order["recommendation_id"] == "liq-paper-AAPL-1786104000"
         session.rollback()
+
+
+def _exit_risk_adjustment_literals() -> list[frozenset[str]]:
+    """Every ``risk_adjustments={...}`` literal the risk service publishes.
+
+    AST again, for the same reason as the publish-site check: a new exit
+    control is a new dict literal, and this must see it the day it is written.
+    ``process_recommendation`` builds its adjustments in a variable rather than
+    a literal, so the ordinary sleeve path is out of scope here exactly as it
+    is out of scope for the guard.
+    """
+    tree = ast.parse(inspect.getsource(runner_module))
+    cls = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == "RiskServiceRunner"
+    )
+    literals: list[frozenset[str]] = []
+    for node in ast.walk(cls):
+        if not isinstance(node, ast.Call):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg != "risk_adjustments":
+                continue
+            for child in ast.walk(keyword.value):
+                if isinstance(child, ast.Dict):
+                    literals.append(
+                        frozenset(
+                            key.value
+                            for key in child.keys
+                            if isinstance(key, ast.Constant)
+                            and isinstance(key.value, str)
+                        )
+                    )
+    return literals
+
+
+def test_every_risk_exit_is_labelled_for_the_oversell_guard():
+    """KAN-10: execution reads ``risk_adjustments`` to tell an emergency sell
+    from a sleeve rotation, and only guards the former. A new exit control
+    that ships without one of those labels would submit uncapped into a
+    working BUY — silently, because the guard would simply not run.
+    """
+    literals = _exit_risk_adjustment_literals()
+
+    assert len(literals) >= 4, literals
+    unlabelled = [
+        sorted(keys)
+        for keys in literals
+        if not keys & RISK_EXIT_ADJUSTMENT_KEYS
+    ]
+    assert unlabelled == []

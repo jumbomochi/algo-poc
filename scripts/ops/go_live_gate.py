@@ -8,9 +8,19 @@ mocks without touching real infrastructure.
 
 from __future__ import annotations
 
+import argparse
+import json
+import re
+import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Protocol, runtime_checkable
+
+from sqlalchemy import create_engine
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session, sessionmaker
+
+from scripts.ops.gate_data_source import GateDataUnavailable, PostgresGateDataSource
 
 
 # ---------------------------------------------------------------------------
@@ -271,3 +281,199 @@ class GoLiveGateChecker:
     def is_ready_for_live(self) -> bool:
         """Return ``True`` only when **all** gates pass."""
         return all(r.passed for r in self.run_all_gates())
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+
+#: Gate name -> checker method. The name is spelled out here because a gate
+#: whose data source raises never gets to name itself, and an unmeasurable gate
+#: still has to appear in the report.
+_GATES: tuple[tuple[str, str], ...] = (
+    ("paper_duration", "check_paper_duration"),
+    ("risk_stability", "check_risk_stability"),
+    ("drawdown_bound", "check_drawdown"),
+    ("execution_quality", "check_execution_quality"),
+    ("reliability", "check_reliability"),
+    ("data_integrity", "check_data_integrity"),
+    ("model_governance", "check_model_governance"),
+    ("backtest_regression", "check_backtest_regression"),
+)
+
+
+def evaluate(
+    checker: GoLiveGateChecker, *, session: Session | None = None
+) -> list[GateResult]:
+    """Run all eight gates, containing per-gate evidence failures.
+
+    ``run_all_gates`` is fine against an in-memory source, but a real one can
+    fail to measure — no fills yet, no backtest artifact, a silent alert
+    recorder, a database that has not had ``alembic upgrade head`` run against
+    it. Such a gate becomes a **failure with the reason attached** rather than
+    an exception that hides the other seven. It is never a pass: the difference
+    between "we looked and it is bad" and "we could not look" must survive all
+    the way to the operator's screen.
+
+    Pass ``session`` when the source reads a database. Postgres aborts the whole
+    transaction on a failed statement, so without a rollback between gates one
+    missing table makes every later gate report "current transaction is
+    aborted" — a cascade of false unavailables that hides what those gates would
+    actually have said.
+    """
+    results: list[GateResult] = []
+    for name, method in _GATES:
+        try:
+            results.append(getattr(checker, method)())
+        except (GateDataUnavailable, SQLAlchemyError) as exc:
+            if session is not None:
+                session.rollback()
+            results.append(
+                GateResult(
+                    name=name,
+                    passed=False,
+                    message=f"evidence unavailable: {exc}",
+                    details={"data_unavailable": True},
+                )
+            )
+    return results
+
+
+def exit_code(results: list[GateResult]) -> int:
+    """``0`` only when every gate passes."""
+    return 0 if all(r.passed for r in results) else 1
+
+
+def render_text(
+    results: list[GateResult], *, mode: str, evaluated_at: datetime
+) -> str:
+    """Human-readable report: one line per gate, verdict last."""
+    width = max((len(r.name) for r in results), default=0)
+    lines = [
+        f"Go-live gate — mode={mode}, evaluated {evaluated_at.isoformat()}",
+        "",
+    ]
+    lines += [
+        f"  {'PASS' if r.passed else 'FAIL'}  {r.name.ljust(width)}  {r.message}"
+        for r in results
+    ]
+    failed = [r.name for r in results if not r.passed]
+    lines += ["", f"{len(results) - len(failed)}/{len(results)} gates pass."]
+    if failed:
+        lines.append("NOT READY for live — blocked by: " + ", ".join(failed))
+    else:
+        lines.append("READY for live — all gates pass.")
+    return "\n".join(lines)
+
+
+def render_json(
+    results: list[GateResult], *, mode: str, evaluated_at: datetime
+) -> str:
+    """Machine-readable report, for the gate-day review record."""
+    return json.dumps(
+        {
+            "mode": mode,
+            "evaluated_at": evaluated_at.isoformat(),
+            "ready": all(r.passed for r in results),
+            "gates": [
+                {
+                    "name": r.name,
+                    "passed": r.passed,
+                    "message": r.message,
+                    "details": r.details,
+                }
+                for r in results
+            ],
+        },
+        indent=2,
+        sort_keys=False,
+        default=str,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Evaluate the eight promotion gates against the real book."""
+    parser = argparse.ArgumentParser(
+        prog="python -m scripts.ops.go_live_gate",
+        description=(
+            "Evaluate the paper-to-live promotion gates. Exits 0 only when all "
+            "eight pass; a gate whose evidence cannot be measured fails."
+        ),
+    )
+    parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Defaults to config/default.yaml (ALGO_DATABASE_URL overrides it).",
+    )
+    parser.add_argument("--mode", default="paper", choices=["paper", "live"])
+    parser.add_argument(
+        "--paper-start",
+        type=date.fromisoformat,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help=(
+            "Start of the current paper era. Defaults to the earliest equity "
+            "snapshot, which reads across a re-baseline; pass the date recorded "
+            "in docs/operations/go-live-checklist.md when the clock restarted."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="output",
+        help="Where backtest_multi_*.json artifacts live.",
+    )
+    parser.add_argument("--json", action="store_true", help="Emit JSON.")
+    args = parser.parse_args(argv)
+
+    database_url = args.database_url
+    if database_url is None:
+        from shared.config import load_config
+
+        database_url = load_config("config/default.yaml").database.url
+
+    evaluated_at = datetime.now(timezone.utc)
+    engine = create_engine(database_url)
+    try:
+        # Probed once, before any gate runs. Per-gate containment is right for
+        # a gate that cannot be measured, but it would render an unreachable
+        # database as eight tidy "evidence unavailable" lines — indistinguishable
+        # from an empty book, and the config default (localhost:5432) is not
+        # where the local stack listens. A wrong URL must look wrong.
+        try:
+            with engine.connect():
+                pass
+        except SQLAlchemyError as exc:
+            print(
+                f"Cannot reach the database at {_redact(database_url)}: {exc}\n"
+                "Set --database-url or ALGO_DATABASE_URL to the running stack.",
+                file=sys.stderr,
+            )
+            return 2
+
+        with sessionmaker(bind=engine)() as session:
+            results = evaluate(
+                GoLiveGateChecker(
+                    PostgresGateDataSource(
+                        session,
+                        mode=args.mode,
+                        output_dir=args.output_dir,
+                        paper_start=args.paper_start,
+                    )
+                ),
+                session=session,
+            )
+    finally:
+        engine.dispose()
+
+    render = render_json if args.json else render_text
+    print(render(results, mode=args.mode, evaluated_at=evaluated_at))
+    return exit_code(results)
+
+
+def _redact(database_url: str) -> str:
+    """Strip any password before a URL reaches the operator's terminal."""
+    return re.sub(r"://([^:/@]+):[^@]*@", r"://\1:***@", database_url)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -12,12 +12,28 @@
 set -uo pipefail
 
 # launchd's default PATH lacks /usr/local/bin, where the docker CLI lives.
-export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# $ALGO_PATH_PREFIX exists only so the test can put its `docker`/`curl` stubs
+# ahead of the real ones — this assignment REPLACES the inherited PATH, so
+# prepending to $PATH from outside would otherwise have no effect. Unset in
+# production, where launchd supplies an empty environment.
+export PATH="${ALGO_PATH_PREFIX:+$ALGO_PATH_PREFIX:}/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-ALGO_DIR="/Users/huiliang/GitHub/algo-poc"
-VENV="$ALGO_DIR/.venv/bin/python"
+# ALGO_DIR / ALGO_PYTHON / ALGO_DATABASE_URL are overridable only so
+# tests/deploy/test_pipeline_report.py can drive this wrapper end-to-end
+# against stubs — launchd starts jobs with an empty environment, so production
+# always takes the defaults. Never export any of the three in a login shell: a
+# manual run would then use whatever tree, interpreter or database they point
+# at.
+ALGO_DIR="${ALGO_DIR:-/Users/huiliang/GitHub/algo-poc}"
+VENV="${ALGO_PYTHON:-$ALGO_DIR/.venv/bin/python}"
 LOG_DIR="$HOME/ibc/logs"
 TODAY=$(date +%Y%m%d)
+# Lower bound for "this run's" fills and rejections. Local midnight, stamped
+# with its offset so the summariser does no timezone guessing: at 04:52 SGT it
+# brackets the 04:15 paper run and excludes yesterday's. A UTC calendar date
+# would be wrong here — 04:52 SGT is 20:52 UTC the *previous* day, so the
+# headline would read zero fills on a day that traded.
+SINCE=$(date +%Y-%m-%dT00:00:00%z)
 LOG_FILE="$LOG_DIR/pipeline_report_${TODAY}.log"
 PAPER_LOG="$LOG_DIR/paper_trading_${TODAY}.log"
 # Secrets come from the macOS login keychain via the shared loader. Sourced by
@@ -57,6 +73,11 @@ fi
 if ! algo_load_secrets POSTGRES_PASSWORD REDIS_PASSWORD; then
     echo "$(ts): WARNING - docker compose sections will fail: $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
 fi
+
+# The paper DB is the dockerized postgres on a machine-local port (see
+# docker-compose.override.yml); config/default.yaml's localhost:5432 default
+# points at nothing on this machine. Same DSN run_divergence.sh builds.
+export ALGO_DATABASE_URL="${ALGO_DATABASE_URL:-postgresql://algo:${POSTGRES_PASSWORD:-}@localhost:55432/algo_poc}"
 
 {
     echo "$(ts): ===== daily pipeline report ====="
@@ -112,16 +133,27 @@ elif [ -f "$PAPER_LOG" ]; then
 else
     RUN_STATUS="❌ paper run MISSING"
 fi
-BUYS=$(grep -c '  BUY ' "$PAPER_LOG" 2>/dev/null || true)
-SELLS=$(grep -c '  SELL' "$PAPER_LOG" 2>/dev/null || true)
-SKIPS=$(grep -c '  SKIP' "$PAPER_LOG" 2>/dev/null || true)
+# Halt state, fills and rejections come from the ledger tables, not from log
+# text. A grep count can report a healthy number of orders while the pipeline
+# never received one (KAN-31), and a halt leaves no line in the paper log at
+# all — so the operator could be halted and never told. The BUY/SELL/SKIP
+# greps stay in the log body above for diagnosis; they are just no longer the
+# headline number.
+#
+# A read failure degrades to a named marker, never to a reassuring
+# "halt: clear" we cannot substantiate: absence of evidence is not evidence
+# that nothing is halted.
+SUMMARY=$("$VENV" "$ALGO_DIR/scripts/ops/pipeline_report_summary.py" \
+              --since "$SINCE" --mode "${ALGO_MODE:-paper}" \
+              2>>"$LOG_FILE") || SUMMARY=""
+[ -n "$SUMMARY" ] || SUMMARY="⚠️ halt/fills/rejections UNKNOWN (DB read failed)"
 DIV=$(grep -oE "Divergence monitor OK|BREACH|hard error" \
       "$LOG_DIR/divergence_${TODAY}.log" 2>/dev/null | tail -1)
 RESTING=$(grep -oE "[0-9]+ resting orders" "$LOG_FILE" | tail -1)
 SNAP=$(grep -q "$(date +%Y-%m-%d)" "$LOG_FILE" && echo "today's snapshot ✓" \
        || echo "today's snapshot MISSING")
 
-telegram "$RUN_STATUS — B:${BUYS:-0} S:${SELLS:-0} skip:${SKIPS:-0} | divergence: ${DIV:-no log} | ${RESTING:-IB check failed} | $SNAP"
+telegram "$SUMMARY | $RUN_STATUS | divergence: ${DIV:-no log} | ${RESTING:-IB check failed} | $SNAP"
 
 # Prune report logs older than 30 days.
 find "$LOG_DIR" -name "pipeline_report_*.log" -mtime +30 -delete 2>/dev/null

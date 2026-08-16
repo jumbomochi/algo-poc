@@ -105,6 +105,10 @@ class IBExecutorProtocol(Protocol):
         """Cancel a live broker order, tracked by this process or not."""
         ...
 
+    async def broker_position(self, con_id: int) -> float:
+        """Net quantity the broker reports held for one contract."""
+        ...
+
 
 class NotConnectedError(RuntimeError):
     """Raised when an order operation is attempted without an IB connection."""
@@ -640,6 +644,38 @@ class IBExecutor:
         self._ib.cancelOrder(trade.order)
         self._logger.info("Order cancel requested", order_id=order_id)
         return True
+
+    async def broker_position(self, con_id: int) -> float:
+        """Net quantity IB reports held for ``con_id`` on this account.
+
+        The broker is authoritative on what can be sold: the durable book
+        lags every fill the projector has not applied yet, and an emergency
+        sell sized off that lag is how an unlevered long-only account ends up
+        short (KAN-10). Live-requested rather than read from ib_insync's
+        cached ``positions()`` — the guard runs during exactly the incidents
+        where a stale subscription is most likely.
+
+        Scoped to the configured account (KAN-11): one Gateway session can
+        report positions for several accounts, and counting a foreign one
+        would license a sell this account cannot cover. With no account
+        configured there is nothing to filter on, so what the session reports
+        is the best available answer.
+        """
+        await self._ensure_connected()
+        total = 0.0
+        for item in await self._ib.reqPositionsAsync():
+            if (
+                self._account_id is not None
+                and str(getattr(item, "account", "") or "") != self._account_id
+            ):
+                continue
+            contract = getattr(item, "contract", None)
+            if contract is None:
+                continue
+            if int(getattr(contract, "conId", 0) or 0) != int(con_id):
+                continue
+            total += float(getattr(item, "position", 0.0) or 0.0)
+        return total
 
     async def restore_order_by_ref(
         self, recommendation_id: str, expected_order_id: str

@@ -275,9 +275,26 @@ class OrderLedger:
         return intent
 
     def record_submission(
-        self, recommendation_id: str, ib_order_id: str | int
+        self,
+        recommendation_id: str,
+        ib_order_id: str | int,
+        *,
+        reason: str | None = None,
     ) -> OrderIntent:
-        intent = self.transition(recommendation_id, OrderStatus.SUBMITTED)
+        """Mark an intent SUBMITTED and bind it to its broker order id.
+
+        ``reason`` records why the submitted order differs from the one that
+        was approved — today only the KAN-10 oversell cap, which places fewer
+        shares than the intent requested. It is a marker on the row, not an
+        archive: :meth:`transition` assigns ``reason`` unconditionally, so the
+        next transition (the fill, normally) clears it again. The durable
+        record of a capped exit is the log line and the placed quantity on the
+        fill; this is what an operator sees while the order is still working.
+        Omitted, the behaviour is exactly the pre-KAN-10 one.
+        """
+        intent = self.transition(
+            recommendation_id, OrderStatus.SUBMITTED, reason=reason
+        )
         intent.ib_order_id = str(ib_order_id)
         self.session.flush()
         return intent
@@ -417,6 +434,70 @@ class OrderLedger:
             conditions.append(~_unpublished_exit_clause())
         stmt = select(exists().where(*conditions))
         return bool(self.session.scalar(stmt))
+
+    def active_buy_intents(
+        self, *, account_id: str | None, con_id: int | None
+    ) -> list[OrderIntent]:
+        """Working BUY intents against one broker position, oldest first.
+
+        The scope is ``{account_id, con_id}`` and deliberately NOT the sleeve:
+        the broker holds one position per contract per account, so a BUY
+        working in *any* sleeve adds shares to the very position an exit is
+        sizing against. That is the whole oversell race (KAN-10) — the
+        emergency sell is sized from a book that has not seen the incoming
+        shares yet, and selling them too turns the exit into a short.
+
+        Only :data:`ACTIVE_RESERVATION_STATUSES` counts. A PROPOSED buy has
+        not been approved by risk so nothing will submit it, and a terminal
+        one is already off the broker's book; treating either as working would
+        make the guard's cancel-confirmation fail on an order that does not
+        exist, holding back the flatten for no reason.
+        """
+        stmt = (
+            select(OrderIntent)
+            .where(
+                OrderIntent.account_id == account_id,
+                OrderIntent.con_id == con_id,
+                func.upper(OrderIntent.action) == "BUY",
+                OrderIntent.status.in_(ACTIVE_RESERVATION_STATUSES),
+            )
+            .order_by(OrderIntent.id)
+        )
+        return list(self.session.scalars(stmt))
+
+    def outstanding_sell_quantity(
+        self,
+        *,
+        account_id: str | None,
+        con_id: int | None,
+        exclude_recommendation_id: str | None = None,
+    ) -> float:
+        """Shares already being sold against one broker position.
+
+        A broker position is not reduced by an unfilled sell, so the number IB
+        reports as held is a claim two exits can both act on. The kill path
+        deliberately does not suppress on a pending sell — it must flatten the
+        whole book — so a kill landing on top of a working stop-loss is a
+        designed-for case, and without this subtraction each would be sized
+        against the same shares and the account would end up short (KAN-10).
+
+        Same ``{account_id, con_id}`` scope as :meth:`active_buy_intents`, and
+        for the same reason: the sells drawing down this position may belong to
+        any sleeve. Counted as ``requested - filled`` so a partially filled
+        sell only reserves what is left of it.
+        """
+        unfilled = OrderIntent.requested_quantity - OrderIntent.filled_quantity
+        stmt = select(func.coalesce(func.sum(unfilled), 0.0)).where(
+            OrderIntent.account_id == account_id,
+            OrderIntent.con_id == con_id,
+            func.upper(OrderIntent.action) == "SELL",
+            OrderIntent.status.in_(ACTIVE_RESERVATION_STATUSES),
+        )
+        if exclude_recommendation_id is not None:
+            stmt = stmt.where(
+                OrderIntent.recommendation_id != exclude_recommendation_id
+            )
+        return max(0.0, float(self.session.scalar(stmt) or 0.0))
 
     def unpublished_exit_intents(
         self, *, mode: str | None = None

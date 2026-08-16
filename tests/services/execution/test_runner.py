@@ -2570,3 +2570,549 @@ class TestRecurringExitsCrossToExecution:
         )
         mock_redis.send_to_dead_letter.assert_not_awaited()
         ledger_session.rollback()
+
+
+
+
+class GuardOrderManager:
+    """Order manager exposing the KAN-10 guard primitives.
+
+    A bare ``AsyncMock`` cannot stand in here: the runner probes the manager's
+    *type* for ``broker_position`` and skips the guard when it is absent (the
+    same idiom it uses for ``restore_broker_tracking``), so a mock would
+    silently exercise the unguarded path. This records call order too, because
+    "cancel before sizing" is the whole point.
+    """
+
+    def __init__(
+        self,
+        *,
+        broker_quantity: float = 0.0,
+        unconfirmed_refs: list[str] | None = None,
+        position_error: Exception | None = None,
+    ) -> None:
+        self.broker_quantity = broker_quantity
+        self.unconfirmed_refs = unconfirmed_refs or []
+        self.position_error = position_error
+        self.calls: list[tuple] = []
+        self.open_orders: dict[str, dict] = {}
+
+    async def cancel_working_orders(self, orders):
+        self.calls.append(("cancel_working_orders", list(orders)))
+        return list(self.unconfirmed_refs)
+
+    async def broker_position(self, con_id):
+        self.calls.append(("broker_position", con_id))
+        if self.position_error is not None:
+            raise self.position_error
+        return self.broker_quantity
+
+    async def submit_exit(self, *, ticker, quantity, recommendation_id):
+        self.calls.append(("submit_exit", ticker, quantity, recommendation_id))
+        return "ib-sell"
+
+    async def submit_entry(self, *, ticker, quantity, limit_price, recommendation_id):
+        self.calls.append(("submit_entry", ticker, quantity, recommendation_id))
+        return "ib-buy-new"
+
+    async def cancel_all_orders(self):
+        self.calls.append(("cancel_all_orders",))
+        return []
+
+
+class TestOversellGuard:
+    """KAN-10: a risk-side sell must never open a short.
+
+    Position projection is asynchronous, so the ledger's view of a holding
+    lags the broker's. A BUY working when the sell fires closes that gap the
+    wrong way — the sell is sized against shares that have not arrived.
+    """
+
+    KILL_ID = "liq-paper-AAPL-1754568000"
+
+    @classmethod
+    def _sell_order(
+        cls,
+        quantity: float = 50.0,
+        recommendation_id: str | None = None,
+        risk_adjustments: dict | None = None,
+    ) -> ApprovedOrderMessage:
+        return ApprovedOrderMessage(
+            ticker="AAPL",
+            timestamp=datetime.now(timezone.utc),
+            action="sell",
+            quantity=quantity,
+            order_type="market",
+            limit_price=None,
+            recommendation_id=recommendation_id or cls.KILL_ID,
+            risk_adjustments=(
+                {"kill_switch": True, "reason": "drawdown"}
+                if risk_adjustments is None
+                else risk_adjustments
+            ),
+        )
+
+    @staticmethod
+    def _guard_runner(mock_config, mock_redis, ledger_session, manager):
+        ledger = OrderLedger(ledger_session)
+        runner = ExecutionServiceRunner(
+            config=mock_config,
+            redis_client=mock_redis,
+            order_manager=manager,
+            order_ledger=ledger,
+        )
+        return runner, ledger
+
+    @classmethod
+    def _seed_sell(
+        cls,
+        ledger,
+        quantity: float = 50.0,
+        recommendation_id: str | None = None,
+        *,
+        status: OrderStatus = OrderStatus.APPROVED,
+        filled_quantity: float = 0.0,
+    ):
+        recommendation_id = recommendation_id or cls.KILL_ID
+        proposal = SimpleNamespace(
+            recommendation_id=recommendation_id,
+            account_id="DUN551088",
+            mode="paper",
+            portfolio="momentum",
+            con_id=265598,
+            symbol="AAPL",
+            exchange="SMART",
+            currency="USD",
+            action="SELL",
+            quantity=quantity,
+            limit_price=None,
+            order_type="MKT",
+        )
+        intent = ledger.create_intent(proposal)
+        ledger.transition(recommendation_id, OrderStatus.APPROVED)
+        if status is not OrderStatus.APPROVED:
+            ledger.record_submission(recommendation_id, f"ib-{recommendation_id}")
+        intent.filled_quantity = filled_quantity
+        ledger.session.commit()
+        return intent
+
+    @staticmethod
+    def _alerts(mock_redis):
+        return [
+            AlertMessage.from_stream_dict(c.args[1])
+            for c in mock_redis.publish.call_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_working_buy_is_cancelled_before_the_sell_is_sized(
+        self, mock_config, mock_redis, ledger_session
+    ):
+        """Design test #26. A BUY that fills between sizing and selling is
+        exactly the race this prevents, so the cancel has to be confirmed
+        before the broker position is read — not merely requested."""
+        manager = GuardOrderManager(broker_quantity=30.0)
+        runner, ledger = self._guard_runner(
+            mock_config, mock_redis, ledger_session, manager
+        )
+        seed_approved_intent(ledger, "buy-1", ib_order_id="ib-buy", action="BUY")
+        self._seed_sell(ledger, quantity=50.0)
+
+        await runner.process_approved_order(self._sell_order(50.0))
+
+        assert [c[0] for c in manager.calls] == [
+            "cancel_working_orders",
+            "broker_position",
+            "submit_exit",
+        ]
+        assert manager.calls[0][1] == [("ib-buy", "buy-1")]
+        # Never short: the sell is capped to what the broker says is held.
+        assert manager.calls[2][2] == 30.0
+
+    @pytest.mark.asyncio
+    async def test_cap_takes_the_broker_quantity_when_the_ledger_is_higher(
+        self, mock_config, mock_redis, ledger_session
+    ):
+        manager = GuardOrderManager(broker_quantity=30.0)
+        runner, ledger = self._guard_runner(
+            mock_config, mock_redis, ledger_session, manager
+        )
+        self._seed_sell(ledger, quantity=50.0)
+
+        await runner.process_approved_order(self._sell_order(50.0))
+
+        assert ("submit_exit", "AAPL", 30.0, self.KILL_ID) in manager.calls
+
+    @pytest.mark.asyncio
+    async def test_cap_takes_the_ledger_quantity_when_the_broker_is_higher(
+        self, mock_config, mock_redis, ledger_session
+    ):
+        """The broker holds one position per {account, conId}; a second sleeve
+        holding the same contract must not have its shares sold by this
+        sleeve's exit. The published quantity and the intent disagree here on
+        purpose — otherwise the assertion passes whichever source is read."""
+        manager = GuardOrderManager(broker_quantity=200.0)
+        runner, ledger = self._guard_runner(
+            mock_config, mock_redis, ledger_session, manager
+        )
+        self._seed_sell(ledger, quantity=50.0)
+
+        await runner.process_approved_order(self._sell_order(80.0))
+
+        assert ("submit_exit", "AAPL", 50.0, self.KILL_ID) in manager.calls
+
+    @pytest.mark.asyncio
+    async def test_sells_already_working_are_subtracted_from_what_is_held(
+        self, mock_config, mock_redis, ledger_session
+    ):
+        """A broker position is not reduced by an unfilled sell. The kill path
+        deliberately does not suppress on a pending sell — it must flatten the
+        whole book — so a kill landing on a working stop-loss would otherwise
+        see the same 100 shares twice and sell 200 of them."""
+        manager = GuardOrderManager(broker_quantity=100.0)
+        runner, ledger = self._guard_runner(
+            mock_config, mock_redis, ledger_session, manager
+        )
+        self._seed_sell(
+            ledger,
+            quantity=100.0,
+            recommendation_id="stop-loss-DUN551088-momentum-265598-2026-08-16-0",
+            status=OrderStatus.SUBMITTED,
+            filled_quantity=40.0,
+        )
+        self._seed_sell(ledger, quantity=100.0)
+
+        await runner.process_approved_order(self._sell_order(100.0))
+
+        # 100 held, 60 of them already being sold -> 40 left to sell.
+        assert ("submit_exit", "AAPL", 40.0, self.KILL_ID) in manager.calls
+
+    @pytest.mark.asyncio
+    async def test_an_exit_already_covered_by_working_sells_is_not_submitted(
+        self, mock_config, mock_redis, ledger_session
+    ):
+        """And it does not page: the position IS being exited, by the sell
+        already working. A kill flattening a book where every name has a
+        stop-loss working would otherwise alert once per name."""
+        manager = GuardOrderManager(broker_quantity=100.0)
+        runner, ledger = self._guard_runner(
+            mock_config, mock_redis, ledger_session, manager
+        )
+        self._seed_sell(
+            ledger,
+            quantity=100.0,
+            recommendation_id="stop-loss-DUN551088-momentum-265598-2026-08-16-0",
+            status=OrderStatus.SUBMITTED,
+        )
+        self._seed_sell(ledger, quantity=100.0)
+
+        await runner.process_approved_order(self._sell_order(100.0))
+
+        assert "submit_exit" not in [c[0] for c in manager.calls]
+        assert ledger.get(self.KILL_ID).status == OrderStatus.SUBMISSION_FAILED.value
+        assert self._alerts(mock_redis) == []
+
+    @pytest.mark.asyncio
+    async def test_capped_sell_records_the_reduction_on_the_intent(
+        self, mock_config, mock_redis, ledger_session
+    ):
+        """Without this the shortfall is only inferable from the fills."""
+        manager = GuardOrderManager(broker_quantity=30.0)
+        runner, ledger = self._guard_runner(
+            mock_config, mock_redis, ledger_session, manager
+        )
+        self._seed_sell(ledger, quantity=50.0)
+
+        await runner.process_approved_order(self._sell_order(50.0))
+
+        intent = ledger.get(self.KILL_ID)
+        assert intent.status == OrderStatus.SUBMITTED.value
+        assert "50" in intent.reason and "30" in intent.reason
+        assert "oversell guard" in intent.reason.lower()
+
+    @pytest.mark.asyncio
+    async def test_uncapped_sell_leaves_the_intent_reason_untouched(
+        self, mock_config, mock_redis, ledger_session
+    ):
+        """AC6: when there is no working BUY and the positions agree, the
+        common path is what it was before the guard."""
+        manager = GuardOrderManager(broker_quantity=50.0)
+        runner, ledger = self._guard_runner(
+            mock_config, mock_redis, ledger_session, manager
+        )
+        self._seed_sell(ledger, quantity=50.0)
+
+        await runner.process_approved_order(self._sell_order(50.0))
+
+        assert manager.calls[0] == ("cancel_working_orders", [])
+        assert ("submit_exit", "AAPL", 50.0, self.KILL_ID) in manager.calls
+        assert ledger.get(self.KILL_ID).reason is None
+        assert self._alerts(mock_redis) == []
+
+    @pytest.mark.asyncio
+    async def test_a_hair_under_the_requested_quantity_does_not_cap(
+        self, mock_config, mock_redis, ledger_session
+    ):
+        """Quantities are floats. Capping on a rounding artefact would place
+        49.9999, which whole-share truncation turns into 49 — an emergency
+        flatten that leaves a share behind."""
+        manager = GuardOrderManager(broker_quantity=49.9999999)
+        runner, ledger = self._guard_runner(
+            mock_config, mock_redis, ledger_session, manager
+        )
+        self._seed_sell(ledger, quantity=50.0)
+
+        await runner.process_approved_order(self._sell_order(50.0))
+
+        assert ("submit_exit", "AAPL", 50.0, self.KILL_ID) in manager.calls
+
+    @pytest.mark.asyncio
+    async def test_zero_held_at_the_broker_submits_nothing(
+        self, mock_config, mock_redis, ledger_session
+    ):
+        """Silently succeeding on a no-op sell would hide a reconciliation
+        problem — the book thinks it holds shares the broker does not."""
+        manager = GuardOrderManager(broker_quantity=0.0)
+        runner, ledger = self._guard_runner(
+            mock_config, mock_redis, ledger_session, manager
+        )
+        self._seed_sell(ledger, quantity=50.0)
+
+        await runner.process_approved_order(self._sell_order(50.0))
+
+        assert [c[0] for c in manager.calls] == [
+            "cancel_working_orders",
+            "broker_position",
+        ]
+        intent = ledger.get(self.KILL_ID)
+        assert intent.status == OrderStatus.SUBMISSION_FAILED.value
+        assert "broker holds none" in intent.reason.lower()
+        alerts = self._alerts(mock_redis)
+        assert [a.event_type for a in alerts] == ["oversell_guard_no_position"]
+        assert alerts[0].priority == "critical"
+
+    @pytest.mark.asyncio
+    async def test_unconfirmed_cancel_does_not_fall_through_to_the_sell(
+        self, mock_config, mock_redis, ledger_session
+    ):
+        """AC5: selling into an unresolved working BUY is the exact failure
+        this guards."""
+        manager = GuardOrderManager(
+            broker_quantity=50.0, unconfirmed_refs=["buy-1"]
+        )
+        runner, ledger = self._guard_runner(
+            mock_config, mock_redis, ledger_session, manager
+        )
+        seed_approved_intent(ledger, "buy-1", ib_order_id="ib-buy", action="BUY")
+        self._seed_sell(ledger, quantity=50.0)
+
+        await runner.process_approved_order(self._sell_order(50.0))
+
+        assert [c[0] for c in manager.calls] == ["cancel_working_orders"]
+        intent = ledger.get(self.KILL_ID)
+        assert intent.status == OrderStatus.SUBMISSION_FAILED.value
+        assert "working buys still live" in intent.reason.lower()
+        alerts = self._alerts(mock_redis)
+        assert [a.event_type for a in alerts] == ["oversell_guard_cancel_failed"]
+        assert alerts[0].priority == "critical"
+
+    @pytest.mark.asyncio
+    async def test_broker_read_is_retried_before_the_exit_is_refused(
+        self, mock_config, mock_redis, ledger_session
+    ):
+        """This Gateway drops API sockets routinely; one transient reconnect
+        race must not be enough to refuse an emergency flatten."""
+        manager = GuardOrderManager(position_error=RuntimeError("IB down"))
+        runner, ledger = self._guard_runner(
+            mock_config, mock_redis, ledger_session, manager
+        )
+        self._seed_sell(ledger, quantity=50.0)
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            await runner.process_approved_order(self._sell_order(50.0))
+
+        assert [c[0] for c in manager.calls].count("broker_position") == 3
+        assert "submit_exit" not in [c[0] for c in manager.calls]
+        assert [a.event_type for a in self._alerts(mock_redis)] == [
+            "oversell_guard_position_unavailable"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_refused_exit_is_terminal_so_risk_can_re_fire(
+        self, mock_config, mock_redis, ledger_session
+    ):
+        """The reason this refuses rather than retaining the message. A
+        retained exit sits in the PEL until the service restarts, and while it
+        sits its intent stays non-terminal — which is exactly what
+        `nonterminal_sell_exists` reads to suppress the *next* stop-loss for
+        the position. Retaining would mute the control being protected."""
+        manager = GuardOrderManager(position_error=RuntimeError("IB down"))
+        runner, ledger = self._guard_runner(
+            mock_config, mock_redis, ledger_session, manager
+        )
+        self._seed_sell(ledger, quantity=50.0)
+        mock_redis.read_group = AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    message_id="1-1", data=self._sell_order(50.0).to_stream_dict()
+                )
+            ]
+        )
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            await runner._consume_and_process(
+                "stream:approved_orders",
+                ApprovedOrderMessage.from_stream_dict,
+                runner.process_approved_order,
+                count=1,
+                block_ms=0,
+            )
+
+        assert not ledger.nonterminal_sell_exists(
+            account_id="DUN551088", portfolio="momentum", con_id=265598
+        )
+        # Acked, not dead-lettered: the refusal is recorded durably, and risk
+        # re-fires from a terminal row.
+        mock_redis.ack.assert_awaited_once()
+        mock_redis.send_to_dead_letter.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_approved_buy_that_never_reached_ib_is_terminalised(
+        self, mock_config, mock_redis, ledger_session
+    ):
+        """An APPROVED buy is still sitting on stream:approved_orders waiting
+        to be submitted. Leaving it alone would let it reach IB moments after
+        the flatten — the same race, one message later."""
+        manager = GuardOrderManager(broker_quantity=50.0)
+        runner, ledger = self._guard_runner(
+            mock_config, mock_redis, ledger_session, manager
+        )
+        seed_approved_intent(ledger, "buy-1", action="BUY")
+        self._seed_sell(ledger, quantity=50.0)
+
+        await runner.process_approved_order(self._sell_order(50.0))
+
+        buy = ledger.get("buy-1")
+        assert buy.status == OrderStatus.SUBMISSION_FAILED.value
+        assert "oversell guard" in buy.reason.lower()
+        # Nothing to cancel at the broker: it was never submitted.
+        assert manager.calls[0] == ("cancel_working_orders", [])
+
+    @pytest.mark.asyncio
+    async def test_terminalised_buy_is_not_submitted_when_its_message_arrives(
+        self, mock_config, mock_redis, ledger_session
+    ):
+        manager = GuardOrderManager(broker_quantity=50.0)
+        runner, ledger = self._guard_runner(
+            mock_config, mock_redis, ledger_session, manager
+        )
+        seed_approved_intent(ledger, "buy-1", action="BUY")
+        self._seed_sell(ledger, quantity=50.0)
+        await runner.process_approved_order(self._sell_order(50.0))
+
+        await runner.process_approved_order(
+            make_approved_order(recommendation_id="buy-1")
+        )
+
+        assert "submit_entry" not in [c[0] for c in manager.calls]
+
+    @pytest.mark.asyncio
+    async def test_a_passive_trim_caps_but_cancels_nothing(
+        self, mock_config, mock_redis, ledger_session
+    ):
+        """A trim is a rebalance back to the soft target — a few shares off a
+        position that stays open. Cancelling another sleeve's 300-share entry
+        under a 5-share trim would destroy a legitimate order to no purpose,
+        and an APPROVED one is destroyed permanently: nothing recreates it."""
+        manager = GuardOrderManager(broker_quantity=300.0)
+        runner, ledger = self._guard_runner(
+            mock_config, mock_redis, ledger_session, manager
+        )
+        seed_approved_intent(ledger, "buy-1", ib_order_id="ib-buy", action="BUY")
+        self._seed_sell(ledger, quantity=5.0)
+
+        await runner.process_approved_order(
+            self._sell_order(
+                5.0,
+                risk_adjustments={"passive_trim": True, "target_pct": 10.0},
+            )
+        )
+
+        assert [c[0] for c in manager.calls] == ["broker_position", "submit_exit"]
+        assert ledger.get("buy-1").status == OrderStatus.SUBMITTED.value
+
+    @pytest.mark.asyncio
+    async def test_a_passive_trim_is_still_capped(
+        self, mock_config, mock_redis, ledger_session
+    ):
+        manager = GuardOrderManager(broker_quantity=3.0)
+        runner, ledger = self._guard_runner(
+            mock_config, mock_redis, ledger_session, manager
+        )
+        self._seed_sell(ledger, quantity=5.0)
+
+        await runner.process_approved_order(
+            self._sell_order(
+                5.0,
+                risk_adjustments={"passive_trim": True, "target_pct": 10.0},
+            )
+        )
+
+        assert ("submit_exit", "AAPL", 3.0, self.KILL_ID) in manager.calls
+
+    @pytest.mark.asyncio
+    async def test_ordinary_sleeve_sell_is_not_guarded(
+        self, mock_config, mock_redis, ledger_session
+    ):
+        """Out of scope by design: a daily sleeve exit flows through the
+        recommendation path with its own sizing, and cancelling a working BUY
+        under a routine rotation would be a behaviour change nobody asked
+        for."""
+        manager = GuardOrderManager(broker_quantity=0.0)
+        runner, ledger = self._guard_runner(
+            mock_config, mock_redis, ledger_session, manager
+        )
+        self._seed_sell(ledger, quantity=50.0)
+
+        await runner.process_approved_order(
+            self._sell_order(50.0, risk_adjustments={"portfolio": "momentum"})
+        )
+
+        assert [c[0] for c in manager.calls] == ["submit_exit"]
+
+    @pytest.mark.asyncio
+    async def test_republished_exit_is_guarded(
+        self, mock_config, mock_redis, ledger_session
+    ):
+        """KAN-8 republishes an orphaned exit with its own risk_adjustments;
+        it is still a risk-side sell and still needs the cap."""
+        manager = GuardOrderManager(broker_quantity=30.0)
+        runner, ledger = self._guard_runner(
+            mock_config, mock_redis, ledger_session, manager
+        )
+        self._seed_sell(ledger, quantity=50.0)
+
+        await runner.process_approved_order(
+            self._sell_order(
+                50.0, risk_adjustments={"republished": True, "reason": "orphan"}
+            )
+        )
+
+        assert ("submit_exit", "AAPL", 30.0, self.KILL_ID) in manager.calls
+
+    @pytest.mark.asyncio
+    async def test_an_unguardable_risk_sell_says_so(
+        self, mock_config, mock_redis, mock_order_manager, ledger_session, capsys
+    ):
+        """The probe fails open so embeddings without a broker keep working.
+        A safety control that quietly does not run is the failure mode this
+        whole tranche of work exists to remove, so it is at least logged."""
+        runner, ledger = self._guard_runner(
+            mock_config, mock_redis, ledger_session, mock_order_manager
+        )
+        self._seed_sell(ledger, quantity=50.0)
+
+        await runner.process_approved_order(self._sell_order(50.0))
+
+        mock_order_manager.submit_exit.assert_awaited_once()
+        assert "not guarded against overselling" in capsys.readouterr().out

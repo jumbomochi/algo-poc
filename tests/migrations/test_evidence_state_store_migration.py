@@ -18,6 +18,7 @@ EVIDENCE_TABLES = {
 }
 
 PREVIOUS_REVISION = "82623f87013d"
+EVIDENCE_REVISION = "d4b8e1f5a207"
 
 
 def _config(database_url: str) -> Config:
@@ -144,4 +145,8 @@ def test_evidence_revision_keeps_a_single_head(monkeypatch, tmp_path):
     heads = script.get_heads()
 
     assert len(heads) == 1
-    assert script.get_revision(heads[0]).down_revision == PREVIOUS_REVISION
+    # Asserted against the evidence revision itself rather than the head, so
+    # later migrations stacking on top do not read as a fork.
+    assert (
+        script.get_revision(EVIDENCE_REVISION).down_revision == PREVIOUS_REVISION
+    )

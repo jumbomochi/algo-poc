@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -216,3 +217,109 @@ class TestBrokerOrderPassthrough:
 
         assert await mgr.cancel_broker_order("77") is False
         assert "77" in mgr.open_orders
+
+
+class TestOversellGuardPrimitives:
+    """KAN-10: what the execution runner needs from the broker before it
+    sizes an emergency sell — working BUYs gone, and a position count."""
+
+    @staticmethod
+    def _manager(executor):
+        mgr = OrderManager(
+            executor=executor,
+            redis_client=AsyncMock(),
+            db_session=MagicMock(),
+        )
+        # No real waiting in tests; the schedule's length is what matters.
+        mgr._cancel_ack_backoff = (0.0, 0.0, 0.0)
+        return mgr
+
+    @staticmethod
+    def _open_order(order_id: str = "77", order_ref: str = "buy-1"):
+        return SimpleNamespace(
+            order_id=order_id,
+            order_ref=order_ref,
+            action="BUY",
+            ticker="AAPL",
+            quantity=50.0,
+            account_id="DUN551088",
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancel_is_confirmed_against_the_broker_not_the_request(self):
+        """cancelOrder only *requests* a cancel. Sizing a sell the moment the
+        request returns is the race the guard exists to close, so the ref has
+        to be gone from the broker's open orders first."""
+        executor = AsyncMock()
+        executor.cancel_broker_order = AsyncMock(return_value=True)
+        executor.list_open_orders = AsyncMock(
+            side_effect=[[self._open_order()], []]
+        )
+        mgr = self._manager(executor)
+
+        assert await mgr.cancel_working_orders([("77", "buy-1")]) == []
+        assert executor.list_open_orders.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_a_ref_still_live_after_the_wait_is_reported(self):
+        executor = AsyncMock()
+        executor.cancel_broker_order = AsyncMock(return_value=True)
+        executor.list_open_orders = AsyncMock(
+            return_value=[self._open_order()]
+        )
+        mgr = self._manager(executor)
+
+        assert await mgr.cancel_working_orders([("77", "buy-1")]) == ["buy-1"]
+
+    @pytest.mark.asyncio
+    async def test_an_order_already_gone_from_ib_is_confirmed_cancelled(self):
+        """cancel_broker_order returns False for an order IB no longer lists —
+        which is the state the caller wanted. The broker's book decides, not
+        the return value of the request."""
+        executor = AsyncMock()
+        executor.cancel_broker_order = AsyncMock(return_value=False)
+        executor.list_open_orders = AsyncMock(return_value=[])
+        mgr = self._manager(executor)
+
+        assert await mgr.cancel_working_orders([("77", "buy-1")]) == []
+
+    @pytest.mark.asyncio
+    async def test_a_raising_cancel_is_still_settled_by_the_brokers_book(self):
+        """The book is the authority, not the request. An order IB does not
+        list is not working, however the cancel that removed it returned."""
+        executor = AsyncMock()
+        executor.cancel_broker_order = AsyncMock(side_effect=RuntimeError("boom"))
+        executor.list_open_orders = AsyncMock(return_value=[])
+        mgr = self._manager(executor)
+
+        assert await mgr.cancel_working_orders([("77", "buy-1")]) == []
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_book_leaves_the_ref_unconfirmed(self):
+        """The disconnect case: nothing can be confirmed, so nothing is. This
+        is what stops an emergency sell from being sized while a BUY may still
+        be working."""
+        executor = AsyncMock()
+        executor.cancel_broker_order = AsyncMock(side_effect=RuntimeError("boom"))
+        executor.list_open_orders = AsyncMock(side_effect=RuntimeError("no ib"))
+        mgr = self._manager(executor)
+
+        assert await mgr.cancel_working_orders([("77", "buy-1")]) == ["buy-1"]
+
+    @pytest.mark.asyncio
+    async def test_no_orders_makes_no_broker_call(self):
+        executor = AsyncMock()
+        mgr = self._manager(executor)
+
+        assert await mgr.cancel_working_orders([]) == []
+        executor.cancel_broker_order.assert_not_awaited()
+        executor.list_open_orders.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_broker_position_delegates_to_the_executor(self):
+        executor = AsyncMock()
+        executor.broker_position = AsyncMock(return_value=7.0)
+        mgr = self._manager(executor)
+
+        assert await mgr.broker_position(265598) == 7.0
+        executor.broker_position.assert_awaited_once_with(265598)

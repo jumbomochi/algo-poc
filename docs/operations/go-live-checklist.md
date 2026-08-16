@@ -16,8 +16,100 @@ algo-poc trading bot is promoted from **paper** trading mode to **live** mode.
 
 ## Pre-Promotion Gates
 
-All eight gates below must pass. Run `scripts/ops/go_live_gate.py` for an
-automated assessment; record the results alongside manual verification.
+All eight gates below must pass. Run the evaluator for an automated assessment
+and record its output alongside manual verification:
+
+```bash
+# The config default is localhost:5432; the local stack listens on 55432.
+export ALGO_DATABASE_URL=postgresql://algo:$POSTGRES_PASSWORD@localhost:55432/algo_poc
+python -m scripts.ops.go_live_gate --paper-start 2026-07-30
+python -m scripts.ops.go_live_gate --paper-start 2026-07-30 --json
+```
+
+**`--paper-start` is not optional in practice — pass the restarted clock date
+recorded under Gate 1 below.** Without it the evaluator uses the earliest
+equity snapshot, which on this book is **2026-07-10**, i.e. *before* the Path A
+flatten-and-refund. Measured across that reset, gate 1 overstates the elapsed
+days and gate 3 reports the re-baseline as a **68.38% drawdown** — a capital
+event dressed up as a trading loss. With `--paper-start 2026-07-30` the same
+book reports **0.33%**. Both numbers are arithmetically correct; only one is
+about trading.
+
+It exits `0` only when all eight gates pass, `2` if the database is unreachable
+(checked before any gate runs, so a wrong URL cannot masquerade as an empty
+book). Today several gates fail — the 60-day clock and model governance among
+them — and that is the correct output, not a malfunction.
+
+### Where each gate's number comes from
+
+`PostgresGateDataSource` (`scripts/ops/gate_data_source.py`) maps every gate to
+one query against the trading database. Two rules apply throughout:
+
+- **A gate never passes by ignorance.** When the evidence cannot be measured —
+  no fills yet, no backtest artifact, a silent alert recorder — the gate is
+  reported as `evidence unavailable: <reason>` and **fails**. "We looked and it
+  is bad" and "we could not look" are different answers and both block
+  promotion, but only the first is a measurement.
+- **Drills never move a number.** Every portfolio-scoped query excludes
+  `_`-prefixed portfolios, so a synthetic stop-loss drill cannot contaminate
+  drawdown or execution quality.
+
+| Gate | Source |
+|---|---|
+| 1 Paper duration | earliest `equity_snapshots.date` for a non-excluded portfolio |
+| 2 Risk stability | `system_halt` rows with `source='circuit_breaker'` in the window (a manual `kill` is an operator decision, not instability) |
+| 3 Drawdown | `shared/evidence_store.max_drawdown_pct` — the same arithmetic the epoch report uses, not a second copy |
+| 4 Execution quality | `execution_fills` collapsed to a per-order VWAP against `order_intents.limit_price`; failure rate over the orders that actually reached the broker |
+| 5 Reliability | `alert_records` — see below |
+| 6 Data integrity | newest `reconciliation_reports` row for this mode, **rejected if older than 7 days** — a stale `ok` is not a current one |
+| 7 Model governance | `model_versions` |
+| 8 Backtest regression | `aggregate.metrics` of the newest `output/backtest_multi_*.json` |
+
+### Resolved: how gates 5 and 6 get durable evidence (KAN-42)
+
+Both gates once asked questions nothing stored the answer to. Resolution:
+
+- **Gate 6** needed no new mechanism. `scripts/reconcile_paper.py` already
+  persists a `reconciliation_reports` row on every paper run, so the gate reads
+  the newest one for its mode. No row at all is *unavailable*, never "ok".
+- **Gate 5** did. Alerts were published to `stream:alerts`, fanned out, and
+  forgotten. The notifications service now writes one `alert_records` row per
+  alert **before dispatching**, so an alert no channel could deliver is still on
+  the record. The database is deliberately off the delivery path: a failed write
+  is logged and the alert still goes out.
+
+  The gate counts criticals in the window with `resolved_at IS NULL`. It is
+  guarded against the failure this whole readiness effort exists to remove: if
+  the recorder wrote *nothing at all* in the window, a count of zero would mean
+  "notifications was down" just as readily as "nothing went wrong", so the gate
+  reports evidence unavailable instead of passing.
+
+  **Nothing in the system publishes a routine alert on a schedule**, so a
+  genuinely quiet fortnight reports unavailable. Until something does, an
+  operator must prime the guard at least once every 14 days:
+
+  ```bash
+  python -m scripts.ops.send_test_alert            # low priority
+  ```
+
+  A low-priority alert proves the pipe without counting against the gate.
+
+  Resolving an alert is a named human act, never automatic:
+
+  ```bash
+  python -m scripts.ops.resolve_alert --list
+  python -m scripts.ops.resolve_alert --id 41 --resolved-by <name>
+  ```
+
+  Already-resolved alerts are refused rather than overwritten, so the trail
+  records who called the incident closed first.
+
+**Gate 7 has no approval field to read.** `model_versions` records
+`is_active`, not approval, so the data source reports `none` / `inactive` /
+`active` and never `approved` — inventing governance the repo does not have is
+exactly the kind of silent pass the rest of this document is written against.
+Gate 7 therefore fails until the ML decision (KAN-35) and the two-person
+approval substitute (KAN-37) land.
 
 ### Gate 1 — Paper Trading Duration
 
@@ -86,11 +178,27 @@ metrics accrue from here via the divergence monitor + reconciliation reports.
 - Median slippage: ______ bps  (accruing since 2026-07-30)
 - Failed-order rate: ______%  (accruing since 2026-07-30)
 
+**Read the slippage number with its benchmark in mind.** Nothing in the repo
+stores an arrival price, so slippage is measured against the *intent's limit* —
+the only benchmark that exists. `execution.entry_buffer_pct: 0.3` places buy
+limits ~30 bps above the reference, so a normal un-repriced fill reads as
+roughly **−30 bps** and this arm of the gate can almost never fail. A negative
+reading is the buffer, not evidence of excellent execution. Capturing an arrival
+price so the metric can bite is a follow-up, not part of KAN-42.
+
+The failed-order rate counts **broker rejections only**. Orders the system
+declined to send itself — a buy refused while halted, a size that rounds to zero
+whole shares — leave both sides of the ratio; the execution service does not
+call those failures either, and gate 2 already counts the halt.
+
 ### Gate 5 — Reliability
 
 - [ ] **Zero** unresolved critical alerts (Redis, PostgreSQL, IB connectivity)
   in the last 14 days.
 - Unresolved alerts: ______
+- Evidence: `alert_records`, written by the notifications service. A window with
+  no recorded alert of any priority reports *unavailable*, not zero — see
+  "Resolved: how gates 5 and 6 get durable evidence" above.
 
 ### Gate 6 — Data Integrity
 
