@@ -12,7 +12,7 @@ freezes new entries once it crosses ``sector_concentration_pct`` (the
 2026-08-07 incident). Curated ``SECTOR_MAP`` entries take precedence over this
 map, so nothing here can change how a currently-traded name is bucketed.
 
-Generated 2026-08-16 from 48 snapshots; 690 tickers.
+Generated 2026-08-16 from 48 snapshots; 688 tickers.
 """
 from __future__ import annotations
 
@@ -92,7 +92,6 @@ HISTORICAL_SECTOR_MAP: dict[str, str] = {
     'BCR': 'Healthcare',
     'BEN': 'Financials',
     'BF B': 'Consumer Staples',
-    'BF-B': 'Consumer Staples',
     'BG': 'Consumer Staples',
     'BHF': 'Financials',
     'BHGE': 'Energy',
@@ -107,7 +106,6 @@ HISTORICAL_SECTOR_MAP: dict[str, str] = {
     'BNY': 'Financials',
     'BR': 'Industrials',
     'BRCM': 'Technology',
-    'BRK-B': 'Financials',
     'BRO': 'Financials',
     'BWA': 'Consumer Discretionary',
     'BX': 'Financials',

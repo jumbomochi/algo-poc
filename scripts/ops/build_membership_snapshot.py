@@ -101,11 +101,19 @@ GICS_TO_REPO_SECTOR: dict[str, str] = {
 def normalize_symbol(symbol: str) -> str:
     """Wikipedia's ticker spelling -> this repo's.
 
-    Class shares are the only real difference: Wikipedia writes ``BRK.B`` and
-    every universe list here writes ``BRK B`` (IB's own convention).
+    Class shares are the only real difference, and Wikipedia has spelled them
+    three ways across this window: ``BRK.B``, ``BRK-B`` (2015-07 .. 2017-04)
+    and ``BRK B``. All normalise to ``BRK B`` — IB's convention, and the
+    spelling in ``SP500_TOP50``.
+
+    Normalising *both* separators is not cosmetic. Left distinct, ``BRK.B`` and
+    ``BRK-B`` read as an index removal in 2015 and a re-addition in 2017: the
+    backtest liquidates the position at the next open with ``exit_reason:
+    universe_removal`` and books a fabricated round-trip, while the hyphen
+    spelling prices at IB as nothing and lands in the coverage exclusions.
     """
     cleaned = symbol.replace(" ", " ").replace("­", "").strip()
-    return cleaned.replace(".", " ").upper()
+    return cleaned.replace(".", " ").replace("-", " ").upper()
 
 
 def repo_sector(gics: str) -> str:

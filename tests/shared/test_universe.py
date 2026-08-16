@@ -320,3 +320,27 @@ class TestCommittedMembershipSnapshot:
         from shared.universe import SECTOR_MAP
 
         assert set(HISTORICAL_SECTOR_MAP) & set(SECTOR_MAP) == set()
+
+    def test_no_ticker_carries_a_separator_ib_cannot_resolve(self, calendar):
+        """One spelling per company, or the same name reads as two.
+
+        Wikipedia wrote Berkshire as BRK.B, BRK-B and BRK B at different points
+        in this window. Any spelling that survives normalisation as a second
+        symbol produces a fabricated index removal + re-addition (the backtest
+        liquidates at the next open with exit_reason: universe_removal) and is
+        unpriceable at IB, so it also inflates the coverage exclusions.
+        """
+        bad = sorted(
+            t for t in calendar.all_tickers()
+            if not all(c.isalpha() or c == " " for c in t)
+        )
+        assert bad == [], (
+            f"tickers with an unnormalised separator: {bad}. Fix "
+            "normalize_symbol in scripts/ops/build_membership_snapshot.py and "
+            "regenerate."
+        )
+
+    def test_the_class_share_spelling_matches_the_static_universe(self, calendar):
+        tickers = set(calendar.all_tickers())
+        assert "BRK B" in tickers
+        assert "BRK-B" not in tickers and "BRK.B" not in tickers

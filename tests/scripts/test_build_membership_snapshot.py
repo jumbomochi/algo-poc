@@ -34,6 +34,12 @@ from scripts.ops.build_membership_snapshot import (
         # repo writes them with a space ("BRK B" in SP500_TOP50).
         ("BRK.B", "BRK B"),
         ("BF.B", "BF B"),
+        # Wikipedia used the hyphen spelling from 2015-07 to 2017-04. Left
+        # unnormalised it reads as Berkshire *leaving* the index in 2015 and
+        # rejoining in 2017 — a fabricated universe_removal round-trip in the
+        # baseline, and two years of the name unpriceable at IB.
+        ("BRK-B", "BRK B"),
+        ("BF-B", "BF B"),
         ("  AAPL  ", "AAPL"),
         # Non-breaking space and soft hyphen leak out of wikitext regularly.
         ("GOOG ", "GOOG"),
