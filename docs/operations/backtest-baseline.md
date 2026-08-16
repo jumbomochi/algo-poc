@@ -86,18 +86,56 @@ survivorship bias moved out of the universe and into the trade statistics. The
 write-off marks at the last close, which is neutral — optimistic for a
 bankruptcy, pessimistic for a cash acquisition at a premium.
 
-**Sourcing the data.** The membership history is not in this repo — it has to
-come from a data vendor or a reconstructed index-change list. Whatever the
-source, record it in the file's `source` field. Two things must accompany it
-for the equity sleeves to work properly on delisted names:
+**Sourcing the data.** The membership history **is** in this repo, at
+`data/universe/sp500_membership.json` (KAN-23). It is generated, not
+hand-maintained:
+
+```bash
+python scripts/ops/build_membership_snapshot.py --start 2015-01-01
+```
+
+That reads the revision history of the Wikipedia article *List of S&P 500
+companies* through the MediaWiki API — one revision per quarter — and writes
+both the snapshot file and `shared/historical_sectors.py` from the same
+revisions. Every snapshot records the exact `revid` and revision timestamp it
+came from in the file's `revisions` block, so the file is reproducible and can
+be audited line-by-line against Wikipedia. Consecutive quarters with identical
+membership are collapsed (a snapshot is effective *until the next one*), which
+is why the file has fewer snapshots than quarters in the window.
+
+Two honest limits on this source, both of which are fine for a divergence
+baseline and are **not** fine for attribution or an index-replication claim:
+
+- Wikipedia lags real index changes by days, so an entry/exit date is accurate
+  to roughly a week rather than to the session.
+- Quarterly cadence bounds how long a departed name stays tradable (or a new
+  member stays invisible) at one quarter.
+
+If you later buy a vendor history, point `--output` at the same path and keep
+the envelope shape; nothing downstream needs to change.
+
+Two things must accompany the file for the equity sleeves to work properly on
+delisted names:
 
 1. **Bars** for every ticker in `snapshots` (the run fetches
-   `MembershipCalendar.all_tickers()`, which includes the delisted ones).
-2. **Fundamentals and sector labels** for those names — `SECTOR_MAP` in
-   `scripts/fetch_fundamentals.py` only covers the present-day top 100, so
-   delisted names currently fall into the `Unknown` sector bucket and are
-   grouped together by the sector-concentration limit. Extend `SECTOR_MAP`
-   when the snapshot file lands.
+   `MembershipCalendar.all_tickers()`, which includes the delisted ones). This
+   is the operator step — see *Regenerating the headline baseline* below.
+2. **Sector labels** for those names. `SECTOR_MAP` (in `shared/universe.py` —
+   `scripts/fetch_fundamentals.py` only re-exports it) covers the present-day
+   top 100 only, so historical members used to fall into the `Unknown` bucket
+   and be grouped together by the sector-concentration limit — the freeze
+   documented in the 2026-08-07 incident. `shared/historical_sectors.py` now
+   supplies a real GICS sector for the other ~690 names, and `lookup_sector`
+   consults it last, so the curated map still wins for anything currently
+   traded. `tests/shared/test_universe.py` fails if a regenerated snapshot ever
+   introduces a name with no sector.
+
+   **Known divergence:** the curated `SECTOR_MAP` labels `TGT` *Consumer
+   Discretionary*; S&P reclassified Target to *Consumer Staples* in 2023 and
+   the index history agrees. The generator reports such conflicts and refuses to
+   auto-apply them — a curated label decides how a **currently held** name is
+   bucketed by the live risk engine, so changing one is a trading-behaviour
+   change that belongs in its own reviewed commit.
 
 **Coverage floor: ≥ 95% of membership-days must be priceable.** Point-in-time
 membership only removes survivorship bias if the historical members can
@@ -163,6 +201,39 @@ python scripts/run_backtest.py \
 
 The run prints a `SURVIVORSHIP BIASED` banner if `--universe-snapshots` is
 omitted. Treat any headline number produced without it as indicative only.
+
+### The weekly refresh passes the snapshot too
+
+`deploy/launchd/run_backtest_refresh.sh` (Tuesdays 05:00 SGT) reruns the same
+backtest so the baseline stays current. It passes `--universe-snapshots`, and
+**aborts with exit 2 and a Telegram alert if the snapshot file is missing**
+rather than running without it. That guard is the point: the monitor
+auto-selects the *newest* `output/backtest_multi_*.json`, so one refresh
+without the flag would write a survivorship-biased artifact that supersedes the
+rebaselined one and revert the monitor to exit 3 — undoing the rebaseline
+within a week, silently. Producing nothing is strictly better.
+
+Exit codes: `1` = IB Gateway unreachable, `2` = membership snapshot missing,
+otherwise the backtest's own code.
+
+### Names IB cannot price
+
+The point-in-time universe is only as good as the bars behind it, and the names
+that fail to pull are disproportionately the delistings — exactly the ones that
+removed the bias. `scripts/run_backtest.py` prints a `failed:` list at the end
+of the fetch, and the artifact's `config.coverage.excluded_tickers` records the
+membership-day cost of each one.
+
+After a regeneration, record the exclusions here, per name, with their
+membership-day cost — a bare percentage hides whether the 3% missing is one
+long-lived name or forty brief ones:
+
+| Ticker | Membership days lost | Why IB cannot price it |
+|---|---|---|
+| _(none recorded yet — fill in from the first PIT regeneration)_ | | |
+
+Total excluded must stay at or below the 5.0% floor or the artifact reads
+`coverage.state: BLOCKED` and the monitor exits 3.
 
 ### Comparing old to new
 

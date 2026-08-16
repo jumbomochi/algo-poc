@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +11,7 @@ from shared.universe import (
     ACTIVE_SLEEVES,
     DRILL_PORTFOLIO,
     EXCLUDED_PORTFOLIO_PREFIX,
+    SP500_TOP100,
     UNIVERSE_REGISTRY,
     MembershipCalendar,
     contract_conid_for,
@@ -18,6 +20,8 @@ from shared.universe import (
     make_stock_contract,
     resolve_watchlist,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class TestRegistry:
@@ -225,3 +229,94 @@ class TestExcludedPortfolios:
     def test_drill_tag_uses_the_established_prefix(self):
         """A second mechanism would silently bypass the three existing filters."""
         assert DRILL_PORTFOLIO.startswith(EXCLUDED_PORTFOLIO_PREFIX)
+
+
+class TestCommittedMembershipSnapshot:
+    """KAN-23 AC1/AC2 — the committed point-in-time universe.
+
+    The divergence monitor exits 3 (BLIND) against a survivorship-biased
+    baseline, so the paper track record accruing toward the go-live gate has no
+    fidelity check behind it. These pin the file that fixes that, and they are
+    the reason a future snapshot regeneration cannot silently reintroduce an
+    unmapped name.
+    """
+
+    SNAPSHOT = "data/universe/sp500_membership.json"
+
+    @pytest.fixture(scope="class")
+    def calendar(self):
+        from scripts.run_backtest import ALWAYS_TRADABLE
+
+        return MembershipCalendar.from_json_file(
+            str(REPO_ROOT / self.SNAPSHOT), always=ALWAYS_TRADABLE
+        )
+
+    def test_the_snapshot_is_committed_and_loads(self, calendar):
+        assert calendar.all_tickers()
+
+    def test_it_covers_the_full_ten_year_backtest_window(self, calendar):
+        """AC1. ``run_backtest.py --years 10`` starts at ``today - 10*365``;
+        MembershipCalendar makes *nothing* tradable before its first snapshot,
+        so a file that starts late silently produces an empty early window."""
+        today = date.today()
+        start = today - timedelta(days=10 * 365)
+        assert calendar.first_snapshot_date <= start, (
+            f"snapshot starts {calendar.first_snapshot_date}, after the 10-year "
+            f"window opens at {start} — regenerate with an earlier --start"
+        )
+        # The tail matters as much: membership frozen months before today means
+        # recent index changes are invisible to the baseline.
+        assert calendar.last_snapshot_date >= today - timedelta(days=120), (
+            f"newest snapshot is {calendar.last_snapshot_date}; regenerate with "
+            "scripts/ops/build_membership_snapshot.py"
+        )
+
+    def test_every_snapshot_ticker_resolves_to_a_real_sector(self, calendar):
+        """AC2 — the guard that makes this permanent.
+
+        Historical members that resolve to "Unknown" all land in one
+        pseudo-sector; once it crosses ``sector_concentration_pct`` the risk
+        engine rejects every entry in every unmapped name (the 2026-08-07
+        freeze). Regenerating the snapshot regenerates
+        shared/historical_sectors.py alongside it, and this test fails if
+        someone updates one without the other.
+        """
+        from shared.universe import lookup_sector
+
+        unmapped = sorted(
+            t for t in calendar.all_tickers() if lookup_sector(t) == "Unknown"
+        )
+        assert unmapped == [], (
+            f"{len(unmapped)} snapshot tickers have no sector: {unmapped[:20]}. "
+            "Re-run scripts/ops/build_membership_snapshot.py to regenerate "
+            "shared/historical_sectors.py from the same revisions."
+        )
+
+    def test_it_carries_the_provenance_needed_to_audit_it(self):
+        """A membership file with no stated source cannot be checked against
+        the index, and this one feeds gate evidence."""
+        payload = json.loads((REPO_ROOT / self.SNAPSHOT).read_text())
+        assert "Wikipedia" in payload["source"]
+        assert payload["generator"].endswith("build_membership_snapshot.py")
+        # Every snapshot names the exact revision it was read from.
+        assert set(payload["revisions"]) == set(payload["snapshots"])
+        for entry in payload["revisions"].values():
+            assert isinstance(entry["revid"], int)
+
+    def test_delisted_members_are_present_not_just_survivors(self, calendar):
+        """The whole point of a point-in-time universe: names that left the
+        index are still in ``all_tickers()`` so their bars get fetched."""
+        tickers = set(calendar.all_tickers())
+        survivors = set(SP500_TOP100)
+        assert len(tickers - survivors) > 300, (
+            "a point-in-time file over 10 years should carry hundreds of names "
+            "that are no longer members"
+        )
+
+    def test_the_curated_map_wins_over_the_generated_one(self):
+        """Precedence, asserted: nothing generated from Wikipedia can change
+        how a currently-traded name is bucketed by the live risk engine."""
+        from shared.historical_sectors import HISTORICAL_SECTOR_MAP
+        from shared.universe import SECTOR_MAP
+
+        assert set(HISTORICAL_SECTOR_MAP) & set(SECTOR_MAP) == set()
