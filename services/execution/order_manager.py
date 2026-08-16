@@ -285,6 +285,16 @@ class OrderManager:
 
         return order_id
 
+    async def find_stop_order(self, recommendation_id: str) -> str | None:
+        """The broker order id resting under this ref, if IB has one.
+
+        Used to tell "the stop never reached IB" from "it reached IB and then
+        something else failed" — the difference between re-placing and
+        double-covering a position.
+        """
+        found = await self._executor.find_order_by_ref(recommendation_id)
+        return str(found) if isinstance(found, (str, int)) else None
+
     def restore_submission(
         self,
         recommendation_id: str,
@@ -615,14 +625,28 @@ class OrderManager:
         """Net quantity the broker reports held for ``con_id``."""
         return await self._executor.broker_position(con_id)
 
-    async def cancel_all_orders(self) -> list[str]:
+    async def cancel_all_orders(
+        self, *, include_stops: bool = True
+    ) -> list[str]:
         """Cancel all open orders.
+
+        ``include_stops`` is the difference between a kill and a shutdown. A
+        kill flattens the book, so a protective stop left resting would sell
+        short against a position that is already gone — it must go. A graceful
+        shutdown ends *our* participation, not IB's: a GTC stop is precisely
+        the protection meant to outlive this process, and cancelling it on
+        every deploy would invert the point of placing it (KAN-19).
 
         Returns:
             List of cancelled order IDs.
         """
         cancelled = []
         for order_id in list(self.open_orders.keys()):
+            if (
+                not include_stops
+                and self.open_orders[order_id].get("order_type") == "stop"
+            ):
+                continue
             try:
                 await self._executor.cancel_order(order_id)
                 cancelled.append(order_id)
@@ -635,9 +659,13 @@ class OrderManager:
                 self._logger.exception(
                     "Failed to cancel order", order_id=order_id
                 )
-        if self.open_orders:
+        stranded = [
+            order_id
+            for order_id, info in self.open_orders.items()
+            if include_stops or info.get("order_type") != "stop"
+        ]
+        if stranded:
             self._logger.error(
-                "Orders remain open after cancel-all",
-                remaining=list(self.open_orders.keys()),
+                "Orders remain open after cancel-all", remaining=stranded
             )
         return cancelled

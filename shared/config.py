@@ -47,10 +47,6 @@ class ExecutionConfig(BaseModel):
     # cancelled at the broker, or the account keeps orphan protective orders no
     # code knows about.
     broker_stops_enabled: bool = False
-    # The account whose positions this service is responsible for protecting.
-    # None = whatever the Gateway session reports; a stop on another account's
-    # shares protects nothing (KAN-11).
-    broker_stops_account_id: str | None = None
     # GTC is the property the design rests on: the KAN-18 spike watched a GTC
     # stop survive a Gateway process restart with every field intact.
     broker_stops_tif: str = "GTC"

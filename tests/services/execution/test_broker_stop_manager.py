@@ -60,6 +60,7 @@ def make_position(
 def make_manager(session, *, order_manager=None, enabled=True, **kwargs):
     order_manager = order_manager or AsyncMock()
     order_manager.submit_stop = AsyncMock(return_value="4242")
+    order_manager.find_stop_order = AsyncMock(return_value=None)
     defaults = dict(
         order_manager=order_manager,
         order_ledger=OrderLedger(session),
@@ -378,10 +379,8 @@ class TestRunnerWiring:
         from services.execution.runner import ExecutionServiceRunner
 
         config = MagicMock(spec=AppConfig)
-        config.execution = ExecutionConfig(
-            broker_stops_enabled=enabled, broker_stops_account_id=account_id
-        )
-        config.ib = IBConfig()
+        config.execution = ExecutionConfig(broker_stops_enabled=enabled)
+        config.ib = IBConfig(account_id=account_id)
         config.mode = "paper"
         config.risk = MagicMock()
         config.risk.stop_loss_trailing_pct = 15.0
@@ -389,6 +388,7 @@ class TestRunnerWiring:
 
         order_manager = MagicMock()
         order_manager.submit_stop = AsyncMock(return_value="4242")
+        order_manager.find_stop_order = AsyncMock(return_value=None)
         order_manager.open_orders = {}
 
         runner = ExecutionServiceRunner(
@@ -622,10 +622,8 @@ class TestKillAndExitInteraction:
         from shared.config import AppConfig, ExecutionConfig, IBConfig
 
         config = MagicMock(spec=AppConfig)
-        config.execution = ExecutionConfig(
-            broker_stops_enabled=True, broker_stops_account_id="DUN551088"
-        )
-        config.ib = IBConfig()
+        config.execution = ExecutionConfig(broker_stops_enabled=True)
+        config.ib = IBConfig(account_id="DUN551088")
         config.mode = "paper"
         config.risk = MagicMock()
         config.risk.stop_loss_trailing_pct = 15.0
@@ -695,3 +693,323 @@ class TestKillAndExitInteraction:
         )
 
         assert working == pytest.approx(21.0)
+
+
+class TestReviewRegressions:
+    """Bugs found in review of the first cut — each pinned by the case that broke."""
+
+    def _runner(self, session, *, enabled=True, account_id="DUN551088"):
+        from unittest.mock import MagicMock
+
+        from services.execution.order_manager import OrderManager
+        from services.execution.runner import ExecutionServiceRunner
+        from shared.config import AppConfig, ExecutionConfig, IBConfig
+
+        config = MagicMock(spec=AppConfig)
+        config.execution = ExecutionConfig(broker_stops_enabled=enabled)
+        config.ib = IBConfig(account_id=account_id)
+        config.mode = "paper"
+        config.risk = MagicMock()
+        config.risk.stop_loss_trailing_pct = 15.0
+
+        executor = AsyncMock()
+        executor.find_order_by_ref = AsyncMock(return_value=None)
+        executor.submit_stop_order = AsyncMock(return_value="4242")
+        executor.cancel_order = AsyncMock(return_value=True)
+        order_manager = OrderManager(
+            executor=executor, redis_client=AsyncMock(), db_session=session
+        )
+        runner = ExecutionServiceRunner(
+            config=config,
+            redis_client=AsyncMock(),
+            order_manager=order_manager,
+            order_ledger=OrderLedger(session),
+        )
+        return runner, order_manager, executor
+
+    def _seed_buy_intent(self, session, recommendation_id="rec-1"):
+        from types import SimpleNamespace
+
+        ledger = OrderLedger(session)
+        ledger.create_intent(
+            SimpleNamespace(
+                recommendation_id=recommendation_id,
+                account_id="DUN551088", mode="paper", portfolio="momentum",
+                con_id=265598, symbol="AAPL", exchange="SMART", currency="USD",
+                action="BUY", quantity=21, limit_price=220.65,
+                order_type="limit",
+            )
+        )
+        ledger.transition(recommendation_id, OrderStatus.APPROVED)
+        ledger.record_submission(recommendation_id, "order-1")
+        session.commit()
+
+    def _buy_fill(self, **overrides):
+        payload = {
+            "order_id": "order-1", "account_id": "DUN551088",
+            "execution_id": "exec-1", "con_id": 265598, "ticker": "AAPL",
+            "exchange": "SMART", "currency": "USD", "side": "buy",
+            "quantity": 21, "cumulative_quantity": 21, "fill_price": 220.65,
+            "timestamp": OPENED_AT, "order_done": True,
+        }
+        payload.update(overrides)
+        return payload
+
+    # --- C1 -----------------------------------------------------------------
+
+    async def test_a_projected_fill_is_not_counted_twice_when_topping_up(
+        self, session
+    ):
+        """The bug: 21 held + 9 bought => 51 shares of stops against 30 held.
+
+        ``_local_fill_effects`` is only purged by the duplicate-fill and kill
+        paths, so once the projector writes the Position row the same shares
+        are counted by both the durable read and the local overlay. On trigger
+        IB would sell 51 against a 30-share long — the account goes short,
+        which is the one outcome this module exists to prevent.
+        """
+        from shared.models import ExecutionFill
+
+        runner, order_manager, executor = self._runner(session)
+        self._seed_buy_intent(session)
+        await runner.handle_ib_fill(self._buy_fill())
+
+        # The projector catches up: the position is durable, and the fill it
+        # came from is marked applied.
+        session.add(make_position(quantity=21))
+        session.add(ExecutionFill(
+            account_id="DUN551088", execution_id="exec-1", ib_order_id="order-1",
+            recommendation_id="rec-1", portfolio="momentum", con_id=265598,
+            symbol="AAPL", exchange="SMART", currency="USD",
+            side="buy", quantity=21, price=220.65, commission=0.0,
+            executed_at=OPENED_AT, projection_applied=True,
+        ))
+        session.commit()
+        executor.submit_stop_order = AsyncMock(return_value="4243")
+
+        await runner.handle_ib_fill(
+            self._buy_fill(execution_id="exec-2", quantity=9)
+        )
+
+        covered = OrderLedger(session).open_stop_quantity(
+            "DUN551088", "momentum", 265598
+        )
+        assert covered == pytest.approx(30.0)
+
+    # --- C2 -----------------------------------------------------------------
+
+    async def test_a_graceful_shutdown_leaves_the_stops_resting(self, session):
+        """The whole point is that they outlive us.
+
+        ``shutdown`` cancels open orders to avoid orphans, and stops now live
+        in ``open_orders`` so the kill can reach them — but a deploy or a
+        SIGTERM must not strip every position's protection on the way out.
+        Worse, the cancel is only *requested*, so the intents stay SUBMITTED
+        and the next startup reads the positions as covered and places nothing.
+        """
+        runner, order_manager, executor = self._runner(session)
+        await runner._broker_stops.ensure_coverage(
+            account_id="DUN551088", portfolio="momentum", con_id=265598,
+            symbol="AAPL", exchange="SMART", currency="USD",
+            quantity=21, reference_price=220.65,
+        )
+
+        await runner.shutdown()
+
+        executor.cancel_order.assert_not_awaited()
+        assert "4242" in order_manager.open_orders
+
+    async def test_shutdown_still_cancels_working_entries(self, session):
+        runner, order_manager, executor = self._runner(session)
+        executor.submit_limit_order = AsyncMock(return_value="order-9")
+        await order_manager.submit_entry(
+            ticker="AAPL", quantity=10, limit_price=150.0,
+            recommendation_id="rec-9",
+        )
+
+        await runner.shutdown()
+
+        executor.cancel_order.assert_awaited_with("order-9")
+
+    # --- I3 -----------------------------------------------------------------
+
+    async def test_flag_off_a_restored_market_exit_is_still_swept(self, session):
+        """AC4 is about the whole fill/restart path, not just placement.
+
+        Risk writes order_type="market" for every exit. Passing the ledger's
+        order_type through unconditionally made restored market exits
+        sweep-exempt with the flag OFF — a behaviour change in a path this
+        story is not supposed to touch.
+        """
+        from datetime import timedelta
+
+        runner, order_manager, _ = self._runner(session, enabled=False)
+        ledger = OrderLedger(session)
+        from types import SimpleNamespace
+
+        ledger.create_intent(SimpleNamespace(
+            recommendation_id="exit-1", account_id="DUN551088", mode="paper",
+            portfolio="momentum", con_id=265598, symbol="AAPL",
+            exchange="SMART", currency="USD", action="SELL", quantity=21,
+            limit_price=None, order_type="market",
+        ))
+        ledger.transition("exit-1", OrderStatus.APPROVED)
+        ledger.record_submission("exit-1", "order-7")
+        session.commit()
+
+        runner.restore_pending_orders()
+
+        assert "order_type" not in order_manager.open_orders["order-7"]
+
+    # --- I4 -----------------------------------------------------------------
+
+    def test_enabling_stops_without_a_pinned_account_is_refused(self, session):
+        """Unpinned, the backfill would place stops for every account in the DB."""
+        with pytest.raises(ValueError, match="account"):
+            self._runner(session, account_id=None)
+
+    # --- I6 -----------------------------------------------------------------
+
+    async def test_a_stop_intent_stranded_before_submission_is_not_coverage(
+        self, session
+    ):
+        """A crash between the APPROVED commit and the placement.
+
+        The row claims the position forever, so the backfill sees it covered
+        and places nothing — unprotected, with the ledger saying otherwise.
+        """
+        from types import SimpleNamespace
+
+        runner, order_manager, executor = self._runner(session)
+        ledger = OrderLedger(session)
+        ledger.create_intent(SimpleNamespace(
+            recommendation_id="stop-DUN551088-momentum-265598-0",
+            account_id="DUN551088", mode="paper", portfolio="momentum",
+            con_id=265598, symbol="AAPL", exchange="SMART", currency="USD",
+            action="SELL", quantity=21, limit_price=None, order_type="stop",
+        ))
+        ledger.transition(
+            "stop-DUN551088-momentum-265598-0", OrderStatus.APPROVED
+        )
+        session.add(make_position(quantity=21))
+        session.commit()
+
+        placed = await runner.backfill_broker_stops()
+
+        assert placed == ["4242"]
+
+    # --- I7 -----------------------------------------------------------------
+
+    async def test_a_stop_that_reached_ib_before_the_error_is_adopted(
+        self, session
+    ):
+        """placeOrder succeeded; the failure was after it.
+
+        Terminalising the intent and minting a new id would place a SECOND
+        stop for the same shares, and leave the first one unledgered — which
+        is the reconciliation-disabling state the ledger-first design exists
+        to avoid.
+        """
+        runner, order_manager, executor = self._runner(session)
+        executor.submit_stop_order = AsyncMock(
+            side_effect=RuntimeError("lost the connection after placing")
+        )
+        executor.find_order_by_ref = AsyncMock(
+            side_effect=[None, "4242"]  # miss before submitting, hit after
+        )
+
+        order_id = await runner._broker_stops.ensure_coverage(
+            account_id="DUN551088", portfolio="momentum", con_id=265598,
+            symbol="AAPL", exchange="SMART", currency="USD",
+            quantity=21, reference_price=220.65,
+        )
+
+        assert order_id == "4242"
+        assert OrderLedger(session).open_stop_quantity(
+            "DUN551088", "momentum", 265598
+        ) == pytest.approx(21.0)
+
+    # --- I8 -----------------------------------------------------------------
+
+    async def test_two_rows_for_one_contract_are_covered_as_one_position(
+        self, session
+    ):
+        """`positions` has no unique key on the scope; reconcile handles n>1.
+
+        Sizing per row let the second row's shortfall be computed against the
+        first row's coverage: 10 + 15 held, 15 covered, 10 silently naked.
+        """
+        runner, order_manager, executor = self._runner(session)
+        session.add_all([
+            make_position(quantity=10, highest=220.65),
+            make_position(quantity=15, highest=220.65),
+        ])
+        session.commit()
+
+        await runner.backfill_broker_stops()
+
+        assert OrderLedger(session).open_stop_quantity(
+            "DUN551088", "momentum", 265598
+        ) == pytest.approx(25.0)
+
+    # --- I9 -----------------------------------------------------------------
+
+    async def test_an_unsizeable_stop_pages_like_an_unplaced_one(self, session):
+        """Zero protection is zero protection, whatever the reason."""
+        runner, order_manager, executor = self._runner(session)
+
+        await runner._broker_stops.ensure_coverage(
+            account_id="DUN551088", portfolio="momentum", con_id=265598,
+            symbol="AAPL", exchange="SMART", currency="USD",
+            quantity=21, reference_price=0.0,
+        )
+
+        published = [
+            call.args[1] for call in runner._redis.publish.await_args_list
+        ]
+        assert any(
+            row.get("event_type") == "broker_stop_not_placed" for row in published
+        )
+
+    # --- M1 -----------------------------------------------------------------
+
+    def test_the_stop_price_is_exactly_representable_as_a_tick(self):
+        """IB rejects a price off the minimum variation (error 110)."""
+        price = ips_stop_price(33.33, 15.0)
+
+        assert price == 28.33
+        assert f"{price}" == "28.33"
+
+    # --- M3 -----------------------------------------------------------------
+
+    async def test_the_ledger_records_the_quantity_that_can_be_placed(
+        self, session
+    ):
+        """Whole-share truncation happens at the executor.
+
+        Ledgering 10.4 while IB holds 10 leaves 0.4 of phantom coverage
+        forever, and trips reconcile's remaining-quantity comparison.
+        """
+        runner, order_manager, executor = self._runner(session)
+
+        await runner._broker_stops.ensure_coverage(
+            account_id="DUN551088", portfolio="momentum", con_id=265598,
+            symbol="AAPL", exchange="SMART", currency="USD",
+            quantity=10.4, reference_price=220.65,
+        )
+
+        assert OrderLedger(session).open_stop_quantity(
+            "DUN551088", "momentum", 265598
+        ) == pytest.approx(10.0)
+
+    async def test_a_sub_share_shortfall_is_skipped_not_paged(self, session):
+        runner, order_manager, executor = self._runner(session)
+
+        order_id = await runner._broker_stops.ensure_coverage(
+            account_id="DUN551088", portfolio="momentum", con_id=265598,
+            symbol="AAPL", exchange="SMART", currency="USD",
+            quantity=0.4, reference_price=220.65,
+        )
+
+        assert order_id is None
+        order_manager._executor.submit_stop_order.assert_not_awaited()

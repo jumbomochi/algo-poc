@@ -545,6 +545,50 @@ class OrderLedger:
         )
         return float(self.session.scalar(stmt) or 0.0)
 
+    def projected_execution_keys(
+        self, execution_keys: Iterable[tuple[str, str]]
+    ) -> set[tuple[str, str]]:
+        """Which of these broker executions the projector has already applied.
+
+        The same test :meth:`managed_position_snapshot` makes before it
+        overlays local fills on the durable book, available on its own for
+        callers that only need the pruning half.
+        """
+        keys = list(execution_keys)
+        if not keys:
+            return set()
+        stmt = select(
+            ExecutionFill.account_id, ExecutionFill.execution_id
+        ).where(
+            tuple_(ExecutionFill.account_id, ExecutionFill.execution_id).in_(
+                keys
+            ),
+            ExecutionFill.projection_applied.is_(True),
+        )
+        return {
+            (row.account_id, row.execution_id)
+            for row in self.session.execute(stmt)
+        }
+
+    def unsubmitted_stop_intents(self) -> list[OrderIntent]:
+        """Stop intents approved but never bound to a broker order (KAN-19).
+
+        The crash-window rows: approved and committed, then the process died
+        before the placement returned. They count as coverage — which is what
+        makes them dangerous, because the position reads as protected while
+        nothing rests at IB.
+        """
+        stmt = (
+            select(OrderIntent)
+            .where(
+                func.lower(OrderIntent.order_type) == BROKER_STOP_ORDER_TYPE,
+                OrderIntent.status == OrderStatus.APPROVED.value,
+                OrderIntent.ib_order_id.is_(None),
+            )
+            .order_by(OrderIntent.id)
+        )
+        return list(self.session.scalars(stmt))
+
     def count_intents_with_id_prefix(self, prefix: str) -> int:
         """How many intents already carry a recommendation id under ``prefix``.
 

@@ -405,11 +405,28 @@ KAN-20 owns. This is a hard precondition on KAN-33 flipping the flag: the flag
 must not be turned on before KAN-20 lands. Pinned by
 `test_a_resting_stop_makes_an_exit_refuse_rather_than_oversell`.
 
-One more consequence of the same ledger row, for KAN-20's attention:
-`nonterminal_sell_exists` will also see the resting stop and suppress the
-risk service's software stop-loss re-fires for that position. Suppression is
-arguably correct while the broker stop is genuinely covering the position —
-but it is a behaviour change that arrives with the flag, not a no-op.
+The same applies to the kill. `process_kill` cancels the stops and then
+liquidates, but `cancelOrder` only *requests* a cancel. What makes that safe is
+the same guard: until IB's `Cancelled` status lands and terminalises the intent,
+the stop still counts as a working sell, so the liquidation is refused rather
+than stacked on top of it. Fail-safe, but a kill can be refused — confirming the
+cancel against IB's book first (the `cancel_working_orders` path, which already
+does exactly this for working buys) is what turns that refusal back into a
+liquidation, and it belongs with KAN-20's adjustment work.
+
+Three more consequences for KAN-20's attention, all recorded in
+`services/execution/broker_stops.py`'s module docstring:
+
+1. `nonterminal_sell_exists` also sees the resting stop and suppresses the risk
+   service's software stop-loss re-fires for that position. Arguably correct
+   while the broker stop genuinely covers the position — but it is a behaviour
+   change that arrives with the flag, not a no-op.
+2. **The level is set once, not trailed.** Priced from the high known at
+   placement and never revised, so it loosens relative to the IPS rule as the
+   high rises. The broker stop and `check_stop_loss` agree on day one and drift
+   after.
+3. **Nothing reduces a stop when shares leave.** Coverage is only brought up.
+   A position sold outside this service leaves its stop resting.
 
 ---
 
