@@ -452,7 +452,9 @@ class OrderLedger:
         )
         return int(self.session.scalar(stmt) or 0)
 
-    def latest_intent_with_id_prefix(self, prefix: str) -> OrderIntent | None:
+    def latest_intent_with_id_prefix(
+        self, prefix: str, *, mode: str | None = None
+    ) -> OrderIntent | None:
         """The most recent intent in an id family, or None if it has none.
 
         The re-fire decision (KAN-9) is made against the *last* attempt on the
@@ -460,6 +462,13 @@ class OrderLedger:
         An earlier, already-terminal sibling answers neither question, so the
         newest row — highest ``id``, which is also highest ``seq`` because that
         is the order they are minted in — is the one that decides.
+
+        ``mode`` scopes the answer to one book, matching
+        :meth:`unpublished_exit_intents`: an intent the re-publish sweep cannot
+        act on must not be the one that says an exit is in flight. The count
+        that mints the next ``seq`` stays unscoped on purpose — ids are unique
+        across the whole table, so a free sequence number has to be free in
+        every mode.
         """
         stmt = (
             select(OrderIntent)
@@ -467,6 +476,8 @@ class OrderLedger:
             .order_by(OrderIntent.id.desc())
             .limit(1)
         )
+        if mode is not None:
+            stmt = stmt.where(OrderIntent.mode == mode)
         return self.session.scalar(stmt)
 
     @staticmethod

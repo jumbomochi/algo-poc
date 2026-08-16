@@ -251,6 +251,22 @@ class TestExitSuppressionQueries:
             ledger.latest_intent_with_id_prefix("stop-loss-DU-quality-1-x-") is None
         )
 
+    def test_latest_can_be_scoped_to_one_mode(self, session):
+        """The re-publish sweep only ever sees intents in the running mode, so
+        the re-fire decision must be made over the same set — otherwise a row
+        the sweep cannot act on decides whether an exit is in flight."""
+        ledger = OrderLedger(session)
+        ledger.create_intent(make_proposal("stop-loss-DU-momentum-1-x-0"))
+        live = ledger.create_intent(make_proposal("stop-loss-DU-momentum-1-x-1"))
+        live.mode = "live"
+        session.flush()
+
+        latest = ledger.latest_intent_with_id_prefix(
+            "stop-loss-DU-momentum-1-x-", mode="paper"
+        )
+
+        assert latest.recommendation_id == "stop-loss-DU-momentum-1-x-0"
+
     def test_latest_escapes_like_wildcards(self, session):
         """Same trap as the count: `_` is a LIKE wildcard and sleeve names carry
         one, so `thematic_momentum` must not adopt `thematicXmomentum`'s row."""

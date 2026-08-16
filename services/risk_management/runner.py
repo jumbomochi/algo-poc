@@ -1223,21 +1223,28 @@ class RiskServiceRunner:
         * **nothing yet** → ``seq`` 0, sized to whatever the control asks for.
         * **still in flight** → the *same* id, so a re-emit converges on that
           intent instead of stacking a second sell against the same shares.
-          The suppression rule usually stops the caller before this matters;
-          the one case it deliberately lets through — KAN-8's committed-but-
-          unpublished orphan — lands here and is adopted and published rather
-          than duplicated. An orphan the re-publish sweep has abandoned as
-          stale is the exception to the exception: converging on it would fire
-          exactly the day-old price decision the sweep refused to.
+          The ceiling is that row's own requested quantity: its economics are
+          immutable, so an adoption has to reproduce them or ``create_intent``
+          refuses it. The suppression rule usually stops the caller before this
+          matters; the one case it deliberately lets through — KAN-8's
+          committed-but-unpublished orphan — lands here and is adopted and
+          published rather than duplicated. An orphan the re-publish sweep has
+          abandoned as stale is the exception to the exception: converging on it
+          would fire exactly the day-old price decision the sweep refused to.
         * **terminal with an unfilled remainder** → a failed or half-done
           attempt. ``seq + 1``, because a terminal row can never be written to
-          again, and a ceiling of what that attempt left behind — so 40 filled
-          of 100 re-fires for 60, not for 100. The fill is projected
-          asynchronously, so the book may still read the pre-fill quantity;
-          the ledger is what knows how much was already sold.
-        * **terminal and fully filled** → the episode is closed. Its remainder
-          is zero, but that zero must not cap a *later* breach on shares held
-          again, so the next exit is uncapped.
+          again, and a ceiling of what is held *minus what that attempt already
+          sold* — so 40 filled of 100 re-fires for 60. Fills are projected
+          asynchronously, so the book may still read the pre-fill quantity; the
+          ledger is what knows those 40 are gone. Sizing off the prior *request*
+          instead would ratchet: a one-share attempt that failed would pin every
+          later exit that day to one share, however far the breach had grown.
+        * **terminal and fully filled** → the episode is closed and the next
+          exit is uncapped. The alternative — subtracting a full fill from a
+          book that has not caught up yet — would mute a re-entered position for
+          the rest of the day, which is the failure this epic exists to remove.
+          Selling into an unprojected fill is bounded downstream instead, by the
+          broker-position cap on the submit path (KAN-10).
 
         The day is the UTC date, which is one-to-one with an NYSE session for
         regular trading hours (00:00 UTC is 20:00 ET, after the close). ``seq``
@@ -1259,22 +1266,25 @@ class RiskServiceRunner:
         if self._order_ledger is None:
             return _ExitPlan(f"{prefix}0", None)
         try:
-            latest = self._order_ledger.latest_intent_with_id_prefix(prefix)
+            latest = self._order_ledger.latest_intent_with_id_prefix(
+                prefix, mode=self._config.mode
+            )
             if latest is None:
                 return _ExitPlan(f"{prefix}0", None)
-            remaining = max(
-                float(latest.requested_quantity) - float(latest.filled_quantity),
-                0.0,
+            requested = float(latest.requested_quantity)
+            sold = float(latest.filled_quantity)
+            if (
+                OrderStatus(latest.status) not in TERMINAL_STATUSES
+                and not self._is_abandoned_orphan(latest)
+            ):
+                return _ExitPlan(latest.recommendation_id, requested)
+            next_id = (
+                f"{prefix}{self._order_ledger.count_intents_with_id_prefix(prefix)}"
             )
-            if OrderStatus(latest.status) not in TERMINAL_STATUSES:
-                if not self._is_abandoned_orphan(latest):
-                    return _ExitPlan(latest.recommendation_id, remaining)
-                remaining = 0.0
-            next_seq = self._order_ledger.count_intents_with_id_prefix(prefix)
-            return _ExitPlan(
-                f"{prefix}{next_seq}",
-                remaining if remaining > EXIT_QUANTITY_EPSILON else None,
-            )
+            if requested - sold <= EXIT_QUANTITY_EPSILON:
+                return _ExitPlan(next_id, None)
+            held = float(target.get("quantity") or 0.0)
+            return _ExitPlan(next_id, round(max(held - sold, 0.0), 4))
         finally:
             self._order_ledger.session.rollback()
 
@@ -1283,9 +1293,12 @@ class RiskServiceRunner:
 
         The sweep re-publishes only exits approved today; an older one is
         escalated to an operator and left inert (KAN-8). Inert has to mean inert
-        here too — adopting its id would publish the stale exit by the back door,
-        and capping today's breach to its quantity would size today's sell off a
-        day-old position.
+        here too — adopting its id would publish the stale exit by the back door.
+
+        A stale orphan minted in production carries its own (older) date in its
+        id, so it sits in a different family and the lookup never sees it. This
+        guard is for the state that is left: a row under *today's* prefix whose
+        ``approved_at`` says otherwise.
         """
         return intent.published_at is None and self._approved_before(
             intent, self._start_of_trading_day()
@@ -1323,13 +1336,16 @@ class RiskServiceRunner:
 
     async def _emit_liquidation_exit(
         self, pos: dict[str, Any], *, epoch: int, reason: str
-    ) -> bool:
+    ) -> float | None:
         """Kill/breaker path: flatten one position through the shared emitter.
 
         Caller #1 of :meth:`_emit_ledgered_exit`. The deterministic id makes a
         replay a no-op; the id scheme itself is unchanged here (KAN-6 revisits
         it), and the default ``risk_adjustments`` keep the published payload
         byte-identical to what shipped before the extraction.
+
+        No re-fire ceiling: a kill flattens the whole book, and sizing it off an
+        earlier stop-loss attempt would leave shares held through the emergency.
         """
         return await self._emit_ledgered_exit(
             "liq",
@@ -1349,7 +1365,7 @@ class RiskServiceRunner:
         max_quantity: float | None = None,
         risk_adjustments: dict[str, Any] | None = None,
         suppress_if_pending: bool = False,
-    ) -> bool:
+    ) -> float | None:
         """Create an APPROVED ledger intent for a risk-side exit and publish it.
 
         THE single publish site for every risk-side sell. Adding another
@@ -1363,10 +1379,12 @@ class RiskServiceRunner:
         mechanism in the logs and in the unroutable alert, so an operator can
         tell which control could not route. ``quantity`` defaults to flattening
         the whole target; a partial exit (passive trim) passes its own.
-        ``max_quantity`` is the re-fire ceiling from :meth:`_plan_exit` — what
-        the previous attempt on this scope left unfilled. Both are floors on
-        each other, so a re-fire never asks for more than is still owed *or*
-        more than is still held.
+        ``max_quantity`` is the re-fire ceiling from :meth:`_plan_exit`, and the
+        smaller of the two wins. Note what that ceiling is measured against: the
+        ledger's record of the last attempt and the *book's* position. Neither
+        knows about a fill the projector has not applied yet, so this bounds
+        stacking, not overselling — the broker-position cap on the submit path
+        (KAN-10) is what bounds that.
 
         The exit-intent lifecycle, end to end (design §T2)::
 
@@ -1404,9 +1422,11 @@ class RiskServiceRunner:
         flatten the whole book, and skipping a position because a partial trim
         is in flight would leave the rest of it held through the emergency.
 
-        Returns True when an exit was published. The ledger intent is what lets
-        execution actually place the sell (a synthetic id with no intent is
-        rejected), and a deterministic id makes a replay a no-op.
+        Returns the quantity that was published, or None if nothing went out —
+        the size after the ceiling, so a caller's own log or alert names the
+        order that exists rather than the one it asked for. The ledger intent is
+        what lets execution actually place the sell (a synthetic id with no
+        intent is rejected), and a deterministic id makes a replay a no-op.
         """
         if quantity is None:
             quantity = target["quantity"]
@@ -1414,7 +1434,7 @@ class RiskServiceRunner:
             capped = min(quantity, max_quantity)
             if capped < quantity:
                 self._logger.info(
-                    "Exit re-sized to what the prior attempt left unfilled",
+                    "Exit re-sized to what is left after the prior attempt",
                     kind=kind,
                     ticker=target["ticker"],
                     asked_for=quantity,
@@ -1423,7 +1443,7 @@ class RiskServiceRunner:
                 )
             quantity = capped
         if quantity is None or quantity <= 0:
-            return False
+            return None
 
         if suppress_if_pending and self._has_pending_sell(target):
             self._logger.info(
@@ -1434,7 +1454,7 @@ class RiskServiceRunner:
                 con_id=target.get("con_id"),
                 recommendation_id=exit_id,
             )
-            return False
+            return None
 
         # With a ledger, a missing con_id means we cannot create the backing
         # intent, so execution would reject the exit — the position would go
@@ -1460,7 +1480,7 @@ class RiskServiceRunner:
                     "quantity": quantity,
                 },
             )
-            return False
+            return None
 
         if self._order_ledger is not None and target.get("con_id") is not None:
             proposal = SimpleNamespace(
@@ -1519,7 +1539,7 @@ class RiskServiceRunner:
                         "recommendation_id": exit_id,
                     },
                 )
-                return False
+                return None
             except Exception:
                 self._order_ledger.session.rollback()
                 raise
@@ -1546,7 +1566,7 @@ class RiskServiceRunner:
             quantity=quantity,
             recommendation_id=exit_id,
         )
-        return True
+        return quantity
 
     async def _publish_approved_exit(self, order: ApprovedOrderMessage) -> None:
         """Put an already-APPROVED exit on the stream and record that it went.
@@ -1810,7 +1830,7 @@ class RiskServiceRunner:
                     "Hard-ceiling auto-trim order published",
                     ticker=breach.ticker,
                     portfolio=target.get("portfolio"),
-                    sell_quantity=share,
+                    sell_quantity=published,
                     current_pct=breach.current_pct,
                     target_pct=breach.target_pct,
                 )
@@ -1865,7 +1885,10 @@ class RiskServiceRunner:
                     message=decision.reason,
                     context={
                         "ticker": ticker,
-                        "quantity": target["quantity"],
+                        # The size that went out, which a re-fire ceiling may
+                        # have cut below the position. An alert naming a number
+                        # nobody sent is worse than no number at all.
+                        "quantity": published,
                         "portfolio": target.get("portfolio"),
                     },
                 )

@@ -236,7 +236,7 @@ class TestKillPathIsUnchanged:
             reason="emergency",
         )
 
-        assert published is True
+        assert published == pytest.approx(10.0)
         orders = _published_orders(mock_redis)
         assert len(orders) == 1
         # timestamp is wall-clock and excluded; every other field must match
@@ -281,7 +281,7 @@ class TestGuardsMovedIntact:
             reason="trailing stop hit",
         )
 
-        assert published is False
+        assert published is None
         assert _published_orders(mock_redis) == []
         alerts = _alerts(mock_redis)
         assert any("AAPL" in a and "manual" in a.lower() for a in alerts)
@@ -327,7 +327,7 @@ class TestGuardsMovedIntact:
             "liq", _target(), exit_id=exit_id, reason="emergency"
         )
 
-        assert published is False
+        assert published is None
         assert _published_orders(mock_redis) == []
         assert any("manual" in a.lower() for a in _alerts(mock_redis))
         # The conflicting row is untouched, and the session survives so the
@@ -351,7 +351,7 @@ class TestGuardsMovedIntact:
             reason="emergency",
         )
 
-        assert published is False
+        assert published is None
         assert _published_orders(mock_redis) == []
         session.rollback()
 
@@ -593,7 +593,7 @@ class TestStopLossReachesTheBroker:
                 exit_id="stop-loss-DUTEST-momentum-111-2026-08-15-0",
                 reason="trailing stop hit",
             )
-            assert published is True
+            assert published == pytest.approx(10.0)
 
         assert len(_intents(session)) == 1
 
@@ -1342,3 +1342,92 @@ class TestReFireAndReSize:
         assert float(intents[1].requested_quantity) == pytest.approx(6.0)
         nonterminal = [i for i in intents if OrderStatus(i.status) not in TERMINAL_STATUSES]
         assert len(nonterminal) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_small_failed_attempt_does_not_ratchet_a_later_exit_down(
+        self, db_runner, mock_redis
+    ):
+        """The ceiling is what is still held minus what the last attempt already
+        sold — not the size of whatever that attempt happened to ask for.
+
+        Sizing off the prior *request* ratchets: a one-share trim that was
+        rejected would pin every later exit that day to one share, however far
+        the breach had grown by then.
+        """
+        runner, _ledger, session = db_runner
+        _prior_exit(session, status=OrderStatus.RISK_REJECTED, requested=1.0)
+        _set_position(session, 25.0)
+        _breaching(runner, quantity=25.0)
+
+        await runner.run_stop_loss_check()
+
+        (order,) = _published_orders(mock_redis)
+        assert float(order["quantity"]) == pytest.approx(25.0)
+
+    @pytest.mark.asyncio
+    async def test_the_trigger_alert_reports_the_size_that_was_actually_sent(
+        self, db_runner, mock_redis
+    ):
+        """An operator reading the stop-loss alert during an incident must see
+        the order that went out, not what the control asked for before the
+        re-fire ceiling cut it down."""
+        runner, _ledger, session = db_runner
+        _prior_exit(
+            session, status=OrderStatus.CANCELLED, requested=10.0, filled=6.0
+        )
+        _breaching(runner)
+
+        await runner.run_stop_loss_check()
+
+        (order,) = _published_orders(mock_redis)
+        assert float(order["quantity"]) == pytest.approx(4.0)
+        (triggered,) = [a for a in _alerts(mock_redis) if "stop_loss_triggered" in a]
+        assert "4.0" in triggered
+        assert "10.0" not in triggered
+
+    @pytest.mark.asyncio
+    async def test_an_orphan_the_position_no_longer_covers_alerts_and_holds(
+        self, db_runner, mock_redis
+    ):
+        """The intersection of adopting an orphan and flooring at the position.
+
+        The orphan says sell 10, only 4 are held, and its row cannot be re-sized
+        (its economics are immutable). Publishing either number is wrong — 10
+        oversells, 4 contradicts the row execution will read — so this is one of
+        the states that belongs to an operator.
+        """
+        runner, ledger, session = db_runner
+        orphan = await _orphan_a_stop_loss(runner, mock_redis)
+        _set_position(session, 4.0)
+        _breaching(runner, quantity=4.0)
+
+        await runner.run_stop_loss_check()
+
+        assert _published_orders(mock_redis) == []
+        unroutable = [a for a in _alerts(mock_redis) if "liquidation_unroutable" in a]
+        assert len(unroutable) == 1
+        assert "critical" in unroutable[0]
+        assert [i.recommendation_id for i in _intents(session)] == [orphan]
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_a_kill_flattens_the_whole_position_whatever_came_before(
+        self, db_runner, mock_redis
+    ):
+        """The re-fire ceiling is for the recurring controls only. A kill must
+        flatten the book: sizing it off an earlier stop-loss attempt would leave
+        shares held through the emergency."""
+        runner, _ledger, session = db_runner
+        _prior_exit(
+            session, status=OrderStatus.CANCELLED, requested=10.0, filled=6.0
+        )
+
+        published = await runner._emit_liquidation_exit(
+            _target(), epoch=1786104000, reason="emergency"
+        )
+
+        assert published
+        (order,) = _published_orders(mock_redis)
+        assert float(order["quantity"]) == pytest.approx(10.0)
+        assert order["recommendation_id"] == "liq-paper-AAPL-1786104000"
+        session.rollback()
