@@ -329,7 +329,7 @@ RUN_DIVERGENCE = DEPLOY_DIR / "run_divergence.sh"
 
 def _drive_wrapper(tmp_path, exit_code, report_payload=None, curl_exit=0,
                    renderer_fails=False, serve_credentials=True,
-                   stale_report=None):
+                   stale_report=None, serve_redis=True):
     """Run run_divergence.sh end-to-end against a stubbed monitor and curl.
 
     Everything the wrapper reaches out to is stubbed on PATH: ``nc`` (the DB
@@ -362,7 +362,8 @@ def _drive_wrapper(tmp_path, exit_code, report_payload=None, curl_exit=0,
     stub("security", """#!/bin/bash
 case "${@: -1}" in
   POSTGRES_PASSWORD)  echo "stub-pg" ;;
-""" + ("""  TELEGRAM_BOT_TOKEN) echo "stub-token" ;;
+""" + ("""  REDIS_PASSWORD)     echo "stub-redis" ;;
+""" if serve_redis else "") + ("""  TELEGRAM_BOT_TOKEN) echo "stub-token" ;;
   TELEGRAM_CHAT_ID)   echo "stub-chat" ;;
 """ if serve_credentials else "") + """  *) echo "could not be found" >&2; exit 44 ;;
 esac
@@ -396,6 +397,7 @@ case "$1" in
   *divergence_alert.py) {renderer} ;;
 esac
 [ -f {fixture} ] && cp {fixture} {report}
+echo "monitor saw ALGO_REDIS_URL=${{ALGO_REDIS_URL:-unset}}"
 echo "stub monitor ran" >&2
 echo "ERROR: stub monitor could not load paper state from DB"
 exit {exit_code}
@@ -556,3 +558,28 @@ def test_an_earlier_runs_report_is_not_narrated_as_this_runs(tmp_path):
     assert len(sends) == 1, sends
     assert "BREACH" in sends[0]
     assert "momentum" not in sends[0], sends[0]
+
+
+def test_the_monitor_is_given_a_redis_url_for_its_persistence_alert(tmp_path):
+    """KAN-27: the monitor's only signal for a failed evidence write is an
+    alert on stream:alerts, which needs a Redis it can reach. The wrapper is
+    where the credential lives, so an unexported URL would leave that alert
+    permanently undeliverable — the unwired-safety failure class."""
+    _, _, log = _drive_wrapper(
+        tmp_path, 0, _report(_portfolio("momentum", "OK")),
+    )
+    assert "ALGO_REDIS_URL=redis://:stub-redis@localhost:56379/0" in log, log
+
+
+def test_a_missing_redis_credential_does_not_abort_the_monitor(tmp_path):
+    """The Redis credential serves only the store-failure alert. Treating it as
+    required would let an alert-path dependency take down drift detection —
+    strictly worse than the outage it exists to report."""
+    res, sends, log = _drive_wrapper(
+        tmp_path, 1, _report(_portfolio("momentum", "BREACH")),
+        serve_redis=False,
+    )
+    assert res.returncode == 1
+    assert len(sends) == 1, sends
+    assert "monitor saw ALGO_REDIS_URL=unset" in log, log
+    assert "evidence-store write failure cannot be alerted" in log, log

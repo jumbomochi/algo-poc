@@ -45,15 +45,20 @@ def db_session():
     session.close()
 
 
-def _seed_state(session: Session) -> PaperTradingState:
-    """Seed a paper-trading state with two portfolios and a week of snapshots."""
+def _seed_state(session: Session, start: date | None = None) -> PaperTradingState:
+    """Seed a paper-trading state with two portfolios and a week of snapshots.
+
+    ``start`` moves the seven-day window; the default keeps the fixed historical
+    dates every other test asserts on. Tests that care about *when* the window
+    ends relative to today pass it explicitly.
+    """
     state = PaperTradingState.create_new(
         portfolio_capitals={"momentum": 23080.0, "sector_rotation": 15380.0},
         session=session,
     )
 
     # Seven days of equity snapshots, +0.2%/day for momentum, +0.1%/day for sector_rotation.
-    base = date(2026, 5, 19)
+    base = start or date(2026, 5, 19)
     now = datetime.now(timezone.utc)
     mom_v = 23080.0
     sec_v = 15380.0
@@ -73,10 +78,13 @@ def _seed_state(session: Session) -> PaperTradingState:
     return state
 
 
-def _write_backtest_json(tmp_path: Path, label: str = "20260525_000000") -> Path:
+def _write_backtest_json(
+    tmp_path: Path, label: str = "20260525_000000", start: date | None = None
+) -> Path:
     """Write a minimal valid backtest results JSON for the loader to parse."""
     # Seven dates matching the seeded equity snapshots.
-    dates = [date(2026, 5, 19 + i).isoformat() for i in range(7)]
+    base = start or date(2026, 5, 19)
+    dates = [date.fromordinal(base.toordinal() + i).isoformat() for i in range(7)]
     # portfolio_values is len(dates) + 1; first element is pre-day-0 initial capital.
     mom_pv = [23080.0] + [23080.0 * (1.002 ** (i + 1)) for i in range(7)]
     sec_pv = [15380.0] + [15380.0 * (1.001 ** (i + 1)) for i in range(7)]
@@ -598,3 +606,400 @@ def test_drill_equity_is_absent_from_the_aggregate_report(
     assert {r["portfolio"] for r in with_drill["reports"]} == {
         r["portfolio"] for r in without["reports"]
     }
+
+
+# ---------------------------------------------------------------------------
+# Evidence persistence (KAN-27)
+# ---------------------------------------------------------------------------
+
+
+def _comparable_backtest(
+    tmp_path: Path,
+    label: str = "20260525_000000",
+    start: date | None = None,
+    momentum_daily: float | None = None,
+) -> Path:
+    """A baseline the monitor is willing to grade against.
+
+    The bare ``_write_backtest_json`` declares no execution model, which reads
+    as pre-rebaseline (same-bar fills) and forces every verdict to NO_DATA.
+    ``momentum_daily`` slows the momentum sleeve's backtest growth so live
+    diverges from it far enough to BREACH.
+    """
+    path = _write_backtest_json(tmp_path, label=label, start=start)
+    data = json.loads(path.read_text())
+    data["config"].update({
+        "fill_model": "next_open",
+        "commission_minimum": 1.0,
+        "point_in_time_universe": True,
+        "coverage": {
+            "state": "OK",
+            "excluded_pct": 0.0,
+            "total_membership_days": 12_000,
+            "excluded_membership_days": 0,
+            "excluded_tickers": {},
+            "floor_pct": 5.0,
+        },
+    })
+    if momentum_daily is not None:
+        data["portfolios"]["momentum"]["portfolio_values"] = (
+            [23080.0] + [23080.0 * (momentum_daily ** (i + 1)) for i in range(7)]
+        )
+    path.write_text(json.dumps(data))
+    return path
+
+
+def _evidence_db(
+    tmp_path: Path,
+    name: str,
+    *,
+    start: date | None = None,
+    with_divergence_table: bool = True,
+) -> str:
+    """Create a seeded sqlite paper DB and return its URL.
+
+    ``with_divergence_table=False`` builds every table EXCEPT ``divergence_daily``
+    — a real un-migrated store, so the failure path is exercised by SQLAlchemy
+    raising for real rather than by a stubbed writer.
+    """
+    from shared.models.evidence import DivergenceDaily
+
+    db_url = f"sqlite:///{tmp_path / (name + '.db')}"
+    engine = create_engine(db_url)
+    tables = None
+    if not with_divergence_table:
+        tables = [
+            t for t in Base.metadata.sorted_tables
+            if t.name != DivergenceDaily.__tablename__
+        ]
+    Base.metadata.create_all(engine, tables=tables)
+    session = sessionmaker(bind=engine)()
+    _seed_state(session, start=start)
+    session.commit()
+    session.close()
+    return db_url
+
+
+def _run_monitor_main(
+    monkeypatch, *, backtest: Path, db_url: str, output: Path, window: str = "5"
+) -> int:
+    from scripts import divergence_monitor
+
+    monkeypatch.setattr(divergence_monitor.sys, "argv", [
+        "divergence_monitor.py",
+        "--backtest", str(backtest),
+        "--db-url", db_url,
+        "--window", window,
+        "--output", str(output),
+    ])
+    return divergence_monitor.main()
+
+
+def _capture_alerts(monkeypatch) -> list[tuple[str, dict]]:
+    """Record what the monitor would publish to ``stream:alerts``.
+
+    Every store-failure test installs this: without it the run would open a
+    real Redis connection from the developer's config, which is both slow and
+    capable of publishing a test alert onto the live stream.
+    """
+    from scripts import divergence_monitor
+
+    published: list[tuple[str, dict]] = []
+
+    class _FakeRedis:
+        def xadd(self, stream, payload):
+            published.append((stream, payload))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        divergence_monitor, "_redis_from_url", lambda url, **kw: _FakeRedis()
+    )
+    return published
+
+
+def _verdict_rows(db_url: str) -> list:
+    from shared.models.evidence import DivergenceDaily
+
+    session = sessionmaker(bind=create_engine(db_url))()
+    try:
+        return list(
+            session.query(DivergenceDaily)
+            .order_by(DivergenceDaily.sleeve, DivergenceDaily.session_date)
+            .all()
+        )
+    finally:
+        session.close()
+
+
+def test_one_verdict_row_per_scored_sleeve(tmp_path: Path, monkeypatch, capsys):
+    """AC1: one row per included sleeve, statuses matching the report verbatim."""
+    db_url = _evidence_db(tmp_path, "rows")
+    report_path = tmp_path / "divergence.json"
+
+    code = _run_monitor_main(
+        monkeypatch,
+        backtest=_comparable_backtest(tmp_path),
+        db_url=db_url,
+        output=report_path,
+    )
+    capsys.readouterr()
+
+    assert code == EXIT_OK
+    rows = _verdict_rows(db_url)
+    reported = {
+        r["portfolio"]: r["status"]
+        for r in json.loads(report_path.read_text())["reports"]
+        if r["portfolio"] != "AGGREGATE"
+    }
+    assert {row.sleeve: row.status for row in rows} == reported
+    assert len(rows) == len(reported) == 2
+    assert {row.baseline_id for row in rows} == {"backtest_multi_20260525_000000.json"}
+    assert {row.window_sessions for row in rows} == {5}
+
+
+def test_a_no_data_verdict_is_recorded_rather_than_skipped(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """AC2: "the monitor ran and could not judge" is an observation, not absence.
+
+    Absence means the monitor did not run at all; KAN-26's pause-clock
+    arithmetic distinguishes the two, so a NO_DATA verdict must leave a row.
+    """
+    db_url = _evidence_db(tmp_path, "nodata")
+    # No declared execution model ⇒ pre-rebaseline baseline ⇒ every verdict NO_DATA.
+    code = _run_monitor_main(
+        monkeypatch,
+        backtest=_write_backtest_json(tmp_path),
+        db_url=db_url,
+        output=tmp_path / "divergence.json",
+    )
+    capsys.readouterr()
+
+    assert code == EXIT_BASELINE_NOT_COMPARABLE
+    rows = _verdict_rows(db_url)
+    assert len(rows) == 2
+    assert {row.status for row in rows} == {"NO_DATA"}
+
+
+def test_a_rerun_on_the_same_baseline_updates_rather_than_duplicates(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """AC3: the unique constraint is honoured by an upsert, not by a crash."""
+    db_url = _evidence_db(tmp_path, "idempotent")
+    backtest = _comparable_backtest(tmp_path)
+    report_path = tmp_path / "divergence.json"
+
+    _run_monitor_main(
+        monkeypatch, backtest=backtest, db_url=db_url, output=report_path
+    )
+    first = _verdict_rows(db_url)
+    _run_monitor_main(
+        monkeypatch, backtest=backtest, db_url=db_url, output=report_path
+    )
+    capsys.readouterr()
+    second = _verdict_rows(db_url)
+
+    assert len(second) == len(first) == 2
+    assert [row.id for row in second] == [row.id for row in first]
+
+
+def test_a_different_baseline_inserts_its_own_rows(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """AC3: a verdict is only interpretable against the baseline that produced it."""
+    db_url = _evidence_db(tmp_path, "rebaselined")
+    report_path = tmp_path / "divergence.json"
+
+    _run_monitor_main(
+        monkeypatch,
+        backtest=_comparable_backtest(tmp_path, label="20260525_000000"),
+        db_url=db_url,
+        output=report_path,
+    )
+    _run_monitor_main(
+        monkeypatch,
+        backtest=_comparable_backtest(tmp_path, label="20260601_120000"),
+        db_url=db_url,
+        output=report_path,
+    )
+    capsys.readouterr()
+
+    rows = _verdict_rows(db_url)
+    assert len(rows) == 4
+    assert {row.baseline_id for row in rows} == {
+        "backtest_multi_20260525_000000.json",
+        "backtest_multi_20260601_120000.json",
+    }
+
+
+def test_session_date_is_the_last_aligned_session_not_today(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """AC4: the row dates the session it describes, not the day it was written.
+
+    The monitor runs after the close and can run late (a Saturday catch-up
+    reports Friday), so stamping ``date.today()`` would silently mis-date the
+    evidence the epoch clock counts.
+    """
+    last_session = date.fromordinal(date.today().toordinal() - 2)
+    window_start = date.fromordinal(last_session.toordinal() - 6)
+    db_url = _evidence_db(tmp_path, "dated", start=window_start)
+
+    _run_monitor_main(
+        monkeypatch,
+        backtest=_comparable_backtest(tmp_path, start=window_start),
+        db_url=db_url,
+        output=tmp_path / "divergence.json",
+    )
+    capsys.readouterr()
+
+    rows = _verdict_rows(db_url)
+    assert rows
+    assert {row.session_date for row in rows} == {last_session}
+    assert date.today() not in {row.session_date for row in rows}
+
+
+def test_the_aggregate_rollup_is_not_persisted(tmp_path: Path, monkeypatch, capsys):
+    """AC5: AGGREGATE is derived truth (D15) — the digest recomputes it."""
+    db_url = _evidence_db(tmp_path, "aggregate")
+    report_path = tmp_path / "divergence.json"
+
+    _run_monitor_main(
+        monkeypatch,
+        backtest=_comparable_backtest(tmp_path),
+        db_url=db_url,
+        output=report_path,
+    )
+    capsys.readouterr()
+
+    reported = {r["portfolio"] for r in json.loads(report_path.read_text())["reports"]}
+    assert "AGGREGATE" in reported  # the report still shows it
+    assert {row.sleeve for row in _verdict_rows(db_url)} == {
+        "momentum", "sector_rotation",
+    }
+
+
+def test_a_verdict_with_no_overlapping_window_writes_no_row(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """No aligned session ⇒ no session to date the row by ⇒ absence, not a placeholder.
+
+    ``divergence_daily.session_date`` is the session a verdict covers. When live
+    and the baseline share no dates there is no such session, and inventing
+    today's would claim a verdict for a session that was never scored — which
+    the blindness rule reads as evidence the monitor was working.
+    """
+    db_url = _evidence_db(tmp_path, "disjoint")
+    backtest = _comparable_backtest(tmp_path, start=date(2025, 1, 6))
+
+    code = _run_monitor_main(
+        monkeypatch,
+        backtest=backtest,
+        db_url=db_url,
+        output=tmp_path / "divergence.json",
+    )
+    out = capsys.readouterr().out
+
+    assert code == EXIT_OK  # a genuine NO_DATA on a good baseline is not a fault
+    assert _verdict_rows(db_url) == []
+    assert "no aligned session" in out.lower()
+
+
+def test_a_store_write_failure_leaves_the_exit_code_untouched(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """AC6: a store outage must never mask the verdict the wrapper branches on."""
+    _capture_alerts(monkeypatch)
+    db_url = _evidence_db(tmp_path, "unmigrated", with_divergence_table=False)
+
+    code = _run_monitor_main(
+        monkeypatch,
+        backtest=_comparable_backtest(tmp_path),
+        db_url=db_url,
+        output=tmp_path / "divergence.json",
+    )
+    out = capsys.readouterr().out
+
+    assert code == EXIT_OK
+    assert "could not persist" in out.lower()
+
+
+def test_a_breach_still_exits_one_when_the_store_write_fails(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """AC6: the louder signal survives — exit 1 is what pages the operator."""
+    _capture_alerts(monkeypatch)
+    db_url = _evidence_db(tmp_path, "breach", with_divergence_table=False)
+
+    code = _run_monitor_main(
+        monkeypatch,
+        backtest=_comparable_backtest(tmp_path, momentum_daily=1.0005),
+        db_url=db_url,
+        output=tmp_path / "divergence.json",
+    )
+    out = capsys.readouterr().out
+
+    assert code == EXIT_BREACH
+    assert "could not persist" in out.lower()
+
+
+def test_a_store_write_failure_raises_a_high_priority_alert(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """AC6: exit 0 is silent by design, so the alert is the only operator signal."""
+    published = _capture_alerts(monkeypatch)
+    db_url = _evidence_db(tmp_path, "alerting", with_divergence_table=False)
+
+    _run_monitor_main(
+        monkeypatch,
+        backtest=_comparable_backtest(tmp_path),
+        db_url=db_url,
+        output=tmp_path / "divergence.json",
+    )
+    capsys.readouterr()
+
+    assert len(published) == 1, published
+    stream, payload = published[0]
+    assert stream == "stream:alerts"
+    assert payload["priority"] == "high"
+    assert "divergence" in payload["message"].lower()
+
+
+def test_the_alert_never_leaks_the_database_password(tmp_path: Path, monkeypatch):
+    """The alert fans out to Telegram; the DSN in a DB error carries the password."""
+    from scripts import divergence_monitor
+
+    published = _capture_alerts(monkeypatch)
+    divergence_monitor.emit_persist_failure_alert(
+        RuntimeError("could not connect to postgresql://algo:hunter2@db:5432/algo_poc"),
+        redis_url="redis://:secret@localhost:6379/0",
+    )
+
+    assert published
+    assert "hunter2" not in published[0][1]["message"]
+
+
+def test_a_dead_alert_channel_does_not_break_the_run(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """Best-effort by construction: the exit code is the guaranteed signal."""
+    from scripts import divergence_monitor
+
+    def _explode(url, **kwargs):
+        raise ConnectionError("redis is down")
+
+    monkeypatch.setattr(divergence_monitor, "_redis_from_url", _explode)
+    db_url = _evidence_db(tmp_path, "deadalerts", with_divergence_table=False)
+
+    code = _run_monitor_main(
+        monkeypatch,
+        backtest=_comparable_backtest(tmp_path),
+        db_url=db_url,
+        output=tmp_path / "divergence.json",
+    )
+    out = capsys.readouterr().out
+
+    assert code == EXIT_OK
+    assert "could not raise" in out.lower()

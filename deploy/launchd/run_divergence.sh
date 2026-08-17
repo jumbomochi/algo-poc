@@ -107,6 +107,18 @@ if ! algo_load_secrets POSTGRES_PASSWORD; then
 fi
 export ALGO_DATABASE_URL="postgresql://algo:${POSTGRES_PASSWORD}@localhost:55432/algo_poc"
 
+# Redis is NOT required to run the monitor: it carries only the alert the
+# monitor raises if it cannot write its verdicts to the evidence store (KAN-27).
+# That failure leaves the exit code untouched by design, so this is the sole
+# operator-visible signal for it — but making the credential mandatory would
+# let an alert-path dependency abort drift detection, which is strictly worse
+# than the outage it reports. Warn and carry on.
+if algo_load_secrets REDIS_PASSWORD; then
+    export ALGO_REDIS_URL="redis://:${REDIS_PASSWORD}@localhost:56379/0"
+else
+    echo "$(date): WARNING - $ALGO_SECRETS_ERROR; an evidence-store write failure cannot be alerted" >> "$LOG_FILE"
+fi
+
 # Wait up to 5 min for the dockerized paper DB before hard-erroring (exit 2).
 if ! wait_for_port 127.0.0.1 55432 "paper DB (docker compose up?)" 300; then
     algo_alert_local "divergence monitor aborted — paper DB never came up on 55432"
