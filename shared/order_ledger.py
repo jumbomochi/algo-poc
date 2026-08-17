@@ -545,6 +545,30 @@ class OrderLedger:
         )
         return float(self.session.scalar(stmt) or 0.0)
 
+    def open_stop_intents(
+        self, account_id: str, portfolio: str, con_id: int
+    ) -> list[OrderIntent]:
+        """The stop intents currently claiming to protect one position (KAN-20).
+
+        The rows :meth:`open_stop_quantity` counts, returned whole so the
+        verifier can hold each one against what IB is actually resting. The
+        claim and the reality diverge in exactly the ways this scan exists to
+        catch: the order was cancelled out of band, or its size or level was
+        changed underneath us.
+        """
+        stmt = (
+            select(OrderIntent)
+            .where(
+                OrderIntent.account_id == account_id,
+                OrderIntent.portfolio == portfolio,
+                OrderIntent.con_id == con_id,
+                func.lower(OrderIntent.order_type) == BROKER_STOP_ORDER_TYPE,
+                OrderIntent.status.in_(NONTERMINAL_STATUSES),
+            )
+            .order_by(OrderIntent.id)
+        )
+        return list(self.session.scalars(stmt))
+
     def projected_execution_keys(
         self, execution_keys: Iterable[tuple[str, str]]
     ) -> set[tuple[str, str]]:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from sqlalchemy import create_engine, event, select
@@ -1604,7 +1604,13 @@ class TestKillHandling:
 
         await runner.process_kill(kill_msg)
 
-        mock_order_manager.cancel_all_orders.assert_called_once()
+        # Working orders first, stops per position (KAN-20), then a
+        # stops-only sweep for any the per-position path could not reach —
+        # never a blanket cancel-all, which would take the exits with it.
+        assert mock_order_manager.cancel_all_orders.call_args_list == [
+            call(include_stops=False)
+        ]
+        mock_order_manager.cancel_all_stops.assert_awaited_once()
         # Should have submitted market exits for all positions
         assert mock_order_manager.submit_exit.call_count == 2
 

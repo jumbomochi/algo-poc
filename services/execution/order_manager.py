@@ -550,6 +550,14 @@ class OrderManager:
         """
         return list(await self._executor.list_open_orders())
 
+    async def completed_order_states(self) -> dict[str, str]:
+        """Terminal status per ``orderRef`` from IB's completed-order history.
+
+        What the stop verifier needs to tell a cancelled stop from a filled
+        one (KAN-20). One account-wide request, fetched once per scan.
+        """
+        return dict(await self._executor.completed_order_states())
+
     async def cancel_broker_order(self, order_id: str) -> bool:
         """Cancel one live broker order, tracked locally or not.
 
@@ -559,6 +567,65 @@ class OrderManager:
         cancelled = await self._executor.cancel_broker_order(order_id)
         if cancelled:
             self.open_orders.pop(order_id, None)
+        return cancelled
+
+    async def cancel_stops_for_ticker(self, ticker: str) -> list[str]:
+        """Cancel the protective stops resting on one ticker (KAN-20).
+
+        The kill path's replacement for cancelling every stop up front. Doing
+        it per position, immediately before that position's liquidation sell,
+        bounds the unprotected window to the one name being flattened: a sell
+        that fails mid-loop no longer strips the protection off every position
+        behind it in the queue.
+        """
+        return await self._cancel_tracked_stops(
+            [
+                order_id
+                for order_id, info in self.open_orders.items()
+                if info.get("order_type") == "stop"
+                and info.get("ticker") == ticker
+            ],
+            ticker=ticker,
+        )
+
+    async def cancel_all_stops(self) -> list[str]:
+        """Cancel every protective stop still tracked, on any ticker (KAN-20).
+
+        The kill's backstop for a stop the per-position path never reached: one
+        on a name the book no longer holds, or whose exit was already in
+        flight. Deliberately **not** :meth:`cancel_all_orders` — by this point
+        the kill's own liquidation exits are tracked in ``open_orders`` too
+        (:meth:`submit_exit` records them so a stuck exit stays reachable), and
+        a blanket cancel-all would cancel the very sells the kill just ordered
+        and leave the book un-flattened.
+        """
+        return await self._cancel_tracked_stops(
+            [
+                order_id
+                for order_id, info in self.open_orders.items()
+                if info.get("order_type") == "stop"
+            ]
+        )
+
+    async def _cancel_tracked_stops(
+        self, order_ids: list[str], *, ticker: str | None = None
+    ) -> list[str]:
+        cancelled: list[str] = []
+        for order_id in order_ids:
+            try:
+                if await self.cancel_broker_order(order_id):
+                    cancelled.append(order_id)
+            except Exception:
+                # A stop we could not cancel is still live at IB, so it stays
+                # tracked and the caller still liquidates — the pre-existing
+                # cancel-all behaved the same way. The log is the signal.
+                self._logger.exception(
+                    "Failed to cancel a protective stop before liquidation",
+                    order_id=order_id,
+                    ticker=ticker or self.open_orders.get(order_id, {}).get(
+                        "ticker"
+                    ),
+                )
         return cancelled
 
     async def cancel_working_orders(

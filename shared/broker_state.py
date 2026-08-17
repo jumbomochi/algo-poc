@@ -1,7 +1,35 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
+
+
+def optional_str(value: Any) -> str | None:
+    """A reported string, or None when IB left the field empty."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def optional_float(value: Any) -> float | None:
+    """A reported price, or None when IB reports its "unset" sentinel.
+
+    IB fills numeric order fields it has no value for with ``DBL_MAX`` rather
+    than leaving them absent (observed on ``trailingPercent`` during the KAN-18
+    spike). Read literally that is a price of 1.8e308, so anything not finite
+    is reported as absent — otherwise KAN-20's verifier would read an
+    unprotected position as protected at an unreachable level.
+    """
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
 
 
 @dataclass(frozen=True)
