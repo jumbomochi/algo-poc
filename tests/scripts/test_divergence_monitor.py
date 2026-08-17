@@ -681,7 +681,8 @@ def _evidence_db(
 
 
 def _run_monitor_main(
-    monkeypatch, *, backtest: Path, db_url: str, output: Path, window: str = "5"
+    monkeypatch, *, backtest: Path, db_url: str, output: Path, window: str = "5",
+    extra: list[str] | None = None,
 ) -> int:
     from scripts import divergence_monitor
 
@@ -691,7 +692,7 @@ def _run_monitor_main(
         "--db-url", db_url,
         "--window", window,
         "--output", str(output),
-    ])
+    ] + (extra or []))
     return divergence_monitor.main()
 
 
@@ -786,23 +787,79 @@ def test_a_no_data_verdict_is_recorded_rather_than_skipped(
 def test_a_rerun_on_the_same_baseline_updates_rather_than_duplicates(
     tmp_path: Path, monkeypatch, capsys
 ):
-    """AC3: the unique constraint is honoured by an upsert, not by a crash."""
+    """AC3: the unique constraint is honoured by an upsert, not by a crash.
+
+    The re-run is given a changed live series, so this pins that the row is
+    actually rewritten. Asserting only the row count would pass just as well
+    against a writer that silently did nothing on the second run.
+    """
     db_url = _evidence_db(tmp_path, "idempotent")
-    backtest = _comparable_backtest(tmp_path)
+    backtest = _comparable_backtest(tmp_path, momentum_daily=1.0005)
     report_path = tmp_path / "divergence.json"
 
     _run_monitor_main(
         monkeypatch, backtest=backtest, db_url=db_url, output=report_path
     )
-    first = _verdict_rows(db_url)
+    first = {row.sleeve: row for row in _verdict_rows(db_url)}
+    assert first["momentum"].status == "BREACH"
+
+    # A correction lands: momentum's live series now tracks the baseline.
+    session = sessionmaker(bind=create_engine(db_url))()
+    snapshots = session.query(EquitySnapshot).filter(
+        EquitySnapshot.portfolio == "momentum"
+    ).order_by(EquitySnapshot.date).all()
+    for i, snapshot in enumerate(snapshots):
+        snapshot.equity = 23080.0 * (1.0005 ** i)
+    session.commit()
+    session.close()
+
     _run_monitor_main(
         monkeypatch, backtest=backtest, db_url=db_url, output=report_path
     )
     capsys.readouterr()
-    second = _verdict_rows(db_url)
+    second = {row.sleeve: row for row in _verdict_rows(db_url)}
 
     assert len(second) == len(first) == 2
-    assert [row.id for row in second] == [row.id for row in first]
+    assert second["momentum"].id == first["momentum"].id  # updated, not re-inserted
+    assert second["momentum"].status == "OK"
+    assert second["momentum"].metric_value != first["momentum"].metric_value
+    assert second["momentum"].threshold == first["momentum"].threshold
+
+
+def test_an_ad_hoc_rerun_cannot_overwrite_a_differently_pinned_verdict(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """A verdict is only meaningful under the window/threshold it was scored at.
+
+    The runbook invites ad-hoc runs with a different --window/--threshold, and
+    those land on the same (sleeve, session_date, baseline_id) key as the
+    canonical 04:45 run — window_end does not move with --window. Letting one
+    overwrite the other would let an exploratory command silently clear a
+    firing breach streak that the capital ladder gates on, with no trace.
+    """
+    db_url = _evidence_db(tmp_path, "pinned")
+    backtest = _comparable_backtest(tmp_path, momentum_daily=1.0005)
+    report_path = tmp_path / "divergence.json"
+
+    canonical = _run_monitor_main(
+        monkeypatch, backtest=backtest, db_url=db_url, output=report_path
+    )
+    assert canonical == EXIT_BREACH
+    before = {row.sleeve: (row.status, row.threshold) for row in _verdict_rows(db_url)}
+    assert before["momentum"] == ("BREACH", pytest.approx(0.20))
+
+    # The same session, scored at a threshold no divergence could breach.
+    ad_hoc = _run_monitor_main(
+        monkeypatch, backtest=backtest, db_url=db_url, output=report_path,
+        extra=["--portfolio", "momentum", "--threshold", "9.0"],
+    )
+    out = capsys.readouterr().out
+
+    assert ad_hoc == EXIT_OK  # the ad-hoc run reports its own verdict as usual
+    after = {row.sleeve: (row.status, row.threshold) for row in _verdict_rows(db_url)}
+    assert after == before
+    assert "not recording 'momentum'" in out.lower()
+    assert "differently-pinned" in out.lower()
 
 
 def test_a_different_baseline_inserts_its_own_rows(
@@ -1003,3 +1060,29 @@ def test_a_dead_alert_channel_does_not_break_the_run(
 
     assert code == EXIT_OK
     assert "could not raise" in out.lower()
+
+
+def test_the_persist_connection_is_bounded_by_a_statement_timeout():
+    """The 04:45 job must not hang on the store.
+
+    The verdict reaches the operator only after the process exits — the wrapper
+    sends the Telegram message from the exit code — so an INSERT blocked on a
+    lock (a migration mid-flight, a half-open connection) would swallow a
+    BREACH entirely. Bounding the write turns that into a reported failure.
+    """
+    from scripts import divergence_monitor
+
+    kwargs = divergence_monitor.persist_engine_kwargs(
+        "postgresql://algo:pw@localhost:55432/algo_poc"
+    )
+    assert (
+        f"statement_timeout={divergence_monitor.PERSIST_STATEMENT_TIMEOUT_MS}"
+        in kwargs["connect_args"]["options"]
+    )
+
+
+def test_a_non_postgres_url_gets_no_postgres_only_connect_args():
+    """sqlite (the test store) has no statement_timeout — passing one would fail."""
+    from scripts import divergence_monitor
+
+    assert divergence_monitor.persist_engine_kwargs("sqlite:///paper.db") == {}

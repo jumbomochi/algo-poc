@@ -86,6 +86,13 @@ transient or overwritten, so they are reports, not evidence.
   baseline updates the row in place; a re-run after a rebaseline inserts new
   rows, because a verdict is only interpretable against the baseline that
   produced it.
+- **An ad-hoc run cannot overwrite the canonical verdict.** The examples above
+  re-score the same session at a different `--window`/`--threshold`, which lands
+  on the same key (`window_end` does not move with `--window`). A stored verdict
+  scored under different pins is a different observation, so the monitor prints
+  its reason and leaves the row alone — exploring a threshold must not be able
+  to clear a firing breach streak. Re-run with the canonical pins (the defaults,
+  which is what the 04:45 job uses) to update it.
 - **`NO_DATA` is recorded, absence is not.** A recorded `NO_DATA` means the
   monitor ran and could not judge; a missing row on an NYSE trading day means
   the monitor did not run. Both pause the epoch clock, and the store has to be

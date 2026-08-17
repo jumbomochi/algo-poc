@@ -379,6 +379,45 @@ def baseline_id_for(backtest_path: str) -> str:
     return Path(backtest_path).name
 
 
+# Generous for two INSERTs, and short next to the job's window. The verdict
+# reaches the operator only once this process exits — the launchd wrapper sends
+# the Telegram message from the exit code — so a write blocked on a lock would
+# otherwise swallow a BREACH rather than merely lose a row.
+PERSIST_STATEMENT_TIMEOUT_MS = 30_000
+
+
+def persist_engine_kwargs(db_url: str) -> dict[str, Any]:
+    """Engine options for the short-lived connection that writes the verdicts.
+
+    Postgres-only: ``statement_timeout`` is a server setting sqlite (the test
+    store) would reject. Applied to a connection of its own rather than to the
+    read engine, so bounding the write cannot change how the reporting half of
+    the run behaves.
+    """
+    if db_url.startswith("postgresql"):
+        return {
+            "connect_args": {
+                "options": f"-c statement_timeout={PERSIST_STATEMENT_TIMEOUT_MS}"
+            }
+        }
+    return {}
+
+
+# A float that round-tripped through the DB should compare equal, but a hair of
+# drift must not be read as "a different threshold" and block a real update.
+_THRESHOLD_TOLERANCE = 1e-9
+
+
+def _same_pins(
+    existing: DivergenceDaily, window_sessions: int, threshold: float
+) -> bool:
+    """Was the stored verdict scored under the same window and threshold?"""
+    return (
+        existing.window_sessions == window_sessions
+        and abs(existing.threshold - threshold) <= _THRESHOLD_TOLERANCE
+    )
+
+
 def persist_divergence_rows(
     session: Session,
     reports: list[PortfolioDivergenceReport],
@@ -439,14 +478,26 @@ def persist_divergence_rows(
                     created_at=now,
                 )
             )
+        elif not _same_pins(existing, window_sessions, threshold):
+            # An ad-hoc run with a different --window/--threshold lands on the
+            # same key as the canonical one — window_end does not move with
+            # --window — but it is a different observation, not a correction.
+            # Overwriting would let an exploratory command silently clear a
+            # firing breach streak the capital ladder gates on.
+            print(
+                f"  ⚠ Not recording '{report.portfolio}' for {report.window_end}: "
+                f"the stored verdict was scored at window {existing.window_sessions}/"
+                f"threshold {existing.threshold:g} and this run used "
+                f"{window_sessions}/{threshold:g}. A differently-pinned verdict is a "
+                f"different observation, so the recorded one stands; re-run with the "
+                f"canonical pins to update it."
+            )
+            continue
         else:
-            # A re-run scores the same session against the same baseline, so
-            # the verdict may legitimately differ (a late snapshot landed). The
-            # pins are rewritten too: a stale window/threshold beside a fresh
-            # status would make the row uninterpretable.
+            # A re-run of the same observation: the verdict may legitimately
+            # differ (a late or corrected snapshot landed), and the freshest
+            # scoring of that session is the one the store should hold.
             existing.status = report.status
-            existing.window_sessions = window_sessions
-            existing.threshold = threshold
             existing.metric_value = report.relative_divergence
             existing.created_at = now
         written += 1
@@ -727,25 +778,32 @@ def main() -> int:
     # Last because the JSON report and the .prom file are what the launchd
     # wrapper's alert renderer reads back: a slow or wedged store must not cost
     # the operator the message about a BREACH.
+    # The write gets a connection of its own — bounded by a statement timeout,
+    # and with an identity map that holds none of the ORM objects the reporting
+    # half loaded, so it can only ever commit the rows built below.
     try:
-        written = persist_divergence_rows(
-            session,
-            sleeve_reports,
-            baseline_id=baseline_id_for(backtest_path),
-            window_sessions=args.window,
-            threshold=args.threshold,
-        )
-        session.commit()
+        persist_session: Session = sessionmaker(
+            bind=create_engine(args.db_url, **persist_engine_kwargs(args.db_url))
+        )()
+        try:
+            written = persist_divergence_rows(
+                persist_session,
+                sleeve_reports,
+                baseline_id=baseline_id_for(backtest_path),
+                window_sessions=args.window,
+                threshold=args.threshold,
+            )
+            persist_session.commit()
+        finally:
+            # Closing rolls back anything uncommitted, so a partial write can
+            # never be left half-applied on the way out.
+            persist_session.close()
         print(f"  Recorded {written} divergence verdict row(s) in the evidence store.")
     except Exception as e:
         # The monitor's job is to report divergence. A store outage is a real
         # problem — it makes the session look blind to the epoch clock — but it
         # is the operator's to fix, and swallowing the verdict to report it
         # would be strictly worse. Hence: alert, and leave the exit code alone.
-        try:
-            session.rollback()
-        except Exception:
-            pass
         print(f"ERROR: could not persist divergence verdicts: {_redact(str(e))}")
         emit_persist_failure_alert(e, redis_url=args.redis_url)
 
