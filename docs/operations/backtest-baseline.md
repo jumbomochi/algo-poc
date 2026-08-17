@@ -25,6 +25,7 @@ results so downstream tools can check it:
 | Universe | point-in-time membership, when snapshots are supplied | Otherwise the run is survivorship-biased and says so, loudly. |
 | Universe coverage | ≥ 95% of membership-days priceable | A point-in-time member whose bars cannot be pulled is silently skipped, and the skipped names are disproportionately the delistings. |
 | Fundamentals | available 45 days after period-end (or the row's `filing_date`) | A quarter ending 31 March is not public on 31 March. |
+| Share sizing | fractional, unless `--whole-shares` | Live truncates to whole shares and refuses the order at zero; the backtest does not, so the two disagree by default. See below. |
 
 `config.fill_model`, `config.commission_minimum`,
 `config.slippage_bps_by_ticker`, `config.point_in_time_universe` and
@@ -40,6 +41,31 @@ read as the unsafe value; absence is never a pass.
 When the baseline fails that check the monitor exits **3** (not 0), and
 `deploy/launchd/run_divergence.sh` logs it as `divergence monitor BLIND`. A
 blind monitor is an outage, not a clean run.
+
+### Whole-share sizing (`--whole-shares`)
+
+Off by default, so every existing invocation — the weekly refresh included —
+is unchanged. With it on, entry quantities truncate toward zero at the sizing
+sites **and** after `RiskEngine.check_entry` caps an order, mirroring
+`ib_executor._effective_quantity`. An entry whose budget cannot buy one whole
+share opens no position and is recorded per sleeve:
+
+```json
+"skipped_signals": {"count": 7395, "signals": [
+  {"ticker": "AAPL", "date": "2019-04-01", "fractional_quantity": 0.2131, "price": 160.2}
+]},
+"entry_signals_sized": 7395
+```
+
+`entry_signals_sized` is the denominator — how many entries the sleeve tried to
+open at all — so a skip count can be read as a rate. `config.whole_shares`
+records which mode produced the artifact, and `open_positions` lists lots still
+held at the last session, which `trades` (closed round-trips only) omits.
+
+This matters most at small capital, where a sleeve's per-position budget can be
+smaller than one share: see
+[`rung0-economics.md`](rung0-economics.md), where `quality_value` fills 0 of
+7,395 signals at USD 3,700.
 
 ---
 
