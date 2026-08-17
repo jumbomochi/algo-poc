@@ -93,6 +93,27 @@ reference basis):
 | `thematic_momentum` | 14.10% | THEMATIC_ETFS |
 | `tail_risk_hedge` | 12.83% | DEFENSIVE_TICKERS |
 
+> **⚠ Rung-0 allocation overlay, 2026-08-17 (amendment below, KAN-34 / direction
+> D8).** The weights above remain the configuration of record and are unchanged.
+> **At Rung 0 only (5,000 SGD ≈ USD 3,700), the live account runs `momentum`
+> alone at 100%**; the other five sleeves are **suspended, not retired**, and
+> return at higher rungs by between-epoch amendment. Reason: at Rung 0 the
+> six-way split sizes positions at $34–119, below one whole share of most of the
+> universe — `quality_value` filled 0 of 7,395 entry signals over ten years.
+> Two consequences govern here rather than in the memo:
+>
+> - **No standing crash hedge at Rung 0.** `tail_risk_hedge` is suspended.
+> - **The crash entry freeze becomes a total trading freeze.** Every sleeve
+>   except `tail_risk_hedge` is wrapped by the freeze, so in a crash regime a
+>   one-sleeve book opens no positions at all — including the `SH`/`PSQ`
+>   rotation inside `momentum`. Exits are never blocked and the 10% trailing
+>   stop continues to fire. This is accepted as a conservative posture at
+>   smoke-test size, not overlooked.
+>
+> The overlay is conditional on `momentum`'s edge verdict of record (direction
+> D10); if it fails, the decision reopens and Rung 0 does not arm on it. Full
+> decision: [rung0-economics.md §9](rung0-economics.md).
+
 **Hard constraints:**
 
 - **No leverage** beyond what the sleeve definitions already imply; `total_exposure_limit_pct`
@@ -350,6 +371,8 @@ deployed system capital reaches −25%.**
 | 2026-06-30 | Currency reconciliation (§ 5, § 8, § 10) | Smoke test funded as 5,000 SGD (wired 2026-06-16), not USD; added funding-currency/FX section (NAV measured in USD, SGD/USD FX is unhedged and outside § 7); W-8BEN / SGD-residency tax notes; refreshed monitoring note now that the divergence + gateway-watchdog launchd jobs are deployed. |
 | 2026-08-06 | Implementation review adopted; § 6 enforcement caveat added | 6-agent read-only review found several § 6 limits declared but not wired on the live path (stop-loss, passive-scan, circuit-breaker liquidation; drawdown measured on budget not equity). **No limits changed** — this is a factual correction of the "enforced in code" claim. Tracked in **T1 (#2)** / **T2 (#3)**. Full review: [implementation-review-2026-08-06.md](implementation-review-2026-08-06.md). |
 | 2026-08-17 | **Capital-scaling ladder supersedes § 5 in full** (KAN-37, direction D9/D14/D16) | Two conflicting deployment paths cannot both govern real money. The ladder's written rungs + clean-epoch criteria replace § 5's illustrative steps; the 8-gate re-clear is retained at Rung 0 entry and after a Rung-0 disarm, the capacity review at Rung 3. Records that the **divergence monitor is a capital-decision input by rule** — resolving its own doc's "not a kill switch" wording, which stays true of automated action and is now false of capital authority. Restates the two standing constraints the ladder does not override: the **30% household satellite ceiling by dollar** (§ 3) and **W-8BEN / tax closure before any scale-up** (§ 10). Prerequisite for Rung 0 entry. Per-sleeve demotion rules: [sleeve-kill-criteria.md](sleeve-kill-criteria.md). |
+
+| 2026-08-17 | **Rung-0 allocation overlay: one sleeve** (§ 4) (KAN-34, direction D8) | The measured Rung-0 run showed the six-way split does not trade at this capital rather than merely trading expensively: positions size to $34–119, `quality_value` filled **0 of 7,395** entry signals and `tail_risk_hedge` 4 of 5,956, and round-trip commission drag on what did fill was 236–632 bps against $1,766 of gross P&L. Rung 0 therefore runs **`momentum` alone at 100%** ($444/position, 87.7% of the universe fillable, ~45 bps round-trip); the other five are **suspended, not retired**, and return at higher rungs by amendment. **No weight of record changed** — this is a rung-scoped overlay. Risk-posture consequences accepted and recorded in § 4: no standing crash hedge, and the crash entry freeze becomes a total trading freeze (exits unaffected). Conditional on `momentum`'s D10 edge verdict of record; fallback `sector_rotation`. Decision: [rung0-economics.md § 9](rung0-economics.md). |
 
 ### Appendix A — revival conditions for dropped sleeves
 

@@ -1,6 +1,6 @@
 # Rung-0 economics: is the six-sleeve split viable at USD 3.7k?
 
-**Status:** measured, decision pending (KAN-34 / direction-doc D8).
+**Status:** measured; **decision logged 2026-08-17 — see §9** (KAN-34 / direction-doc D8).
 **Run date:** 2026-08-17. **Window:** 2016-08-08 → 2026-08-03 (2,510 sessions).
 **Gates:** epoch v2's restructure decision (KAN-33).
 
@@ -255,6 +255,13 @@ Two constraints on adopting this:
 
 ---
 
+> **Outcome:** the operator adopted (c) and went further — **one sleeve,
+> `momentum`**, not two. The reasoning, the conditions attached, and the
+> risk-posture consequences are in **§9**; this section records what was
+> recommended, §9 records what was decided.
+
+---
+
 ## 8. Operator steps — not run by the agent
 
 1. **Regenerate the PIT-universe bar set and re-run all three arms**, so the
@@ -275,11 +282,181 @@ Two constraints on adopting this:
        --universe-snapshots data/universe/sp500_membership.json
    ```
 
-2. **Log the restructure decision** from the three options above with its
-   rationale against the measured numbers (KAN-34 AC 6). Whichever option
-   wins, D16 requires the rung's divergence baseline be regenerated
-   capital-specific — a second baseline artifact and a second set of monitor
-   pins. That work is not a no-op and should be sequenced before Rung 0 arms.
+2. ~~**Log the restructure decision**~~ — **DONE 2026-08-17, see §9.** The
+   decision was taken on fill feasibility and commission arithmetic, both of
+   which are independent of the universe caveat in §1, so it did not wait on
+   step 1. D16's capital-specific divergence baseline is still owed and is
+   condition §9.6(2): **one** baseline artifact and one set of monitor pins,
+   not the two that option (a) would have required. That work is not a no-op
+   and should be sequenced before Rung 0 arms.
+
+## 9. Decision (D8) — Rung 0 runs one sleeve: `momentum`
+
+**Status:** logged 2026-08-17. **Decides:** direction-doc D8 (OPEN since
+2026-08-11). **Closes:** KAN-34 AC 6. **Unblocks:** KAN-33 (epoch v2).
+
+### 9.1 The decision
+
+Rung 0 (5,000 SGD ≈ USD 3,700) is allocated **100% to `momentum`**. The other
+five sleeves are **suspended at Rung 0, not retired** — they are re-admitted at
+higher rungs by between-epoch amendment (§9.6(4)).
+
+This is option **(c) concentrate**, taken one step further than §7's
+recommendation of two sleeves.
+
+The **sleeve weights of record are unchanged.** `CAPITAL_ALLOCATIONS` and
+`ACTIVE_SLEEVES` (`shared/universe.py`, `scripts/run_paper.py:104-111`) continue
+to describe the six-sleeve book; Rung 0 runs a *capital overlay* on top of them,
+so the `tests/shared/test_universe.py` invariant that the two agree is untouched.
+
+### 9.2 Why one sleeve, at these numbers
+
+Recomputed from the same universe as §2 (138 tickers, median latest close
+$171.61), holding `position_size_pct` at its committed 0.12:
+
+| Allocation | momentum position size | universe fillable¹ | round-trip drag² |
+|---|---:|---:|---:|
+| Six-way (today) | $102.48 | 31.9% (44/138) | 264 bps *(measured, §4)* |
+| Two-way (§7's recommendation) | $266.45 | 66.7% (92/138) | ~75 bps |
+| **One sleeve (this decision)** | **$444.00** | **87.7% (121/138)** | **~45 bps** |
+
+¹ Names where one whole share fits the position budget. ² $1.00 commission floor
+× 2 legs ÷ position notional; the floor binds at every one of these sizes.
+
+Median capital utilisation at $444 is **86.8%** — once a name is affordable,
+whole-share rounding wastes ~13% of the position budget, against a six-way
+budget that buys nothing at all in two sleeves.
+
+**Why not §7's two sleeves.** Two is materially better than six and materially
+worse than one. The tie-breaker is not return, it is what Rung 0 is *for*: the
+IPS names the smoke test's purpose as validating execution, reconciliation,
+slippage, and the daily ops loop — "success = the operational gates behave, not
+a P&L target" (`investment-policy-statement.md`, deployment path item 1).
+Diversification buys return smoothing that a ~2-month window at this size cannot
+measure; fill rate buys exercised code paths, which is the actual deliverable.
+
+### 9.3 Why `momentum`, and on what grounds it was picked
+
+Selected on **operational criteria, explicitly not on backtest return**:
+
+- **Signal frequency** — 5,952 signals reaching sizing over ten years
+  (joint-highest), 233 closed trades at Rung 0 (second only to
+  `thematic_momentum`'s 269, which is gross-profitable but fee-killed, §4).
+  Frequency is what exercises the ops loop inside a two-month window.
+- **Smallest departure from the committed book** — at 0.2308 it already holds
+  the largest weight, so concentrating on it is the least violent overlay
+  available.
+- **Already the drill sleeve** — `DRILL_BASE_SLEEVE = "momentum"`
+  (`scripts/run_paper.py`), so the isolation-drill machinery already exercises
+  exactly this sleeve.
+- **Carries the bear tickers** — `SH`/`PSQ` are in its eligible universe
+  (`shared/universe.py:40,71`), so the sleeve is not structurally long-only.
+
+**Not** selected for posting the highest Arm A return (+75.48%). That figure is
+survivorship-biased (§1) and selecting on it would add a further trial on top of
+the eight-candidate → six-sleeve search of 2026-05-26. Every ground above is
+independent of realised return.
+
+### 9.4 What this decision deliberately does not change
+
+- **`position_size_pct` stays 0.12 and `top_n` stays 5.** Consequence: maximum
+  deployment is 5 × 12% = **60% of the 3,700**, leaving ~40% in cash. This is
+  accepted, not overlooked. Raising it means moving `position_size_pct` *and*
+  the momentum `RiskEngine`'s `position_entry_limit_pct=12.0` together — a
+  strategy-parameter change, which is a new trial in the registry and belongs at
+  an epoch boundary, not inside a capital decision. The idle cash also absorbs
+  SGD→USD translation and whole-share slop.
+- **No sleeve is judged or retired here.** `quality_value` returns +9.71% in the
+  $100k control; its Rung-0 failure is a budget fact, not an edge fact.
+
+### 9.5 Risk-posture consequences — IPS amendment required
+
+Concentrating is an allocation change; dropping the hedge is a **risk-posture
+change**, and it carries a second-order effect §7 did not name:
+
+1. **No standing crash hedge.** `tail_risk_hedge` is suspended, so the book
+   holds no dedicated defensive position.
+2. **The crash entry freeze becomes a total trading freeze.** Every sleeve
+   *except* `tail_risk_hedge` is wrapped in `make_crash_freeze_signals_fn`
+   (`scripts/run_paper.py:264-271`; wrapper at
+   `scripts/run_backtest.py:1796-1818`), which suppresses **all** buy signals in
+   a crash regime and passes exits through. With `momentum` as the only sleeve,
+   a crash regime means the book opens **nothing at all** — including the
+   `SH`/`PSQ` rotation that would otherwise be its own hedge. Exits still fire
+   via the 10% trailing stop. **Accepted for Rung 0:** at smoke-test size,
+   "crash ⇒ stop opening risk" is a conservative posture and one fewer moving
+   part. Exempting momentum's bear tickers from the freeze is a **follow-up
+   candidate, not part of this decision** — it changes safety logic and needs
+   its own story.
+3. **Single-factor concentration.** Accepted; the Gate-3 bound (max drawdown
+   ≤12% on USD NAV) governs unchanged, on ~USD 3.7k of exposure.
+4. **If `momentum` is demoted, the book goes to cash.** Per the kill-criteria
+   rule that a demotion does not auto-redistribute
+   ([sleeve-kill-criteria.md](sleeve-kill-criteria.md)), the vacated weight sits
+   in cash until the operator rebalances at a review. With one sleeve that means
+   a 100%-cash book awaiting a review — an intended outcome, not an edge case.
+
+### 9.6 Conditions attached
+
+1. **Paper runs the same shape before live.** `scripts/run_paper.py:104-111`
+   hardcodes the six-way allocations and has no whole-share parity with the live
+   rung. A six-sleeve fractional paper book does not predict a one-sleeve
+   whole-share live book. This is the implementation half of the decision and
+   lands via KAN-33.
+2. **One capital-specific divergence baseline** regenerated per D16
+   (whole-share, commission floor, Rung-0 capital, `momentum` only) with its own
+   monitor pins — cheaper than option (a), which would have required a second
+   baseline describing a book that is 100% cash in two of six sleeves.
+3. **The PIT re-run (§8 step 1) does not block this decision.** It was made on
+   fill feasibility and commission arithmetic, both functions of a position
+   budget and a share price, and therefore independent of index membership. The
+   PIT re-run remains **required before any Rung-0 return figure or divergence
+   threshold is quoted.**
+4. **Re-admission is an epoch boundary.** Suspended sleeves return at a higher
+   rung by amendment, and the Rung-0 20-session divergence-OK window does **not**
+   transfer to the multi-sleeve book it becomes.
+
+### 9.7 Evidence limits — read before citing any Rung-0 result
+
+Five concurrent positions over roughly two months produces a handful of closed
+trades. That is enough to validate fills, reconciliation, stop behaviour,
+slippage, and the daily ops loop — what the IPS asks Rung 0 to prove. It is
+nowhere near enough to say anything about `momentum`'s edge. **A clean Rung 0 is
+evidence the machine works, never evidence the strategy works.**
+
+### 9.8 Standing condition — `momentum`'s edge verdict of record
+
+Direction D10 requires the edge-validation framework's incumbent evaluation to
+complete **before Rung 0 arms**, and that evaluation has authority over this
+decision: a sleeve without a passing verdict of record cannot be the sleeve
+Rung 0 runs.
+
+As of this decision the verdicts of record do not exist — the table in
+[incumbent-edge-evaluation.md](incumbent-edge-evaluation.md) is empty pending
+the real run. Its **rehearsal**, explicitly marked not-evidence and not-citable
+(inflated by survivorship and same-bar fills), nonetheless puts `momentum` at
+**DSR 0.868 against the 0.95 threshold — FAIL**, with `sector_rotation` the
+cleanest pass at 0.993. The rehearsal's failure mode for `momentum` is
+deflation against a search of eight, not out-of-sample collapse: its holdout
+Sharpe is **+1.16** over 44 sessions.
+
+**Therefore this decision is conditional.** If `momentum` fails its verdict of
+record:
+
+- **D8 reopens.** It is not amended silently and Rung 0 does not arm on a failed
+  sleeve.
+- **The named fallback is `sector_rotation`** — the rehearsal's cleanest DSR, and
+  at 100% of Rung 0 it sizes to **$740 per position, 95.7% of the universe
+  fillable (132/138), ~27 bps round-trip drag**, all better than `momentum`'s.
+  The cost is operational: 741 sized signals over ten years against
+  `momentum`'s 5,952, so a two-month window exercises the ops loop roughly an
+  order of magnitude less. That trade-off is re-decided at the time, on the
+  verdicts of record, not pre-committed here.
+- **If neither passes, Rung 0 does not arm at all** — a decision the ladder
+  already provides for, and a better outcome than arming on a sleeve the
+  framework rejected.
+
+---
 
 ## Reproducing this memo
 
