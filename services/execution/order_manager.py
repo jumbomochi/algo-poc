@@ -550,6 +550,14 @@ class OrderManager:
         """
         return list(await self._executor.list_open_orders())
 
+    async def completed_order_states(self) -> dict[str, str]:
+        """Terminal status per ``orderRef`` from IB's completed-order history.
+
+        What the stop verifier needs to tell a cancelled stop from a filled
+        one (KAN-20). One account-wide request, fetched once per scan.
+        """
+        return dict(await self._executor.completed_order_states())
+
     async def cancel_broker_order(self, order_id: str) -> bool:
         """Cancel one live broker order, tracked locally or not.
 

@@ -58,6 +58,16 @@ _PRICE_EPSILON = _TICK / 2
 # Share counts are floats only because fractional accounts exist; this is float
 # noise, not a real difference in coverage.
 _QUANTITY_EPSILON = 1e-6
+# IB statuses that mean a stop's protection is genuinely gone. "Filled" is
+# deliberately absent: those shares were sold by the stop itself, and the fill
+# handler owns that transition — see _confirm_absent.
+_RELEASABLE_ORDER_STATES = frozenset(
+    {"cancelled", "apicancelled", "expired", "inactive"}
+)
+# Consecutive scans that may fail to confirm before the operator is paged. One
+# blip is noise; a Gateway outage silently freezes every release, and this
+# module exists because of a Gateway outage.
+_CONFIRM_FAILURES_BEFORE_ALERT = 2
 
 
 def ips_stop_price(reference_price: float, trailing_pct: float) -> float:
@@ -201,10 +211,14 @@ class BrokerStopManager:
         self._drifts_alerted: set[tuple[str, str]] = set()
         self._drifts_seen_this_pass: set[tuple[str, str]] = set()
         # Refs absent from IB's book on the previous scan, and refs placed so
-        # recently that absence proves nothing — both feed _may_release.
+        # recently that absence proves nothing — both gate the release path.
         self._missing_last_pass: set[str] = set()
         self._missing_this_pass: set[str] = set()
         self._skip_release: set[str] = set()
+        # IB's completed-order statuses for the pass in flight, fetched at most
+        # once, and how many passes running have failed to fetch them.
+        self._completed_states: dict[str, str] | None = None
+        self._confirm_failures = 0
         self._logger = get_logger("broker_stops")
 
     @property
@@ -425,6 +439,7 @@ class BrokerStopManager:
         self._skip_release = set(resumed)
         self._drifts_seen_this_pass = set()
         self._missing_this_pass = set()
+        self._completed_states = None
 
         try:
             live, trusted = await self._live_stops_by_ref()
@@ -473,7 +488,7 @@ class BrokerStopManager:
 
         An empty book therefore does not *prove* absence; it only fails to
         show presence. Callers treat it as untrusted and make a vanished stop
-        prove itself twice (see :meth:`_may_release`).
+        prove itself twice (see :meth:`_confirm_absent`).
         """
         orders = await self._order_manager.list_open_broker_orders()
         return (
@@ -488,47 +503,98 @@ class BrokerStopManager:
     async def _confirm_absent(
         self, claim: _StopClaim, scope: _PositionScope
     ) -> bool:
-        """Ask IB directly whether this specific order still exists.
+        """Whether this stop's protection is really gone, per IB's own status.
 
-        The open-order book not listing it is weak evidence: that book is
-        ``clientId``-scoped, so a stop placed under a different client id — a
-        changed ``ib.client_id``, a second instance on a fallback id — is
-        invisible to us while resting perfectly well at IB. Releasing it
-        terminalises a live stop and places a second one for the same shares.
+        The open-order book alone cannot answer it. A missing ref is a stop
+        somebody cancelled, a stop that filled, or a stop resting under
+        another ``clientId`` and therefore invisible to us — and the three
+        want opposite handling. IB's completed-order history carries the
+        status that separates them:
 
-        ``find_order_by_ref`` also falls back to completed orders, so a stop
-        that *filled* answers here too. That is deliberate: a filled stop
-        whose fill never reached the ledger leaves the position over-claimed
-        until the fill is recorded, which reconciliation surfaces — where
-        releasing a live one puts a naked short in the account. Between an
-        accounting lag and a short, take the lag.
+        * ``Cancelled`` / ``ApiCancelled`` / ``Expired`` / ``Inactive`` — the
+          protection is gone and this is what AC1 exists to recreate.
+        * ``Filled`` — the shares were sold by this very stop. Held, not
+          released: the fill belongs to the fill handler, and a row released
+          here would be recorded as cancelled when it was not. The position
+          reads over-claimed until the fill lands, which reconciliation
+          surfaces; releasing a live stop instead puts a naked short in the
+          account. Between an accounting lag and a short, take the lag.
+        * absent from the history too — the history is same-day, so a stop
+          cancelled yesterday is in neither book. Nothing here contradicts the
+          open-order read, so the caller's evidence stands: a trusted book
+          releases at once, an untrusted one after the second consecutive
+          scan. Requiring a positive status as well would mean a stop
+          cancelled yesterday could never be recreated at all.
 
-        Refusing to answer counts as "still there" for the same reason.
+        **Known residual:** ``openTrades`` is ``clientId``-scoped, so a stop
+        placed under a different client id (a changed ``ib.client_id``, a
+        second instance on a fallback) is invisible in both books and reads as
+        cancelled. Closing that needs ``reqAllOpenOrders``, which would also
+        widen what KAN-13's halt sweep cancels — out of scope here. The
+        broker-position ceiling bounds the damage to the held quantity rather
+        than removing it.
         """
-        finder = getattr(self._order_manager, "find_stop_order", None)
-        if finder is None:
-            return True
-        try:
-            found = await finder(claim.recommendation_id)
-        except Exception:
-            self._logger.exception(
-                "Could not confirm whether a missing stop still exists; "
-                "leaving its coverage claimed",
-                recommendation_id=claim.recommendation_id,
-                symbol=scope.symbol,
-            )
+        states = await self._completed_order_states(scope)
+        if states is None:
             return False
-        if found is None:
+        status = states.get(claim.recommendation_id)
+        if status is None or status.lower() in _RELEASABLE_ORDER_STATES:
             return True
         self._logger.warning(
-            "A stop absent from the open-order book still exists at IB; "
-            "leaving it alone rather than placing a second one",
+            "A stop is gone from the open-order book but IB reports it "
+            "%s; leaving it alone rather than re-covering the position",
+            status,
             recommendation_id=claim.recommendation_id,
-            order_id=str(found),
             symbol=scope.symbol,
             con_id=scope.con_id,
+            broker_status=status,
         )
         return False
+
+    async def _completed_order_states(
+        self, scope: _PositionScope
+    ) -> dict[str, str] | None:
+        """The day's terminal order statuses, fetched once per pass.
+
+        ``None`` when IB could not be asked, which holds every release: an
+        unconfirmable absence must not free coverage. That is fail-closed in
+        the safe direction, but it is *also* the state where a genuinely
+        deleted stop stops being recreated — so it pages rather than sitting
+        in a log, on the same channel as an unplaced stop.
+        """
+        if self._completed_states is not None:
+            return self._completed_states
+        reader = getattr(self._order_manager, "completed_order_states", None)
+        if reader is None:
+            # No such capability (older double, backtest stub). Absence from a
+            # trusted open-order book is then the only evidence available.
+            self._completed_states = {}
+            return self._completed_states
+        try:
+            self._completed_states = dict(await reader())
+        except Exception:
+            self._confirm_failures += 1
+            self._logger.exception(
+                "Could not read completed orders to confirm a missing stop; "
+                "no coverage will be released this cycle",
+                consecutive_failures=self._confirm_failures,
+            )
+            if self._confirm_failures >= _CONFIRM_FAILURES_BEFORE_ALERT:
+                await self._report_failure(
+                    symbol=scope.symbol,
+                    con_id=scope.con_id,
+                    quantity=scope.quantity,
+                    stop_price=None,
+                    reason=(
+                        "cannot confirm whether protective stops are still "
+                        f"resting at IB ({self._confirm_failures} consecutive "
+                        "scans); a stop deleted now would not be recreated"
+                    ),
+                )
+                self._confirm_failures = 0
+            return None
+        self._confirm_failures = 0
+        return self._completed_states
 
     async def _verify_scope(
         self,
@@ -658,7 +724,7 @@ class BrokerStopManager:
         )
         if order_id is not None:
             report.placed.append(order_id)
-        self._spend_budget(scope, budget, allowed)
+        self._spend_con_id_budget(scope.con_id, budget, allowed)
 
     async def _protectable_quantity(
         self, scope: _PositionScope, budget: dict[int, float | None]
@@ -675,14 +741,6 @@ class BrokerStopManager:
         if remaining is None:
             return None
         return max(0.0, min(scope.quantity, remaining))
-
-    def _spend_budget(
-        self,
-        scope: _PositionScope,
-        budget: dict[int, float | None],
-        claimed: float,
-    ) -> None:
-        self._spend_con_id_budget(scope.con_id, budget, claimed)
 
     async def _broker_held(self, con_id: int) -> float | None:
         """Net long quantity IB reports for this contract, or None if unasked."""
@@ -825,8 +883,8 @@ class BrokerStopManager:
         """
         if await self._protectable_quantity(scope, budget) is None:
             return
-        self._spend_budget(
-            scope,
+        self._spend_con_id_budget(
+            scope.con_id,
             budget,
             sum(self._broker_quantity(order) for _, order in resting),
         )

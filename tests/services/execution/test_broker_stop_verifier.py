@@ -123,6 +123,10 @@ def make_manager(
     order_manager.cancel_working_orders = AsyncMock(return_value=[])
     # What IB says the account actually holds — the ceiling on any placement.
     order_manager.broker_position = AsyncMock(return_value=broker_held)
+    # IB's completed-order statuses. Empty by default: nothing terminated
+    # today, so a trusted open-order book that omits a stop is the only
+    # evidence there is.
+    order_manager.completed_order_states = AsyncMock(return_value={})
     defaults = dict(
         order_manager=order_manager,
         order_ledger=OrderLedger(session),
@@ -644,8 +648,8 @@ class TestAbsenceFromTheBookIsConfirmedBeforeRelease:
     is invisible to us while resting perfectly well at IB, on every scan, so
     the two-scan rule alone would only delay the duplicate by 30 minutes."""
 
-    async def test_a_stop_ib_still_knows_about_is_not_released(self, session):
-        manager, order_manager = make_manager(session)
+    async def _missing_with_status(self, session, status, **kwargs):
+        manager, order_manager = make_manager(session, **kwargs)
         session.add(make_position(quantity=100, highest=220.0))
         session.commit()
         stop_id = await seed_resting_stop(
@@ -655,14 +659,36 @@ class TestAbsenceFromTheBookIsConfirmedBeforeRelease:
         order_manager.list_open_broker_orders = AsyncMock(
             return_value=[unrelated_order()]
         )
-        order_manager.find_stop_order = AsyncMock(return_value="4242")
-        order_manager.submit_stop = AsyncMock(return_value="never")
+        if status is not None:
+            order_manager.completed_order_states = AsyncMock(
+                return_value={stop_id: status}
+            )
+        order_manager.submit_stop = AsyncMock(return_value="5150")
+        return manager, order_manager, stop_id
+
+    async def test_a_cancelled_stop_is_released_and_recreated(self, session):
+        """AC1's actual population. IB reports a cancelled stop in the day's
+        *completed* orders, so a confirmation that only asks "does an order
+        with this ref exist" answers yes and never recreates it."""
+        manager, order_manager, stop_id = await self._missing_with_status(
+            session, "Cancelled"
+        )
+
+        report = await manager.verify_coverage()
+
+        assert report.released_intents == [stop_id]
+        assert report.placed == ["5150"]
+
+    async def test_a_filled_stop_keeps_its_coverage_claimed(self, session):
+        """The shares were sold by this stop. The fill handler owns that
+        transition; releasing here would record it as cancelled."""
+        manager, order_manager, stop_id = await self._missing_with_status(
+            session, "Filled", broker_held=0
+        )
 
         report = await manager.verify_coverage()
 
         assert report.released_intents == []
-        assert report.placed == []
-        order_manager.submit_stop.assert_not_awaited()
         assert OrderLedger(session).get(stop_id).status == (
             OrderStatus.SUBMITTED.value
         )
@@ -670,24 +696,69 @@ class TestAbsenceFromTheBookIsConfirmedBeforeRelease:
     async def test_an_unanswerable_confirmation_leaves_coverage_claimed(
         self, session
     ):
-        manager, order_manager = make_manager(session)
-        session.add(make_position(quantity=100, highest=220.0))
-        session.commit()
-        await seed_resting_stop(
-            manager, order_manager, quantity=100, reference_price=220.0
+        manager, order_manager, stop_id = await self._missing_with_status(
+            session, None
         )
-        order_manager.list_open_broker_orders = AsyncMock(
-            return_value=[unrelated_order()]
-        )
-        order_manager.find_stop_order = AsyncMock(
+        order_manager.completed_order_states = AsyncMock(
             side_effect=RuntimeError("IB went away")
         )
-        order_manager.submit_stop = AsyncMock(return_value="never")
 
         report = await manager.verify_coverage()
 
         assert report.released_intents == []
         order_manager.submit_stop.assert_not_awaited()
+        assert OrderLedger(session).get(stop_id).status == (
+            OrderStatus.SUBMITTED.value
+        )
+
+    async def test_repeated_confirmation_failure_pages_the_operator(
+        self, session
+    ):
+        """A Gateway outage freezes every release. Silently, otherwise — and
+        this module exists because of a Gateway outage."""
+        pages: list = []
+        manager, order_manager, _ = await self._missing_with_status(
+            session, None
+        )
+        manager._on_placement_failed = AsyncMock(
+            side_effect=lambda **kw: pages.append(kw)
+        )
+        order_manager.completed_order_states = AsyncMock(
+            side_effect=RuntimeError("IB went away")
+        )
+
+        await manager.verify_coverage()
+        assert pages == []
+        await manager.verify_coverage()
+
+        assert len(pages) == 1
+        assert "cannot confirm" in pages[0]["reason"]
+
+    async def test_the_history_is_read_once_per_pass_not_once_per_stop(
+        self, session
+    ):
+        """One account-wide request per missing claim would run on the loop
+        that also drains the kill stream."""
+        manager, order_manager = make_manager(session, broker_held=100)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        await seed_resting_stop(
+            manager, order_manager, quantity=60, reference_price=220.0,
+            order_id="4242",
+        )
+        await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=220.0,
+            order_id="4343",
+        )
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[unrelated_order()]
+        )
+        order_manager.completed_order_states = AsyncMock(return_value={})
+        order_manager.submit_stop = AsyncMock(return_value="5150")
+
+        await manager.verify_coverage()
+
+        order_manager.completed_order_states.assert_awaited_once()
 
 
 class TestAnUntrustedMissIsNotBankedAsEvidence:
@@ -787,6 +858,200 @@ class TestAnUntrustedMissIsNotBankedAsEvidence:
         assert report.released_intents == []
         assert OrderLedger(session).get(stop_id).status == (
             OrderStatus.SUBMITTED.value
+        )
+
+
+class TestTheTwoGuardsComposeRatherThanSubstitute:
+    """The two-scan rule and the status confirmation cover different failures.
+    Either one alone leaves a hole, so both must run on every release."""
+
+    async def test_a_filled_stop_is_held_even_on_an_untrusted_book(
+        self, session
+    ):
+        """The status check must not be skipped just because the book was
+        empty — that is the path where confirmation matters most."""
+        manager, order_manager = make_manager(session, broker_held=0)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        stop_id = await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=220.0
+        )
+        order_manager.list_open_broker_orders = AsyncMock(return_value=[])
+        order_manager.completed_order_states = AsyncMock(
+            return_value={stop_id: "Filled"}
+        )
+        order_manager.submit_stop = AsyncMock(return_value="never")
+
+        await manager.verify_coverage()
+        report = await manager.verify_coverage()
+
+        # Two consecutive misses satisfy the two-scan rule; the status does not.
+        assert report.released_intents == []
+        assert OrderLedger(session).get(stop_id).status == (
+            OrderStatus.SUBMITTED.value
+        )
+
+
+class TestAFailedBookReadChangesNothing:
+    """A pass that cannot read the order book has observed nothing: it must
+    release nothing, and leave no evidence for the next pass to pair with.
+
+    The per-pass state is therefore assigned *before* the read rather than
+    after it — after, a pass that returned early would carry the previous
+    pass's `_skip_release` while leaving its own freshly-resumed refs
+    unguarded.
+    """
+
+    async def test_a_pass_whose_read_failed_releases_nothing(self, session):
+        manager, order_manager = make_manager(session)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        ledger = OrderLedger(session)
+        ledger.create_intent(
+            SimpleNamespace(
+                recommendation_id="stop-DUN551088-momentum-265598-0",
+                account_id="DUN551088",
+                mode="paper",
+                portfolio="momentum",
+                con_id=265598,
+                symbol="AAPL",
+                exchange="SMART",
+                currency="USD",
+                quantity=100,
+                action="SELL",
+                limit_price=187.0,
+                order_type="stop",
+            )
+        )
+        ledger.transition("stop-DUN551088-momentum-265598-0", OrderStatus.APPROVED)
+        session.commit()
+        # The resume places the stop; then the book read blows up.
+        order_manager.list_open_broker_orders = AsyncMock(
+            side_effect=RuntimeError("IB went away")
+        )
+        order_manager.submit_stop = AsyncMock(return_value="7000")
+
+        report = await manager.verify_coverage()
+
+        assert report.released_intents == []
+        assert report.placed == []
+        assert order_manager.submit_stop.await_count == 1
+        assert ledger.get("stop-DUN551088-momentum-265598-0").status == (
+            OrderStatus.SUBMITTED.value
+        )
+
+
+class TestCoverageIsAttributedToTheSleeveThatHoldsIt:
+    """Contract-level totals are not the whole invariant: the ledger is scoped
+    to ``{account, portfolio, con_id}``, so one sleeve's stop must not be sized
+    to cover another sleeve's shares."""
+
+    async def test_a_sleeve_is_capped_by_its_own_holding(self, session):
+        manager, order_manager = make_manager(session, broker_held=100)
+        session.add(make_position(quantity=40, highest=220.0, portfolio="momentum"))
+        session.add(make_position(quantity=60, highest=220.0, portfolio="value"))
+        session.commit()
+        placed: list[tuple[str, float]] = []
+
+        async def submit_stop(**kwargs):
+            placed.append(
+                (kwargs["recommendation_id"], kwargs["quantity"])
+            )
+            return f"order-{len(placed)}"
+
+        order_manager.submit_stop = submit_stop
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[unrelated_order()]
+        )
+
+        await manager.verify_coverage()
+
+        assert [quantity for _, quantity in placed] == [
+            pytest.approx(40),
+            pytest.approx(60),
+        ]
+        assert "momentum" in placed[0][0]
+        assert "value" in placed[1][0]
+
+    async def test_a_resume_spends_the_contract_budget(self, session):
+        """Otherwise a resumed stop and a fresh placement can both claim the
+        same shares of one contract."""
+        manager, order_manager = make_manager(session, broker_held=100)
+        session.add(make_position(quantity=100, highest=220.0, portfolio="value"))
+        session.commit()
+        ledger = OrderLedger(session)
+        ledger.create_intent(
+            SimpleNamespace(
+                recommendation_id="stop-DUN551088-momentum-265598-0",
+                account_id="DUN551088",
+                mode="paper",
+                portfolio="momentum",
+                con_id=265598,
+                symbol="AAPL",
+                exchange="SMART",
+                currency="USD",
+                quantity=100,
+                action="SELL",
+                limit_price=187.0,
+                order_type="stop",
+            )
+        )
+        ledger.transition("stop-DUN551088-momentum-265598-0", OrderStatus.APPROVED)
+        session.commit()
+        placed: list[float] = []
+
+        async def submit_stop(**kwargs):
+            placed.append(kwargs["quantity"])
+            return f"order-{len(placed)}"
+
+        order_manager.submit_stop = submit_stop
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[unrelated_order()]
+        )
+
+        await manager.verify_coverage()
+
+        # The resume takes all 100; `value` may then claim nothing.
+        assert placed == [pytest.approx(100)]
+
+
+class TestAProposedStopIsNotTreatedAsAVanishedOne:
+    """A PROPOSED stop intent is nonterminal — so it is a claim — but it was
+    never bound to a broker order, and `unsubmitted_stop_intents` only selects
+    APPROVED rows, so nothing else settles it. Releasing it as "vanished"
+    would report a cancel for an order that never existed."""
+
+    async def test_an_unbound_intent_is_left_for_its_own_path(self, session):
+        manager, order_manager = make_manager(session)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        ledger = OrderLedger(session)
+        ledger.create_intent(
+            SimpleNamespace(
+                recommendation_id="stop-DUN551088-momentum-265598-0",
+                account_id="DUN551088",
+                mode="paper",
+                portfolio="momentum",
+                con_id=265598,
+                symbol="AAPL",
+                exchange="SMART",
+                currency="USD",
+                quantity=100,
+                action="SELL",
+                limit_price=187.0,
+                order_type="stop",
+            )
+        )
+        session.commit()
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[unrelated_order()]
+        )
+
+        report = await manager.verify_coverage()
+
+        assert report.released_intents == []
+        assert ledger.get("stop-DUN551088-momentum-265598-0").status == (
+            OrderStatus.PROPOSED.value
         )
 
 

@@ -57,11 +57,10 @@ class OpenBrokerOrder:
     ticker: str
     quantity: float
     account_id: str | None = None
-    # What kind of order this is and where it triggers (KAN-20). The verifier
-    # has to tell a resting protective stop from a working entry, and compare
-    # the level IB is actually holding against the one the ledger recorded.
-    # Optional so every existing construction still builds.
-    order_type: str | None = None
+    # Where this order triggers, and how much of it is already done (KAN-20).
+    # The verifier compares the level IB is actually holding against the one
+    # the ledger recorded, and coverage is the *unfilled* remainder. Optional
+    # so every existing construction still builds.
     aux_price: float | None = None
     filled_quantity: float = 0.0
 
@@ -125,6 +124,10 @@ class IBExecutorProtocol(Protocol):
 
     async def list_open_orders(self) -> list[OpenBrokerOrder]:
         """Enumerate every order live at the broker, with its orderRef."""
+        ...
+
+    async def completed_order_states(self) -> dict[str, str]:
+        """Terminal status per orderRef, from IB completed-order history."""
         ...
 
     async def cancel_broker_order(self, order_id: str) -> bool:
@@ -594,6 +597,34 @@ class IBExecutor:
             for trade in completed
         )
 
+    async def completed_order_states(self) -> dict[str, str]:
+        """Terminal status per ``orderRef``, from IB's completed-order history.
+
+        The set IB calls "completed" is the set of orders that are *done* —
+        ``Filled``, ``Cancelled``, ``ApiCancelled``, ``Expired`` — which makes
+        it the only place that can tell a stop somebody cancelled from a stop
+        that filled (KAN-20). :meth:`find_order_by_ref` deliberately collapses
+        both into "an order exists", because its callers only need to avoid
+        double-placing; a verifier deciding whether protection is *gone* needs
+        the status itself.
+
+        One account-wide request, so callers fetch it once per pass rather
+        than once per order. Same-day only: IB rolls the history at the
+        session boundary, so an order cancelled yesterday appears in neither
+        this nor the open-order book.
+        """
+        await self._ensure_connected()
+        completed = await self._ib.reqCompletedOrdersAsync(apiOnly=False)
+        states: dict[str, str] = {}
+        for trade in completed:
+            ref = optional_str(getattr(trade.order, "orderRef", None))
+            status = optional_str(
+                getattr(getattr(trade, "orderStatus", None), "status", None)
+            )
+            if ref is not None and status is not None:
+                states[ref] = status
+        return states
+
     async def find_order_by_ref(self, recommendation_id: str) -> str | None:
         """Recover an IB-accepted order from its stable recommendation ref."""
         await self._ensure_connected()
@@ -638,7 +669,6 @@ class IBExecutor:
                     account_id=(
                         str(getattr(order, "account", "") or "") or None
                     ),
-                    order_type=optional_str(getattr(order, "orderType", None)),
                     aux_price=optional_float(getattr(order, "auxPrice", None)),
                     filled_quantity=float(
                         getattr(
