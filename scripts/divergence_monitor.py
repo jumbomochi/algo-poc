@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import asdict
 from datetime import date, datetime, timezone
@@ -39,7 +40,7 @@ from glob import glob
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from backtest.divergence import (
@@ -55,6 +56,7 @@ from backtest.divergence import (
 )
 from scripts.paper_state import PaperTradingState
 from shared.config import load_config
+from shared.models.evidence import DivergenceDaily
 from shared.universe import is_excluded_portfolio
 
 
@@ -362,6 +364,215 @@ def write_prometheus_textfile(
 
 
 # ---------------------------------------------------------------------------
+# Evidence store — the durable copy of each verdict (KAN-27)
+# ---------------------------------------------------------------------------
+
+
+def baseline_id_for(backtest_path: str) -> str:
+    """The identity of the baseline a verdict was scored against.
+
+    The file's basename, not its full path: the same artifact read from a
+    worktree, a deployed checkout, or a backup directory is the same baseline,
+    and the path would fragment the ``(sleeve, session_date, baseline_id)``
+    key that makes a re-run idempotent.
+    """
+    return Path(backtest_path).name
+
+
+# Generous for two INSERTs, and short next to the job's window. The verdict
+# reaches the operator only once this process exits — the launchd wrapper sends
+# the Telegram message from the exit code — so a write blocked on a lock would
+# otherwise swallow a BREACH rather than merely lose a row.
+PERSIST_STATEMENT_TIMEOUT_MS = 30_000
+
+
+def persist_engine_kwargs(db_url: str) -> dict[str, Any]:
+    """Engine options for the short-lived connection that writes the verdicts.
+
+    Postgres-only: ``statement_timeout`` is a server setting sqlite (the test
+    store) would reject. Applied to a connection of its own rather than to the
+    read engine, so bounding the write cannot change how the reporting half of
+    the run behaves.
+    """
+    if db_url.startswith("postgresql"):
+        return {
+            "connect_args": {
+                "options": f"-c statement_timeout={PERSIST_STATEMENT_TIMEOUT_MS}"
+            }
+        }
+    return {}
+
+
+# A float that round-tripped through the DB should compare equal, but a hair of
+# drift must not be read as "a different threshold" and block a real update.
+_THRESHOLD_TOLERANCE = 1e-9
+
+
+def _same_pins(
+    existing: DivergenceDaily, window_sessions: int, threshold: float
+) -> bool:
+    """Was the stored verdict scored under the same window and threshold?"""
+    return (
+        existing.window_sessions == window_sessions
+        and abs(existing.threshold - threshold) <= _THRESHOLD_TOLERANCE
+    )
+
+
+def persist_divergence_rows(
+    session: Session,
+    reports: list[PortfolioDivergenceReport],
+    *,
+    baseline_id: str,
+    window_sessions: int,
+    threshold: float,
+) -> int:
+    """Write one ``divergence_daily`` row per report, and return how many.
+
+    The row is dated by the session the verdict *covers* — the last aligned
+    session in the window — never by the wall clock, so a late or catch-up run
+    cannot mis-date the evidence the epoch clock counts.
+
+    Two rules the caller must not "fix":
+
+    * A ``NO_DATA`` verdict IS written. "The monitor ran and could not judge"
+      is a recorded observation, and D11 pauses the clock on it. Absence means
+      something else entirely — the monitor did not run — and KAN-26's
+      arithmetic depends on being able to tell the two apart.
+    * A report with no aligned session (live and baseline share no dates) is
+      skipped. There is no session to date it by, and stamping today's would
+      claim a verdict for a session that was never scored, which the blindness
+      rule would read as a working monitor.
+
+    Idempotent against ``uq_divergence_daily_sleeve_date_baseline``: a same-day
+    re-run on the same baseline updates its row in place. A hand-rolled
+    select-then-update rather than a dialect-specific upsert, matching
+    ``PaperTradingState.record_equity_snapshot``.
+    """
+    now = datetime.now(timezone.utc)
+    written = 0
+    for report in reports:
+        if report.window_end is None:
+            print(
+                f"  ⚠ Not recording '{report.portfolio}': no aligned session to "
+                f"date the verdict by (live and baseline share no dates), so the "
+                f"run is recorded as blind by absence rather than as a verdict."
+            )
+            continue
+        existing = session.execute(
+            select(DivergenceDaily).where(
+                DivergenceDaily.sleeve == report.portfolio,
+                DivergenceDaily.session_date == report.window_end,
+                DivergenceDaily.baseline_id == baseline_id,
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            session.add(
+                DivergenceDaily(
+                    sleeve=report.portfolio,
+                    session_date=report.window_end,
+                    status=report.status,
+                    baseline_id=baseline_id,
+                    window_sessions=window_sessions,
+                    threshold=threshold,
+                    metric_value=report.relative_divergence,
+                    created_at=now,
+                )
+            )
+        elif not _same_pins(existing, window_sessions, threshold):
+            # An ad-hoc run with a different --window/--threshold lands on the
+            # same key as the canonical one — window_end does not move with
+            # --window — but it is a different observation, not a correction.
+            # Overwriting would let an exploratory command silently clear a
+            # firing breach streak the capital ladder gates on.
+            print(
+                f"  ⚠ Not recording '{report.portfolio}' for {report.window_end}: "
+                f"the stored verdict was scored at window {existing.window_sessions}/"
+                f"threshold {existing.threshold:g} and this run used "
+                f"{window_sessions}/{threshold:g}. A differently-pinned verdict is a "
+                f"different observation, so the recorded one stands; re-run with the "
+                f"canonical pins to update it."
+            )
+            continue
+        else:
+            # A re-run of the same observation: the verdict may legitimately
+            # differ (a late or corrected snapshot landed), and the freshest
+            # scoring of that session is the one the store should hold.
+            existing.status = report.status
+            existing.metric_value = report.relative_divergence
+            existing.created_at = now
+        written += 1
+    return written
+
+
+ALERTS_STREAM = "stream:alerts"
+
+# A DB error echoes the DSN, and the DSN carries the paper database password.
+# stream:alerts fans out to Telegram, which is not a secret store. Same strip
+# as scripts/run_paper.py and scripts/ops/divergence_alert.py: greedy to the
+# LAST '@', because the password is whatever secrets.sh returned and may itself
+# contain '@' or whitespace. Over-redacting is the safe direction.
+_DSN_CREDENTIAL = re.compile(r"(?P<prefix>[a-zA-Z][\w+.-]*://[^\s/@]*:).*@")
+
+# The store is a side effect of a run whose real job is the verdict; a wedged
+# Redis must not hold the 04:45 job open past its window.
+ALERT_SOCKET_TIMEOUT_SECONDS = 5
+
+
+def _redact(text: str) -> str:
+    return _DSN_CREDENTIAL.sub(r"\g<prefix>***@", text)
+
+
+def _redis_from_url(url: str, **kwargs: Any) -> Any:
+    """Single seam for the one Redis connection this script opens."""
+    import redis as redis_sync
+
+    return redis_sync.Redis.from_url(url, **kwargs)
+
+
+def emit_persist_failure_alert(error: BaseException, *, redis_url: str) -> bool:
+    """Page the operator that today's verdicts were computed but never stored.
+
+    This is the only operator-visible signal for the failure: the exit code is
+    deliberately unchanged (a store outage must not mask a BREACH), and the
+    launchd wrapper stays silent on exit 0. Best-effort — a failure here is
+    printed and swallowed, because the run's own verdict still has to be
+    delivered.
+    """
+    from shared.schemas.messages import AlertMessage
+
+    message = _redact(
+        f"divergence_monitor.py: could not persist today's divergence verdicts "
+        f"({error}). The verdicts were computed and reported, but the evidence "
+        f"store has no rows for this session — the epoch clock will read the "
+        f"gap as a blind session until it is re-run."
+    )
+    try:
+        conn = _redis_from_url(
+            redis_url,
+            socket_connect_timeout=ALERT_SOCKET_TIMEOUT_SECONDS,
+            socket_timeout=ALERT_SOCKET_TIMEOUT_SECONDS,
+        )
+        try:
+            alert = AlertMessage(
+                timestamp=datetime.now(timezone.utc),
+                event_type="divergence_persist_failed",
+                priority="high",
+                message=message,
+                context={"script": "divergence_monitor.py"},
+            )
+            conn.xadd(ALERTS_STREAM, alert.to_stream_dict())
+        finally:
+            conn.close()
+        return True
+    except Exception as alert_error:
+        print(
+            "WARNING: could not raise the divergence-persistence alert "
+            f"({_redact(str(alert_error))})"
+        )
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -369,7 +580,9 @@ def write_prometheus_textfile(
 def main() -> int:
     # Load default DB URL from config (may fail if config file missing, that's OK).
     try:
-        default_db_url = load_config("config/default.yaml").database.url
+        _config = load_config("config/default.yaml")
+        default_db_url = _config.database.url
+        default_redis_url = _config.redis.url
     except Exception:
         # Honour ALGO_DATABASE_URL even when the config file can't be loaded, so
         # a missing/unreadable config can't silently fall back to the wrong DB
@@ -377,6 +590,7 @@ def main() -> int:
         default_db_url = os.environ.get(
             "ALGO_DATABASE_URL", "postgresql://algo:algo@localhost:5432/algo_poc"
         )
+        default_redis_url = os.environ.get("ALGO_REDIS_URL", "redis://localhost:6379/0")
 
     parser = argparse.ArgumentParser(
         description="Compare live paper-trading equity to backtest expectations."
@@ -410,6 +624,10 @@ def main() -> int:
         help="Write Prometheus gauges to this .prom file for node_exporter to scrape.",
     )
     parser.add_argument("--db-url", default=default_db_url, help="PostgreSQL database URL.")
+    parser.add_argument(
+        "--redis-url", default=default_redis_url,
+        help="Redis URL used only to alert if the verdicts cannot be stored.",
+    )
     args = parser.parse_args()
 
     # --- Resolve inputs ---
@@ -507,6 +725,12 @@ def main() -> int:
         )
         reports.append(report)
 
+    # Everything scored so far is a real sleeve. The aggregate is appended
+    # below and must never be persisted (D15: the store holds observations,
+    # not derived truth — the digest recomputes the roll-up from these rows),
+    # so the sleeve list is captured here rather than filtered by name later.
+    sleeve_reports = list(reports)
+
     # --- Aggregate report (only over sleeves that exist in both) ---
     if not args.portfolio:
         comparable = {
@@ -549,6 +773,39 @@ def main() -> int:
 
     if args.prometheus_textfile:
         write_prometheus_textfile(reports, args.prometheus_textfile)
+
+    # --- Persist the verdicts (last, and unable to change the exit code) ---
+    # Last because the JSON report and the .prom file are what the launchd
+    # wrapper's alert renderer reads back: a slow or wedged store must not cost
+    # the operator the message about a BREACH.
+    # The write gets a connection of its own — bounded by a statement timeout,
+    # and with an identity map that holds none of the ORM objects the reporting
+    # half loaded, so it can only ever commit the rows built below.
+    try:
+        persist_session: Session = sessionmaker(
+            bind=create_engine(args.db_url, **persist_engine_kwargs(args.db_url))
+        )()
+        try:
+            written = persist_divergence_rows(
+                persist_session,
+                sleeve_reports,
+                baseline_id=baseline_id_for(backtest_path),
+                window_sessions=args.window,
+                threshold=args.threshold,
+            )
+            persist_session.commit()
+        finally:
+            # Closing rolls back anything uncommitted, so a partial write can
+            # never be left half-applied on the way out.
+            persist_session.close()
+        print(f"  Recorded {written} divergence verdict row(s) in the evidence store.")
+    except Exception as e:
+        # The monitor's job is to report divergence. A store outage is a real
+        # problem — it makes the session look blind to the epoch clock — but it
+        # is the operator's to fix, and swallowing the verdict to report it
+        # would be strictly worse. Hence: alert, and leave the exit code alone.
+        print(f"ERROR: could not persist divergence verdicts: {_redact(str(e))}")
+        emit_persist_failure_alert(e, redis_url=args.redis_url)
 
     return exit_code_for(reports, execution_model)
 

@@ -71,6 +71,40 @@ python scripts/divergence_monitor.py \
 | `--no-output` | — | Skip writing JSON |
 | `--prometheus-textfile` | — | Path to write `.prom` for node_exporter |
 | `--db-url` | from `config/default.yaml` | PostgreSQL connection string |
+| `--redis-url` | from `config/default.yaml` | Only used to alert if the verdicts cannot be stored |
+
+### Evidence store rows
+
+Every run writes one `divergence_daily` row per scored sleeve (KAN-27) — the
+durable copy the epoch clock, the breach-streak trigger and the weekly digest
+read. The console table, the JSON report and the `.prom` file are all either
+transient or overwritten, so they are reports, not evidence.
+
+- **Dated by the session, not the clock.** `session_date` is the last aligned
+  session in the window, so a Saturday catch-up run records Friday's session.
+- **Keyed `(sleeve, session_date, baseline_id)`.** A re-run against the same
+  baseline updates the row in place; a re-run after a rebaseline inserts new
+  rows, because a verdict is only interpretable against the baseline that
+  produced it.
+- **An ad-hoc run cannot overwrite the canonical verdict.** The examples above
+  re-score the same session at a different `--window`/`--threshold`, which lands
+  on the same key (`window_end` does not move with `--window`). A stored verdict
+  scored under different pins is a different observation, so the monitor prints
+  its reason and leaves the row alone — exploring a threshold must not be able
+  to clear a firing breach streak. Re-run with the canonical pins (the defaults,
+  which is what the 04:45 job uses) to update it.
+- **`NO_DATA` is recorded, absence is not.** A recorded `NO_DATA` means the
+  monitor ran and could not judge; a missing row on an NYSE trading day means
+  the monitor did not run. Both pause the epoch clock, and the store has to be
+  able to tell them apart. The one case that writes nothing is a window with no
+  aligned session at all — there is no session to date the row by.
+- **`AGGREGATE` is never stored.** It is a derived roll-up (D15); the digest
+  recomputes it from the per-sleeve rows.
+- **A write failure never changes the exit code.** The wrapper branches on the
+  verdict, and a store outage must not mask a BREACH. The failure is logged and
+  raised as a high-priority `stream:alerts` alert instead — which is why
+  `run_divergence.sh` exports `ALGO_REDIS_URL`. That credential is optional by
+  design: an alert-path dependency must not be able to abort drift detection.
 
 ### Exit codes
 
