@@ -168,6 +168,33 @@ not defended against.
     lives in the registration's note, and `evaluate()` will happily hand you
     the split for any purpose.
 
+## Evaluating a sleeve rather than a factor
+
+Everything above scores *factors*: a cross-sectional rank and the forward
+return of its top quantile. A sleeve is a strategy that already made its own
+sizing and timing decisions and produced one equity curve. The statistics
+downstream of that curve are identical, so `scripts/run_sleeve_evaluation.py`
+bridges the two rather than duplicating the machinery — it reads the per-sleeve
+curves out of a saved backtest artifact, normalises the sign, annualisation and
+day-0-peak conventions the two packages disagree on, and writes a mapping file
+the analysis consumes. Same boundary crossing as the stability sweep: the
+driver lives outside `research/`, and the file is what crosses.
+
+Two things it does differently from the factor path, both deliberate:
+
+- **The FDR p-value is `1 − PSR(sr, n, skew, kurt, 0)`,** not a Gaussian IC
+  t-test. A sleeve has no cross-sectional information coefficient, and strategy
+  returns are the case the moment correction exists for.
+- **The trial count is scoped to the sleeve-selection entry (8),** not the
+  registry total. A sleeve chosen in May 2026 was not selected against factors
+  specified in August; counting them is the over-deflation limit #3 warns about.
+
+It refuses a baseline that is not like-for-like (exit 3, same bar as the
+divergence monitor) rather than spending the single-use holdout measuring
+survivorship bias. See
+[incumbent-edge-evaluation.md](incumbent-edge-evaluation.md) for the applied
+result.
+
 ## Parameter stability
 
 `research/evaluation/stability.py` plus `scripts/run_stability_sweep.py`.
