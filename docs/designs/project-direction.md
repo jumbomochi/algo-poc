@@ -20,7 +20,7 @@ The 10x version of this project is not more strategies — it's a system whose e
 1. **Readiness closure** — the eng-cleared plan of record (`huiliang-main-design-20260811-145715.md`), tranches 1–3.
 2. **Gate-evidence epoch v2** — starts when tranches 1+2 are deployed (broker stops enabled at the boundary); pre-fix history preserved but labeled.
 3. **Go-live gate review** — the written criteria are the 8-gate checklist (`docs/operations/go-live-checklist.md`, evaluated by `scripts/ops/go_live_gate.py`) PLUS the clean-epoch criteria below PLUS the edge-framework evaluation of the incumbents (D10). **Epoch v2 runs 60 calendar days** (Gate 1's 60-day paper requirement governs; deliberately longer than the standard 6-week rung epoch). **Two-person approval, solo-operator substitute (ceo-review D14):** the gate decision is DRAFTED in writing against the evidence digest; an independent cross-model AI adversarial review challenges it; a mandatory **7-day cooling-off** separates draft from arming; any unresolved challenge blocks. The checklist's Two-Person Approval section is amended once to name this substitute. Passing arms the live account at Rung 0.
-   **Pre-epoch investigation (ceo-review D8 — OPEN decision pending results):** before epoch v2 starts, run the backtest at Rung-0 capital (~USD 3.7k) with whole-share rounding and the commission floor to quantify small-capital distortion (six-way split → ~$34–119 positions, 84–293bps commission drag). The restructure decision — concentrate Rung 0 on fewer sleeves / raise Rung 0 funding / accept with a capital-specific baseline — is made on those numbers and logged.
+   **Pre-epoch investigation (ceo-review D8 — DECIDED 2026-08-17):** the Rung-0 backtest ran at ~USD 3.7k with whole-share rounding and the commission floor (KAN-34). It found the six-way split does not merely trade expensively — `quality_value` filled **0 of 7,395** entry signals and `tail_risk_hedge` 4 of 5,956; round-trip drag on what did fill is **236–632 bps** (the 84–293bps above is the *one-way* figure). **Decision: option (c) concentrate — Rung 0 runs one sleeve, `momentum`, at 100%** ($444/position, 87.7% of the universe fillable, ~45 bps round-trip). The other five are suspended at Rung 0, not retired, and return at higher rungs by amendment. Conditional on `momentum`'s D10 edge verdict of record, with `sector_rotation` the named fallback. Full decision, conditions and IPS consequences: [rung0-economics.md §9](../operations/rung0-economics.md).
 4. **Capital-scaling ladder** — below. **This ladder supersedes IPS §5's illustrative deployment path (25K/50K/100K, monthly reviews) IN FULL: the clean-epoch criteria replace §5's per-step conditions (the 8-gate re-clear at size and the 20-day divergence-OK window). The full 8-gate review is retained only at Rung 0 entry and after any Rung-0-floor disarm; the capacity review at Rung 3. The documented IPS amendment (per IPS §9) is a Rung 0 entry prerequisite, logged like any ladder amendment** — note in the amendment that the divergence monitor becomes a capital-decision input by rule (its own doc calls it "not a kill switch"; the ladder deliberately makes it one).
 
 ### Track 2 — Research (yields to Track 1)
@@ -121,7 +121,7 @@ Weekly Telegram evidence digest (rides `run_pipeline_report` + the verified bot)
 
 ## Sequencing (what implementation plans get written, in order)
 1. Readiness tranche 1 (already specced — plan of record)
-2. **Rung-0 economics investigation (D8)** — whole-share backtest at ~USD 3.7k; restructure decision logged on its results (before epoch v2)
+2. ~~**Rung-0 economics investigation (D8)**~~ — **DONE**: whole-share backtest at ~USD 3.7k (KAN-34, PR #80); restructure decision logged 2026-08-17 (one sleeve, `momentum`). Implementation of the one-sleeve Rung-0 overlay on the paper path rides KAN-33
 3. Evidence state store (1A/D15) + weekly digest (D3.4/2A) — lands alongside tranche 2 so epoch v2's first week is on record
 4. Tranches 2–3 + epoch v2 start (epoch manifest recorded at start; ML architecture decision by tranche-3 end)
 5. **Edge-validation framework (D10)** — runs in parallel with epoch v2; incumbent evaluation + per-sleeve kill criteria written before gate day
@@ -132,7 +132,7 @@ Weekly Telegram evidence digest (rides `run_pipeline_report` + the verified bot)
 
 | # | Finding | Decision |
 |---|---------|----------|
-| D8 | Rung-0 economics (~$34–119 positions, 84–293bps drag) | INVESTIGATE first — whole-share backtest at Rung-0 capital; restructure decision follows results (OPEN) |
+| D8 | Rung-0 economics (~$34–119 positions, 84–293bps drag) | INVESTIGATED (KAN-34) — the split does not trade at all at Rung 0, not merely expensively. **DECIDED 2026-08-17: option (c), Rung 0 runs `momentum` alone at 100%**; five sleeves suspended-not-retired; conditional on the D10 verdict of record, fallback `sector_rotation`. See [rung0-economics.md §9](../operations/rung0-economics.md) |
 | D9 | Incumbent sleeves bypass the pipeline | Grandfather via epoch v2 + retroactive kill criteria + pro-rata funding rule |
 | D10 | Gate proves fidelity, not edge | Formal edge-validation framework (holdout, deflated Sharpe, parameter stability); incumbents evaluated before Rung 0 |
 | D11 | 60d window doesn't fit 30-session epochs; streak autocorrelation | Epoch-matched 30-session window, full-window scoring rule, persistent-state wording |
@@ -164,7 +164,7 @@ With this direction, the 12-month ideal ("live capital at whatever rung the crit
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
-| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | ISSUES OPEN (1) | 5 proposals, 4 accepted, 1 deferred; +10 outside-voice rulebook decisions absorbed |
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | CLEAR (D8 resolved 2026-08-17) | 5 proposals, 4 accepted, 1 deferred; +10 outside-voice rulebook decisions absorbed |
 | Codex Review | `/codex review` | Independent 2nd opinion | 2 | ISSUES ABSORBED | direction pass: 12 findings, majors verified, all decided (9 accepted, 1 investigate-first) |
 | Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR (PLAN) | 21 issues, 0 critical gaps (readiness plan of record) |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
@@ -172,7 +172,7 @@ With this direction, the 12-month ideal ("live capital at whatever rung the crit
 
 **CROSS-MODEL:** Codex's direction pass challenged the rulebook's economics and governance; all 12 findings verified against repo docs (capital split, two-person gate, partial-window grading, IPS ceilings) — zero refuted, all resolved by decision D8–D17c above.
 
-**VERDICT:** CEO + ENG CLEARED for implementation sequencing — direction is the plan of record for strategy; one investigation gates epoch v2.
+**VERDICT:** CEO + ENG CLEARED for implementation sequencing — direction is the plan of record for strategy. The one investigation that gated epoch v2 (D8) reported and was decided 2026-08-17; what remains before Rung 0 arms is the D10 edge verdict of record, which the D8 decision is conditional on.
 
 **UNRESOLVED DECISIONS:**
-- D8: Rung-0 restructure (concentrate sleeves / raise funding / accept with capital-specific baseline) — pending the whole-share backtest at Rung-0 capital (sequencing item 2)
+- ~~D8: Rung-0 restructure~~ — **RESOLVED 2026-08-17.** Concentrate: Rung 0 runs `momentum` alone at 100% of ~USD 3.7k, five sleeves suspended-not-retired, conditional on the D10 edge verdict of record (fallback `sector_rotation`). Decision: [rung0-economics.md §9](../operations/rung0-economics.md); IPS amendment logged 2026-08-17.
