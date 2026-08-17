@@ -734,6 +734,103 @@ class TestAbsenceFromTheBookIsConfirmedBeforeRelease:
         assert len(pages) == 1
         assert "cannot confirm" in pages[0]["reason"]
 
+    @pytest.mark.parametrize(
+        "status", ["Cancelled", "ApiCancelled", "Expired", "Inactive"]
+    )
+    async def test_every_gone_status_releases(self, session, status):
+        """All four mean the protection is not there any more. Pinned as a set
+        because IB reports different ones for a TWS cancel, an API cancel, a
+        GTC that lapsed, and an order the broker deactivated."""
+        manager, order_manager, stop_id = await self._missing_with_status(
+            session, status
+        )
+
+        report = await manager.verify_coverage()
+
+        assert report.released_intents == [stop_id]
+        assert report.placed == ["5150"]
+
+    async def test_the_history_is_read_once_per_pass_even_when_it_fails(
+        self, session
+    ):
+        """A retry per claim would be N reconnect attempts for N uncovered
+        positions — ``completed_order_states`` opens with ``_ensure_connected``,
+        whose reconnect carries four-second timeouts, on the loop that also
+        drains the kill stream."""
+        pages: list = []
+        manager, order_manager = make_manager(session, broker_held=100)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        await seed_resting_stop(
+            manager, order_manager, quantity=60, reference_price=220.0,
+            order_id="4242",
+        )
+        await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=220.0,
+            order_id="4343",
+        )
+        manager._on_placement_failed = AsyncMock(
+            side_effect=lambda **kw: pages.append(kw)
+        )
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[unrelated_order()]
+        )
+        order_manager.completed_order_states = AsyncMock(
+            side_effect=RuntimeError("IB went away")
+        )
+
+        await manager.verify_coverage()
+
+        order_manager.completed_order_states.assert_awaited_once()
+        # And the threshold counts scans, so two missing stops in one scan is
+        # one failure, not two — the page text says "consecutive scans".
+        assert pages == []
+
+    async def test_a_successful_scan_resets_the_failure_count(self, session):
+        """Otherwise the counter is cumulative, not consecutive, and an
+        unrelated blip weeks ago contributes to today's page."""
+        pages: list = []
+        manager, order_manager, _ = await self._missing_with_status(
+            session, None
+        )
+        manager._on_placement_failed = AsyncMock(
+            side_effect=lambda **kw: pages.append(kw)
+        )
+        order_manager.completed_order_states = AsyncMock(
+            side_effect=[RuntimeError("blip"), {}, RuntimeError("blip")]
+        )
+
+        await manager.verify_coverage()
+        await manager.verify_coverage()
+        await manager.verify_coverage()
+
+        # Fail, succeed, fail: never two failures running, so no page.
+        assert pages == []
+
+    async def test_an_order_manager_without_the_capability_says_so(
+        self, session
+    ):
+        """Losing the status guard silently is how a future stub inherits a
+        weaker safety property without anyone noticing."""
+        manager, order_manager, stop_id = await self._missing_with_status(
+            session, None
+        )
+        del order_manager.completed_order_states
+        warnings: list[str] = []
+        manager._logger = SimpleNamespace(
+            warning=lambda msg, **kw: warnings.append(msg),
+            info=lambda *a, **kw: None,
+            debug=lambda *a, **kw: None,
+            error=lambda *a, **kw: None,
+            exception=lambda *a, **kw: None,
+        )
+
+        report = await manager.verify_coverage()
+
+        # Degrades to the open-order book alone, and says it did.
+        assert report.released_intents == [stop_id]
+        assert any("completed-order status" in msg for msg in warnings)
+
     async def test_the_history_is_read_once_per_pass_not_once_per_stop(
         self, session
     ):

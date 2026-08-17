@@ -215,9 +215,12 @@ class BrokerStopManager:
         self._missing_last_pass: set[str] = set()
         self._missing_this_pass: set[str] = set()
         self._skip_release: set[str] = set()
-        # IB's completed-order statuses for the pass in flight, fetched at most
-        # once, and how many passes running have failed to fetch them.
+        # IB's completed-order statuses for the pass in flight, fetched at
+        # most once — a failure is remembered too, so one bad pass is one read.
+        # ``_confirm_failures`` counts consecutive *scans* that could not read
+        # them, which is what the page threshold is expressed in.
         self._completed_states: dict[str, str] | None = None
+        self._confirm_read_failed = False
         self._confirm_failures = 0
         self._logger = get_logger("broker_stops")
 
@@ -440,6 +443,7 @@ class BrokerStopManager:
         self._drifts_seen_this_pass = set()
         self._missing_this_pass = set()
         self._completed_states = None
+        self._confirm_read_failed = False
 
         try:
             live, trusted = await self._live_stops_by_ref()
@@ -561,23 +565,41 @@ class BrokerStopManager:
         the safe direction, but it is *also* the state where a genuinely
         deleted stop stops being recreated — so it pages rather than sitting
         in a log, on the same channel as an unplaced stop.
+
+        A failure is remembered for the rest of the pass, not just a success.
+        Retrying per claim would mean N reads for N uncovered positions, and
+        this read opens with ``_ensure_connected`` — so a Gateway outage would
+        turn one scan into N sequential reconnect attempts, each carrying
+        ``connectAsync``'s four-second timeouts, on the loop that also drains
+        the kill stream. It is also what makes the page threshold count scans:
+        counting reads would page twice inside a single pass and say
+        "2 consecutive scans" about one.
         """
         if self._completed_states is not None:
             return self._completed_states
+        if self._confirm_read_failed:
+            return None
         reader = getattr(self._order_manager, "completed_order_states", None)
         if reader is None:
-            # No such capability (older double, backtest stub). Absence from a
-            # trusted open-order book is then the only evidence available.
+            # No such capability (a test double, a backtest stub). Absence
+            # from a trusted open-order book is then the only evidence there
+            # is — logged, because losing the status guard silently is how a
+            # future reader inherits a weaker safety property without knowing.
+            self._logger.warning(
+                "Order manager cannot report completed-order status; a "
+                "missing stop cannot be told from a filled one this cycle"
+            )
             self._completed_states = {}
             return self._completed_states
         try:
             self._completed_states = dict(await reader())
         except Exception:
+            self._confirm_read_failed = True
             self._confirm_failures += 1
             self._logger.exception(
                 "Could not read completed orders to confirm a missing stop; "
                 "no coverage will be released this cycle",
-                consecutive_failures=self._confirm_failures,
+                consecutive_scans_failed=self._confirm_failures,
             )
             if self._confirm_failures >= _CONFIRM_FAILURES_BEFORE_ALERT:
                 await self._report_failure(
