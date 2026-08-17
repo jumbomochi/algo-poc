@@ -39,6 +39,7 @@ Synthetic portfolios in use today:
 
 | Reader | Reads | Excludes? | How |
 |---|---|---|---|
+| `shared/position_loader.py` — `load_open_positions` | `positions` | ✅ | SQL `~Position.portfolio.startswith("_")` — see the consequence below |
 | `shared/position_loader.py` — `load_portfolio_state` cash | `portfolio_config.cash` | ✅ | SQL `NOT portfolio LIKE '_%'` via `EXCLUDED_PORTFOLIO_PREFIX` |
 | `shared/position_loader.py` — `load_portfolio_state` peak_nav | `equity_snapshots.equity` | ✅ | same predicate, applied before the per-date sum |
 | `scripts/divergence_monitor.py` — per-sleeve scoring | `portfolio_config`, `equity_snapshots`, `trades` | ✅ | explicit `is_excluded_portfolio(name)` skip with a logged reason |
@@ -58,6 +59,28 @@ the paper-start date, the drawdown series (via `shared/evidence_store`, which
 already excluded), the slippage join, and the failed-order ratio. Each is pinned
 by a test that seeds a `__drill__` row and asserts the gate's number does not
 move.
+
+### Consequence of the `load_open_positions` exclusion: no software stop on a drill position
+
+`load_open_positions` is not only an evidence reader — it is what fills the risk
+service's in-memory book, and `_refresh_portfolio_from_db` rebuilds that book
+(and `_current_prices` with it) from the same call on every cycle
+(`services/risk_management/runner.py:1953`). So the exclusion means the periodic
+**stop-loss scan never evaluates a `__drill__` position**. A fill can insert the
+ticker transiently; the next refresh removes it again.
+
+Two things keep that from being a hole:
+
+- `BrokerStopManager._open_positions` (`services/execution/broker_stops.py:1282`)
+  filters on status, quantity and account only — **not** portfolio — so a drill
+  position gets a real GTC stop like any other. Under D16 that is the primary
+  protection anyway.
+- `load_liquidation_targets` (`shared/liquidation.py:74`) also keeps drill rows,
+  so a kill still flattens one.
+
+It does, however, decide how the synthetic stop-loss drill has to be built: it
+drives the broker-stop verifier, not the software scan. See
+[`drill-runbook.md`](drill-runbook.md).
 
 ### ⚠️ Structural gap: gate 5 cannot be portfolio-scoped
 
@@ -83,6 +106,15 @@ python -m scripts.ops.resolve_alert --id <n> --resolved-by <name>
 Resolving is a named human act and refuses to overwrite an earlier resolution,
 so the trail shows a person judged the drill's alert closed rather than a filter
 having hidden it.
+
+**Update (KAN-32): the drill as actually specified does not take this path.**
+A kill flattens all six graded sleeves, so [`drill-runbook.md`](drill-runbook.md)
+activates the halt out of band — a `system_halt` row the risk service adopts on
+re-sync — and neither `kill_switch_activated` nor `kill_switch_liquidation` is
+published. The drill's own alerts are `high`, which gate 5 does not count. The
+gap above is therefore sidestepped by the drill, not closed: it still applies to
+any real kill or circuit-breaker firing, and to `halt_sweep_cancel_failed`, which
+is `critical` and can appear during a drill when IB refuses a cancel.
 
 The `synthetic_stop` drill needs none of this: `stop_loss_triggered` publishes
 at `priority="high"`, which gate 5 does not count.

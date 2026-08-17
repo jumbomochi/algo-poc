@@ -12,6 +12,7 @@ Entry point for operational documentation.
 - `api-security.md` — TLS, secrets, auth lockout, dependency scanning, schema/model integrity (T9)
 - `dependency-lockfile.md` — Regenerating the lockfiles, why each `uv pip compile` flag exists, upgrade procedure, version-ceiling policy (KAN-36)
 - `drill-evidence-isolation.md` — The portfolio exclusion contract: which readers must exclude `__drill__`/`_`-prefixed portfolios, and how to run a tagged drill (KAN-24)
+- `drill-runbook.md` — The two per-epoch drills, step by step: out-of-band halt (not a kill), the broker-stop breach that takes a real fill, unwind/reconcile, and what the drills deliberately do not prove (KAN-32)
 - `broker-stop-prototype.md` — Broker-native GTC stop spike on the paper account: runbook, findings, go/no-go for KAN-19 (scripts/ops/broker_stop_spike.py)
 - `dead-man-switches.md` — The two external checks that page when this host goes quiet, why "no trades today" is deliberately not an internal alert, and the delivery drill (KAN-15)
 - `dlq-audit-2026-08.md` — 2026-08 audit of `stream:approved_orders:dlq`: the queue never existed, why the stop-loss dead-lettering was latent rather than active, and the two monitoring gaps left open (KAN-21)
