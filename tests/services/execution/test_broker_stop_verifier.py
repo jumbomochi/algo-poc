@@ -88,12 +88,24 @@ def resting(
     )
 
 
-def make_manager(session, *, live=(), enabled=True, on_drift=None, **kwargs):
+def make_manager(
+    session,
+    *,
+    live=(),
+    enabled=True,
+    on_drift=None,
+    broker_held: float = 100.0,
+    **kwargs,
+):
     order_manager = AsyncMock()
     order_manager.submit_stop = AsyncMock(return_value="9001")
     order_manager.find_stop_order = AsyncMock(return_value=None)
     order_manager.list_open_broker_orders = AsyncMock(return_value=list(live))
     order_manager.cancel_broker_order = AsyncMock(return_value=True)
+    # Confirmed-cancel primitive: empty means IB's book agrees it is gone.
+    order_manager.cancel_working_orders = AsyncMock(return_value=[])
+    # What IB says the account actually holds — the ceiling on any placement.
+    order_manager.broker_position = AsyncMock(return_value=broker_held)
     defaults = dict(
         order_manager=order_manager,
         order_ledger=OrderLedger(session),
@@ -171,7 +183,7 @@ class TestRecreatesAMissingStop:
 
         report = await manager.verify_coverage()
 
-        assert report.vanished == [stop_id]
+        assert report.released_intents == [stop_id]
         ledger = OrderLedger(session)
         assert ledger.get(stop_id).status == OrderStatus.CANCELLED.value
 
@@ -190,7 +202,7 @@ class TestRecreatesAMissingStop:
         report = await manager.verify_coverage()
 
         assert report.placed == []
-        assert report.cancelled == []
+        assert report.cancelled_order_ids == []
         order_manager.submit_stop.assert_not_awaited()
 
 
@@ -204,7 +216,7 @@ class TestResizesAfterAPartialFill:
     async def test_the_stop_is_re_placed_at_the_remaining_quantity(
         self, session
     ):
-        manager, order_manager = make_manager(session)
+        manager, order_manager = make_manager(session, broker_held=60)
         session.add(make_position(quantity=100, highest=220.0))
         session.commit()
         stop_id = await seed_resting_stop(
@@ -221,8 +233,12 @@ class TestResizesAfterAPartialFill:
 
         report = await manager.verify_coverage()
 
-        assert report.cancelled == ["4242"]
-        order_manager.cancel_broker_order.assert_awaited_once_with("4242")
+        assert report.cancelled_order_ids == ["4242"]
+        # Confirmed against IB's book, not merely requested — a cancel that
+        # does not take would leave the replacement double-covering.
+        order_manager.cancel_working_orders.assert_awaited_once_with(
+            [("4242", stop_id)]
+        )
         assert report.placed == ["5150"]
         assert order_manager.submit_stop.await_args.kwargs[
             "quantity"
@@ -230,7 +246,7 @@ class TestResizesAfterAPartialFill:
 
     async def test_the_over_covering_intent_is_terminalised(self, session):
         """A cancelled stop that still reads as coverage blocks the re-place."""
-        manager, order_manager = make_manager(session)
+        manager, order_manager = make_manager(session, broker_held=60)
         session.add(make_position(quantity=100, highest=220.0))
         session.commit()
         stop_id = await seed_resting_stop(
@@ -270,7 +286,7 @@ class TestTrailingLevelAdvances:
 
         report = await manager.verify_coverage()
 
-        assert report.cancelled == ["4242"]
+        assert report.cancelled_order_ids == ["4242"]
         assert report.placed == ["5150"]
         assert order_manager.submit_stop.await_args.kwargs[
             "stop_price"
@@ -298,9 +314,9 @@ class TestTrailingLevelAdvances:
 
         report = await manager.verify_coverage()
 
-        assert report.cancelled == []
+        assert report.cancelled_order_ids == []
         assert report.placed == []
-        order_manager.cancel_broker_order.assert_not_awaited()
+        order_manager.cancel_working_orders.assert_not_awaited()
 
 
 class TestDriftIsReportedNotCorrected:
@@ -366,12 +382,12 @@ class TestDriftIsReportedNotCorrected:
 
         await manager.verify_coverage()
 
-        order_manager.cancel_broker_order.assert_not_awaited()
+        order_manager.cancel_working_orders.assert_not_awaited()
         order_manager.submit_stop.assert_not_awaited()
 
     async def test_the_three_benign_cases_do_not_alert(self, session):
         """Missing, over-covered and under-levelled are all handled silently."""
-        manager, order_manager = make_manager(session)
+        manager, order_manager = make_manager(session, broker_held=60)
         session.add(make_position(quantity=60, highest=260.0))
         session.commit()
         stop_id = await seed_resting_stop(
@@ -425,6 +441,259 @@ class TestInertWithTheFlagOff:
         assert report.placed == []
         assert report.drifts == []
         order_manager.list_open_broker_orders.assert_not_awaited()
+
+
+class TestNeverProtectsSharesTheAccountNoLongerHolds:
+    """The ``positions`` row lags every fill until the projector applies it.
+
+    Sizing a top-up off that row places protective sells for shares that are
+    already sold — coverage above the holding is a short on trigger, not
+    protection. Every placement is capped by what IB itself reports.
+    """
+
+    async def test_a_partial_fill_the_projector_has_not_applied_adds_nothing(
+        self, session
+    ):
+        manager, order_manager = make_manager(session, broker_held=60)
+        # Position row still says 100; IB has already sold 40 off the stop.
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        stop_id = await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=220.0
+        )
+        ledger = OrderLedger(session)
+        ledger.transition(stop_id, OrderStatus.PARTIALLY_FILLED)
+        ledger.get(stop_id).filled_quantity = 40
+        session.commit()
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[
+                resting(
+                    order_ref=stop_id, quantity=100, aux_price=187.0, filled=40
+                )
+            ]
+        )
+        order_manager.submit_stop = AsyncMock(return_value="never")
+
+        report = await manager.verify_coverage()
+
+        assert report.placed == []
+        order_manager.submit_stop.assert_not_awaited()
+
+    async def test_a_stop_that_filled_completely_is_not_re_placed(self, session):
+        """ib_insync drops filled orders from openTrades, so a fully-filled
+        stop looks exactly like a deleted one. The broker position is what
+        tells them apart: nothing is held, so nothing needs protecting."""
+        manager, order_manager = make_manager(session, broker_held=0)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        stop_id = await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=220.0
+        )
+        order_manager.list_open_broker_orders = AsyncMock(return_value=[])
+        order_manager.submit_stop = AsyncMock(return_value="never")
+
+        report = await manager.verify_coverage()
+
+        assert report.released_intents == [stop_id]
+        assert report.placed == []
+        order_manager.submit_stop.assert_not_awaited()
+
+    async def test_an_unreadable_broker_position_places_nothing(self, session):
+        """Blind is not clear. Guessing here is what mints the naked short."""
+        manager, order_manager = make_manager(session)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        order_manager.broker_position = AsyncMock(
+            side_effect=RuntimeError("IB disconnected")
+        )
+        order_manager.submit_stop = AsyncMock(return_value="never")
+
+        report = await manager.verify_coverage()
+
+        assert report.placed == []
+        order_manager.submit_stop.assert_not_awaited()
+
+    async def test_two_sleeves_on_one_contract_share_the_broker_position(
+        self, session
+    ):
+        """Sizing both against the full position double-covers the contract."""
+        manager, order_manager = make_manager(session, broker_held=100)
+        session.add(make_position(quantity=100, highest=220.0, portfolio="momentum"))
+        session.add(make_position(quantity=100, highest=220.0, portfolio="value"))
+        session.commit()
+        placed: list[float] = []
+
+        async def submit_stop(**kwargs):
+            placed.append(kwargs["quantity"])
+            return f"order-{len(placed)}"
+
+        order_manager.submit_stop = submit_stop
+        order_manager.list_open_broker_orders = AsyncMock(return_value=[])
+
+        await manager.verify_coverage()
+
+        assert sum(placed) == pytest.approx(100)
+
+
+class TestAnUnconfirmedCancelNeverFreesCoverage:
+    """``cancelOrder`` is a request. A stop that refuses to go is still live,
+    and terminalising its row lets the replacement double-cover the shares."""
+
+    async def test_a_stop_ib_still_lists_is_left_resting(self, session):
+        manager, order_manager = make_manager(session, broker_held=60)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        stop_id = await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=220.0
+        )
+        position = session.scalars(select(Position)).one()
+        position.quantity = 60
+        session.commit()
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[resting(order_ref=stop_id, quantity=100, aux_price=187.0)]
+        )
+        # IB still lists the ref after the cancel window.
+        order_manager.cancel_working_orders = AsyncMock(return_value=[stop_id])
+        order_manager.submit_stop = AsyncMock(return_value="never")
+
+        report = await manager.verify_coverage()
+
+        assert report.cancelled_order_ids == []
+        assert OrderLedger(session).get(stop_id).status == (
+            OrderStatus.SUBMITTED.value
+        )
+        order_manager.submit_stop.assert_not_awaited()
+
+
+class TestDriftDoesNotSilentlyDropOtherCoverage:
+    """A drift aborts the scope, so the abort must not have already released
+    a sibling's coverage on the way past."""
+
+    async def test_a_vanished_sibling_is_not_terminalised_during_a_drift(
+        self, session
+    ):
+        manager, order_manager = make_manager(session, broker_held=100)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        first = await seed_resting_stop(
+            manager, order_manager, quantity=60, reference_price=220.0,
+            order_id="4242",
+        )
+        # ensure_coverage brings total coverage up to `quantity`, so this
+        # places the remaining 40 as a second stop.
+        second = await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=220.0,
+            order_id="4343",
+        )
+        # The first drifted; the second is gone from IB entirely.
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[
+                resting(
+                    order_id="4242", order_ref=first, quantity=60,
+                    aux_price=150.0,
+                )
+            ]
+        )
+
+        report = await manager.verify_coverage()
+
+        assert len(report.drifts) == 1
+        assert report.released_intents == []
+        ledger = OrderLedger(session)
+        assert ledger.get(second).status == OrderStatus.SUBMITTED.value
+
+    async def test_an_unresolved_drift_pages_once_not_every_scan(self, session):
+        """Paging every 30 minutes forever is how a channel gets muted — and
+        this channel also carries 'your position is unprotected'."""
+        alerts: list = []
+        manager, order_manager = make_manager(
+            session, on_drift=AsyncMock(side_effect=lambda d: alerts.append(d))
+        )
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        stop_id = await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=220.0
+        )
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[resting(order_ref=stop_id, quantity=100, aux_price=150.0)]
+        )
+
+        await manager.verify_coverage()
+        await manager.verify_coverage()
+        await manager.verify_coverage()
+
+        assert len(alerts) == 1
+
+
+class TestResizingNeverLoosensAStop:
+    """AC5 holds on the resize branch too, not only the re-level branch."""
+
+    async def test_a_shrunken_position_keeps_the_tighter_resting_level(
+        self, session
+    ):
+        manager, order_manager = make_manager(session, broker_held=60)
+        # The recorded high was corrected downward, so the IPS level (187) is
+        # looser than what is already resting (221).
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        stop_id = await seed_resting_stop(
+            manager, order_manager, quantity=100, reference_price=260.0
+        )
+        position = session.scalars(select(Position)).one()
+        position.quantity = 60
+        session.commit()
+        order_manager.list_open_broker_orders = AsyncMock(
+            return_value=[resting(order_ref=stop_id, quantity=100, aux_price=221.0)]
+        )
+        order_manager.submit_stop = AsyncMock(return_value="5150")
+
+        await manager.verify_coverage()
+
+        kwargs = order_manager.submit_stop.await_args.kwargs
+        assert kwargs["quantity"] == pytest.approx(60)
+        assert kwargs["stop_price"] == pytest.approx(221.0)
+
+
+class TestApprovedButNeverSubmittedIsSweptOnTheScan:
+    """A stop approved and never placed counts as coverage while nothing rests
+    at IB. The backfill settles those at startup; a process up for weeks needs
+    the same sweep on the scan (otherwise the position reads protected for
+    ever)."""
+
+    async def test_the_scan_resumes_an_unsubmitted_stop(self, session):
+        manager, order_manager = make_manager(session)
+        session.add(make_position(quantity=100, highest=220.0))
+        session.commit()
+        ledger = OrderLedger(session)
+        ledger.create_intent(
+            SimpleNamespace(
+                recommendation_id="stop-DUN551088-momentum-265598-0",
+                account_id="DUN551088",
+                mode="paper",
+                portfolio="momentum",
+                con_id=265598,
+                symbol="AAPL",
+                exchange="SMART",
+                currency="USD",
+                quantity=100,
+                action="SELL",
+                limit_price=187.0,
+                order_type="stop",
+            )
+        )
+        ledger.transition("stop-DUN551088-momentum-265598-0", OrderStatus.APPROVED)
+        session.commit()
+        order_manager.list_open_broker_orders = AsyncMock(return_value=[])
+        order_manager.submit_stop = AsyncMock(return_value="7000")
+
+        await manager.verify_coverage()
+
+        # The resume runs before anything else, re-driving the existing row
+        # rather than minting a second id for the same shares.
+        assert order_manager.submit_stop.await_args_list[0].kwargs[
+            "recommendation_id"
+        ] == "stop-DUN551088-momentum-265598-0"
+        assert ledger.get("stop-DUN551088-momentum-265598-0").ib_order_id == "7000"
 
 
 def _config() -> AppConfig:
@@ -592,6 +861,54 @@ class TestKillDoesNotOrphanStopCoverage:
         assert "entry-C" not in order_manager.open_orders
         assert sequence[0] == ("cancel", "stop-A")
 
+    async def test_the_stop_sweep_does_not_cancel_the_kills_own_exits(self):
+        """The sweep must reach stops only.
+
+        ``submit_exit`` tracks every liquidation in ``open_orders`` so a stuck
+        one stays reachable — which means a blanket ``cancel_all_orders()``
+        after the loop cancels the very sells the kill just ordered, reports
+        ``positions_liquidated`` anyway, and leaves the book open *and*
+        unprotected. Built with the real OrderManager: an AsyncMock stub never
+        touches ``open_orders`` and cannot see this.
+        """
+        from services.execution.order_manager import OrderManager
+
+        config = _config()
+        executor = AsyncMock()
+        executor.find_order_by_ref = AsyncMock(return_value=None)
+        executor.submit_market_order = AsyncMock(
+            side_effect=lambda ticker, quantity, **kw: f"exit-{ticker}"
+        )
+        executor.cancel_order = AsyncMock(return_value=True)
+        executor.cancel_broker_order = AsyncMock(return_value=True)
+        order_manager = OrderManager(
+            executor=executor, redis_client=AsyncMock(), db_session=MagicMock()
+        )
+        now = datetime.now(timezone.utc)
+        order_manager.open_orders["stop-A"] = {
+            "ticker": "AAPL",
+            "quantity": 100,
+            "limit_price": None,
+            "stop_price": 187.0,
+            "placed_at": now,
+            "last_repriced_at": now,
+            "reprice_count": 0,
+            "recommendation_id": "rec-stop-A",
+            "order_type": "stop",
+        }
+        runner = ExecutionServiceRunner(
+            config=config, redis_client=AsyncMock(), order_manager=order_manager
+        )
+        runner._positions = {"AAPL": 100}
+
+        await runner.process_kill(self._kill())
+
+        assert executor.submit_market_order.await_count == 1
+        # The exit is still working at IB — nothing cancelled it.
+        assert [c.args[0] for c in executor.cancel_order.await_args_list] == []
+        assert "exit-AAPL" in order_manager.open_orders
+        assert "stop-A" not in order_manager.open_orders
+
     async def test_a_stop_on_a_position_with_no_shares_is_still_cancelled(self):
         """Otherwise it rests against a flat book and sells short on trigger.
 
@@ -605,5 +922,9 @@ class TestKillDoesNotOrphanStopCoverage:
 
         await runner.process_kill(self._kill())
 
-        assert sequence == [("cancel", "stop-A"), ("sell", "AAPL")]
+        assert sequence == [
+            ("cancel", "stop-A"),
+            ("sell", "AAPL"),
+            ("cancel", "stop-B"),
+        ]
         assert order_manager.open_orders == {}

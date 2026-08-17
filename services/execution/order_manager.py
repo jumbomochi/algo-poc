@@ -570,12 +570,40 @@ class OrderManager:
         that fails mid-loop no longer strips the protection off every position
         behind it in the queue.
         """
+        return await self._cancel_tracked_stops(
+            [
+                order_id
+                for order_id, info in self.open_orders.items()
+                if info.get("order_type") == "stop"
+                and info.get("ticker") == ticker
+            ],
+            ticker=ticker,
+        )
+
+    async def cancel_all_stops(self) -> list[str]:
+        """Cancel every protective stop still tracked, on any ticker (KAN-20).
+
+        The kill's backstop for a stop the per-position path never reached: one
+        on a name the book no longer holds, or whose exit was already in
+        flight. Deliberately **not** :meth:`cancel_all_orders` — by this point
+        the kill's own liquidation exits are tracked in ``open_orders`` too
+        (:meth:`submit_exit` records them so a stuck exit stays reachable), and
+        a blanket cancel-all would cancel the very sells the kill just ordered
+        and leave the book un-flattened.
+        """
+        return await self._cancel_tracked_stops(
+            [
+                order_id
+                for order_id, info in self.open_orders.items()
+                if info.get("order_type") == "stop"
+            ]
+        )
+
+    async def _cancel_tracked_stops(
+        self, order_ids: list[str], *, ticker: str | None = None
+    ) -> list[str]:
         cancelled: list[str] = []
-        for order_id in [
-            order_id
-            for order_id, info in self.open_orders.items()
-            if info.get("order_type") == "stop" and info.get("ticker") == ticker
-        ]:
+        for order_id in order_ids:
             try:
                 if await self.cancel_broker_order(order_id):
                     cancelled.append(order_id)
@@ -586,7 +614,9 @@ class OrderManager:
                 self._logger.exception(
                     "Failed to cancel a protective stop before liquidation",
                     order_id=order_id,
-                    ticker=ticker,
+                    ticker=ticker or self.open_orders.get(order_id, {}).get(
+                        "ticker"
+                    ),
                 )
         return cancelled
 

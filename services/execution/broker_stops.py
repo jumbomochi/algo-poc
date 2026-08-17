@@ -118,12 +118,26 @@ class StopDrift:
 
 @dataclass
 class StopVerification:
-    """What one verification pass changed, for the log and for the tests."""
+    """What one verification pass changed, for the log and for the tests.
+
+    ``placed`` and ``cancelled_order_ids`` are broker order ids;
+    ``released_intents`` are recommendation ids. Named apart because they are
+    different namespaces and a log line mixing them silently is unreadable at
+    3am.
+    """
 
     placed: list[str] = field(default_factory=list)
-    cancelled: list[str] = field(default_factory=list)
-    vanished: list[str] = field(default_factory=list)
+    cancelled_order_ids: list[str] = field(default_factory=list)
+    released_intents: list[str] = field(default_factory=list)
     drifts: list[StopDrift] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        return bool(
+            self.placed
+            or self.cancelled_order_ids
+            or self.released_intents
+            or self.drifts
+        )
 
 
 @dataclass(frozen=True)
@@ -183,6 +197,9 @@ class BrokerStopManager:
         self._whole_shares = whole_shares
         self._on_placement_failed = on_placement_failed
         self._on_drift_detected = on_drift_detected
+        # (recommendation_id, reason) already paged — see _report_drift.
+        self._drifts_alerted: set[tuple[str, str]] = set()
+        self._drifts_seen_this_pass: set[tuple[str, str]] = set()
         self._logger = get_logger("broker_stops")
 
     @property
@@ -200,12 +217,18 @@ class BrokerStopManager:
         currency: str | None,
         quantity: float,
         reference_price: float,
+        stop_price: float | None = None,
     ) -> str | None:
         """Bring one position up to full stop coverage.
 
         Returns the broker order id of the stop placed, or None when nothing
         needed placing — or when placing it failed, which is recorded as a
         ``SUBMISSION_FAILED`` intent rather than reported as protection.
+
+        ``stop_price`` overrides the level the IPS rule computes from
+        ``reference_price``. The verifier passes one so a replacement can be
+        clamped to the tighter of the computed level and what is already
+        resting; nothing else should need it.
         """
         if not self._enabled:
             return None
@@ -231,7 +254,8 @@ class BrokerStopManager:
             return None
 
         try:
-            stop_price = ips_stop_price(reference_price, self._trailing_pct)
+            if stop_price is None:
+                stop_price = ips_stop_price(reference_price, self._trailing_pct)
         except ValueError as exc:
             self._logger.error(
                 "Cannot size a protective stop",
@@ -359,10 +383,24 @@ class BrokerStopManager:
           never down.
 
         Anything else is :class:`StopDrift`: reported, and left alone.
+
+        Every placement is capped by what IB says the account actually holds.
+        The ``positions`` row lags each fill until the projector applies it,
+        and sizing a top-up off a stale row places protective sells for shares
+        that are already gone — which is a short, not protection.
         """
         report = StopVerification()
         if not self._enabled:
             return report
+
+        # A stop approved but never submitted counts as coverage while nothing
+        # rests at IB. The backfill settles those at startup; a process that
+        # stays up for weeks needs the same sweep on the scan.
+        try:
+            await self._resume_unsubmitted_stops()
+        except Exception:
+            self._ledger.session.rollback()
+            self._logger.exception("Could not resume unsubmitted stop intents")
 
         try:
             live = await self._live_stops_by_ref()
@@ -375,9 +413,14 @@ class BrokerStopManager:
             )
             return report
 
+        # Shares IB reports per contract, spent down as each scope claims its
+        # share. Two sleeves can hold the same contract, and sizing both
+        # against the full broker position would double-cover it.
+        budget: dict[int, float | None] = {}
+        self._drifts_seen_this_pass = set()
         for scope in self._open_position_scopes():
             try:
-                await self._verify_scope(scope, live, report)
+                await self._verify_scope(scope, live, report, budget)
             except Exception:
                 # One position's verification must not abandon the rest, and a
                 # half-applied ledger transaction on this shared session would
@@ -388,6 +431,9 @@ class BrokerStopManager:
                     symbol=scope.symbol,
                     con_id=scope.con_id,
                 )
+        # Exactly this pass's drifts stay suppressed: one that is still there
+        # keeps quiet, and one that went away can page again if it returns.
+        self._drifts_alerted = set(self._drifts_seen_this_pass)
         return report
 
     async def _live_stops_by_ref(self) -> dict[str, Any]:
@@ -404,39 +450,62 @@ class BrokerStopManager:
         scope: _PositionScope,
         live: dict[str, Any],
         report: StopVerification,
+        budget: dict[int, float | None],
     ) -> None:
         claims = self._stop_claims(scope)
 
         resting: list[tuple[_StopClaim, Any]] = []
-        drifted = False
+        missing: list[_StopClaim] = []
+        drifts: list[StopDrift] = []
         for claim in claims:
             order = live.get(claim.recommendation_id)
             if order is None:
-                self._release_vanished_stop(claim, scope, report)
+                missing.append(claim)
                 continue
             drift = self._drift(claim, order, scope)
             if drift is not None:
-                report.drifts.append(drift)
-                await self._report_drift(drift)
-                drifted = True
+                drifts.append(drift)
             resting.append((claim, order))
 
-        if drifted:
-            # Reported, not corrected — and the whole position is left alone,
-            # because re-placing around a stop somebody moved would destroy
-            # the state an operator has to look at to find out why.
+        if drifts:
+            # Reported, not corrected — and the whole position is left exactly
+            # as it is, because re-placing around a stop somebody moved would
+            # destroy the state an operator has to look at to find out why.
+            # Including the missing rows: releasing their coverage here would
+            # drop protection quietly while the alert talks about a different
+            # order, and no later pass would place the replacement either.
+            for drift in drifts:
+                report.drifts.append(drift)
+                await self._report_drift(drift)
+            return
+
+        for claim in missing:
+            self._release_vanished_stop(claim, scope, report)
+
+        allowed = await self._protectable_quantity(scope, budget)
+        if allowed is None:
+            # No broker truth this cycle. Sizing off the durable row alone is
+            # how a top-up ends up protecting shares that are already sold.
             return
 
         covered = sum(self._broker_quantity(order) for _, order in resting)
-        desired_price = self._desired_stop_price(scope)
+        levels = [self._broker_price(order) for _, order in resting]
+        ips_level = self._ips_level(scope)
 
-        over_covered = covered > scope.quantity + _QUANTITY_EPSILON
-        under_levelled = desired_price is not None and any(
-            self._broker_price(order) is None
-            or self._broker_price(order) < desired_price - _PRICE_EPSILON
-            for _, order in resting
+        over_covered = covered > allowed + _QUANTITY_EPSILON
+        under_levelled = ips_level is not None and any(
+            level is None or level < ips_level - _PRICE_EPSILON
+            for level in levels
         )
+        replacement_level = ips_level
         if over_covered or under_levelled:
+            # A resize must not double as a loosening. The replacement sits at
+            # the tighter of what the IPS rule wants and what is already
+            # resting, so re-sizing after a fill can never widen live
+            # protection (AC5 holds on this branch too).
+            known = [level for level in levels if level is not None]
+            if replacement_level is not None and known:
+                replacement_level = max(replacement_level, *known)
             # Cancel first, then re-place whole: IB has no modify path here,
             # and ``ensure_coverage`` sizes against the ledger, so the old row
             # has to be terminal before the replacement can be sized at all.
@@ -450,11 +519,60 @@ class BrokerStopManager:
             symbol=scope.symbol,
             exchange=scope.exchange,
             currency=scope.currency,
-            quantity=scope.quantity,
+            quantity=allowed,
             reference_price=scope.highest_price_since_entry,
+            stop_price=replacement_level,
         )
         if order_id is not None:
             report.placed.append(order_id)
+        self._spend_budget(scope, budget, allowed)
+
+    async def _protectable_quantity(
+        self, scope: _PositionScope, budget: dict[int, float | None]
+    ) -> float | None:
+        """Shares of this position a stop may cover, per the broker's own book.
+
+        ``None`` when IB could not be asked — the caller then places nothing,
+        because the alternative is sizing off a ``positions`` row that lags
+        every fill the projector has not applied.
+        """
+        if scope.con_id not in budget:
+            budget[scope.con_id] = await self._broker_held(scope.con_id)
+        remaining = budget[scope.con_id]
+        if remaining is None:
+            return None
+        return max(0.0, min(scope.quantity, remaining))
+
+    def _spend_budget(
+        self,
+        scope: _PositionScope,
+        budget: dict[int, float | None],
+        claimed: float,
+    ) -> None:
+        remaining = budget.get(scope.con_id)
+        if remaining is not None:
+            budget[scope.con_id] = max(0.0, remaining - claimed)
+
+    async def _broker_held(self, con_id: int) -> float | None:
+        """Net long quantity IB reports for this contract, or None if unasked."""
+        try:
+            held = await self._order_manager.broker_position(con_id)
+        except Exception:
+            self._logger.exception(
+                "Could not read the broker position backing a stop; leaving "
+                "coverage unchanged this cycle",
+                con_id=con_id,
+            )
+            return None
+        try:
+            return max(0.0, float(held))
+        except (TypeError, ValueError):
+            self._logger.error(
+                "Broker reported an unusable position for a stop",
+                con_id=con_id,
+                held=held,
+            )
+            return None
 
     def _stop_claims(self, scope: _PositionScope) -> list[_StopClaim]:
         """The ledger rows claiming to protect this position, read and released."""
@@ -507,7 +625,7 @@ class BrokerStopManager:
             reason="stop is no longer resting at the broker",
         )
         self._ledger.session.commit()
-        report.vanished.append(claim.recommendation_id)
+        report.released_intents.append(claim.recommendation_id)
         self._logger.warning(
             "Protective stop is gone from the broker; re-covering the position",
             recommendation_id=claim.recommendation_id,
@@ -522,16 +640,25 @@ class BrokerStopManager:
         scope: _PositionScope,
         report: StopVerification,
     ) -> None:
-        """Cancel a stop at IB and terminalise its row, so it can be re-placed."""
+        """Cancel a stop at IB and terminalise its row, so it can be re-placed.
+
+        Confirmed against IB's own book, not merely requested.
+        ``cancelOrder`` is a request: a stop that refuses to cancel, or that
+        triggers in the same instant, is still live. Terminalising on the
+        request alone frees coverage the broker is still holding, and the
+        replacement placed straight after double-covers the position — which
+        sells it short on trigger. :meth:`OrderManager.cancel_working_orders`
+        is the primitive that waits for the book to agree (KAN-10).
+        """
         if claim.order_id is None:
             return
-        cancelled = await self._order_manager.cancel_broker_order(claim.order_id)
-        if not cancelled:
-            # Still live at IB. Terminalising anyway would free coverage the
-            # broker is still holding, and the replacement would double-cover
-            # the position — a short on trigger. Leave it for the next cycle.
+        still_live = await self._order_manager.cancel_working_orders(
+            [(claim.order_id, claim.recommendation_id)]
+        )
+        if still_live:
             self._logger.error(
-                "Could not cancel a stop for replacement; leaving it resting",
+                "Could not confirm a stop cancel; leaving it resting and "
+                "retrying next cycle",
                 recommendation_id=claim.recommendation_id,
                 order_id=claim.order_id,
                 symbol=scope.symbol,
@@ -543,9 +670,9 @@ class BrokerStopManager:
             reason="replaced by a re-sized or re-levelled stop",
         )
         self._ledger.session.commit()
-        report.cancelled.append(claim.order_id)
+        report.cancelled_order_ids.append(claim.order_id)
 
-    def _desired_stop_price(self, scope: _PositionScope) -> float | None:
+    def _ips_level(self, scope: _PositionScope) -> float | None:
         """The level the IPS rule wants right now, or None if it cannot be sized.
 
         A reference price that cannot produce a stop is not silently ignored —
@@ -608,7 +735,14 @@ class BrokerStopManager:
         return None if price is None else float(price)
 
     async def _report_drift(self, drift: StopDrift) -> None:
-        """Page: a resting stop was changed by something that is not us."""
+        """Page: a resting stop was changed by something that is not us.
+
+        Once per distinct drift, not once per scan. The verifier deliberately
+        does not correct a drift, so an unresolved one is still there on every
+        later pass — paging every 30 minutes forever is how an alert channel
+        gets muted, and this is a channel that also carries "your position is
+        unprotected". The same dedup the post-halt sweep uses.
+        """
         self._logger.error(
             "Protective stop has drifted from its ledger intent",
             recommendation_id=drift.recommendation_id,
@@ -617,7 +751,9 @@ class BrokerStopManager:
             con_id=drift.con_id,
             reason=drift.reason,
         )
-        if self._on_drift_detected is None:
+        key = (drift.recommendation_id, drift.reason)
+        self._drifts_seen_this_pass.add(key)
+        if key in self._drifts_alerted or self._on_drift_detected is None:
             return
         try:
             await self._on_drift_detected(drift)

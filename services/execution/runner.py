@@ -196,9 +196,12 @@ class ExecutionServiceRunner:
         # and disables entries for the session, so without durability there is
         # no safe way to place one.
         self._broker_stops: BrokerStopManager | None = None
-        # The KAN-20 verification scan. Same cadence as the risk service's
-        # passive scan — that scan's stop-loss job is now this one, moved to
-        # the loop that actually holds the broker connection.
+        # The KAN-20 verification scan, on the risk service's passive-scan
+        # cadence. It runs here rather than there because verifying a broker
+        # stop takes a broker connection, which only this service has. The
+        # risk scan keeps emitting software stop-loss exits either way — with
+        # stops resting, KAN-10's outstanding-sell guard already sizes those
+        # to zero, so the software path is the fallback the design intends.
         self._stop_verification_interval_seconds = 1800
         self._last_stop_verification_at: float | None = None
         if order_ledger is not None and config.execution.broker_stops_enabled:
@@ -1276,16 +1279,22 @@ class ExecutionServiceRunner:
         except Exception:
             # Best-effort, like every other sweep on this loop: a verification
             # failure must not tear down the loop that still has to process
-            # fills and liquidation sells.
-            self._order_ledger.session.rollback()
+            # fills and liquidation sells. The rollback is itself guarded —
+            # when the database is the thing that died, rollback() raises too,
+            # and letting that escape would take the service down for exactly
+            # the blip this handler exists to survive.
+            try:
+                self._order_ledger.session.rollback()
+            except Exception:
+                self._logger.exception("Rollback after a failed verification")
             self._logger.exception("Broker stop verification failed; continuing")
             return True
-        if report.placed or report.cancelled or report.vanished or report.drifts:
+        if report:
             self._logger.info(
                 "Broker stop verification adjusted resting protection",
-                placed=report.placed,
-                cancelled=report.cancelled,
-                vanished=report.vanished,
+                placed_order_ids=report.placed,
+                cancelled_order_ids=report.cancelled_order_ids,
+                released_intents=report.released_intents,
                 drifts=len(report.drifts),
             )
         return True
@@ -1544,10 +1553,14 @@ class ExecutionServiceRunner:
                     ticker=ticker,
                 )
 
-        # Sweep whatever the per-position path did not reach: a stop on a name
+        # Sweep the stops the per-position path did not reach: one on a name
         # the book no longer holds, or on one whose exit was already in flight.
         # Either would rest against a flat position and sell short on trigger.
-        await self._order_manager.cancel_all_orders()
+        # Stops only — cancel_all_orders() here would cancel the liquidation
+        # exits submitted moments ago and leave the book un-flattened.
+        sweeper = getattr(self._order_manager, "cancel_all_stops", None)
+        if sweeper is not None:
+            await sweeper()
 
         # Always publish the critical alert — even on zero positions or partial
         # failure, the operator must learn the kill fired.
@@ -1888,10 +1901,17 @@ class ExecutionServiceRunner:
                         "Post-halt order sweep failed; continuing"
                     )
                 # Broker-stop verification (KAN-20) — the 30-minute scan that
-                # keeps a placed stop true. Guards its own failures internally.
-                await self.maybe_run_stop_verification(
-                    asyncio.get_running_loop().time()
-                )
+                # keeps a placed stop true. Best-effort like the sweeps above:
+                # it must never tear down the loop that still has to process
+                # fills and liquidation sells.
+                try:
+                    await self.maybe_run_stop_verification(
+                        asyncio.get_running_loop().time()
+                    )
+                except Exception:
+                    self._logger.exception(
+                        "Broker stop verification failed; continuing"
+                    )
 
                 await self._consume_and_process(
                     APPROVED_ORDERS_STREAM,
