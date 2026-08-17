@@ -200,6 +200,11 @@ class BrokerStopManager:
         # (recommendation_id, reason) already paged — see _report_drift.
         self._drifts_alerted: set[tuple[str, str]] = set()
         self._drifts_seen_this_pass: set[tuple[str, str]] = set()
+        # Refs absent from IB's book on the previous scan, and refs placed so
+        # recently that absence proves nothing — both feed _may_release.
+        self._missing_last_pass: set[str] = set()
+        self._missing_this_pass: set[str] = set()
+        self._skip_release: set[str] = set()
         self._logger = get_logger("broker_stops")
 
     @property
@@ -393,17 +398,25 @@ class BrokerStopManager:
         if not self._enabled:
             return report
 
+        # Shares IB reports per contract, spent down as each scope claims its
+        # share. Two sleeves can hold the same contract, and sizing both
+        # against the full broker position would double-cover it.
+        budget: dict[int, float | None] = {}
+
         # A stop approved but never submitted counts as coverage while nothing
         # rests at IB. The backfill settles those at startup; a process that
-        # stays up for weeks needs the same sweep on the scan.
+        # stays up for weeks needs the same sweep on the scan. Capped by the
+        # broker like every other placement — a resume is a placement, and
+        # the intent's requested quantity is as stale as any other row.
         try:
-            await self._resume_unsubmitted_stops()
+            resumed = await self._resume_unsubmitted_stops(budget=budget)
         except Exception:
             self._ledger.session.rollback()
             self._logger.exception("Could not resume unsubmitted stop intents")
+            resumed = []
 
         try:
-            live = await self._live_stops_by_ref()
+            live, trusted = await self._live_stops_by_ref()
         except Exception:
             # Blind, not clear. Placing on the assumption that nothing rests
             # would double-cover every position in the book.
@@ -413,14 +426,17 @@ class BrokerStopManager:
             )
             return report
 
-        # Shares IB reports per contract, spent down as each scope claims its
-        # share. Two sleeves can hold the same contract, and sizing both
-        # against the full broker position would double-cover it.
-        budget: dict[int, float | None] = {}
+        # Anything placed moments ago is not "vanished" — the broker's open-order
+        # book may not list it yet, and the adoption path in submit_stop can
+        # return an id sourced from completed orders, which openTrades never
+        # shows. Releasing those would terminalise a live stop and place a
+        # second one for the same shares in the same pass.
+        self._skip_release = set(resumed)
         self._drifts_seen_this_pass = set()
+        self._missing_this_pass: set[str] = set()
         for scope in self._open_position_scopes():
             try:
-                await self._verify_scope(scope, live, report, budget)
+                await self._verify_scope(scope, live, report, budget, trusted)
             except Exception:
                 # One position's verification must not abandon the rest, and a
                 # half-applied ledger transaction on this shared session would
@@ -434,16 +450,52 @@ class BrokerStopManager:
         # Exactly this pass's drifts stay suppressed: one that is still there
         # keeps quiet, and one that went away can page again if it returns.
         self._drifts_alerted = set(self._drifts_seen_this_pass)
+        self._missing_last_pass = self._missing_this_pass
         return report
 
-    async def _live_stops_by_ref(self) -> dict[str, Any]:
-        """Every order live at IB, keyed by the ref our intents are named for."""
+    async def _live_stops_by_ref(self) -> tuple[dict[str, Any], bool]:
+        """Orders live at IB keyed by ref, and whether the read looked synced.
+
+        An empty book is the shape a *failed* sync takes, not only that of a
+        genuinely empty account: ``connectAsync`` gives ``reqOpenOrders`` four
+        seconds and only **logs** the timeout, so a Gateway slow to answer — a
+        data-farm reset, the reconnect ``_ensure_connected`` performs mid-scan
+        — leaves an empty order book behind a connection that reports success.
+        Read as authority, that terminalises every stop intent in the book and
+        places a duplicate for each, while reconciliation sees the still-live
+        originals as ``major`` and disables entries for the session.
+
+        An empty book therefore does not *prove* absence; it only fails to
+        show presence. Callers treat it as untrusted and make a vanished stop
+        prove itself twice (see :meth:`_may_release`).
+        """
         orders = await self._order_manager.list_open_broker_orders()
-        return {
-            str(order.order_ref): order
-            for order in orders
-            if getattr(order, "order_ref", None)
-        }
+        return (
+            {
+                str(order.order_ref): order
+                for order in orders
+                if getattr(order, "order_ref", None)
+            },
+            bool(orders),
+        )
+
+    def _may_release(self, recommendation_id: str, trusted: bool) -> bool:
+        """Whether an absent stop has proved itself absent.
+
+        With other orders visible the book is demonstrably synced, so one miss
+        is enough and a deleted stop is recreated within one cycle (AC1). With
+        nothing visible at all — the ambiguous case, indistinguishable from a
+        failed sync — the same ref has to be missing on two consecutive scans.
+        A transient empty book heals in between; a genuinely deleted stop is
+        recreated one cycle later. Latency is the right thing to trade here:
+        the alternative failure places a second live stop against shares that
+        already have one.
+        """
+        if recommendation_id in self._skip_release:
+            return False
+        if trusted:
+            return True
+        return recommendation_id in self._missing_last_pass
 
     async def _verify_scope(
         self,
@@ -451,6 +503,7 @@ class BrokerStopManager:
         live: dict[str, Any],
         report: StopVerification,
         budget: dict[int, float | None],
+        trusted: bool,
     ) -> None:
         claims = self._stop_claims(scope)
 
@@ -460,6 +513,7 @@ class BrokerStopManager:
         for claim in claims:
             order = live.get(claim.recommendation_id)
             if order is None:
+                self._missing_this_pass.add(claim.recommendation_id)
                 missing.append(claim)
                 continue
             drift = self._drift(claim, order, scope)
@@ -475,11 +529,29 @@ class BrokerStopManager:
             # drop protection quietly while the alert talks about a different
             # order, and no later pass would place the replacement either.
             for drift in drifts:
+                # The number of uncovered siblings is part of the identity of
+                # the alert: a frozen scope that then loses more coverage is a
+                # worse situation than the one already paged for, and must not
+                # be silenced by the dedup.
+                await self._report_drift(drift, uncovered=len(missing))
                 report.drifts.append(drift)
-                await self._report_drift(drift)
+            # Claim what is still resting so another sleeve on this contract
+            # cannot size itself against shares this one is already covering.
+            await self._reserve_frozen_coverage(scope, resting, budget)
             return
 
         for claim in missing:
+            if not self._may_release(claim.recommendation_id, trusted):
+                self._logger.warning(
+                    "A stop is missing from an order book that showed nothing "
+                    "at all; waiting for a second scan before releasing it",
+                    recommendation_id=claim.recommendation_id,
+                    symbol=scope.symbol,
+                    con_id=scope.con_id,
+                )
+                # Its coverage still counts, so the shortfall below is zero and
+                # nothing is placed on top of a stop that may well be resting.
+                continue
             self._release_vanished_stop(claim, scope, report)
 
         allowed = await self._protectable_quantity(scope, budget)
@@ -487,6 +559,19 @@ class BrokerStopManager:
             # No broker truth this cycle. Sizing off the durable row alone is
             # how a top-up ends up protecting shares that are already sold.
             return
+        if allowed < scope.quantity - _QUANTITY_EPSILON:
+            # The book and the broker disagree about the size of this position.
+            # Logged, not paged: reconcile_paper already reports the divergence
+            # as `major`, and the benign version of this (a fill the projector
+            # has not applied) happens on every scan after a partial exit.
+            self._logger.warning(
+                "Broker holds fewer shares than the book; capping stop "
+                "coverage at the broker's number",
+                symbol=scope.symbol,
+                con_id=scope.con_id,
+                book_quantity=scope.quantity,
+                protectable=allowed,
+            )
 
         covered = sum(self._broker_quantity(order) for _, order in resting)
         levels = [self._broker_price(order) for _, order in resting]
@@ -509,8 +594,12 @@ class BrokerStopManager:
             # Cancel first, then re-place whole: IB has no modify path here,
             # and ``ensure_coverage`` sizes against the ledger, so the old row
             # has to be terminal before the replacement can be sized at all.
-            for claim, _ in resting:
-                await self._retire_stop(claim, scope, report)
+            # One confirm cycle for all of them, not one each — the wait is up
+            # to 3.5s of backoff and it runs on the loop that also drains the
+            # kill stream.
+            await self._retire_stops(
+                [claim for claim, _ in resting], scope, report
+            )
 
         order_id = await self.ensure_coverage(
             account_id=scope.account_id,
@@ -549,9 +638,7 @@ class BrokerStopManager:
         budget: dict[int, float | None],
         claimed: float,
     ) -> None:
-        remaining = budget.get(scope.con_id)
-        if remaining is not None:
-            budget[scope.con_id] = max(0.0, remaining - claimed)
+        self._spend_con_id_budget(scope.con_id, budget, claimed)
 
     async def _broker_held(self, con_id: int) -> float | None:
         """Net long quantity IB reports for this contract, or None if unasked."""
@@ -634,13 +721,13 @@ class BrokerStopManager:
             con_id=scope.con_id,
         )
 
-    async def _retire_stop(
+    async def _retire_stops(
         self,
-        claim: _StopClaim,
+        claims: list[_StopClaim],
         scope: _PositionScope,
         report: StopVerification,
     ) -> None:
-        """Cancel a stop at IB and terminalise its row, so it can be re-placed.
+        """Cancel stops at IB and terminalise their rows, so they can be re-placed.
 
         Confirmed against IB's own book, not merely requested.
         ``cancelOrder`` is a request: a stop that refuses to cancel, or that
@@ -650,27 +737,55 @@ class BrokerStopManager:
         sells it short on trigger. :meth:`OrderManager.cancel_working_orders`
         is the primitive that waits for the book to agree (KAN-10).
         """
-        if claim.order_id is None:
+        cancellable = [claim for claim in claims if claim.order_id is not None]
+        if not cancellable:
             return
-        still_live = await self._order_manager.cancel_working_orders(
-            [(claim.order_id, claim.recommendation_id)]
-        )
-        if still_live:
-            self._logger.error(
-                "Could not confirm a stop cancel; leaving it resting and "
-                "retrying next cycle",
-                recommendation_id=claim.recommendation_id,
-                order_id=claim.order_id,
-                symbol=scope.symbol,
+        still_live = set(
+            await self._order_manager.cancel_working_orders(
+                [
+                    (claim.order_id, claim.recommendation_id)
+                    for claim in cancellable
+                ]
             )
-            return
-        self._ledger.transition(
-            claim.recommendation_id,
-            OrderStatus.CANCELLED,
-            reason="replaced by a re-sized or re-levelled stop",
         )
-        self._ledger.session.commit()
-        report.cancelled_order_ids.append(claim.order_id)
+        for claim in cancellable:
+            if claim.recommendation_id in still_live:
+                self._logger.error(
+                    "Could not confirm a stop cancel; leaving it resting and "
+                    "retrying next cycle",
+                    recommendation_id=claim.recommendation_id,
+                    order_id=claim.order_id,
+                    symbol=scope.symbol,
+                )
+                continue
+            self._ledger.transition(
+                claim.recommendation_id,
+                OrderStatus.CANCELLED,
+                reason="replaced by a re-sized or re-levelled stop",
+            )
+            self._ledger.session.commit()
+            report.cancelled_order_ids.append(claim.order_id)
+
+    async def _reserve_frozen_coverage(
+        self,
+        scope: _PositionScope,
+        resting: list[tuple[_StopClaim, Any]],
+        budget: dict[int, float | None],
+    ) -> None:
+        """Spend a drift-frozen scope's coverage out of the contract's budget.
+
+        A frozen scope places nothing, but its stops are still resting against
+        the contract. Leaving its share unspent lets the next sleeve on the
+        same ``con_id`` size itself against the whole broker position and push
+        total coverage past what is held.
+        """
+        if await self._protectable_quantity(scope, budget) is None:
+            return
+        self._spend_budget(
+            scope,
+            budget,
+            sum(self._broker_quantity(order) for _, order in resting),
+        )
 
     def _ips_level(self, scope: _PositionScope) -> float | None:
         """The level the IPS rule wants right now, or None if it cannot be sized.
@@ -734,7 +849,7 @@ class BrokerStopManager:
         price = getattr(order, "aux_price", None)
         return None if price is None else float(price)
 
-    async def _report_drift(self, drift: StopDrift) -> None:
+    async def _report_drift(self, drift: StopDrift, *, uncovered: int = 0) -> None:
         """Page: a resting stop was changed by something that is not us.
 
         Once per distinct drift, not once per scan. The verifier deliberately
@@ -751,7 +866,11 @@ class BrokerStopManager:
             con_id=drift.con_id,
             reason=drift.reason,
         )
-        key = (drift.recommendation_id, drift.reason)
+        # ``uncovered`` is part of the identity: a drift freezes every
+        # adjustment on its position, so a frozen scope that then loses a
+        # second stop is a worse state than the one already paged for and must
+        # not inherit its silence.
+        key = (drift.recommendation_id, f"{drift.reason}|uncovered={uncovered}")
         self._drifts_seen_this_pass.add(key)
         if key in self._drifts_alerted or self._on_drift_detected is None:
             return
@@ -832,7 +951,9 @@ class BrokerStopManager:
                 placed.append(order_id)
         return placed
 
-    async def _resume_unsubmitted_stops(self) -> list[str]:
+    async def _resume_unsubmitted_stops(
+        self, *, budget: dict[int, float | None] | None = None
+    ) -> list[str]:
         """Finish stop intents that were approved but never reached IB.
 
         A crash between the APPROVED commit and the placement (SIGKILL, OOM,
@@ -844,6 +965,14 @@ class BrokerStopManager:
         Re-driving the submission rather than terminalising the row: the
         submit path probes ``find_order_by_ref`` first, so an order that *did*
         reach IB is adopted instead of duplicated.
+
+        ``budget`` caps each resume by what the broker says is held, the same
+        ceiling every other placement obeys. A resume is a placement, and the
+        row it re-drives can be days old: the position it was approved for may
+        have been sold since, in which case the "resumed" stop is a naked
+        short waiting for a trigger. Without a budget (the startup backfill,
+        which then re-reads coverage per position) the row is re-driven as
+        approved.
         """
         resumed: list[str] = []
         for intent in self._ledger.unsubmitted_stop_intents():
@@ -851,7 +980,31 @@ class BrokerStopManager:
             symbol = intent.symbol
             quantity = float(intent.requested_quantity)
             stop_price = intent.limit_price
+            con_id = intent.con_id
             self._ledger.session.rollback()
+            if budget is not None and con_id is not None:
+                held = await self._resumable_quantity(int(con_id), budget)
+                if held is None:
+                    continue
+                if held <= 0:
+                    self._ledger.transition(
+                        recommendation_id,
+                        OrderStatus.SUBMISSION_FAILED,
+                        reason=(
+                            "broker holds none of this contract; the stop this "
+                            "row describes would rest against a flat position"
+                        ),
+                    )
+                    self._ledger.session.commit()
+                    self._logger.warning(
+                        "Abandoned an unsubmitted stop for a position the "
+                        "broker no longer holds",
+                        recommendation_id=recommendation_id,
+                        symbol=symbol,
+                        con_id=con_id,
+                    )
+                    continue
+                quantity = min(quantity, held)
             if stop_price is None:
                 # Pre-dates the stop level being recorded on the intent, so it
                 # cannot be re-placed as approved. Terminalise it so the
@@ -895,9 +1048,28 @@ class BrokerStopManager:
                 order_id=order_id,
                 symbol=symbol,
                 recommendation_id=recommendation_id,
+                quantity=quantity,
             )
-            resumed.append(order_id)
+            if budget is not None and intent.con_id is not None:
+                self._spend_con_id_budget(int(intent.con_id), budget, quantity)
+            # Keyed by ref, which is how the verifier matches a resting stop.
+            resumed.append(recommendation_id)
         return resumed
+
+    async def _resumable_quantity(
+        self, con_id: int, budget: dict[int, float | None]
+    ) -> float | None:
+        """Shares of ``con_id`` still unclaimed, per the broker. None if unasked."""
+        if con_id not in budget:
+            budget[con_id] = await self._broker_held(con_id)
+        return budget[con_id]
+
+    def _spend_con_id_budget(
+        self, con_id: int, budget: dict[int, float | None], claimed: float
+    ) -> None:
+        remaining = budget.get(con_id)
+        if remaining is not None:
+            budget[con_id] = max(0.0, remaining - claimed)
 
     def _open_position_scopes(self) -> list[_PositionScope]:
         """Open positions aggregated to the grain coverage is tracked at.

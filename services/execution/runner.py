@@ -1558,9 +1558,7 @@ class ExecutionServiceRunner:
         # Either would rest against a flat position and sell short on trigger.
         # Stops only — cancel_all_orders() here would cancel the liquidation
         # exits submitted moments ago and leave the book un-flattened.
-        sweeper = getattr(self._order_manager, "cancel_all_stops", None)
-        if sweeper is not None:
-            await sweeper()
+        await self._order_manager.cancel_all_stops()
 
         # Always publish the critical alert — even on zero positions or partial
         # failure, the operator must learn the kill fired.
