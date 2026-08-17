@@ -228,20 +228,57 @@ call those failures either, and gate 2 already counts the halt.
 
 ---
 
-## Two-Person Approval
+## Gate Approval
 
-Promotion requires sign-off from **both** the operator and a reviewer.
+**Amended 2026-08-17 (KAN-37, direction doc D14).** This section previously
+required sign-off from the operator *and a second reviewer*. algo-poc is
+solo-operated: there is no second person, so that gate could only ever be
+skipped or signed twice by the same hand — a control that cannot be satisfied
+is a control that gets quietly dropped on the day it matters most. It is
+replaced, **once**, by the four-part substitute below. All four parts are
+mandatory; the substitute is not "one reviewer's worth" of scrutiny made
+optional.
 
-| Role     | Name | Date | Signature |
-|----------|------|------|-----------|
-| Operator |      |      |           |
-| Reviewer |      |      |           |
+### The four-part solo substitute
+
+1. **Written draft.** The gate decision is **drafted in writing** against the
+   evidence digest — not against scrollback, memory, or a live database query.
+   The draft states each of the 8 gates, its measured value, pass/fail, and the
+   evidence artifact it was read from. A gate whose evidence cannot be cited
+   has not passed.
+2. **Independent adversarial review.** An **adversarial review** by a
+   cross-model AI, given the draft and the evidence, tasked with challenging
+   the decision rather than confirming it. Its challenges are recorded verbatim
+   alongside the draft. Cross-model is the point: a second pass from the model
+   that helped write the draft reproduces its blind spots.
+3. **Cooling-off.** A mandatory **7-day cooling-off** period separates the
+   draft from arming the account. Nothing is armed inside those seven days,
+   however green the evidence looks. The period exists to break the link
+   between a good week and an irreversible decision.
+4. **Unresolved challenges block.** Any **unresolved challenge** from step 2
+   blocks promotion. Resolution means a written answer with evidence, or a
+   scope change — never a judgement that the challenge was unimportant.
+
+### Record
+
+| Field | Value |
+|---|---|
+| Draft written (date) | |
+| Draft location | |
+| Adversarial review model / date | |
+| Challenges raised / resolved | |
+| Cooling-off ends (draft + 7 days) | |
+| Armed (date) | |
 
 ### Conditions
 
-- Both parties have independently reviewed the gate results above.
-- Both parties confirm that no known issues are being deferred.
-- The rollback playbook has been reviewed and is understood by both parties.
+- The draft cites, per gate, the evidence artifact each number came from.
+- No known issue is being deferred without a written, dated decision.
+- The [rollback playbook](rollback-playbook.md) has been reviewed.
+- Every live sleeve has written kill criteria with a **final** (not
+  provisional) drawdown budget — [sleeve-kill-criteria.md](sleeve-kill-criteria.md).
+  This is the universal D3.3 rule: no written kill criteria → no live
+  promotion.
 
 ---
 

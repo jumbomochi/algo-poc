@@ -21,6 +21,7 @@ Entry point for operational documentation.
 ## Reviews & governance
 
 - `investment-policy-statement.md` — IPS: risk limits (§ 6), deployment gates, retirement triggers
+- `sleeve-kill-criteria.md` — Written demotion rules for the six live sleeves: the four triggers, per-sleeve drawdown budgets, the promotion funding rule, and a worked dry-run demotion review (KAN-37)
 - `edge-validation-framework.md` — What gate S and gate P require beyond backtest fidelity: deflated Sharpe against a declared trial count, the pre-registered single-use holdout, parameter stability (KAN-38)
 - `implementation-review-2026-08-06.md` — 2026-08-06 implementation review + findings register; work threads **T1–T9** = issues #2–#10, draft PRs #12–#20
 

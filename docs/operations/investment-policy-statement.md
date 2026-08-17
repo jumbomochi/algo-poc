@@ -42,8 +42,9 @@ Its honest value is **three-fold**, in priority order:
    treats return as a *bonus on top of* drawdown protection, not the thesis.
 
 The operator commits to not rationalizing the strategy upward into "core" status
-on the strength of a good run. Promotion past satellite scale is governed by § 5,
-not by enthusiasm.
+on the strength of a good run. Promotion past satellite scale is governed by the
+capital-scaling ladder (§ 5, superseded — see the banner there), not by
+enthusiasm.
 
 ---
 
@@ -106,7 +107,47 @@ reference basis):
 
 ---
 
-## 5. Capital deployment — drawdown-gated, no fixed cap
+## 5. Capital deployment — SUPERSEDED by the capital-scaling ladder
+
+> **⚠ Superseded in full, 2026-08-17 (amendment below, KAN-37).** The
+> deployment path in this section — the illustrative 25K → 50K → 100K steps
+> and their monthly-review conditions — is **superseded in full** by the
+> **capital-scaling ladder** in
+> [project-direction.md](../designs/project-direction.md). Where the two
+> disagree, the ladder governs. This section is retained for the record and
+> for the parts the ladder does not touch (the funding-currency/FX rules
+> below, which remain in force).
+>
+> **What the ladder changes.** Deployment moves from operator-discretion steps
+> to four written rungs (5,000 / 10,000 / 20,000 / 40,000 SGD of *cumulative
+> funding deployed*), each entered only on a **clean epoch** at the rung
+> below. The clean-epoch criteria replace §5's per-step conditions: the full
+> 8-gate re-clear is retained only at **Rung 0 entry** and after any Rung-0
+> disarm, and the capacity review at **Rung 3** — not at every step. The
+> ≥20-day divergence-OK window is replaced by the epoch-matched
+> 30-session rule. Retained gains do not raise a rung; losses do not lower one
+> — only the written breach criteria act.
+>
+> **The divergence monitor is now a capital-decision input by rule.**
+> [divergence-monitor.md](divergence-monitor.md) states the monitor "is not a
+> kill switch", and as an *automated* control that remains true — it still
+> halts nothing on its own. But the ladder deliberately makes its verdicts
+> binding on capital: a persisting `BREACH` run of 10 consecutive sessions
+> demotes a sleeve ([sleeve-kill-criteria.md](sleeve-kill-criteria.md)), and an
+> out-of-band run breaks the epoch and de-scales a rung. This resolves the
+> contradiction in writing rather than leaving it to be discovered on gate day:
+> **the monitor does not act, and its output decides.**
+>
+> **Standing constraints the ladder does NOT override.** Every rung remains
+> subject to both:
+> - the **30% household satellite ceiling by dollar** (§ 3) — the ladder sizes
+>   the system, it does not raise the satellite's share of the household book;
+> - **tax / W-8BEN administrative closure before any scale-up** (§ 10) — the
+>   open item there is a precondition on scaling, not a footnote.
+>
+> **Amendment procedure.** Ladder edits are permitted only *between* epochs,
+> never during one, and are logged as decisions — the same discipline § 9
+> applies to this document.
 
 Deployment is **gated by realized risk behavior, not by a fixed dollar ceiling.**
 The operator has chosen *not* to set an absolute hard cap: the system may scale
@@ -268,7 +309,14 @@ deployed system capital reaches −25%.**
   prior equity peak). Loosening outside a drawdown requires a written IPS amendment.
 - **Retirement trigger (§ 7):** may not be loosened (made more lenient than −25%)
   while the system is in a drawdown. Tightening is always allowed.
-- **Deployment / scale-up (§ 5):** operator decision at a monthly review only.
+- **Deployment / scale-up:** governed by the capital-scaling ladder, not by
+  operator discretion — a rung is entered when its written criteria are met and
+  left when they are breached. The monthly review is where the ladder's state is
+  *read*, no longer where the step size is chosen. Amending the ladder itself is
+  permitted only between epochs, and is logged like any amendment here.
+- **Sleeve demotion:** mechanical, per
+  [sleeve-kill-criteria.md](sleeve-kill-criteria.md) — not a review decision.
+  **Retirement** of a sleeve is, and requires a logged decision.
 - **All amendments to this IPS** are dated and appended to § 11 with a one-line
   rationale. The git history of this file is the amendment log.
 
@@ -301,6 +349,7 @@ deployed system capital reaches −25%.**
 | 2026-06-11 | Initial adoption | Phase-1 prerequisite. Capital: no fixed cap, drawdown-gated, $5K smoke test first. Retire at −25% deployed. Monthly review. |
 | 2026-06-30 | Currency reconciliation (§ 5, § 8, § 10) | Smoke test funded as 5,000 SGD (wired 2026-06-16), not USD; added funding-currency/FX section (NAV measured in USD, SGD/USD FX is unhedged and outside § 7); W-8BEN / SGD-residency tax notes; refreshed monitoring note now that the divergence + gateway-watchdog launchd jobs are deployed. |
 | 2026-08-06 | Implementation review adopted; § 6 enforcement caveat added | 6-agent read-only review found several § 6 limits declared but not wired on the live path (stop-loss, passive-scan, circuit-breaker liquidation; drawdown measured on budget not equity). **No limits changed** — this is a factual correction of the "enforced in code" claim. Tracked in **T1 (#2)** / **T2 (#3)**. Full review: [implementation-review-2026-08-06.md](implementation-review-2026-08-06.md). |
+| 2026-08-17 | **Capital-scaling ladder supersedes § 5 in full** (KAN-37, direction D9/D14/D16) | Two conflicting deployment paths cannot both govern real money. The ladder's written rungs + clean-epoch criteria replace § 5's illustrative steps; the 8-gate re-clear is retained at Rung 0 entry and after a Rung-0 disarm, the capacity review at Rung 3. Records that the **divergence monitor is a capital-decision input by rule** — resolving its own doc's "not a kill switch" wording, which stays true of automated action and is now false of capital authority. Restates the two standing constraints the ladder does not override: the **30% household satellite ceiling by dollar** (§ 3) and **W-8BEN / tax closure before any scale-up** (§ 10). Prerequisite for Rung 0 entry. Per-sleeve demotion rules: [sleeve-kill-criteria.md](sleeve-kill-criteria.md). |
 
 ### Appendix A — revival conditions for dropped sleeves
 
