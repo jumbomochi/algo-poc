@@ -31,6 +31,10 @@ class BacktestResult:
     dates: list = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
     shadow_candidates: list[dict] = field(default_factory=list)
+    # Lots still held when the last session ended. ``trades`` records closed
+    # round-trips only, so without this a position that never exited leaves no
+    # trace — and any per-trade cost statistic silently drops it.
+    open_positions: list[dict] = field(default_factory=list)
 
 
 class BacktestRunner:
@@ -57,9 +61,20 @@ class BacktestRunner:
         self,
         executor: SimulatedExecutor,
         initial_capital: float = 100_000.0,
+        *,
+        whole_shares: bool = False,
+        skip_ledger: Any = None,
     ) -> None:
         self.executor = executor
         self.initial_capital = initial_capital
+        # Whole-share mode has to bite *after* risk sizing, not only at the
+        # signal. ``RiskEngine.check_entry`` returns an ``adjusted_quantity``
+        # floored to four decimals when it caps an entry, and live that
+        # fraction still has to clear ``ib_executor._effective_quantity``.
+        # Truncating only the signal would leave the backtest booking 0.0001
+        # -share lots that no broker would fill.
+        self.whole_shares = whole_shares
+        self.skip_ledger = skip_ledger
 
     def run(
         self,
@@ -339,9 +354,23 @@ class BacktestRunner:
                     if not decision.approved:
                         continue
 
+                    order_quantity = decision.adjusted_quantity
+                    if self.whole_shares:
+                        truncated = float(int(order_quantity))
+                        if truncated <= 0:
+                            if self.skip_ledger is not None:
+                                self.skip_ledger.record(
+                                    ticker=ticker,
+                                    current_date=current_date,
+                                    fractional_quantity=order_quantity,
+                                    price=limit_price,
+                                )
+                            continue
+                        order_quantity = truncated
+
                     pending_entries[ticker] = _PendingEntry(
                         limit_price=limit_price,
-                        quantity=decision.adjusted_quantity,
+                        quantity=order_quantity,
                         entry_signals=signal.get("signals", {}),
                     )
 
@@ -374,12 +403,25 @@ class BacktestRunner:
             )
             shadow_candidates = []
 
+        open_positions = [
+            {
+                "ticker": ticker,
+                "entry_date": lot.entry_date,
+                "entry_price": lot.entry_price,
+                "quantity": lot.quantity,
+                "entry_commission": lot.entry_commission,
+            }
+            for ticker, lots in positions.items()
+            for lot in lots
+        ]
+
         return BacktestResult(
             trades=trades,
             portfolio_values=portfolio_values,
             dates=dates,
             metrics=metrics,
             shadow_candidates=shadow_candidates,
+            open_positions=open_positions,
         )
 
 

@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import time
+from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -185,6 +186,7 @@ def build_base_config(
     portfolio_capitals: dict[str, float],
     point_in_time_universe: bool,
     coverage: CoverageReport | None = None,
+    whole_shares: bool = False,
 ) -> dict:
     """Provenance block saved with the results.
 
@@ -202,6 +204,7 @@ def build_base_config(
         "years": years,
         "initial_capital": capital,
         "fill_model": NEXT_OPEN_FILL_MODEL,
+        "whole_shares": whole_shares,
         "point_in_time_universe": point_in_time_universe,
         "replacement_policy": replacement_policy,
         "replacement_score_margin": replacement_score_margin,
@@ -357,12 +360,102 @@ def compute_regime_by_date(
     return regime_by_date
 
 
+class SkipLedger:
+    """Records entry signals dropped because whole-share sizing hit zero.
+
+    At Rung-0 capital a sleeve's per-position budget can be smaller than one
+    share of the name it wants to buy. Live, that is an ``OrderSkippedError``
+    from ``ib_executor._effective_quantity``; here it has to be counted rather
+    than silently dropped, because the count *is* the finding — a sleeve that
+    cannot open positions has no edge to measure, and a run that merely
+    reports "few trades" hides why.
+
+    One entry per rejected occurrence, not per unique ticker: the same name
+    turned away on twenty consecutive days is twenty lost entries.
+    """
+
+    def __init__(self) -> None:
+        self._signals: list[dict] = []
+        self.sized = 0
+
+    def count_sized(self) -> None:
+        """Note one entry signal reaching sizing — the skip count's denominator.
+
+        Counted in both modes, so "300 unfillable" can be read against how many
+        entries the sleeve tried to open at all.
+        """
+        self.sized += 1
+
+    def record(
+        self,
+        *,
+        ticker: str,
+        current_date: Any,
+        fractional_quantity: float,
+        price: float,
+    ) -> None:
+        self._signals.append({
+            "ticker": ticker,
+            "date": current_date.isoformat() if hasattr(current_date, "isoformat")
+                    else str(current_date),
+            "fractional_quantity": round(fractional_quantity, 4),
+            "price": price,
+        })
+
+    def to_dict(self) -> dict:
+        return {"count": len(self._signals), "signals": list(self._signals)}
+
+
+EMPTY_SKIP_LEDGER = {"count": 0, "signals": []}
+
+
+def _entry_quantity(
+    *,
+    initial_capital: float,
+    position_size_pct: float,
+    current_price: float,
+    whole_shares: bool,
+    skip_ledger: SkipLedger | None,
+    ticker: str,
+    current_date: Any,
+    weight: float = 1.0,
+) -> float | None:
+    """Size one entry, returning ``None`` when the position cannot be opened.
+
+    Default (``whole_shares=False``) reproduces the historical fractional
+    formula exactly, so every existing invocation — including the weekly
+    refresh — is unaffected. With ``whole_shares=True`` the quantity truncates
+    toward zero the way ``ib_executor._effective_quantity`` does, and a zero
+    is recorded on *skip_ledger* and reported to the caller as no signal.
+    """
+    if skip_ledger is not None:
+        skip_ledger.count_sized()
+
+    fractional = initial_capital * position_size_pct * weight / current_price
+    if not whole_shares:
+        return round(max(0.0001, fractional), 4)
+
+    quantity = float(int(fractional))
+    if quantity <= 0:
+        if skip_ledger is not None:
+            skip_ledger.record(
+                ticker=ticker,
+                current_date=current_date,
+                fractional_quantity=fractional,
+                price=current_price,
+            )
+        return None
+    return quantity
+
+
 def make_signals_fn(
     position_size_pct: float = 0.07,
     initial_capital: float = 100_000,
     trailing_stop_pct: float = 0.10,
     max_lots: int = 2,
     regime_by_date: dict | None = None,
+    whole_shares: bool = False,
+    skip_ledger: SkipLedger | None = None,
 ):
     """Create a signal function implementing mean-reversion on large-cap support levels.
 
@@ -460,7 +553,17 @@ def make_signals_fn(
             ):
                 support_levels = find_support_levels(data)
                 limit_price = support_levels[0] if support_levels else current_price
-                quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
+                quantity = _entry_quantity(
+                    initial_capital=initial_capital,
+                    position_size_pct=position_size_pct,
+                    current_price=current_price,
+                    whole_shares=whole_shares,
+                    skip_ledger=skip_ledger,
+                    ticker=ticker,
+                    current_date=current_date,
+                )
+                if quantity is None:
+                    return None
                 lots.append({
                     "entry_price": current_price,
                     "entry_idx": bar_count,
@@ -486,7 +589,17 @@ def make_signals_fn(
             ):
                 support_levels = find_support_levels(data)
                 limit_price = support_levels[0] if support_levels else current_price
-                quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
+                quantity = _entry_quantity(
+                    initial_capital=initial_capital,
+                    position_size_pct=position_size_pct,
+                    current_price=current_price,
+                    whole_shares=whole_shares,
+                    skip_ledger=skip_ledger,
+                    ticker=ticker,
+                    current_date=current_date,
+                )
+                if quantity is None:
+                    return None
                 tracked[ticker] = [{
                     "entry_price": current_price,
                     "entry_idx": bar_count,
@@ -520,6 +633,8 @@ def make_momentum_signals_fn(
     portfolio_context: PortfolioContext | None = None,
     eligible_tickers: list[str] | None = None,
     membership: MembershipCalendar | None = None,
+    whole_shares: bool = False,
+    skip_ledger: SkipLedger | None = None,
 ):
     """Create a momentum signal function based on 6-month relative strength.
 
@@ -662,7 +777,17 @@ def make_momentum_signals_fn(
             if portfolio_context else 0.0
         )
         if not lots and pending_buy_quantity <= 0 and ticker in top_tickers:
-            quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
+            quantity = _entry_quantity(
+                initial_capital=initial_capital,
+                position_size_pct=position_size_pct,
+                current_price=current_price,
+                whole_shares=whole_shares,
+                skip_ledger=skip_ledger,
+                ticker=ticker,
+                current_date=current_date,
+            )
+            if quantity is None:
+                return None
             if portfolio_context is None:
                 tracked[ticker] = [{
                     "entry_price": current_price,
@@ -737,6 +862,8 @@ def make_sector_rotation_signals_fn(
     regime_by_date: dict | None = None,
     portfolio_context: PortfolioContext | None = None,
     eligible_tickers: list[str] | None = None,
+    whole_shares: bool = False,
+    skip_ledger: SkipLedger | None = None,
 ):
     """Create a sector rotation signal function.
 
@@ -838,7 +965,17 @@ def make_sector_rotation_signals_fn(
             if portfolio_context else 0.0
         )
         if not lots and pending_buy_quantity <= 0 and ticker in top_tickers:
-            quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
+            quantity = _entry_quantity(
+                initial_capital=initial_capital,
+                position_size_pct=position_size_pct,
+                current_price=current_price,
+                whole_shares=whole_shares,
+                skip_ledger=skip_ledger,
+                ticker=ticker,
+                current_date=current_date,
+            )
+            if quantity is None:
+                return None
             if portfolio_context is None:
                 tracked[ticker] = [{
                     "entry_price": current_price,
@@ -871,6 +1008,8 @@ def make_short_term_mr_signals_fn(
     rsi_entry_threshold: float = 0.8,
     bb_period: int = 20,
     bb_num_std: float = 2.0,
+    whole_shares: bool = False,
+    skip_ledger: SkipLedger | None = None,
 ):
     """Create a short-term mean-reversion signal function.
 
@@ -943,7 +1082,17 @@ def make_short_term_mr_signals_fn(
             and bb.value > 0.5
             and volume.value > 0.25
         ):
-            quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
+            quantity = _entry_quantity(
+                initial_capital=initial_capital,
+                position_size_pct=position_size_pct,
+                current_price=current_price,
+                whole_shares=whole_shares,
+                skip_ledger=skip_ledger,
+                ticker=ticker,
+                current_date=bars[-1]["date"],
+            )
+            if quantity is None:
+                return None
             tracked[ticker] = {
                 "entry_price": current_price,
                 "entry_idx": bar_count,
@@ -981,6 +1130,8 @@ def make_thematic_momentum_signals_fn(
     portfolio_context: PortfolioContext | None = None,
     replacement_policy: ReplacementPolicy = ReplacementPolicy.TECHNICAL_ONLY,
     replacement_score_margin: float = 0.25,
+    whole_shares: bool = False,
+    skip_ledger: SkipLedger | None = None,
 ):
     """Create a thematic momentum signal function.
 
@@ -1144,7 +1295,17 @@ def make_thematic_momentum_signals_fn(
             and ticker in top_tickers
             and above_ma
         ):
-            quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
+            quantity = _entry_quantity(
+                initial_capital=initial_capital,
+                position_size_pct=position_size_pct,
+                current_price=current_price,
+                whole_shares=whole_shares,
+                skip_ledger=skip_ledger,
+                ticker=ticker,
+                current_date=current_date,
+            )
+            if quantity is None:
+                return None
             if portfolio_context is None:
                 tracked[ticker] = [{
                     "entry_price": current_price,
@@ -1185,6 +1346,8 @@ def make_quality_value_signals_fn(
     replacement_policy: ReplacementPolicy = ReplacementPolicy.TECHNICAL_ONLY,
     replacement_score_margin: float = 0.25,
     membership: MembershipCalendar | None = None,
+    whole_shares: bool = False,
+    skip_ledger: SkipLedger | None = None,
 ):
     """Create a quality value signal function.
 
@@ -1342,7 +1505,17 @@ def make_quality_value_signals_fn(
             if portfolio_context else 0.0
         )
         if not lots and pending_buy_quantity <= 0 and ticker in top_tickers:
-            quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
+            quantity = _entry_quantity(
+                initial_capital=initial_capital,
+                position_size_pct=position_size_pct,
+                current_price=current_price,
+                whole_shares=whole_shares,
+                skip_ledger=skip_ledger,
+                ticker=ticker,
+                current_date=current_date,
+            )
+            if quantity is None:
+                return None
             if portfolio_context is None:
                 tracked[ticker] = [{
                     "entry_price": current_price,
@@ -1376,6 +1549,8 @@ def make_earnings_drift_signals_fn(
     trailing_stop_pct: float = 0.06,
     regime_by_date: dict | None = None,
     portfolio_context: PortfolioContext | None = None,
+    whole_shares: bool = False,
+    skip_ledger: SkipLedger | None = None,
 ):
     """Create an earnings drift (PEAD) signal function.
 
@@ -1470,7 +1645,17 @@ def make_earnings_drift_signals_fn(
         if surprise < surprise_threshold_pct:
             return None
 
-        quantity = round(max(0.0001, initial_capital * position_size_pct / current_price), 4)
+        quantity = _entry_quantity(
+            initial_capital=initial_capital,
+            position_size_pct=position_size_pct,
+            current_price=current_price,
+            whole_shares=whole_shares,
+            skip_ledger=skip_ledger,
+            ticker=ticker,
+            current_date=current_date,
+        )
+        if quantity is None:
+            return None
         if portfolio_context is None:
             tracked[ticker] = {
                 "entry_price": current_price,
@@ -1499,6 +1684,8 @@ def make_tail_risk_hedge_signals_fn(
     position_size_pct: float = 0.25,
     initial_capital: float = 100_000,
     portfolio_context: PortfolioContext | None = None,
+    whole_shares: bool = False,
+    skip_ledger: SkipLedger | None = None,
 ):
     """Create a tail-risk hedge signal function.
 
@@ -1571,7 +1758,18 @@ def make_tail_risk_hedge_signals_fn(
         )
         if lot is None and pending_buy_quantity <= 0 and ticker in allocation:
             weight = allocation[ticker]
-            quantity = round(max(0.0001, initial_capital * position_size_pct * weight / current_price), 4)
+            quantity = _entry_quantity(
+                initial_capital=initial_capital,
+                position_size_pct=position_size_pct,
+                current_price=current_price,
+                weight=weight,
+                whole_shares=whole_shares,
+                skip_ledger=skip_ledger,
+                ticker=ticker,
+                current_date=current_date,
+            )
+            if quantity is None:
+                return None
             if portfolio_context is None:
                 tracked[ticker] = {
                     "entry_price": current_price,
@@ -1966,6 +2164,8 @@ def save_results(
     bars: dict[str, list[dict]],
     output_dir: str = "output",
     shadow_candidates: list[dict] | None = None,
+    open_positions: list[dict] | None = None,
+    skipped_signals: dict | None = None,
 ) -> str:
     """Serialize backtest output to a timestamped JSON file.
 
@@ -1991,6 +2191,8 @@ def save_results(
         "metrics": metrics,
         "bars": bars,
         "shadow_candidates": shadow_candidates or [],
+        "open_positions": open_positions or [],
+        "skipped_signals": skipped_signals or dict(EMPTY_SKIP_LEDGER),
     }
 
     with open(path, "w") as f:
@@ -2007,8 +2209,15 @@ def save_multi_portfolio_results(
     aggregate: dict,
     bars: dict[str, list[dict]],
     output_dir: str = "output",
+    skipped_signals: dict[str, dict] | None = None,
+    entry_signals_sized: dict[str, int] | None = None,
 ) -> str:
-    """Serialize multi-portfolio backtest output to a timestamped JSON file."""
+    """Serialize multi-portfolio backtest output to a timestamped JSON file.
+
+    ``skipped_signals`` is written for *every* sleeve, empty block included, so
+    a sleeve that skipped nothing reads differently from one that was never
+    measured.
+    """
 
     def _json_serializer(obj: Any) -> str:
         if isinstance(obj, date):
@@ -2030,6 +2239,11 @@ def save_multi_portfolio_results(
             "dates": result.dates,
             "metrics": result.metrics,
             "shadow_candidates": result.shadow_candidates,
+            "open_positions": result.open_positions,
+            "skipped_signals": (skipped_signals or {}).get(
+                name, dict(EMPTY_SKIP_LEDGER)
+            ),
+            "entry_signals_sized": (entry_signals_sized or {}).get(name, 0),
         }
 
     payload = {
@@ -2100,6 +2314,15 @@ def main():
                              "max($1, $0.005/share) and at this account size "
                              "the floor is usually what binds "
                              f"(default: {DEFAULT_COMMISSION_MINIMUM})")
+    parser.add_argument(
+        "--whole-shares",
+        action="store_true",
+        help="Size entries in whole shares, truncating toward zero the way "
+             "live execution does (ib_executor._effective_quantity). A signal "
+             "whose budget cannot buy one share opens no position and is "
+             "recorded under skipped_signals. Off by default: every existing "
+             "invocation stays fractional and byte-identical.",
+    )
     parser.add_argument("--ib-host", default="127.0.0.1")
     parser.add_argument("--ib-port", type=int, default=7497)
     parser.add_argument("--output-dir", default="output",
@@ -2307,7 +2530,22 @@ def main():
     else:
         equity_eligible = list(UNIVERSE_REGISTRY["quality_value"])
         momentum_eligible = list(UNIVERSE_REGISTRY["momentum"])
+
+    # One ledger per sleeve — the unfillable-signal count is a per-sleeve
+    # verdict, not a portfolio total. Defaulted rather than fixed-key so
+    # adding a seventh sleeve cannot crash the run on a missing ledger.
+    skip_ledgers: defaultdict[str, SkipLedger] = defaultdict(SkipLedger)
+    for name in (
+        "momentum", "sector_rotation", "thematic_momentum",
+        "quality_value", "earnings_drift", "tail_risk_hedge",
+    ):
+        skip_ledgers[name]
+    if args.whole_shares:
+        print("  Whole-share sizing ON (truncate toward zero, as live does)")
+
     mom_signals_fn = make_momentum_signals_fn(
+        whole_shares=args.whole_shares,
+        skip_ledger=skip_ledgers["momentum"],
         bars_by_ticker=bars_by_ticker,
         top_n=5,
         lookback_days=126,
@@ -2319,6 +2557,8 @@ def main():
         membership=membership,
     )
     sector_signals_fn = make_sector_rotation_signals_fn(
+        whole_shares=args.whole_shares,
+        skip_ledger=skip_ledgers["sector_rotation"],
         bars_by_ticker=bars_by_ticker,
         eligible_tickers=list(UNIVERSE_REGISTRY["sector_rotation"]),
         top_n=3,
@@ -2328,6 +2568,8 @@ def main():
         trailing_stop_pct=0.08,
     )
     thematic_signals_fn = make_thematic_momentum_signals_fn(
+        whole_shares=args.whole_shares,
+        skip_ledger=skip_ledgers["thematic_momentum"],
         bars_by_ticker=bars_by_ticker,
         eligible_tickers=UNIVERSE_REGISTRY["thematic_momentum"],
         top_n=8,
@@ -2340,6 +2582,8 @@ def main():
         replacement_score_margin=args.replacement_score_margin,
     )
     qv_signals_fn = make_quality_value_signals_fn(
+        whole_shares=args.whole_shares,
+        skip_ledger=skip_ledgers["quality_value"],
         fundamentals_lookup=fundamentals_lookup,
         sector_map=SECTOR_MAP,
         bars_by_ticker=bars_by_ticker,
@@ -2354,6 +2598,8 @@ def main():
         membership=membership,
     )
     ed_signals_fn = make_earnings_drift_signals_fn(
+        whole_shares=args.whole_shares,
+        skip_ledger=skip_ledgers["earnings_drift"],
         earnings_lookup=earnings_lookup,
         surprise_threshold_pct=5.0,
         max_hold_days=20,
@@ -2363,6 +2609,8 @@ def main():
         regime_by_date=regime_by_date,
     )
     tail_risk_signals_fn = make_tail_risk_hedge_signals_fn(
+        whole_shares=args.whole_shares,
+        skip_ledger=skip_ledgers["tail_risk_hedge"],
         regime_by_date=regime_by_date,
         position_size_pct=0.25,
         initial_capital=args.capital * 0.1283,
@@ -2476,7 +2724,12 @@ def main():
     results: dict[str, BacktestResult] = {}
     for name, pc in portfolios.items():
         print(f"  Running portfolio '{name}' (${pc.capital:,.0f})...")
-        runner = BacktestRunner(executor=executor, initial_capital=pc.capital)
+        runner = BacktestRunner(
+            executor=executor,
+            initial_capital=pc.capital,
+            whole_shares=args.whole_shares,
+            skip_ledger=skip_ledgers[name],
+        )
         results[name] = runner.run(
             bars_by_ticker,
             pc.signals_fn,
@@ -2550,6 +2803,16 @@ def main():
                 icon = "!!" if alert["level"] == "critical" else " >"
                 print(f"    {icon} [{alert['level'].upper()}] {alert['message']}")
 
+    if args.whole_shares:
+        print("\n  Unfillable signals (budget < 1 share):")
+        for name in portfolios:
+            ledger = skip_ledgers[name].to_dict()
+            sized = skip_ledgers[name].sized
+            tickers = sorted({s["ticker"] for s in ledger["signals"]})
+            pct = (ledger["count"] / sized * 100) if sized else 0.0
+            print(f"    {name:<20} {ledger['count']:>6} / {sized:<6} "
+                  f"({pct:5.1f}%, {len(tickers)} distinct names)")
+
     # 5. Save results to JSON
     print("\nStep 5: Saving results...")
     base_config = build_base_config(
@@ -2562,6 +2825,7 @@ def main():
         portfolio_capitals={name: pc.capital for name, pc in portfolios.items()},
         point_in_time_universe=membership is not None,
         coverage=coverage,
+        whole_shares=args.whole_shares,
     )
     if args.ml_filter:
         base_config["ml_filter"] = {
@@ -2580,6 +2844,8 @@ def main():
             bars=bars_by_ticker,
             output_dir=args.output_dir,
             shadow_candidates=result.shadow_candidates,
+            open_positions=result.open_positions,
+            skipped_signals=skip_ledgers[next(iter(portfolios))].to_dict(),
         )
     else:
         save_multi_portfolio_results(
@@ -2589,6 +2855,12 @@ def main():
             aggregate=aggregate,
             bars=bars_by_ticker,
             output_dir=args.output_dir,
+            skipped_signals={
+                name: ledger.to_dict() for name, ledger in skip_ledgers.items()
+            },
+            entry_signals_sized={
+                name: ledger.sized for name, ledger in skip_ledgers.items()
+            },
         )
 
 
