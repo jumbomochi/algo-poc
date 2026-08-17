@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +11,7 @@ from shared.universe import (
     ACTIVE_SLEEVES,
     DRILL_PORTFOLIO,
     EXCLUDED_PORTFOLIO_PREFIX,
+    SP500_TOP100,
     UNIVERSE_REGISTRY,
     MembershipCalendar,
     contract_conid_for,
@@ -18,6 +20,8 @@ from shared.universe import (
     make_stock_contract,
     resolve_watchlist,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class TestRegistry:
@@ -225,3 +229,201 @@ class TestExcludedPortfolios:
     def test_drill_tag_uses_the_established_prefix(self):
         """A second mechanism would silently bypass the three existing filters."""
         assert DRILL_PORTFOLIO.startswith(EXCLUDED_PORTFOLIO_PREFIX)
+
+
+class TestCommittedMembershipSnapshot:
+    """KAN-23 AC1/AC2 — the committed point-in-time universe.
+
+    The divergence monitor exits 3 (BLIND) against a survivorship-biased
+    baseline, so the paper track record accruing toward the go-live gate has no
+    fidelity check behind it. These pin the file that fixes that, and they are
+    the reason a future snapshot regeneration cannot silently reintroduce an
+    unmapped name.
+    """
+
+    SNAPSHOT = "data/universe/sp500_membership.json"
+
+    @pytest.fixture(scope="class")
+    def calendar(self):
+        from scripts.run_backtest import ALWAYS_TRADABLE
+
+        return MembershipCalendar.from_json_file(
+            str(REPO_ROOT / self.SNAPSHOT), always=ALWAYS_TRADABLE
+        )
+
+    def test_the_snapshot_is_committed_and_loads(self, calendar):
+        assert calendar.all_tickers()
+
+    def test_it_covers_the_full_ten_year_backtest_window(self, calendar):
+        """AC1. ``run_backtest.py --years 10`` starts at ``today - 10*365``;
+        MembershipCalendar makes *nothing* tradable before its first snapshot,
+        so a file that starts late silently produces an empty early window."""
+        today = date.today()
+        start = today - timedelta(days=10 * 365)
+        assert calendar.first_snapshot_date <= start, (
+            f"snapshot starts {calendar.first_snapshot_date}, after the 10-year "
+            f"window opens at {start} — regenerate with an earlier --start"
+        )
+        # The tail matters as much: membership frozen months before today means
+        # recent index changes are invisible to the baseline.
+        assert calendar.last_snapshot_date >= today - timedelta(days=120), (
+            f"newest snapshot is {calendar.last_snapshot_date}; regenerate with "
+            "scripts/ops/build_membership_snapshot.py"
+        )
+
+    def test_every_snapshot_ticker_resolves_to_a_real_sector(self, calendar):
+        """AC2 — the guard that makes this permanent.
+
+        Historical members that resolve to "Unknown" all land in one
+        pseudo-sector; once it crosses ``sector_concentration_pct`` the risk
+        engine rejects every entry in every unmapped name (the 2026-08-07
+        freeze). Regenerating the snapshot regenerates
+        shared/historical_sectors.py alongside it, and this test fails if
+        someone updates one without the other.
+        """
+        from shared.universe import lookup_sector
+
+        unmapped = sorted(
+            t for t in calendar.all_tickers() if lookup_sector(t) == "Unknown"
+        )
+        assert unmapped == [], (
+            f"{len(unmapped)} snapshot tickers have no sector: {unmapped[:20]}. "
+            "Re-run scripts/ops/build_membership_snapshot.py to regenerate "
+            "shared/historical_sectors.py from the same revisions."
+        )
+
+    def test_it_carries_the_provenance_needed_to_audit_it(self):
+        """A membership file with no stated source cannot be checked against
+        the index, and this one feeds gate evidence."""
+        payload = json.loads((REPO_ROOT / self.SNAPSHOT).read_text())
+        assert "Wikipedia" in payload["source"]
+        assert payload["generator"].endswith("build_membership_snapshot.py")
+        # Every snapshot names the exact revision it was read from.
+        assert set(payload["revisions"]) == set(payload["snapshots"])
+        for entry in payload["revisions"].values():
+            assert isinstance(entry["revid"], int)
+
+    def test_delisted_members_are_present_not_just_survivors(self, calendar):
+        """The whole point of a point-in-time universe: names that left the
+        index are still in ``all_tickers()`` so their bars get fetched."""
+        tickers = set(calendar.all_tickers())
+        survivors = set(SP500_TOP100)
+        assert len(tickers - survivors) > 300, (
+            "a point-in-time file over 10 years should carry hundreds of names "
+            "that are no longer members"
+        )
+
+    def test_the_curated_map_wins_over_the_generated_one(self):
+        """Precedence, asserted: nothing generated from Wikipedia can change
+        how a currently-traded name is bucketed by the live risk engine."""
+        from shared.historical_sectors import HISTORICAL_SECTOR_MAP
+        from shared.universe import SECTOR_MAP
+
+        assert set(HISTORICAL_SECTOR_MAP) & set(SECTOR_MAP) == set()
+
+    def test_no_ticker_carries_a_separator_ib_cannot_resolve(self, calendar):
+        """One spelling per company, or the same name reads as two.
+
+        Wikipedia wrote Berkshire as BRK.B, BRK-B and BRK B at different points
+        in this window. Any spelling that survives normalisation as a second
+        symbol produces a fabricated index removal + re-addition (the backtest
+        liquidates at the next open with exit_reason: universe_removal) and is
+        unpriceable at IB, so it also inflates the coverage exclusions.
+        """
+        bad = sorted(
+            t for t in calendar.all_tickers()
+            if not all(c.isalpha() or c == " " for c in t)
+        )
+        assert bad == [], (
+            f"tickers with an unnormalised separator: {bad}. Fix "
+            "normalize_symbol in scripts/ops/build_membership_snapshot.py and "
+            "regenerate."
+        )
+
+    def test_the_class_share_spelling_matches_the_static_universe(self, calendar):
+        tickers = set(calendar.all_tickers())
+        assert "BRK B" in tickers
+        assert "BRK-B" not in tickers and "BRK.B" not in tickers
+
+    def test_the_generated_module_matches_the_snapshot_it_came_from(self):
+        """I5 — the pair must be regenerated together.
+
+        Without this, editing one file by hand or regenerating only one passes
+        CI, because the AC2 test asks "does every ticker have *a* sector" and
+        both files are produced by the same parse: any ticker the parser
+        invents also gets a sector, so that test cannot fail on a parse defect.
+        This one compares the two artifacts against each other instead.
+        """
+        from shared.historical_sectors import HISTORICAL_SECTOR_MAP
+        from shared.universe import SECTOR_MAP
+
+        payload = json.loads((REPO_ROOT / self.SNAPSHOT).read_text())
+        expected = {
+            t: s for t, s in payload["sectors"].items() if t not in SECTOR_MAP
+        }
+        assert HISTORICAL_SECTOR_MAP == expected, (
+            "shared/historical_sectors.py is out of sync with "
+            f"{self.SNAPSHOT}; re-run scripts/ops/build_membership_snapshot.py"
+        )
+
+    def test_every_snapshot_ticker_has_a_sector_recorded_in_the_envelope(self):
+        payload = json.loads((REPO_ROOT / self.SNAPSHOT).read_text())
+        in_snapshots = {t for members in payload["snapshots"].values() for t in members}
+        assert in_snapshots <= set(payload["sectors"])
+
+    def test_conid_pinned_names_use_the_repo_spelling(self, calendar):
+        """C2 — a rename must not smuggle a name past CONTRACT_CONID_OVERRIDES.
+
+        MMC and FI are pinned by conId because the IB gateway cannot resolve
+        them by symbol (2026-08-09 stale-contract incident). Wikipedia carries
+        the post-rename spellings MRSH and FISV, which have no override — so
+        without aliasing, the two names the override exists to rescue are
+        exactly the two it would miss.
+        """
+        from shared.universe import CONTRACT_CONID_OVERRIDES
+
+        tickers = set(calendar.all_tickers())
+        for pinned in CONTRACT_CONID_OVERRIDES:
+            assert pinned in tickers, f"{pinned} missing from the PIT universe"
+        for alias in ("MRSH", "FISV"):
+            assert alias not in tickers, (
+                f"{alias} is an un-aliased rename of a conId-pinned name; add "
+                "it to TICKER_ALIASES and regenerate"
+            )
+
+    def test_a_conid_pinned_name_is_contiguous_across_its_rename(self, calendar):
+        """The rename must read as one continuous membership, not a removal.
+
+        A gap would make the backtest liquidate at the next open with
+        exit_reason: universe_removal and book a fabricated round-trip.
+        """
+        payload = json.loads((REPO_ROOT / self.SNAPSHOT).read_text())
+        days = list(payload["snapshots"])
+        present = [d for d in days if "MMC" in payload["snapshots"][d]]
+        first, last = days.index(present[0]), days.index(present[-1])
+        assert len(present) == last - first + 1, (
+            "MMC's membership is not contiguous — the MRSH rename is being "
+            "read as an index removal and re-addition"
+        )
+
+
+class TestSectorPrecedence:
+    def test_the_curated_map_is_consulted_before_the_generated_one(self, monkeypatch):
+        """Precedence for real, not just key-disjointness.
+
+        The disjointness test would still pass if lookup_sector consulted
+        HISTORICAL_SECTOR_MAP first; this fails in that case. It matters
+        because the curated label decides how a currently-held name is bucketed
+        by the live sector-concentration limit.
+        """
+        import shared.universe as u
+
+        monkeypatch.setitem(u.SECTOR_MAP, "ZZZDUP", "Energy")
+        monkeypatch.setitem(u.HISTORICAL_SECTOR_MAP, "ZZZDUP", "Utilities")
+        assert u.lookup_sector("ZZZDUP") == "Energy"
+
+    def test_the_generated_map_still_covers_names_the_curated_one_lacks(self, monkeypatch):
+        import shared.universe as u
+
+        monkeypatch.setitem(u.HISTORICAL_SECTOR_MAP, "ZZZONLY", "Utilities")
+        assert u.lookup_sector("ZZZONLY") == "Utilities"
