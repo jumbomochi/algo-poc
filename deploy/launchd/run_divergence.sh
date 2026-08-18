@@ -11,8 +11,28 @@
 #       (same-bar fills, no commission floor, or a survivorship-biased
 #        universe: every report is forced to NO_DATA). Regenerate the baseline
 #        per docs/operations/backtest-baseline.md. Do NOT read this as OK.
+#   4 = baseline artifact is STALE (KAN-56) -> alert; the verdicts are real
+#       but were scored against expectations the weekly refresh stopped
+#       updating. Distinct from 3: the monitor is not blind, it is comparing
+#       against old numbers. Between 2026-07-28 and 2026-08-18 that was true
+#       for three weeks and nothing said so.
 # NOTE: deliberately NOT using `set -e` around the python call, because exit
 # codes 1 and 2 are meaningful signals we branch on, not failures to abort on.
+#
+# DEAD-MAN SWITCH (KAN-56)
+# ------------------------
+# Every alert this script sends requires this script to be running, and the
+# 04:45 job is the one that has actually gone missing: 2026-08-13 and 08-14
+# produced no run at all and 08-13 is a permanent hole in the gate evidence.
+# So a run that reaches a VERDICT pings $ALGO_DEADMAN_DIVERGENCE_URL and an
+# external checker pages when the pings stop. A verdict — not a clean bill of
+# health — is the healthy beat here: exits 1, 3 and 4 all mean the monitor ran,
+# judged, and reported through its own Telegram, and withholding the ping for
+# them would saturate the external check for the whole duration of a real drift
+# episode, which is precisely when telling "did not run" from "ran and found
+# something" matters most. Only exit 2 (nothing could be judged) stays silent.
+# Configure the external check with a period of ~26h. See
+# docs/operations/dead-man-switches.md.
 
 set -uo pipefail
 
@@ -48,6 +68,9 @@ ALGO_SECRETS_ENV_FILE="$ALGO_DIR/.env"   # regular-file fallback only
 ALGO_JOB_LABEL="divergence monitor"
 # shellcheck source=deploy/launchd/lib/telegram.sh
 . "$ALGO_DIR/deploy/launchd/lib/telegram.sh"
+# Dead-man ping helper (KAN-15), likewise sourced by path and never deployed.
+# shellcheck source=deploy/launchd/deadman.sh
+. "$ALGO_DIR/deploy/launchd/deadman.sh"
 
 # Render the alert body from the monitor's own JSON report, so the message
 # names the breaching sleeves / the unmet baseline requirement rather than just
@@ -162,12 +185,28 @@ case "$EXIT_CODE" in
         # A blind monitor is an outage, not a pass.
         telegram "$(divergence_alert_text 3 "⚠️ Divergence monitor is BLIND (exit 3): the baseline backtest is not comparable to live, so every report is forced to NO_DATA. No drift detection is running. Regenerate per docs/operations/backtest-baseline.md")"
         ;;
+    4)
+        echo "$(date): ALERT - divergence baseline is STALE (exit 4): the verdicts" \
+             "above are real but were scored against a baseline the weekly refresh" \
+             "stopped updating. Check ~/ibc/logs/backtest_refresh_*.log" >> "$LOG_FILE"
+        telegram "$(divergence_alert_text 4 "⚠️ Divergence baseline is STALE (exit 4): the weekly backtest refresh has not produced a newer baseline, so drift is being measured against old expectations. See ~/ibc/logs/backtest_refresh_*.log")"
+        ;;
     *)
         echo "$(date): UNEXPECTED exit code $EXIT_CODE from divergence monitor" >> "$LOG_FILE"
         algo_alert_local "divergence monitor returned unexpected exit $EXIT_CODE"
         telegram "🚨 Divergence monitor returned UNEXPECTED exit code $EXIT_CODE. See $LOG_FILE"
         ;;
 esac
+
+# A verdict is the healthy beat, not a clean one — see the header. Mapped here
+# rather than branched on inside the case above so the rule is stated once and
+# a future exit code has to be classified deliberately.
+case "$EXIT_CODE" in
+    0|1|3|4) DEADMAN_EXIT=0 ;;
+    *)       DEADMAN_EXIT="$EXIT_CODE" ;;
+esac
+algo_deadman_ping "$DEADMAN_EXIT" ALGO_DEADMAN_DIVERGENCE_URL
+echo "$(date): dead-man switch: $ALGO_DEADMAN_STATUS" >> "$LOG_FILE"
 
 # Clean up logs older than 30 days
 find "$LOG_DIR" -name "divergence_*.log" -mtime +30 -delete 2>/dev/null

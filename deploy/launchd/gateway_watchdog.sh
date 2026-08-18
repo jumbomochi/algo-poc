@@ -13,6 +13,18 @@
 # refuses to act, sends ONE Telegram alert, and waits for a human.
 #
 # Wire via launchd with StartInterval (300s). See deploy/launchd/.
+#
+# NO DEAD-MAN: covered by others, at both ends (KAN-56 coverage review). This
+# is a StartInterval job, not a calendar one, so it has no slot to miss — after
+# a boot launchd starts it within 300s. And its failure is not silent by
+# nature: if the watchdog stops running, the Gateway it guards eventually goes
+# unreachable, and *that* is what the 04:15 paper run and the Tuesday refresh
+# report (both alert on an unreachable 7497 and both hold their own dead-man
+# check). A ping every 5 minutes would also be the noisiest check in the
+# account while adding a signal that arrives strictly later than the ones
+# already wired. The wider "this host stopped monitoring itself" case belongs
+# to $DEADMAN_WATCHDOG_URL, pinged by Alertmanager from the always-firing
+# Watchdog rule — a different switch for a different blind spot.
 
 set -uo pipefail
 

@@ -34,7 +34,7 @@ import json
 import os
 import re
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from glob import glob
 from pathlib import Path
@@ -72,18 +72,144 @@ EXIT_ERROR = 2
 # This needs its own code — folding it into EXIT_OK made a blind monitor
 # indistinguishable from a healthy one in the daily log.
 EXIT_BASELINE_NOT_COMPARABLE = 3
+# The baseline is comparable and the numbers are real, but the artifact they
+# were computed against is old (KAN-56). Distinct from 3: the monitor is not
+# blind, it is scoring today's equity against expectations that stopped being
+# refreshed. Between 2026-07-28 and 2026-08-18 that was silently true for
+# three weeks — the weekly refresh missed twice, once without alerting at all.
+EXIT_BASELINE_STALE = 4
+
+
+# ---------------------------------------------------------------------------
+# Baseline staleness (KAN-56)
+# ---------------------------------------------------------------------------
+
+#: Two missed weekly refreshes. One miss is a bad week (IB's data farm, a
+#: reboot); two is a broken job, and by then the baseline no longer describes
+#: the regime the live book is trading in.
+DEFAULT_MAX_BASELINE_AGE_DAYS = 14
+
+#: The stable token in the warning line. Kept as a constant because both a
+#: human grepping ~/ibc/logs and the Telegram renderer key off it, and neither
+#: should have to track edits to the prose around it.
+BASELINE_STALE_WARNING = "BASELINE_STALE"
+
+#: ``backtest_multi_20260728_053111.json`` — the date the backtest was *run*.
+_BASELINE_STAMP_RE = re.compile(r"(\d{8})_(\d{6})")
+
+
+@dataclass(frozen=True)
+class BaselineAge:
+    """How old the artifact being scored against is, and how we know.
+
+    Read at the point of *consumption* rather than production on purpose. Over
+    the 2026-07-28 → 2026-08-18 gap two different jobs failed in two different
+    ways (a host that was down at the calendar slot, then an unreachable
+    gateway) and only one of them told anyone. The artifact's own age is the
+    one signal that is identical under every one of those causes, including
+    the ones nobody has thought of yet.
+    """
+
+    path: str
+    age_days: int | None
+    max_age_days: int
+    #: ``filename`` | ``mtime`` | ``unknown`` — worth carrying, because the
+    #: fallback is materially weaker evidence and the operator should be able
+    #: to see which one produced the number.
+    source: str
+
+    @property
+    def is_stale(self) -> bool:
+        # An unknown age is never stale: the caller has already hard-errored on
+        # a missing artifact, and guessing here would turn "cannot tell" into a
+        # confident wrong verdict.
+        return self.age_days is not None and self.age_days > self.max_age_days
+
+    def warning_line(self) -> str | None:
+        if not self.is_stale:
+            return None
+        return (
+            f"{BASELINE_STALE_WARNING}: {Path(self.path).name} is "
+            f"{self.age_days} days old (threshold {self.max_age_days}, age from "
+            f"{self.source}). The weekly refresh has not produced a newer "
+            "baseline; divergence is being scored against stale expectations. "
+            "See deploy/launchd/README.md, 'Weekly backtest refresh'."
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "age_days": self.age_days,
+            "max_age_days": self.max_age_days,
+            "source": self.source,
+            "stale": self.is_stale,
+        }
+
+
+def baseline_age(
+    backtest_path: str,
+    max_age_days: int = DEFAULT_MAX_BASELINE_AGE_DAYS,
+    *,
+    today: date | None = None,
+) -> BaselineAge:
+    """Age the baseline artifact, preferring its filename stamp to its mtime.
+
+    The name records when the backtest was run; the mtime records when the file
+    was last touched. Restoring a backup, rsyncing ``output/`` or a plain
+    ``cp -r`` rewrites the mtime, which would make a three-week-old baseline
+    look like today's — the one direction in which this check must never err.
+    The mtime is the fallback for a hand-named artifact passed via
+    ``--backtest``, which has no stamp to read.
+    """
+    today = today or date.today()
+    name = Path(backtest_path).name
+
+    match = _BASELINE_STAMP_RE.search(name)
+    if match:
+        try:
+            generated = datetime.strptime(match.group(1), "%Y%m%d").date()
+        except ValueError:
+            generated = None
+        if generated is not None:
+            return BaselineAge(
+                path=backtest_path,
+                age_days=(today - generated).days,
+                max_age_days=max_age_days,
+                source="filename",
+            )
+
+    try:
+        mtime = datetime.fromtimestamp(Path(backtest_path).stat().st_mtime).date()
+    except OSError:
+        return BaselineAge(
+            path=backtest_path,
+            age_days=None,
+            max_age_days=max_age_days,
+            source="unknown",
+        )
+    return BaselineAge(
+        path=backtest_path,
+        age_days=(today - mtime).days,
+        max_age_days=max_age_days,
+        source="mtime",
+    )
 
 
 def exit_code_for(
     reports: list[PortfolioDivergenceReport],
     execution_model: ExecutionModel | None = None,
+    baseline: BaselineAge | None = None,
 ) -> int:
     """Map the run's outcome onto the process exit code.
 
-    A breach outranks a stale baseline: it is the louder signal, and in practice
-    the two cannot co-occur (a non-comparable baseline forces every status to
-    NO_DATA). A genuine NO_DATA on a good baseline — no overlapping live history
-    yet — is not a fault and stays at EXIT_OK.
+    Precedence is worst-outage-first: a breach outranks everything (it is the
+    louder signal, and its alert names the sleeves); a non-comparable baseline
+    outranks a stale one (BLIND means no drift detection is running at all,
+    stale means it is running against old expectations). A genuine NO_DATA on a
+    good baseline — no overlapping live history yet — is not a fault and stays
+    at EXIT_OK.
+
+    ``baseline`` is optional so the two-argument contract every existing caller
+    uses keeps working; omitting it simply means staleness is not judged.
     """
     if any_breach(reports):
         return EXIT_BREACH
@@ -91,6 +217,8 @@ def exit_code_for(
         return EXIT_BASELINE_NOT_COMPARABLE
     if any(not r.baseline_comparable for r in reports):
         return EXIT_BASELINE_NOT_COMPARABLE
+    if baseline is not None and baseline.is_stale:
+        return EXIT_BASELINE_STALE
     return EXIT_OK
 
 
@@ -276,6 +404,7 @@ def write_json_report(
     window_days: int,
     threshold: float,
     execution_model: ExecutionModel | None = None,
+    baseline: BaselineAge | None = None,
 ) -> None:
     """Write the full report to a JSON file for historical tracking / Grafana."""
 
@@ -295,6 +424,10 @@ def write_json_report(
     }
     if execution_model is not None:
         payload["baseline_execution_model"] = asdict(execution_model)
+    if baseline is not None:
+        # Read back by scripts/ops/divergence_alert.py to render the exit-4
+        # Telegram, so the message can name the age instead of saying "stale".
+        payload["baseline_staleness"] = baseline.as_dict()
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(payload, f, indent=2)
@@ -304,6 +437,7 @@ def write_json_report(
 def write_prometheus_textfile(
     reports: list[PortfolioDivergenceReport],
     textfile_path: str,
+    baseline: BaselineAge | None = None,
 ) -> None:
     """Write Prometheus-format gauges for ``node_exporter`` textfile collector.
 
@@ -344,7 +478,20 @@ def write_prometheus_textfile(
         ["portfolio"], registry=registry,
     )
 
+    # Unlabelled: there is exactly one baseline per run, and it is a property
+    # of the run rather than of any portfolio. Exported for the day a scraper
+    # exists on this host — the exit code, not this gauge, is what currently
+    # reaches a human (see EXIT_BASELINE_STALE).
+    g_age = Gauge(
+        "algo_poc_divergence_baseline_age_days",
+        "Age in days of the backtest baseline the run was scored against.",
+        registry=registry,
+    )
+
     status_code = {"OK": 0, "WARNING": 1, "BREACH": 2, "NO_DATA": 3}
+
+    if baseline is not None and baseline.age_days is not None:
+        g_age.set(baseline.age_days)
 
     for r in reports:
         if r.absolute_divergence_pp is not None:
@@ -608,6 +755,15 @@ def main() -> int:
         help=f"Relative divergence warning threshold (default {DEFAULT_THRESHOLD}).",
     )
     parser.add_argument(
+        "--max-baseline-age-days", type=int, default=DEFAULT_MAX_BASELINE_AGE_DAYS,
+        help=(
+            "Warn (and exit "
+            f"{EXIT_BASELINE_STALE}) when the baseline artifact is older than "
+            f"this many days (default {DEFAULT_MAX_BASELINE_AGE_DAYS}, i.e. two "
+            "missed weekly refreshes). 0 disables the check."
+        ),
+    )
+    parser.add_argument(
         "--portfolio", default=None,
         help="Limit comparison to a single named portfolio.",
     )
@@ -639,6 +795,18 @@ def main() -> int:
         print(f"ERROR: Backtest file not found: {backtest_path}")
         return EXIT_ERROR
     print(f"  Backtest source: {backtest_path}")
+
+    # Staleness is judged here, at the point of consumption, rather than by the
+    # job that produces the artifact — a producer that never ran cannot report
+    # that it never ran, which is precisely how the 2026-07-28 → 2026-08-18 gap
+    # stayed quiet. 0 disables the check for an ad-hoc run against a
+    # deliberately old baseline.
+    baseline: BaselineAge | None = None
+    if args.max_baseline_age_days > 0:
+        baseline = baseline_age(backtest_path, args.max_baseline_age_days)
+        stale_warning = baseline.warning_line()
+        if stale_warning:
+            print(f"  ⚠ {stale_warning}")
 
     bt_per_portfolio, bt_aggregate = load_backtest_equity_series(backtest_path)
     execution_model = load_backtest_execution_model(backtest_path)
@@ -769,10 +937,11 @@ def main() -> int:
             window_days=args.window,
             threshold=args.threshold,
             execution_model=execution_model,
+            baseline=baseline,
         )
 
     if args.prometheus_textfile:
-        write_prometheus_textfile(reports, args.prometheus_textfile)
+        write_prometheus_textfile(reports, args.prometheus_textfile, baseline=baseline)
 
     # --- Persist the verdicts (last, and unable to change the exit code) ---
     # Last because the JSON report and the .prom file are what the launchd
@@ -807,7 +976,7 @@ def main() -> int:
         print(f"ERROR: could not persist divergence verdicts: {_redact(str(e))}")
         emit_persist_failure_alert(e, redis_url=args.redis_url)
 
-    return exit_code_for(reports, execution_model)
+    return exit_code_for(reports, execution_model, baseline=baseline)
 
 
 if __name__ == "__main__":

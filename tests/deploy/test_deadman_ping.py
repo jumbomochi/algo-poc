@@ -21,6 +21,7 @@ word curl.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -291,3 +292,108 @@ def test_the_dead_man_url_is_an_optional_secret_not_a_required_one() -> None:
     )
     assert "ALGO_DEADMAN_PAPER_URL" not in required
     assert "DEADMAN_WATCHDOG_URL" not in required
+
+
+# ---------------------------------------------------------------------------
+# Coverage policy (KAN-56)
+# ---------------------------------------------------------------------------
+#
+# KAN-15 wired exactly one job. That was correct then and wrong by 2026-08-18:
+# the 04:45 divergence monitor had gone missing twice, the Tuesday refresh had
+# not succeeded in three weeks, and neither absence was reportable from inside
+# this host. Five uncovered scheduled jobs is a policy gap, not five separate
+# oversights — so the rule is now stated once and enforced here: every wrapper
+# either pings, or says in its own header why it does not.
+#
+# "Or says why" is a real answer, not an escape hatch. Two jobs genuinely do
+# not need their own switch, and writing the reason down where the next person
+# will read it is worth more than five external checks nobody maintains.
+
+#: Marker a wrapper carries to opt out, followed by the reason.
+NO_DEADMAN_MARKER = "NO DEAD-MAN:"
+
+#: Sourced libraries and the installer, none of which are scheduled jobs.
+NOT_A_SCHEDULED_JOB = {"deadman.sh", "secrets.sh", "deploy.sh"}
+
+
+def _wrappers() -> list[Path]:
+    return sorted(
+        p for p in DEPLOY_DIR.glob("*.sh") if p.name not in NOT_A_SCHEDULED_JOB
+    )
+
+
+def test_the_wrapper_list_is_not_silently_empty() -> None:
+    """A glob that stops matching would make every assertion below vacuous."""
+    names = {p.name for p in _wrappers()}
+    assert names >= {
+        "run_paper.sh",
+        "run_divergence.sh",
+        "run_backtest_refresh.sh",
+        "run_db_backup.sh",
+        "run_pipeline_report.sh",
+        "run_evidence_digest.sh",
+        "gateway_watchdog.sh",
+    }, names
+
+
+@pytest.mark.parametrize("wrapper", _wrappers(), ids=lambda p: p.name)
+def test_every_wrapper_either_pings_or_records_why_not(wrapper: Path) -> None:
+    """AC5."""
+    text = wrapper.read_text()
+    pings = "algo_deadman_ping" in text or "algo_deadman_url_for" in text
+    assert pings or NO_DEADMAN_MARKER in text, (
+        f"{wrapper.name} neither pings a dead-man nor carries a "
+        f"'{NO_DEADMAN_MARKER}' comment explaining why it does not."
+    )
+
+
+@pytest.mark.parametrize(
+    "wrapper",
+    ["run_backtest_refresh.sh", "run_divergence.sh", "run_db_backup.sh"],
+)
+def test_the_newly_wired_wrappers_source_deadman_by_path(wrapper: str) -> None:
+    """Same rule as secrets.sh and telegram.sh: a copy under ~/ibc would never
+    be executed, so deploying one only plants the stale-copy trap that broke
+    the 2026-08-11 cold boot."""
+    text = (DEPLOY_DIR / wrapper).read_text()
+    assert '. "$ALGO_DIR/deploy/launchd/deadman.sh"' in text
+
+
+def test_every_dead_man_url_is_a_registered_optional_secret() -> None:
+    """An unregistered name resolves at runtime but `secrets.sh --import` never
+    prompts for it and `--check` never reports it — so the operator is told
+    nothing is watching only by reading a log line in a job that ran."""
+    optional = next(
+        line
+        for line in SECRETS.read_text().splitlines()
+        if line.startswith("ALGO_OPTIONAL_SECRET_NAMES=")
+    )
+    used = set()
+    for wrapper in _wrappers():
+        used.update(re.findall(r"ALGO_DEADMAN_\w+_URL", wrapper.read_text()))
+    assert used, "no dead-man URL variables found in any wrapper"
+    for name in sorted(used):
+        assert name in optional, f"{name} is not in ALGO_OPTIONAL_SECRET_NAMES"
+
+
+def test_no_dead_man_url_is_a_required_secret() -> None:
+    """A host that has not configured a switch yet must not make
+    `secrets.sh --check` report that the stack cannot authenticate."""
+    required = next(
+        line
+        for line in SECRETS.read_text().splitlines()
+        if line.startswith("ALGO_SECRET_NAMES=")
+    )
+    assert "DEADMAN" not in required, required
+
+
+def test_the_missed_slot_policy_is_written_down() -> None:
+    """AC4. launchd does not re-fire a StartCalendarInterval job missed while
+    the host was down — that is what silently cost the 2026-08-11 refresh. The
+    behaviour is not obvious, the decision to accept it is deliberate, and
+    neither is discoverable from the plists."""
+    readme = (DEPLOY_DIR / "README.md").read_text()
+    assert "Missed calendar slots" in readme
+    assert "StartCalendarInterval" in readme
+    # The decision, and the thing that covers it.
+    assert "dead-man" in readme.lower()

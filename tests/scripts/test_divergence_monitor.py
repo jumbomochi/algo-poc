@@ -7,7 +7,8 @@ SQLite, and the end-to-end orchestration.
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
+import os
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -15,10 +16,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from scripts.divergence_monitor import (
+    BASELINE_STALE_WARNING,
+    DEFAULT_MAX_BASELINE_AGE_DAYS,
     EXIT_BASELINE_NOT_COMPARABLE,
+    EXIT_BASELINE_STALE,
     EXIT_BREACH,
     EXIT_ERROR,
     EXIT_OK,
+    baseline_age,
     exit_code_for,
     find_latest_backtest_json,
     load_backtest_execution_model,
@@ -458,13 +463,217 @@ class TestExitCode:
         assert code == EXIT_BREACH
 
 
-def test_wrapper_documents_and_branches_on_every_exit_code():
+@pytest.mark.parametrize(
+    "code", [EXIT_BASELINE_NOT_COMPARABLE, EXIT_BASELINE_STALE]
+)
+def test_wrapper_documents_and_branches_on_every_exit_code(code):
     """deploy/launchd/run_divergence.sh must handle the code the script returns."""
     from pathlib import Path as _Path
 
     script = _Path("deploy/launchd/run_divergence.sh").read_text()
-    assert f"{EXIT_BASELINE_NOT_COMPARABLE} = " in script  # contract comment
-    assert f"    {EXIT_BASELINE_NOT_COMPARABLE})" in script  # case branch
+    assert f"{code} = " in script  # contract comment
+    assert f"    {code})" in script  # case branch
+
+
+# ---------------------------------------------------------------------------
+# Baseline staleness (KAN-56)
+# ---------------------------------------------------------------------------
+
+
+def _baseline(tmp_path: Path, name: str, mtime_days_ago: int | None = None) -> Path:
+    """An artifact on disk with the given name, optionally back-dated."""
+    path = tmp_path / name
+    path.write_text("{}")
+    if mtime_days_ago is not None:
+        stamp = (
+            datetime.now(timezone.utc) - timedelta(days=mtime_days_ago)
+        ).timestamp()
+        os.utime(path, (stamp, stamp))
+    return path
+
+
+class TestBaselineStaleness:
+    """The check nobody was running.
+
+    The weekly refresh last succeeded on 2026-07-28; by 2026-08-18 the monitor
+    had spent three weeks scoring live equity against a three-week-old baseline
+    and reporting numbers with a straight face. Whichever job failed — and two
+    different ones did — the artifact's own age is the signal that survives,
+    because it is read at the point of consumption rather than at the point of
+    production.
+    """
+
+    def test_a_three_week_old_baseline_is_stale(self, tmp_path: Path):
+        _baseline(tmp_path, "backtest_multi_20260728_053111.json")
+        age = baseline_age(
+            str(tmp_path / "backtest_multi_20260728_053111.json"),
+            max_age_days=14,
+            today=date(2026, 8, 18),
+        )
+        assert age.age_days == 21
+        assert age.is_stale
+
+    def test_a_one_day_old_baseline_is_not_stale(self, tmp_path: Path):
+        _baseline(tmp_path, "backtest_multi_20260817_053111.json")
+        age = baseline_age(
+            str(tmp_path / "backtest_multi_20260817_053111.json"),
+            max_age_days=14,
+            today=date(2026, 8, 18),
+        )
+        assert age.age_days == 1
+        assert not age.is_stale
+
+    def test_the_default_threshold_is_two_missed_refreshes(self):
+        """The refresh is weekly, so 14 days means it has failed twice — one
+        miss is a bad week, two is a broken job."""
+        assert DEFAULT_MAX_BASELINE_AGE_DAYS == 14
+
+    def test_the_threshold_is_configurable(self, tmp_path: Path):
+        path = str(_baseline(tmp_path, "backtest_multi_20260810_000000.json"))
+        eight_days = dict(today=date(2026, 8, 18))
+        assert not baseline_age(path, max_age_days=14, **eight_days).is_stale
+        assert baseline_age(path, max_age_days=7, **eight_days).is_stale
+
+    def test_exactly_at_the_threshold_is_not_yet_stale(self, tmp_path: Path):
+        path = str(_baseline(tmp_path, "backtest_multi_20260804_000000.json"))
+        age = baseline_age(path, max_age_days=14, today=date(2026, 8, 18))
+        assert age.age_days == 14
+        assert not age.is_stale
+
+    def test_the_age_comes_from_the_filename_not_the_mtime(self, tmp_path: Path):
+        """The name records when the backtest was *run*; the mtime records when
+        the file was last touched. A restored backup, an rsync or a `cp -r` of
+        output/ rewrites the mtime and would silently make a stale baseline
+        look fresh — the exact direction of error that must not happen."""
+        path = str(
+            _baseline(
+                tmp_path, "backtest_multi_20260728_053111.json", mtime_days_ago=0
+            )
+        )
+        age = baseline_age(path, max_age_days=14, today=date(2026, 8, 18))
+        assert age.source == "filename"
+        assert age.age_days == 21
+        assert age.is_stale
+
+    def test_an_unparseable_name_falls_back_to_the_file_mtime(self, tmp_path: Path):
+        """`--backtest` accepts any path, including a hand-named one."""
+        path = str(_baseline(tmp_path, "my-baseline.json", mtime_days_ago=30))
+        age = baseline_age(path, max_age_days=14)
+        assert age.source == "mtime"
+        assert age.age_days is not None and age.age_days >= 29
+        assert age.is_stale
+
+    def test_an_unreadable_artifact_reports_an_unknown_age_and_is_not_stale(
+        self, tmp_path: Path
+    ):
+        """Never invent staleness from a missing file: the caller has already
+        hard-errored on that path, and guessing here would turn an absent
+        artifact into a wrong verdict about a present one."""
+        age = baseline_age(str(tmp_path / "gone.json"), max_age_days=14)
+        assert age.age_days is None
+        assert age.source == "unknown"
+        assert not age.is_stale
+
+    def test_the_warning_is_named_and_carries_the_numbers(self, tmp_path: Path):
+        """"Named" is the point: an operator grepping the daily log, and the
+        Telegram renderer reading the JSON report, both key off one token that
+        does not drift with the prose around it."""
+        path = str(_baseline(tmp_path, "backtest_multi_20260728_053111.json"))
+        warning = baseline_age(
+            path, max_age_days=14, today=date(2026, 8, 18)
+        ).warning_line()
+        assert BASELINE_STALE_WARNING in warning
+        assert "21" in warning
+        assert "14" in warning
+        assert "backtest_multi_20260728_053111.json" in warning
+
+    def test_a_fresh_baseline_has_no_warning_line(self, tmp_path: Path):
+        path = str(_baseline(tmp_path, "backtest_multi_20260817_000000.json"))
+        age = baseline_age(path, max_age_days=14, today=date(2026, 8, 18))
+        assert age.warning_line() is None
+
+
+class TestStaleExitCode:
+    """Staleness has to reach a human, and on this host the only path that
+    does is the exit code: `run_divergence.sh` sends its Telegram from the
+    exit code, and no Prometheus/Alertmanager is running here to evaluate a
+    gauge. A warning that only lands in ~/ibc/logs is the silence this story
+    exists to remove.
+    """
+
+    def _stale(self, stale: bool):
+        from scripts.divergence_monitor import BaselineAge
+
+        return BaselineAge(
+            path="output/backtest_multi_20260728_053111.json",
+            age_days=21 if stale else 1,
+            max_age_days=14,
+            source="filename",
+        )
+
+    def test_a_stale_baseline_gets_its_own_exit_code(self):
+        code = exit_code_for(
+            [_report("OK")], _model(comparable=True), baseline=self._stale(True)
+        )
+        assert code == EXIT_BASELINE_STALE == 4
+        assert code not in (
+            EXIT_OK, EXIT_BREACH, EXIT_ERROR, EXIT_BASELINE_NOT_COMPARABLE
+        )
+
+    def test_a_fresh_baseline_still_exits_zero(self):
+        code = exit_code_for(
+            [_report("OK")], _model(comparable=True), baseline=self._stale(False)
+        )
+        assert code == EXIT_OK
+
+    def test_omitting_the_baseline_keeps_the_old_contract(self):
+        """Every existing caller passes two positional arguments."""
+        assert exit_code_for([_report("OK")], _model(comparable=True)) == EXIT_OK
+
+    def test_a_breach_outranks_a_stale_baseline(self):
+        """A breach is the louder signal and its alert names the sleeves; the
+        staleness rides along in the report rather than displacing it."""
+        code = exit_code_for(
+            [_report("BREACH")], _model(comparable=True), baseline=self._stale(True)
+        )
+        assert code == EXIT_BREACH
+
+    def test_a_blind_baseline_outranks_a_stale_one(self):
+        """BLIND means no drift detection is running at all; stale means it is
+        running against old expectations. The worse outage wins."""
+        code = exit_code_for(
+            [_report("NO_DATA", comparable=False)],
+            _model(comparable=False),
+            baseline=self._stale(True),
+        )
+        assert code == EXIT_BASELINE_NOT_COMPARABLE
+
+
+def test_the_json_report_records_the_baseline_age(tmp_path: Path):
+    """The wrapper's alert renderer reads this file, not the console."""
+    from scripts.divergence_monitor import BaselineAge
+
+    out = tmp_path / "divergence.json"
+    write_json_report(
+        [_report("OK")],
+        str(out),
+        backtest_path="output/backtest_multi_20260728_053111.json",
+        window_days=30,
+        threshold=0.25,
+        baseline=BaselineAge(
+            path="output/backtest_multi_20260728_053111.json",
+            age_days=21,
+            max_age_days=14,
+            source="filename",
+        ),
+    )
+    payload = json.loads(out.read_text())
+    assert payload["baseline_staleness"] == {
+        "age_days": 21,
+        "max_age_days": 14,
+        "source": "filename",
+        "stale": True,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -686,13 +895,22 @@ def _run_monitor_main(
 ) -> int:
     from scripts import divergence_monitor
 
+    extra = list(extra or [])
+    # These fixtures pin a fixed filename stamp (``20260525_000000``), so every
+    # one of them is permanently "stale" and would exit 4 on the staleness
+    # check rather than on the contract each test is actually about. Turned off
+    # here and exercised deliberately in TestStaleExitCode / the end-to-end
+    # case below, rather than allowed to leak into unrelated assertions.
+    if "--max-baseline-age-days" not in extra:
+        extra += ["--max-baseline-age-days", "0"]
+
     monkeypatch.setattr(divergence_monitor.sys, "argv", [
         "divergence_monitor.py",
         "--backtest", str(backtest),
         "--db-url", db_url,
         "--window", window,
         "--output", str(output),
-    ] + (extra or []))
+    ] + extra)
     return divergence_monitor.main()
 
 
@@ -1086,3 +1304,84 @@ def test_a_non_postgres_url_gets_no_postgres_only_connect_args():
     from scripts import divergence_monitor
 
     assert divergence_monitor.persist_engine_kwargs("sqlite:///paper.db") == {}
+
+
+# ---------------------------------------------------------------------------
+# Baseline staleness, end to end through main() (KAN-56)
+# ---------------------------------------------------------------------------
+
+
+def test_main_exits_four_and_warns_against_a_stale_baseline(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """The whole story in one assertion: a comparable baseline whose artifact
+    stopped being refreshed must not read as a clean daily run. Between
+    2026-07-28 and 2026-08-18 it did, for three weeks."""
+    _capture_alerts(monkeypatch)
+    code = _run_monitor_main(
+        monkeypatch,
+        backtest=_comparable_backtest(tmp_path, label="20260525_000000"),
+        db_url=_evidence_db(tmp_path, "stale"),
+        output=tmp_path / "divergence.json",
+        extra=["--max-baseline-age-days", "14"],
+    )
+    out = capsys.readouterr().out
+
+    assert code == EXIT_BASELINE_STALE
+    assert BASELINE_STALE_WARNING in out
+    assert "backtest_multi_20260525_000000.json" in out
+
+
+def test_main_exits_zero_against_a_fresh_baseline(tmp_path: Path, monkeypatch, capsys):
+    """The other half of the contract — the check must not fire every day."""
+    _capture_alerts(monkeypatch)
+    today = date.today().strftime("%Y%m%d")
+    code = _run_monitor_main(
+        monkeypatch,
+        backtest=_comparable_backtest(tmp_path, label=f"{today}_000000"),
+        db_url=_evidence_db(tmp_path, "fresh"),
+        output=tmp_path / "divergence.json",
+        extra=["--max-baseline-age-days", "14"],
+    )
+    out = capsys.readouterr().out
+
+    assert code == EXIT_OK
+    assert BASELINE_STALE_WARNING not in out
+
+
+def test_the_stale_warning_reaches_the_json_report_main_writes(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """The launchd wrapper's Telegram renderer reads the report, not stdout."""
+    _capture_alerts(monkeypatch)
+    report = tmp_path / "divergence.json"
+    _run_monitor_main(
+        monkeypatch,
+        backtest=_comparable_backtest(tmp_path, label="20260525_000000"),
+        db_url=_evidence_db(tmp_path, "stalereport"),
+        output=report,
+        extra=["--max-baseline-age-days", "14"],
+    )
+    capsys.readouterr()
+
+    staleness = json.loads(report.read_text())["baseline_staleness"]
+    assert staleness["stale"] is True
+    assert staleness["source"] == "filename"
+    assert staleness["max_age_days"] == 14
+
+
+def test_the_staleness_check_can_be_turned_off_for_an_ad_hoc_run(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """Scoring deliberately against an old baseline is a legitimate manual
+    operation; it must not be forced through a non-zero exit."""
+    _capture_alerts(monkeypatch)
+    code = _run_monitor_main(
+        monkeypatch,
+        backtest=_comparable_backtest(tmp_path, label="20260525_000000"),
+        db_url=_evidence_db(tmp_path, "adhoc"),
+        output=tmp_path / "divergence.json",
+        extra=["--max-baseline-age-days", "0"],
+    )
+    capsys.readouterr()
+    assert code == EXIT_OK

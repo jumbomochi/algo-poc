@@ -8,6 +8,17 @@
 # Telegram-alerts on any failure. Success is logged, not alerted.
 #
 # Restore runbook: docs/operations/backups.md
+#
+# DEAD-MAN SWITCH (KAN-56)
+# ------------------------
+# The RPO promise is "at most one day of paper history lost", and every failure
+# path below reports through Telegram — but only when this script runs. A job
+# that never starts (host asleep at 05:15, launchd not loaded, a missed
+# calendar slot after a boot) cannot report its own absence, and a backup that
+# silently stopped is discovered at restore time, which is the worst possible
+# moment. So a *successful* dump pings $ALGO_DEADMAN_BACKUP_URL and an external
+# checker pages when the pings stop. Configure its period at ~26h.
+# See docs/operations/dead-man-switches.md.
 
 set -uo pipefail
 
@@ -34,12 +45,21 @@ ALGO_SECRETS_ENV_FILE="$ALGO_DIR/.env"   # regular-file fallback only
 ALGO_JOB_LABEL="db backup"
 # shellcheck source=deploy/launchd/lib/telegram.sh
 . "$ALGO_DIR/deploy/launchd/lib/telegram.sh"
+# Dead-man ping helper (KAN-15), likewise sourced by path and never deployed.
+# shellcheck source=deploy/launchd/deadman.sh
+. "$ALGO_DIR/deploy/launchd/deadman.sh"
 
 ts() { date "+%Y-%m-%d %H:%M:%S %Z"; }
 
 fail() {
     echo "$(ts): ERROR - $1" >> "$LOG_FILE"
     telegram "❌ Paper-DB backup FAILED: $1 — RPO clock is running. See ~/ibc/logs/$(basename "$LOG_FILE")."
+    # A failed dump is not a healthy beat: pinging here would tell the external
+    # checker the RPO promise is being kept while no readable archive exists.
+    # Logged rather than silent so "no ping" is never ambiguous between "the
+    # run failed" and "nothing is configured to watch".
+    algo_deadman_ping 1 ALGO_DEADMAN_BACKUP_URL
+    echo "$(ts): dead-man switch: $ALGO_DEADMAN_STATUS" >> "$LOG_FILE"
     exit 1
 }
 
@@ -76,5 +96,9 @@ echo "$(ts): Backup OK: $DUMP_FILE ($SIZE)" >> "$LOG_FILE"
 # Retention: prune local dumps and job logs older than RETENTION_DAYS.
 find "$BACKUP_DIR" -name "algo_poc_*.dump" -mtime "+$RETENTION_DAYS" -delete 2>/dev/null
 find "$LOG_DIR" -name "db_backup_*.log" -mtime "+$RETENTION_DAYS" -delete 2>/dev/null
+
+# Only here: a verified, readable, non-trivial dump exists on disk.
+algo_deadman_ping 0 ALGO_DEADMAN_BACKUP_URL
+echo "$(ts): dead-man switch: $ALGO_DEADMAN_STATUS" >> "$LOG_FILE"
 
 exit 0

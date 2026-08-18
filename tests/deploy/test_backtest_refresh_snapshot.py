@@ -27,6 +27,10 @@ RUN_REFRESH = DEPLOY_DIR / "run_backtest_refresh.sh"
 #: distinct from 1 (IB Gateway unreachable) so the launchd log says which.
 EXIT_NO_SNAPSHOT = 2
 
+#: The dead-man ping URL the wrapper is pointed at under test (KAN-56). Held
+#: apart from the Telegram sends in the same ``curl`` log by its host.
+DEADMAN_URL = "https://hc.example.test/ping/refresh-1234"
+
 
 _OVERRIDES = (
     'ALGO_DIR="${ALGO_DIR:-',
@@ -64,7 +68,8 @@ def test_the_wrapper_honours_the_test_overrides():
 
 
 def _drive(tmp_path, *, snapshot=True, gateway=True, backtest_exit=0,
-           backtest_sleep=0, timeout_seconds=600):
+           backtest_sleep=0, timeout_seconds=600, curl_exit=0,
+           deadman_url=DEADMAN_URL):
     """Run the wrapper with everything it reaches out to stubbed.
 
     ``ALGO_DIR`` points at a scratch tree that *symlinks* the repo's ``deploy``
@@ -91,6 +96,7 @@ def _drive(tmp_path, *, snapshot=True, gateway=True, backtest_exit=0,
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     curl_log = tmp_path / "curl.log"
+    ping_log = tmp_path / "pings.log"
     argv_log = tmp_path / "argv.log"
 
     def stub(name, body):
@@ -108,9 +114,15 @@ case "${@: -1}" in
   *) echo "could not be found" >&2; exit 44 ;;
 esac
 """)
+    # Dead-man pings are split out of the Telegram sends by host, so the
+    # existing "exactly one message" assertions keep meaning exactly that.
     stub("curl", f"""#!/bin/bash
-{{ for a in "$@"; do printf '%s\\n' "$a"; done; printf -- '---END---\\n'; }} >> {curl_log}
-exit 0
+if printf '%s\\n' "$@" | grep -q 'hc.example.test'; then
+    printf '%s\\n' "$*" >> {ping_log}
+else
+    {{ for a in "$@"; do printf '%s\\n' "$a"; done; printf -- '---END---\\n'; }} >> {curl_log}
+fi
+exit {curl_exit}
 """)
     # Records the backtest's argv and writes a plausible artifact, exactly as
     # the real run does — the wrapper greps the log and names the newest file.
@@ -126,6 +138,7 @@ exit {backtest_exit}
     env = dict(
         os.environ,
         HOME=str(home),
+        ALGO_DEADMAN_REFRESH_URL=deadman_url,
         PATH=f"{bin_dir}:{os.environ['PATH']}",
         ALGO_DIR=str(algo_dir),
         ALGO_PYTHON=str(fake_python),
@@ -276,3 +289,99 @@ def test_a_timed_out_run_does_not_prune_the_baseline_archive(tmp_path):
     monitor with less to fall back on, not more."""
     result, _, _, _, _ = _drive(tmp_path, backtest_sleep=30, timeout_seconds=1)
     assert result.returncode == 124
+
+
+# ---------------------------------------------------------------------------
+# Dead-man switch (KAN-56) — the failure this wrapper cannot observe itself
+# ---------------------------------------------------------------------------
+#
+# Every alert above is sent by the wrapper, about the wrapper, and so requires
+# the wrapper to be running. On 2026-08-11 the host was down at the 05:00
+# calendar slot, launchd did not re-fire the missed job, and the refresh simply
+# never happened — no snapshot check, no gateway check, no timeout, no exit
+# code, no Telegram. Nothing distinguished it from a healthy Tuesday, and the
+# baseline went on ageing for another week before anyone noticed.
+#
+# Only something *outside* this host can see that. So a successful run pings an
+# external checker and the checker pages when the ping does not arrive; the
+# absence of a message is the message. That inverts the requirement being
+# asserted here: the ping must happen on success, and must NOT happen on any
+# outcome that is not a success — a wrapper that pinged unconditionally would
+# report a dead job as a healthy one, which is worse than no check at all.
+
+
+def _pings(tmp_path) -> list[str]:
+    log = tmp_path / "pings.log"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def test_a_successful_refresh_pings_the_dead_man(tmp_path):
+    """AC1."""
+    result, _, _, log, _ = _drive(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    pings = _pings(tmp_path)
+    assert len(pings) == 1, pings
+    assert DEADMAN_URL in pings[0]
+    assert "dead-man switch: pinged" in log, log
+
+
+@pytest.mark.parametrize(
+    "label,kwargs,expected_exit",
+    [
+        ("membership snapshot missing", dict(snapshot=False), EXIT_NO_SNAPSHOT),
+        ("gateway unreachable", dict(gateway=False), 1),
+        ("backtest exited non-zero", dict(backtest_exit=7), 7),
+        (
+            "backtest timed out",
+            dict(backtest_sleep=30, timeout_seconds=1),
+            124,
+        ),
+    ],
+)
+def test_no_failure_mode_pings_the_dead_man(tmp_path, label, kwargs, expected_exit):
+    """AC2, one case per abort path.
+
+    Parametrized rather than written once because the wrapper has four separate
+    early exits and each is its own opportunity to leak a healthy beat — the
+    two that return before the backtest starts do not even reach the tail of
+    the script where the ping lives.
+    """
+    result, _, _, log, _ = _drive(tmp_path, **kwargs)
+
+    # Doubles as AC6's "the exit-code contract is unchanged": routing every
+    # exit through refresh_exit() must return the same code it was handed.
+    assert result.returncode == expected_exit, (label, result.stderr)
+    assert _pings(tmp_path) == [], f"{label} pinged the dead-man"
+    # Silence is not enough: the operator has to be able to tell "did not ping
+    # because the run failed" from "did not ping because it is unconfigured".
+    assert "dead-man switch: not pinged" in log, log
+
+
+def test_a_failing_ping_cannot_fail_the_refresh(tmp_path):
+    """Monitoring must never cause the outage it exists to detect: a flaky
+    network on an otherwise healthy Tuesday must not turn into a failed run."""
+    result, sends, _, log, _ = _drive(tmp_path, curl_exit=7)
+
+    assert result.returncode == 0, result.stderr
+    assert "PING FAILED" in log, log
+    # ...and the success Telegram still went out.
+    assert any("Weekly backtest refreshed" in s for s in sends), sends
+
+
+def test_an_unconfigured_switch_says_so_rather_than_failing_silently(tmp_path):
+    """A host that has not created the external check yet must be able to tell
+    that nothing outside it is watching."""
+    _, _, _, log, _ = _drive(tmp_path, deadman_url="")
+
+    assert _pings(tmp_path) == []
+    assert "NOT CONFIGURED" in log, log
+
+
+def test_the_ping_url_is_never_written_to_the_log_verbatim(tmp_path):
+    """A healthchecks.io URL is a bearer capability — anyone who reads it out
+    of ~/ibc/logs can forge a healthy ping and switch the dead-man off."""
+    _, _, _, log, _ = _drive(tmp_path)
+
+    assert DEADMAN_URL not in log
+    assert "hc.example.test" in log, "too redacted to debug a typo'd host"
