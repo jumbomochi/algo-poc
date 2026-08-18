@@ -1,4 +1,19 @@
 version: 2
+
+# Every entry sets `target-branch: develop`. `develop` is the integration
+# branch (CLAUDE.md, "Branch Flow"); `main` is production and carries no
+# branch protection at all, so a dependency PR must never be based on it.
+#
+# Note the bootstrap asymmetry: Dependabot always reads *this file* from the
+# repository's default branch (`main`), regardless of `target-branch`. A
+# change here therefore does nothing until it is promoted develop -> main.
+# The manifests it diffs, and the PRs it opens, do come from `develop`.
+#
+# Second consequence, deliberate: Dependabot *security* updates are only ever
+# opened against the default branch, so setting `target-branch` means these
+# entries handle version updates only. `pip-audit` (security.yml) is the CVE
+# tripwire here and runs against both lockfiles on every push/PR and weekly.
+
 updates:
   # pyproject.toml is the source of truth; requirements*.lock are derived
   # (see docs/operations/dependency-lockfile.md). Dependabot bumps the
@@ -7,6 +22,7 @@ updates:
   # .github/workflows/security.yml.
   - package-ecosystem: pip
     directory: /
+    target-branch: develop
     schedule:
       interval: weekly
       day: monday
@@ -14,67 +30,156 @@ updates:
     labels:
       - dependencies
       - security
+    # Chosen, not inherited. `auto` resolves to `widen` for a pyproject.toml
+    # carrying ranges, which is what produced eight range-widening PRs
+    # (#30/#33/#35/#36/#37/#38/#43/#82). `increase-if-necessary` leaves the
+    # requirement alone whenever it already admits the new version, so an
+    # in-range minor or patch produces no manifest churn at all; only a
+    # ceiling crossing rewrites anything, and the ignore list below then
+    # declines it.
+    versioning-strategy: increase-if-necessary
     # The upper bounds in pyproject.toml are a deliberate guardrail on a
     # real-money system — a major upgrade gets an explicit evaluation, not an
     # automated range widening. pip-audit (security.yml) remains the CVE
     # tripwire, and it runs against the lockfiles regardless of these ranges.
     # See docs/operations/dependency-lockfile.md.
+    #
+    # These are per-dependency `versions` conditions rather than the wildcard
+    # `update-types: [version-update:semver-major]` they replace, because that
+    # rule never fired. Dependabot's pip updater has no resolved "current
+    # version" for a range requirement in a pyproject.toml it manages no
+    # lockfile for, so it emits *requirement* updates ("update numpy
+    # requirement from ... to ...") rather than *version* updates ("bump numpy
+    # from A to B") — and with no from-version there is nothing for an
+    # `update-types` semver comparison to classify. A `versions` condition
+    # filters candidate versions directly and needs no such comparison.
+    #
+    # Each bound below mirrors the ceiling in pyproject.toml. Raising a
+    # ceiling there means raising it here too; forgetting leaves the old bound
+    # enforced, which fails closed (no PR) rather than open.
     ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-major"]
+      - dependency-name: sqlalchemy
+        versions: [">=3.0"]
+      - dependency-name: alembic
+        versions: [">=2.0"]
+      - dependency-name: psycopg2-binary
+        versions: [">=3.0"]
+      - dependency-name: redis
+        versions: [">=6.0"]
+      - dependency-name: pydantic
+        versions: [">=3.0"]
+      - dependency-name: pydantic-settings
+        versions: [">=3.0"]
+      - dependency-name: fastapi
+        versions: [">=1.0"]
+      - dependency-name: uvicorn
+        versions: [">=1.0"]
+      - dependency-name: httpx
+        versions: [">=1.0"]
+      # PEP 503 normalises `ib_insync` to `ib-insync`; both spellings are
+      # listed because `dependency-name` matching is case-insensitive but not
+      # separator-insensitive, and only one of them can be the one Dependabot
+      # compares against.
+      - dependency-name: ib-insync
+        versions: [">=1.0"]
+      - dependency-name: ib_insync
+        versions: [">=1.0"]
+      - dependency-name: lightgbm
+        versions: [">=5.0"]
+      - dependency-name: scikit-learn
+        versions: [">=2.0"]
+      - dependency-name: pandas
+        versions: [">=3.0"]
+      - dependency-name: numpy
+        versions: [">=2.0"]
+      - dependency-name: exchange-calendars
+        versions: [">=5.0"]
+      - dependency-name: pyyaml
+        versions: [">=7.0"]
+      - dependency-name: structlog
+        versions: [">=25.0"]
+      - dependency-name: opentelemetry-api
+        versions: [">=2.0"]
+      - dependency-name: opentelemetry-sdk
+        versions: [">=2.0"]
+      - dependency-name: prometheus-client
+        versions: [">=1.0"]
+      - dependency-name: joblib
+        versions: [">=2.0"]
+      - dependency-name: plotly
+        versions: [">=6.0"]
+      - dependency-name: vadersentiment
+        versions: [">=4.0"]
+      - dependency-name: praw
+        versions: [">=8.0"]
+      - dependency-name: scipy
+        versions: [">=2.0"]
+      # dev extra; the other dev dependencies carry no upper bound and so
+      # need no entry.
+      - dependency-name: pip-audit
+        versions: [">=3.0"]
 
   # One entry per Dockerfile location — Dependabot's docker ecosystem does
   # not glob subdirectories.
   - package-ecosystem: docker
     directory: /
+    target-branch: develop
     schedule:
       interval: weekly
       day: monday
     labels: [dependencies, docker]
   - package-ecosystem: docker
     directory: /services/ml_model
+    target-branch: develop
     schedule:
       interval: weekly
       day: monday
     labels: [dependencies, docker]
   - package-ecosystem: docker
     directory: /services/signal_generation
+    target-branch: develop
     schedule:
       interval: weekly
       day: monday
     labels: [dependencies, docker]
   - package-ecosystem: docker
     directory: /services/risk_management
+    target-branch: develop
     schedule:
       interval: weekly
       day: monday
     labels: [dependencies, docker]
   - package-ecosystem: docker
     directory: /services/portfolio_accounting
+    target-branch: develop
     schedule:
       interval: weekly
       day: monday
     labels: [dependencies, docker]
   - package-ecosystem: docker
     directory: /services/execution
+    target-branch: develop
     schedule:
       interval: weekly
       day: monday
     labels: [dependencies, docker]
   - package-ecosystem: docker
     directory: /services/api
+    target-branch: develop
     schedule:
       interval: weekly
       day: monday
     labels: [dependencies, docker]
   - package-ecosystem: docker
     directory: /services/data_ingestion
+    target-branch: develop
     schedule:
       interval: weekly
       day: monday
     labels: [dependencies, docker]
   - package-ecosystem: docker
     directory: /services/notifications
+    target-branch: develop
     schedule:
       interval: weekly
       day: monday
@@ -82,6 +187,7 @@ updates:
 
   - package-ecosystem: github-actions
     directory: /
+    target-branch: develop
     schedule:
       interval: weekly
       day: monday
