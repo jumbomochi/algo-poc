@@ -112,28 +112,135 @@ of the numeric stack change behaviour rather than just API surface — numpy
 2.x, for instance, changed dtype promotion rules. Crossing a major boundary
 is an evaluation with its own story, not dependency hygiene.
 
-Accordingly `.github/dependabot.yml` carries, on the **pip** ecosystem entry
-only:
+### How the ceiling is enforced
+
+`.github/dependabot.yml` carries, on the **pip** ecosystem entry only, one
+`ignore` entry per upper-bounded dependency, each naming the ceiling that
+`pyproject.toml` sets:
+
+```yaml
+versioning-strategy: increase-if-necessary
+ignore:
+  - dependency-name: numpy
+    versions: [">=2.0"]
+  # ... one per dependency carrying an upper bound
+```
+
+Two pieces, doing different jobs:
+
+- **`versioning-strategy: increase-if-necessary`** decides *when* Dependabot
+  rewrites the manifest at all. It leaves a requirement alone whenever the
+  range already admits the new version, so in-range minors and patches
+  produce no PR. Only a ceiling crossing rewrites anything. The value is set
+  explicitly because the default, `auto`, resolves to `widen` for a
+  `pyproject.toml` with ranges — which is what generated the PRs in the table
+  below.
+- **The per-dependency `versions` conditions** then decline that crossing.
+
+Each bound mirrors `pyproject.toml`. **Raising a ceiling there means raising
+it here too.** Forgetting fails closed — the old bound stays enforced and no
+PR appears — which is the safe direction, but it is silent, so the two lists
+are checked against each other whenever either moves.
+
+`pip-audit` gates CVEs on both lockfiles independently of all this, so
+nothing security-relevant hides behind these rules.
+
+#### Why not the wildcard `update-types` rule
+
+This replaced the form KAN-36 introduced:
 
 ```yaml
 ignore:
   - dependency-name: "*"
-    update-types: ["version-update:semver-major"]
+    update-types: ["version-update:semver-major"]   # never fired
 ```
 
-This is the form currently in effect. It suppresses Dependabot's
-range-widening PRs (`numpy>=1.26,<2.0` → `>=1.26,<3.0` and friends), which
-are classified by the new version's bump type. If any of those reappear after
-a scheduled Monday run, replace the wildcard with per-dependency entries
-naming `numpy`, `pandas`, `redis`, `plotly`, `praw`, and `structlog` with no
-`update-types` key, and update this paragraph to say so. `pip-audit` gates
-CVEs on both lockfiles either way, so nothing security-relevant hides behind
-this rule.
+That rule reads correctly and does nothing. Dependabot has no resolved
+"current version" for a *range* requirement in a `pyproject.toml` whose
+lockfile it does not manage — `requirements.lock` is not a manifest format
+Dependabot parses. With no current version it cannot emit a *version* update,
+so it emits a **requirement** update instead, and an `update-types` condition
+has no from-version/to-version pair to run a semver comparison against. The
+PR titles are the visible tell:
 
-The docker ecosystem entries are deliberately left un-ignored, but note that
-base-image bumps past `python:3.12-slim` are blocked in practice: numpy
-1.26.4 publishes wheels only for cp39–cp312, so a 3.13/3.14 base image fails
-every service build. That unblocks itself only behind a numpy major upgrade.
+| Form | Title | Classified? |
+|---|---|---|
+| Requirement update (pip, ranges) | `update praw requirement from <8.0,>=7.7 to >=7.7,<9.0` | no — `update-types` cannot match |
+| Version update (docker, actions) | `bump actions/checkout from 4 to 7` | yes |
+
+Every pip PR this repo has ever received is the first form; every docker and
+github-actions PR is the second. A `versions` condition filters candidate
+versions directly and needs no comparison, which is why it works where
+`update-types` could not.
+
+### Declined majors — the precedent
+
+Each of these was opened by Dependabot and closed unmerged. They are recorded
+so a reopened PR is answered by a citation rather than a fresh evaluation.
+None of them was evaluated on its merits; each was declined under the ceiling
+policy above, which makes the default "not automatically" — it does not make
+it "never".
+
+| PR | Dependency | Requested widen | Closed |
+|---|---|---|---|
+| #30 | redis | `>=5.0,<6.0` → `>=5.0,<9.0` | 2026-08-14 |
+| #33 | pandas | `>=2.0,<3.0` → `>=2.0,<4.0` | 2026-08-14 |
+| #35 | plotly | `>=5.18,<6.0` → `>=5.18,<7.0` | 2026-08-14 |
+| #36 | numpy | `>=1.26,<2.0` → `>=1.26,<3.0` | 2026-08-14 |
+| #37 | praw | `>=7.7,<8.0` → `>=7.7,<9.0` | 2026-08-14 |
+| #38 | structlog | `>=24.0,<25.0` → `>=24.0,<27.0` | 2026-08-14 |
+| #43 | numpy | `>=1.26,<2.0` → `>=1.26,<3.0` | 2026-08-14 (repeat of #36) |
+| #82 | praw | `>=7.7,<8.0` → `>=7.7,<9.0` | 2026-08-18 (repeat of #37) |
+
+Closing one does not settle it: #43 reappeared about a minute after #42
+landed, and #82 is #37 filed again four days later. That is what the ignore
+list is for.
+
+Note also that numpy's ceiling is load-bearing for more than numpy. numpy
+1.26.4 publishes wheels only for cp39–cp312, so the `python:3.13`/`3.14`
+base-image bumps (#21–#32, also closed) fail every service build until numpy
+crosses its major first.
+
+#### Green CI on a widening PR is not evidence
+
+This is the non-obvious part, and it is why these PRs cannot be triaged by
+looking at the checks. A widen touches `pyproject.toml` only. The lockfile is
+not regenerated, `requirements.lock` keeps the old pin, and every service
+Dockerfile installs `--no-deps -r requirements.lock` — so the suite runs
+against the **version already in use**, not the newly-permitted major.
+
+#82 passed all five checks while exercising praw 7.8.2 — the version it was
+not asking about. Its green tells you the range edit did not break the status
+quo. It tells you nothing whatsoever about praw 8.x.
+
+Evaluating a major therefore means editing the range, regenerating both
+lockfiles (see *Upgrading a dependency on purpose* above), and reading the
+suite against the new pin. That is the "explicit evaluation" the ceiling
+policy asks for, and it is a story of its own.
+
+### Where dependency PRs are based
+
+Every entry in `.github/dependabot.yml` sets `target-branch: develop`, so no
+dependency PR is based on `main`. Before this, none did: every one of the
+twenty Dependabot PRs this repo has received targeted `main`, which is
+production and carries no branch protection at all (CLAUDE.md, "Branch
+Flow"). It never bit only because nineteen of the twenty were closed
+unmerged — the twentieth, #31, merged straight to production.
+
+Two consequences worth knowing:
+
+- **Dependabot reads `.github/dependabot.yml` from the default branch**
+  (`main`) regardless of `target-branch`. A change to that file therefore has
+  no effect until it is promoted develop → main. The manifests it diffs, and
+  the PRs it opens, do come from `develop`.
+- **Security updates only ever open against the default branch**, so with
+  `target-branch` set these entries handle version updates only. `pip-audit`
+  is the CVE tripwire here, on both lockfiles, on every push/PR and weekly.
+
+The docker and github-actions entries carry no `ignore` list at all — only
+the pip entry does. Their update policy is a separate question from the
+version ceilings, and unresolved; `target-branch` is the only thing this
+change altered about them.
 
 ## What CI checks
 
