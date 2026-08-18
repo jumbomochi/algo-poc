@@ -190,7 +190,38 @@ def _render(
             f"drift detection is running.\n{body}\n{DOC_HINT}"
         )
 
+    if exit_code == 4:
+        return (
+            "⚠️ Divergence baseline is STALE (exit 4): the numbers below were "
+            "scored against expectations that stopped being refreshed.\n"
+            f"{_staleness_line(report)}\n"
+            "The weekly backtest refresh (Tue 05:00 SGT) has not produced a "
+            "newer baseline — check ~/ibc/logs/backtest_refresh_*.log and the "
+            "refresh dead-man check."
+        )
+
     return f"🚨 Divergence monitor returned UNEXPECTED exit code {exit_code}."
+
+
+def _staleness_line(report: dict[str, Any] | None) -> str:
+    """One line naming the artifact, its age and the threshold it passed.
+
+    Degrades rather than raises on a missing or partial block: exit 4 must
+    still produce a message when the report could not be read at all, because
+    "the baseline is old" is already the whole finding — the numbers only make
+    it actionable.
+    """
+    staleness = (report or {}).get("baseline_staleness") or {}
+    name = Path((report or {}).get("backtest_source") or "").name
+    age = staleness.get("age_days")
+    threshold = staleness.get("max_age_days")
+    if age is None or threshold is None:
+        return f"• {name or 'the baseline'} — age not recorded in the report"
+    source = staleness.get("source", "unknown")
+    return (
+        f"• {name or 'baseline'} is {age} days old "
+        f"(threshold {threshold}, age from {source})"
+    )
 
 
 def _load_report(

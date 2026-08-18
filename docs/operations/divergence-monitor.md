@@ -114,10 +114,47 @@ transient or overwritten, so they are reports, not evidence.
 | 1 | At least one portfolio BREACH | Alert (Slack/email) |
 | 2 | Hard error (DB unreachable, backtest missing, invalid args) | Page on-call |
 | 3 | Baseline not comparable — **the monitor is blind**, no drift detection is running | Alert; regenerate the baseline ([backtest-baseline.md](backtest-baseline.md)) |
+| 4 | Baseline **stale** — the verdicts are real, but the artifact they were scored against is older than `--max-baseline-age-days` | Alert; the fault is upstream in the weekly refresh, not in divergence |
 
-A breach outranks code 3 if both somehow apply. In practice they cannot
-co-occur: a non-comparable baseline forces every status to `NO_DATA`, so there
-is nothing left to breach — which is exactly why code 3 must not be 0.
+Precedence is worst-outage-first: **1 > 2 > 3 > 4**. A breach outranks code 3
+if both somehow apply — in practice they cannot co-occur, since a
+non-comparable baseline forces every status to `NO_DATA` and there is nothing
+left to breach, which is exactly why code 3 must not be 0. Code 3 outranks
+code 4 for the same kind of reason: *blind* means no drift detection is running
+at all, *stale* means it is running against old expectations.
+
+### Baseline staleness (code 4)
+
+The weekly refresh (`deploy/launchd/run_backtest_refresh.sh`, Tue 05:00 SGT)
+keeps the baseline current. Between **2026-07-28 and 2026-08-18 it did not
+succeed once**: one Tuesday the host was booted after the calendar slot and
+launchd never re-fired the job, the next the IB Gateway was unreachable. Only
+the second told anyone. Throughout, this monitor went on comparing live equity
+to a three-week-old baseline and printing numbers, because nothing checked how
+old the thing it was reading actually was.
+
+So the age is now checked **here, where the artifact is consumed**, rather than
+in the job that produces it — a producer that never runs cannot report that it
+never ran, and this check is identical under every cause of the gap, including
+ones nobody has enumerated.
+
+- **Threshold:** `--max-baseline-age-days`, default **14** — two missed weekly
+  refreshes. One miss is a bad week; two is a broken job. `0` disables the
+  check, for an ad-hoc run deliberately scored against an old baseline.
+- **Where the age comes from:** the artifact's filename stamp
+  (`backtest_multi_YYYYMMDD_HHMMSS.json`), falling back to its mtime for a
+  hand-named file passed via `--backtest`. The filename is preferred because it
+  records when the backtest was *run*: restoring a backup, rsyncing `output/`
+  or a plain `cp -r` rewrites the mtime and would make a stale baseline look
+  fresh, which is the one direction this check must never err in.
+- **What you see:** a `BASELINE_STALE:` line on stdout (so it lands in
+  `~/ibc/logs/divergence_YYYYMMDD.log`), a `baseline_staleness` block in the
+  JSON report, an `algo_poc_divergence_baseline_age_days` gauge in the
+  Prometheus textfile, and exit 4 — which is what actually reaches a human,
+  since `run_divergence.sh` sends its Telegram from the exit code.
+- **The fix is upstream.** Check `~/ibc/logs/backtest_refresh_*.log` and the
+  refresh's dead-man check; do not clear the warning by re-running the backtest
+  without `--universe-snapshots` (see [backtest-baseline.md](backtest-baseline.md)).
 
 ---
 
@@ -189,8 +226,8 @@ written that day's `equity_snapshots` row. The deployed job is:
 | 04:45 | `scripts/divergence_monitor.py --prometheus-textfile ...` | Reads the snapshots just written |
 | 05:00 Tue | Backtest refresh (weekly, `local.algo-backtest-refresh`) | Updates the baseline that divergence is measured against. Tuesday, not Monday: IBKR's hist-data farm is routinely down from Saturday night through Monday pre-market. |
 
-**Alert wiring:** the script exits non-zero on BREACH (1) and on a
-non-comparable baseline (3). Wrap the cron line in:
+**Alert wiring:** the script exits non-zero on BREACH (1), on a non-comparable
+baseline (3) and on a stale one (4). Wrap the cron line in:
 
 ```bash
 python scripts/divergence_monitor.py || notify-slack "divergence breach or blind monitor"

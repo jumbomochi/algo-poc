@@ -53,11 +53,14 @@ the repo so there is exactly one copy of the lookup logic and it cannot drift
 the way the hand-copied wrappers did. `deadman.sh` (below) and
 `lib/telegram.sh` (next section) are excluded for the same reason.
 
-Two further accounts are **optional** (`$ALGO_OPTIONAL_SECRET_NAMES`):
-`DEADMAN_WATCHDOG_URL` and `ALGO_DEADMAN_PAPER_URL`. `--import` prompts for
-them and `--check` reports them, but their absence does not make `--check`
-exit non-zero — that status means "the stack cannot authenticate", which is a
-different problem from "no external check is watching this host".
+The dead-man ping URLs are **optional** accounts
+(`$ALGO_OPTIONAL_SECRET_NAMES`): `DEADMAN_WATCHDOG_URL`,
+`ALGO_DEADMAN_PAPER_URL`, `ALGO_DEADMAN_DIVERGENCE_URL`,
+`ALGO_DEADMAN_REFRESH_URL`, `ALGO_DEADMAN_BACKUP_URL` and
+`ALGO_DEADMAN_DIGEST_URL`. `--import` prompts for them and `--check` reports
+them, but their absence does not make `--check` exit non-zero — that status
+means "the stack cannot authenticate", which is a different problem from "no
+external check is watching this host".
 
 ## Sending alerts: `lib/telegram.sh`
 
@@ -90,16 +93,65 @@ confirm delivery end-to-end afterwards, use
 
 ## Dead-man switches: `deadman.sh`
 
-`run_paper.sh` sources `deadman.sh` and pings `$ALGO_DEADMAN_PAPER_URL` **only
-on a successful run**. Every alert the wrappers send is sent by this host,
-about this host, so none of them can fire when the Mac is off — which is
-exactly what "the 04:15 run never happened" looks like from the inside, and
-what went unnoticed for two days on 2026-08-13/14. The ping is fire-and-forget
-by construction and cannot fail the run; its outcome is written to the day's
-log as `dead-man switch: …`.
+Every alert the wrappers send is sent by this host, about this host, so none of
+them can fire when the Mac is off, asleep, or was booted after the job's slot —
+which is exactly what "the run never happened" looks like from the inside. That
+went unnoticed for two days on 2026-08-13/14 (the paper run) and for three
+weeks to 2026-08-18 (the weekly refresh). A wrapper sources `deadman.sh`, pings
+its own external check on a healthy run, and the **checker** pages when the
+ping stops arriving. The ping is fire-and-forget by construction and cannot
+fail the run; its outcome is written to the day's log as `dead-man switch: …`.
+
+**Coverage — every scheduled job either pings or says why not.** This is a
+policy, not a per-job judgement call, and `tests/deploy/test_deadman_ping.py`
+enforces it: a new wrapper with neither reddens the suite.
+
+| Wrapper | Check | Pings when |
+|---|---|---|
+| `run_paper.sh` | `ALGO_DEADMAN_PAPER_URL` | exit 0 |
+| `run_divergence.sh` | `ALGO_DEADMAN_DIVERGENCE_URL` | the run reached a **verdict** — exits 0, 1, 3, 4. Not exit 2 (nothing was judged). Withholding the ping for a real breach would saturate the check for the whole episode, exactly when telling "did not run" from "ran and found something" matters most. |
+| `run_backtest_refresh.sh` | `ALGO_DEADMAN_REFRESH_URL` | exit 0 only. Every abort path (missing snapshot, gateway down, timeout, failed backtest) routes through `refresh_exit()`, so a new early exit cannot become a healthy beat by omission. |
+| `run_db_backup.sh` | `ALGO_DEADMAN_BACKUP_URL` | a verified, readable dump exists |
+| `run_evidence_digest.sh` | `ALGO_DEADMAN_DIGEST_URL` | the digest was **delivered** (pinged from `scripts/ops/evidence_digest.py`, which is the only thing that knows the send succeeded) |
+| `run_pipeline_report.sh` | — | **is** a dead-man: its whole output is a daily message, so a missed run shows up as a missing report. The jobs it reports on carry their own checks. |
+| `gateway_watchdog.sh` | — | `StartInterval`, so it has no slot to miss; a dead watchdog surfaces as an unreachable Gateway in the paper run and the refresh, both of which alert and both of which ping. The host-wide case belongs to `DEADMAN_WATCHDOG_URL`. |
+
+Suggested periods: ~26 h for the daily checks, ~8 days for the weekly refresh
+(one missed Tuesday pages; a late-finishing run does not).
 
 Full setup, cadence guidance and the delivery drill:
 [`docs/operations/dead-man-switches.md`](../../docs/operations/dead-man-switches.md).
+
+### Missed calendar slots — what launchd does, and what covers it
+
+**launchd does not re-fire a `StartCalendarInterval` job whose slot passed
+while the host was down.** It runs the job at the next matching time. For the
+weekly refresh that means a full week; on 2026-08-11 the Mac booted at 07:59,
+two hours after the 05:00 slot, and the Tuesday refresh simply did not happen
+until 08-18 — silently, because a script that never starts cannot alert.
+
+(`StartInterval` jobs behave differently: launchd starts them shortly after
+boot, so `gateway_watchdog.sh` self-heals across a downtime.)
+
+**The policy is to accept this and rely on the dead-man switches**, rather than
+adding a catch-up guard. A catch-up run is worse than the gap it closes: the
+refresh holds IB's historical-data pacing budget for up to six hours, so a job
+that fires at an arbitrary post-boot time could still be running into the next
+04:15 paper run and starve it of data. The failure the catch-up would prevent
+is one late baseline; the failure it would introduce is a missed trading day.
+
+What covers it instead, in order of how fast it speaks:
+
+1. The job's **dead-man check** pages once its period lapses — for the refresh,
+   ~8 days after the last successful Tuesday.
+2. The **divergence monitor's staleness check** (exit 4) fires on the first
+   daily run after the baseline passes `--max-baseline-age-days` (default 14,
+   i.e. two missed refreshes). This one is independent of *which* job failed:
+   it reads the age of the artifact actually being scored against, so it also
+   catches causes nobody has enumerated.
+
+Neither is instant, and that is the accepted trade: the baseline going a week
+stale is a nuisance, and both signals arrive well before it becomes a risk.
 
 ### Why not a plaintext `.env`, and why not 1Password
 
@@ -176,8 +228,14 @@ the 04:15 `local.algo-paper-trading` job has written that day's
   3 = baseline not comparable → the monitor is **BLIND** (every report forced to
   `NO_DATA`; regenerate the baseline per
   [backtest-baseline.md](../../docs/operations/backtest-baseline.md) — do NOT
-  read exit 3 as OK).
-- **Alerting (KAN-43):** exit 1, 2 and 3 each send **exactly one** Telegram
+  read exit 3 as OK), 4 = baseline **STALE** (KAN-56): the verdicts are real,
+  but the artifact they were scored against is older than
+  `--max-baseline-age-days` (default 14 — two missed weekly refreshes). Read it
+  as "the refresh is broken", not as "divergence is bad"; the fix is upstream,
+  in `run_backtest_refresh.sh`. Age is taken from the artifact's filename
+  stamp, falling back to its mtime, so restoring or copying `output/` cannot
+  make a stale baseline look fresh.
+- **Alerting (KAN-43):** exit 1, 2, 3 and 4 each send **exactly one** Telegram
   message; exit 0 sends nothing, so a healthy day never trains you to ignore
   the channel. The body is rendered by
   [`scripts/ops/divergence_alert.py`](../../scripts/ops/divergence_alert.py)
@@ -294,6 +352,15 @@ alongside the 04:15/04:45 jobs (backtest uses IB clientId 10).
 
 - **Telegram**: ✅ with the headline metrics on success, ❌ on failure or when
   the Gateway is unreachable (baseline going stale is a silent risk otherwise).
+- **Dead-man**: pings `$ALGO_DEADMAN_REFRESH_URL` on success only. A missed
+  Tuesday — the host down at 05:00, which is not re-fired; see [Missed calendar
+  slots](#missed-calendar-slots--what-launchd-does-and-what-covers-it) —
+  produces no alert from this job at all, so the external check is the only
+  thing that can report it.
+- **If it does go stale anyway:** the divergence monitor exits 4 and Telegrams
+  once the baseline passes `--max-baseline-age-days` (default 14). Do not
+  silence that by re-running the refresh by hand without
+  `--universe-snapshots`; see KAN-23.
 - **Logs:** `~/ibc/logs/backtest_refresh_YYYYMMDD.log` (pruned after 90 days).
 - **Pruning:** baseline JSONs older than 90 days are deleted (~64 MB each;
   only the newest is ever used).

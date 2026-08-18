@@ -326,10 +326,15 @@ def test_the_shared_helper_is_not_deployed_to_ibc():
 
 RUN_DIVERGENCE = DEPLOY_DIR / "run_divergence.sh"
 
+#: Dead-man ping URL the wrapper is pointed at under test (KAN-56); held apart
+#: from the Telegram sends in the same ``curl`` log by its host.
+DIVERGENCE_DEADMAN_URL = "https://hc.example.test/ping/divergence-1234"
+
 
 def _drive_wrapper(tmp_path, exit_code, report_payload=None, curl_exit=0,
                    renderer_fails=False, serve_credentials=True,
-                   stale_report=None, serve_redis=True):
+                   stale_report=None, serve_redis=True,
+                   deadman_url=DIVERGENCE_DEADMAN_URL):
     """Run run_divergence.sh end-to-end against a stubbed monitor and curl.
 
     Everything the wrapper reaches out to is stubbed on PATH: ``nc`` (the DB
@@ -348,6 +353,7 @@ def _drive_wrapper(tmp_path, exit_code, report_payload=None, curl_exit=0,
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     curl_log = tmp_path / "curl.log"
+    ping_log = tmp_path / "pings.log"
 
     def stub(name, body):
         p = bin_dir / name
@@ -370,8 +376,14 @@ esac
 """)
     # Record every argument on its own line so the test can assert on the
     # message body exactly as passed, not on a re-quoted rendering of it.
+    # Dead-man pings are split out of the Telegram sends by host, so the
+    # existing "exactly one message" assertions keep meaning exactly that.
     stub("curl", f"""#!/bin/bash
-{{ for a in "$@"; do printf '%s\\n' "$a"; done; printf -- '---END---\\n'; }} >> {curl_log}
+if printf '%s\\n' "$@" | grep -q 'hc.example.test'; then
+    printf '%s\\n' "$*" >> {ping_log}
+else
+    {{ for a in "$@"; do printf '%s\\n' "$a"; done; printf -- '---END---\\n'; }} >> {curl_log}
+fi
 exit {curl_exit}
 """)
 
@@ -413,6 +425,7 @@ exit {exit_code}
         ALGO_SECURITY_BIN=str(bin_dir / "security"),
         ALGO_OSASCRIPT_BIN=str(bin_dir / "osascript"),
         ALGO_KEYCHAIN_SERVICE="algo-poc-absent-test-service",
+        ALGO_DEADMAN_DIVERGENCE_URL=deadman_url,
     )
     res = subprocess.run(
         [str(RUN_DIVERGENCE)], capture_output=True, text=True,
@@ -583,3 +596,119 @@ def test_a_missing_redis_credential_does_not_abort_the_monitor(tmp_path):
     assert len(sends) == 1, sends
     assert "monitor saw ALGO_REDIS_URL=unset" in log, log
     assert "evidence-store write failure cannot be alerted" in log, log
+
+
+# ---------------------------------------------------------------------------
+# Exit 4 — the baseline stopped being refreshed (KAN-56)
+# ---------------------------------------------------------------------------
+
+
+def _stale_report(age_days=21, max_age_days=14, source="filename"):
+    payload = _report(_portfolio("momentum", "OK"))
+    payload["backtest_source"] = "output/backtest_multi_20260728_053111.json"
+    payload["baseline_staleness"] = {
+        "age_days": age_days,
+        "max_age_days": max_age_days,
+        "source": source,
+        "stale": True,
+    }
+    return payload
+
+
+def test_stale_names_the_age_the_threshold_and_the_artifact():
+    """The operator's first question is "how bad, and since when" — a message
+    that only says "stale" sends them to the log to find out, which is the
+    friction that let three weeks pass."""
+    text = render_alert(4, _stale_report())
+    assert text
+    assert "21" in text
+    assert "14" in text
+    assert "backtest_multi_20260728_053111.json" in text
+
+
+def test_stale_alerts_even_when_the_report_is_unreadable():
+    """Same rule as exits 1-3: a renderer that can go quiet reintroduces the
+    blindness the exit code exists to remove."""
+    text = render_alert(4, None)
+    assert text
+    assert "stale" in text.lower() or "old" in text.lower()
+
+
+def test_stale_is_not_reported_as_an_unexpected_exit_code():
+    """The regression the 2026-08-11 stale deployed copy produced for exit 3:
+    a handled code narrated as 'UNEXPECTED'."""
+    assert "UNEXPECTED" not in (render_alert(4, _stale_report()) or "")
+
+
+# ---------------------------------------------------------------------------
+# Exit 4 through the wrapper (KAN-56)
+# ---------------------------------------------------------------------------
+
+
+def test_the_wrapper_sends_one_message_naming_the_baseline_age(tmp_path):
+    res, sends, log = _drive_wrapper(tmp_path, 4, report_payload=_stale_report())
+
+    assert res.returncode == 4
+    assert len(sends) == 1, sends
+    assert "21" in sends[0] and "14" in sends[0]
+    assert "STALE" in log or "stale" in log
+
+
+def test_the_wrapper_does_not_call_a_stale_baseline_unexpected(tmp_path):
+    _, sends, log = _drive_wrapper(tmp_path, 4, report_payload=_stale_report())
+    assert "UNEXPECTED" not in log, log
+    assert "UNEXPECTED" not in " ".join(sends)
+
+
+# ---------------------------------------------------------------------------
+# The divergence monitor's own dead-man (KAN-56)
+# ---------------------------------------------------------------------------
+#
+# The 04:45 job is the one that actually went missing: 2026-08-13 and
+# 2026-08-14 produced no divergence run at all, and 08-13 is a permanent hole
+# in the gate evidence. Nothing on this host could have reported that, for the
+# same reason as the refresh — a job that does not start cannot alert.
+#
+# What counts as a healthy beat here is NOT "exit 0", though. This job's
+# purpose is to reach a verdict, and a BREACH (1), a BLIND baseline (3) or a
+# stale one (4) are all verdicts: the monitor ran, judged, and said so through
+# its own Telegram. Suppressing the ping for those would saturate the external
+# check for the entire duration of a real drift episode — exactly when the
+# ability to distinguish "did not run" from "ran and found something" matters
+# most. Only a hard error (2) means nothing was judged.
+
+
+def _pings(tmp_path) -> list[str]:
+    log = tmp_path / "pings.log"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+@pytest.mark.parametrize("exit_code", [0, 1, 3, 4])
+def test_a_run_that_reaches_a_verdict_pings_the_dead_man(tmp_path, exit_code):
+    _, _, log = _drive_wrapper(
+        tmp_path, exit_code, report_payload=_report(_portfolio("momentum", "OK"))
+    )
+    pings = _pings(tmp_path)
+    assert len(pings) == 1, (exit_code, pings)
+    assert DIVERGENCE_DEADMAN_URL in pings[0]
+    assert "dead-man switch: pinged" in log, log
+
+
+def test_a_hard_error_does_not_ping(tmp_path):
+    """Exit 2 is "the monitor could not judge anything" — DB unreachable, no
+    baseline file, bad arguments. That is not a healthy beat."""
+    _, _, log = _drive_wrapper(tmp_path, 2, report_payload=None)
+    assert _pings(tmp_path) == []
+    assert "dead-man switch: not pinged" in log, log
+
+
+def test_the_divergence_ping_url_is_never_logged_verbatim(tmp_path):
+    _, _, log = _drive_wrapper(tmp_path, 0)
+    assert DIVERGENCE_DEADMAN_URL not in log
+    assert "hc.example.test" in log
+
+
+def test_an_unconfigured_divergence_switch_says_so(tmp_path):
+    _, _, log = _drive_wrapper(tmp_path, 0, deadman_url="")
+    assert _pings(tmp_path) == []
+    assert "NOT CONFIGURED" in log, log

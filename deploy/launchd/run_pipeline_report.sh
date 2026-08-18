@@ -8,6 +8,17 @@
 # missed alert cost two paper-record days, so silence from this job IS a
 # signal. Replaces the ad-hoc scratchpad watcher (watch_sat_run.sh) that did
 # not survive reboots.
+#
+# NO DEAD-MAN: this job is already one (KAN-56 coverage review). Its entire
+# output is a message that arrives every morning, so a run that never happens
+# is visible as a missing report rather than as a quiet success — the failure
+# mode an external check exists to expose is the only mode this job has. The
+# jobs it reports ON are separately covered: run_paper.sh, run_divergence.sh,
+# run_backtest_refresh.sh and run_db_backup.sh each ping their own check, so a
+# reader who misses the absence of this report is still paged by theirs. Adding
+# a fifth external check here would page for the same outage twice and buy
+# nothing. If this ever stops sending unconditionally — a digest that is
+# skipped on quiet days, say — that reasoning expires and it needs a switch.
 
 set -uo pipefail
 

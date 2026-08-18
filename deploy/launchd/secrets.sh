@@ -89,11 +89,21 @@ ALGO_SECRET_NAMES="${ALGO_SECRET_NAMES:-POSTGRES_PASSWORD REDIS_PASSWORD TELEGRA
 # when present (docker compose needs DEADMAN_WATCHDOG_URL for the
 # alertmanager container).
 #
-#   DEADMAN_WATCHDOG_URL   — Alertmanager pings this every 5m (the Watchdog
-#                            alert in config/alert_rules.yml)
-#   ALGO_DEADMAN_PAPER_URL — run_paper.sh pings this on a successful run
-#                            (deploy/launchd/deadman.sh)
-ALGO_OPTIONAL_SECRET_NAMES="${ALGO_OPTIONAL_SECRET_NAMES:-DEADMAN_WATCHDOG_URL ALGO_DEADMAN_PAPER_URL}"
+# One name per scheduled job rather than one shared URL: an external checker
+# pages on a *missing* ping, so a shared check would go on looking healthy for
+# as long as any single job kept running. The whole point is to identify which
+# job stopped.
+#
+#   DEADMAN_WATCHDOG_URL        — Alertmanager pings this every 5m (the
+#                                 Watchdog alert in config/alert_rules.yml)
+#   ALGO_DEADMAN_PAPER_URL      — run_paper.sh, on a successful run
+#   ALGO_DEADMAN_DIVERGENCE_URL — run_divergence.sh, on a run that reached a
+#                                 verdict (KAN-56)
+#   ALGO_DEADMAN_REFRESH_URL    — run_backtest_refresh.sh, on success (KAN-56)
+#   ALGO_DEADMAN_BACKUP_URL     — run_db_backup.sh, on a verified dump (KAN-56)
+#   ALGO_DEADMAN_DIGEST_URL     — scripts/ops/evidence_digest.py, on a
+#                                 *delivered* digest (KAN-29)
+ALGO_OPTIONAL_SECRET_NAMES="${ALGO_OPTIONAL_SECRET_NAMES:-DEADMAN_WATCHDOG_URL ALGO_DEADMAN_PAPER_URL ALGO_DEADMAN_DIVERGENCE_URL ALGO_DEADMAN_REFRESH_URL ALGO_DEADMAN_BACKUP_URL ALGO_DEADMAN_DIGEST_URL}"
 
 # Human-readable reason the last lookup failed. Callers log this verbatim; it
 # names the operator action, which is the whole point of separating the failure

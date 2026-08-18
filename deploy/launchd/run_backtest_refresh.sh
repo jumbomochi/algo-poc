@@ -17,6 +17,20 @@
 #   2 = point-in-time membership snapshot missing, nothing run (KAN-23)
 # 124 = the backtest exceeded ALGO_REFRESH_TIMEOUT_SECONDS and was killed
 #   * = the backtest's own exit code
+#
+# WHY THIS JOB ALSO HAS A DEAD-MAN SWITCH (KAN-56)
+# ------------------------------------------------
+# Every alert below is sent by this script, about this script, so all of them
+# require this script to be running. On 2026-08-11 the host was booted at 07:59
+# — after the 05:00 slot — and launchd does NOT re-fire a StartCalendarInterval
+# job that was missed while the machine was down. The refresh simply never
+# happened: no checks, no exit code, no message. That was indistinguishable
+# from a healthy Tuesday, and the baseline aged another week unnoticed.
+#
+# So a successful run pings an external checker ($ALGO_DEADMAN_REFRESH_URL) and
+# the checker pages when the ping stops arriving. Configure its period at ~8
+# days: one missed Tuesday pages, and a run that merely finishes late does not.
+# See docs/operations/dead-man-switches.md.
 
 set -uo pipefail
 
@@ -45,9 +59,23 @@ ALGO_SECRETS_ENV_FILE="$ALGO_DIR/.env"   # regular-file fallback only
 ALGO_JOB_LABEL="backtest refresh"
 # shellcheck source=deploy/launchd/lib/telegram.sh
 . "$ALGO_DIR/deploy/launchd/lib/telegram.sh"
+# Dead-man ping helper (KAN-15), likewise sourced by path and never deployed.
+# shellcheck source=deploy/launchd/deadman.sh
+. "$ALGO_DIR/deploy/launchd/deadman.sh"
 
 mkdir -p "$LOG_DIR"
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
+
+# The single exit for this script. Every `exit` below goes through it so that a
+# new early-abort added later cannot accidentally become a healthy beat — the
+# ping decision is made in exactly one place, from the code being returned.
+# algo_deadman_ping pings only on 0 and returns 0 whatever happens, so this can
+# neither suppress nor alter the exit code it was handed.
+refresh_exit() {
+    algo_deadman_ping "$1" ALGO_DEADMAN_REFRESH_URL
+    echo "$(ts): dead-man switch: $ALGO_DEADMAN_STATUS" >> "$LOG_FILE"
+    exit "$1"
+}
 
 echo "$(ts): Starting weekly backtest refresh" >> "$LOG_FILE"
 
@@ -73,13 +101,13 @@ if [ ! -f "$MEMBERSHIP_SNAPSHOT" ]; then
          "refusing to write a survivorship-biased baseline" >> "$LOG_FILE"
     algo_alert_local "backtest refresh aborted — membership snapshot missing"
     telegram "🚨 Weekly backtest refresh ABORTED: point-in-time membership snapshot missing at data/universe/sp500_membership.json. Refusing to write a survivorship-biased baseline (it would supersede the rebaselined one and blind the divergence monitor). Regenerate with scripts/ops/build_membership_snapshot.py."
-    exit 2
+    refresh_exit 2
 fi
 
 if ! nc -z 127.0.0.1 7497 2>/dev/null; then
     echo "$(ts): ERROR - IB Gateway not reachable on 7497" >> "$LOG_FILE"
     telegram "❌ Weekly backtest refresh SKIPPED: IB Gateway not reachable on 7497."
-    exit 1
+    refresh_exit 1
 fi
 
 cd "$ALGO_DIR"
@@ -132,7 +160,7 @@ if [ -f "$TIMEOUT_FLAG" ]; then
     algo_alert_local "backtest refresh timed out after ${REFRESH_TIMEOUT}s"
     telegram "⏱️ Weekly backtest refresh TIMED OUT after ${REFRESH_TIMEOUT}s and was killed — the point-in-time universe is ~830 tickers, so the IB pull is long. Baseline NOT refreshed; the divergence monitor is scoring against the previous one. See ~/ibc/logs/$(basename "$LOG_FILE")."
     find "$LOG_DIR" -name "backtest_refresh_*.log" -mtime +90 -delete 2>/dev/null
-    exit 124
+    refresh_exit 124
 fi
 
 if [ "$EXIT_CODE" -eq 0 ]; then
@@ -148,4 +176,4 @@ else
 fi
 
 find "$LOG_DIR" -name "backtest_refresh_*.log" -mtime +90 -delete 2>/dev/null
-exit $EXIT_CODE
+refresh_exit "$EXIT_CODE"
