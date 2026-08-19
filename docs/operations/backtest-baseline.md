@@ -318,9 +318,15 @@ Re-pin deliberately; it is a change to what the evidence means.
 2. Confirm its `portfolios` keys match the live book's sleeves — otherwise the
    first pinned run exits 3 with `BASELINE_SHAPE_MISMATCH`.
 3. Set `divergence.baseline_pin` to the new path and land it through a PR.
-4. Redeploy the wrappers (`deploy/launchd/deploy.sh`) if they changed — the
-   config is read from the repo checkout, so a config-only change takes effect at
-   the next 04:45 run without a redeploy.
+4. A config-only change needs **no** redeploy: `~/ibc/run_divergence.sh` resolves
+   the pin by running `$ALGO_DIR/scripts/ops/baseline_pin.py`, which reads the
+   repo checkout's `config/default.yaml`, so the next 04:45 run picks it up.
+   (One exception — **the pin mechanism itself does not exist in production until
+   the wrappers are redeployed.** `local.algo-divergence.plist` runs the deployed
+   copy of `run_divergence.sh`, so until `deploy/launchd/deploy.sh` has run after
+   KAN-51 landed, the 04:45 job still passes no `--backtest` and still takes the
+   recency path. The wrapper's drift check only writes a WARNING line into the
+   log.)
 5. Run the monitor by hand once and confirm the log line `baseline pin: <path>`
    and a non-3 exit before trusting the next night's verdict.
 

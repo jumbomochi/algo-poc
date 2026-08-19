@@ -38,7 +38,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from glob import glob
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -278,19 +278,19 @@ def load_backtest_equity_series(
     return per_portfolio, aggregate
 
 
-def load_backtest_sleeves(backtest_path: str) -> set[str]:
-    """The sleeve names a baseline artifact describes.
+def scoreable_sleeves(names: Iterable[str]) -> set[str]:
+    """The real sleeves among ``names`` — synthetic portfolios dropped.
 
-    Synthetic portfolios are dropped on both sides of the shape comparison —
-    see ``shape_mismatch_reason`` — so that the exclusion contract in
-    docs/operations/drill-evidence-isolation.md holds here too.
+    Takes names rather than a path so the baseline side can be fed the mapping
+    ``load_backtest_equity_series`` already returned: a baseline JSON is tens of
+    megabytes and main() parses it twice already, so a third parse to recover a
+    set of keys it is holding would be pure cost at 04:45.
+
+    Used on both sides of the shape comparison, so the exclusion contract in
+    docs/operations/drill-evidence-isolation.md ("_aggregate", "__drill__",
+    "__liquidation__") holds here like everywhere else.
     """
-    with open(backtest_path) as f:
-        data = json.load(f)
-    return {
-        name for name in (data.get("portfolios") or {})
-        if not is_excluded_portfolio(name)
-    }
+    return {name for name in names if not is_excluded_portfolio(name)}
 
 
 def shape_mismatch_reason(
@@ -946,8 +946,8 @@ def main() -> int:
     # skipping-with-a-warning, which is what makes local iteration usable.
     if args.pinned:
         mismatch = shape_mismatch_reason(
-            load_backtest_sleeves(backtest_path),
-            {n for n in portfolios if not is_excluded_portfolio(n)},
+            scoreable_sleeves(bt_per_portfolio),
+            scoreable_sleeves(portfolios),
         )
         if mismatch is not None:
             # Returned before any report is built or written: "exit 3 with a
