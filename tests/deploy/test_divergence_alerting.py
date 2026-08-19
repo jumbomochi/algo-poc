@@ -409,10 +409,25 @@ RUN_DIVERGENCE = DEPLOY_DIR / "run_divergence.sh"
 DIVERGENCE_DEADMAN_URL = "https://hc.example.test/ping/divergence-1234"
 
 
+#: Where the stub monitor records the argv the wrapper handed it, one argument
+#: per line wrapped in <> so an *empty* argument is still visible — which is the
+#: whole point for the pinned-baseline tests (KAN-51): an unresolvable pin must
+#: arrive at the monitor as an empty --backtest, not as a silently omitted flag.
+MONITOR_ARGV_LOG = "monitor_argv.log"
+
+
+def _monitor_argv(tmp_path) -> list[str]:
+    path = tmp_path / MONITOR_ARGV_LOG
+    if not path.exists():
+        return []
+    return [line[1:-1] for line in path.read_text().splitlines()]
+
+
 def _drive_wrapper(tmp_path, exit_code, report_payload=None, curl_exit=0,
                    renderer_fails=False, serve_credentials=True,
                    stale_report=None, serve_redis=True,
-                   deadman_url=DIVERGENCE_DEADMAN_URL):
+                   deadman_url=DIVERGENCE_DEADMAN_URL,
+                   pin=None, pin_resolver_fails=False):
     """Run run_divergence.sh end-to-end against a stubbed monitor and curl.
 
     Everything the wrapper reaches out to is stubbed on PATH: ``nc`` (the DB
@@ -482,10 +497,19 @@ exit {curl_exit}
     renderer = (
         "exit 99" if renderer_fails else f'exec {sys.executable} "$@"'
     )
+    # The pin resolver is the REAL script under this interpreter — it is the
+    # seam the wrapper depends on, so stubbing it would leave the wrapper's only
+    # config lookup untested. ``pin_resolver_fails`` reproduces "nothing is
+    # pinned": exit 1, empty stdout, exactly what resolve_pin() does when
+    # divergence.baseline_pin is unset.
+    resolver = "exit 1" if pin_resolver_fails else f'exec {sys.executable} "$@"'
+    argv_log = tmp_path / MONITOR_ARGV_LOG
     fake_python = stub("fake-python", f"""#!/bin/bash
 case "$1" in
   *divergence_alert.py) {renderer} ;;
+  *baseline_pin.py) {resolver} ;;
 esac
+{{ for a in "$@"; do printf '<%s>\n' "$a"; done; }} >> {argv_log}
 [ -f {fixture} ] && cp {fixture} {report}
 echo "monitor saw ALGO_REDIS_URL=${{ALGO_REDIS_URL:-unset}}"
 echo "stub monitor ran" >&2
@@ -504,7 +528,15 @@ exit {exit_code}
         ALGO_OSASCRIPT_BIN=str(bin_dir / "osascript"),
         ALGO_KEYCHAIN_SERVICE="algo-poc-absent-test-service",
         ALGO_DEADMAN_DIVERGENCE_URL=deadman_url,
+        # Never left to the committed config here: that pin points into the
+        # gitignored output/ of the real checkout, so the assertions would pass
+        # or fail depending on which machine ran them.
+        ALGO_BASELINE_PIN=str(
+            pin or tmp_path / "output" / "backtest_multi_20260819_183451.json"
+        ),
     )
+    if pin_resolver_fails:
+        env.pop("ALGO_BASELINE_PIN")
     res = subprocess.run(
         [str(RUN_DIVERGENCE)], capture_output=True, text=True,
         timeout=180, env=env, cwd=str(REPO),
@@ -790,3 +822,64 @@ def test_an_unconfigured_divergence_switch_says_so(tmp_path):
     _, _, log = _drive_wrapper(tmp_path, 0, deadman_url="")
     assert _pings(tmp_path) == []
     assert "NOT CONFIGURED" in log, log
+
+
+# ---------------------------------------------------------------------------
+# The pinned baseline reaches the monitor (KAN-51)
+#
+# D16 requires the Rung-0 baseline to have "its own monitor pins". Before this,
+# production never passed --backtest at all: every 04:45 run took the recency
+# path, so the artifact the gate evidence was measured against was replaced by
+# the Tuesday refresh and nothing recorded that it had changed.
+# ---------------------------------------------------------------------------
+
+
+def test_the_wrapper_names_the_pin_flag_at_all():
+    """AC1, in its literal form. Cheap, and it is the one assertion that still
+    holds if someone rewrites how the pin is resolved."""
+    source = RUN_DIVERGENCE.read_text()
+    assert "--backtest" in source
+    assert "--pinned" in source
+
+
+def test_the_monitor_is_invoked_against_the_resolved_pin(tmp_path):
+    pinned = tmp_path / "output" / "backtest_multi_20260819_183451.json"
+    res, _, log = _drive_wrapper(
+        tmp_path, 0, _report(_portfolio("momentum", "OK")), pin=pinned,
+    )
+
+    assert res.returncode == 0, res.stderr
+    argv = _monitor_argv(tmp_path)
+    assert "--backtest" in argv, argv
+    assert argv[argv.index("--backtest") + 1] == str(pinned), argv
+    assert "--pinned" in argv, argv
+    # The operator has to be able to tell from the log which baseline judged the
+    # session, without re-deriving it from the config that was live at the time.
+    assert str(pinned) in log
+
+
+def test_the_existing_monitor_arguments_are_still_passed(tmp_path):
+    """Regression guard: the pin is added to the invocation, not swapped in for
+    the report and metrics paths the alert renderer and node_exporter read."""
+    _drive_wrapper(tmp_path, 0, _report(_portfolio("momentum", "OK")))
+
+    argv = _monitor_argv(tmp_path)
+    assert "--output" in argv and "--prometheus-textfile" in argv
+
+
+def test_an_unresolvable_pin_reaches_the_monitor_as_an_empty_backtest(tmp_path):
+    """AC3's wrapper half. The wrapper must NOT decide to skip, and must not drop
+    the flag — dropping it is the recency fallback wearing a different hat. It
+    hands the empty pin over and lets the monitor exit 3 and alert, so there is
+    exactly one authority on whether the run can happen."""
+    res, sends, log = _drive_wrapper(tmp_path, 3, pin_resolver_fails=True)
+
+    argv = _monitor_argv(tmp_path)
+    assert "--backtest" in argv, argv
+    assert argv[argv.index("--backtest") + 1] == "", argv
+    assert "--pinned" in argv, argv
+    # The monitor's own exit 3 still drives the alert and the dead-man beat.
+    assert res.returncode == 3
+    assert len(sends) == 1, sends
+    assert "BLIND" in sends[0]
+    assert "could not resolve" in log

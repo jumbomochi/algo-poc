@@ -19,6 +19,23 @@
 # NOTE: deliberately NOT using `set -e` around the python call, because exit
 # codes 1 and 2 are meaningful signals we branch on, not failures to abort on.
 #
+# THE BASELINE IS PINNED (KAN-51)
+# -------------------------------
+# The monitor is invoked with an explicit --backtest --pinned. Before this it
+# was invoked with neither, so every production run took the recency path
+# (find_latest_backtest_json), and the artifact the gate evidence was measured
+# against was silently replaced by the Tuesday refresh. Recency selection is not
+# a pin: it makes the baseline of record a filesystem accident.
+#
+# The pin comes from divergence.baseline_pin in config/default.yaml via
+# scripts/ops/baseline_pin.py, so it is a configuration fact rather than a
+# string in this file. If it cannot be resolved the empty value is passed
+# through DELIBERATELY: --pinned makes the monitor exit 3 and this script alerts,
+# which keeps one authority on whether the run can mean anything. Skipping the
+# run here, or quietly dropping --backtest, is the same silent fallback in
+# different clothes — and a job that ran and meant nothing is the 2026-08-13
+# failure pattern this whole cluster of stories exists to remove.
+#
 # DEAD-MAN SWITCH (KAN-56)
 # ------------------------
 # Every alert this script sends requires this script to be running, and the
@@ -57,6 +74,9 @@ REPORT_FILE="${ALGO_DIVERGENCE_REPORT:-$ALGO_DIR/output/divergence_$(date +%Y%m%
 # is on and the early-abort paths below exit before they are stamped.
 RUN_STARTED=0
 LOG_OFFSET=0
+# The baseline of record. Resolved below, after the cd, so a relative config pin
+# means this checkout's output/ rather than wherever launchd started us.
+BASELINE_PIN=""
 # Secrets come from the macOS login keychain via the shared loader. Sourced by
 # path from the repo (never from the deployed ~/ibc copy) so there is exactly
 # one implementation of the lookup and it cannot drift.
@@ -150,6 +170,19 @@ if ! wait_for_port 127.0.0.1 55432 "paper DB (docker compose up?)" 300; then
 fi
 
 cd "$ALGO_DIR"
+
+# Resolve the pinned baseline. An empty result is passed to the monitor as-is —
+# see "THE BASELINE IS PINNED" in the header for why this script does not decide.
+BASELINE_PIN=$("$VENV" "$ALGO_DIR/scripts/ops/baseline_pin.py" 2>>"$LOG_FILE")
+if [ -n "$BASELINE_PIN" ]; then
+    echo "$(date): baseline pin: $BASELINE_PIN" >> "$LOG_FILE"
+else
+    echo "$(date): WARNING - could not resolve a divergence baseline pin;" \
+         "the monitor will refuse to score (exit 3) rather than fall back to" \
+         "the newest artifact in output/. Check divergence.baseline_pin in" \
+         "config/default.yaml" >> "$LOG_FILE"
+fi
+
 # Everything the renderer reads back must be attributable to THIS run: a report
 # left by an earlier run today would otherwise be narrated as this one's, and
 # exit 1 does not prove a breach (the monitor ends in `sys.exit(main())`, so an
@@ -159,6 +192,8 @@ LOG_OFFSET=$(wc -c < "$LOG_FILE" 2>/dev/null | tr -d ' ')
 [ -n "$LOG_OFFSET" ] || LOG_OFFSET=0
 
 "$VENV" scripts/divergence_monitor.py \
+    --backtest "$BASELINE_PIN" \
+    --pinned \
     --output "$REPORT_FILE" \
     --prometheus-textfile "$PROM_FILE" \
     >> "$LOG_FILE" 2>&1
