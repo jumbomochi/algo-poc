@@ -230,6 +230,128 @@ it the same two arguments.
 
 ---
 
+## The pinned baseline of record
+
+The divergence monitor does **not** score against whichever
+`output/backtest_multi_*.json` sorts last. It scores against the artifact named
+by `divergence.baseline_pin` in `config/default.yaml` (KAN-51).
+
+Recency selection is not a pin. Under it the baseline of record was a filesystem
+accident: `run_divergence.sh` passed no `--backtest` at all, so every 04:45 run
+took `find_latest_backtest_json()`, and the weekly refresh replaced the artifact
+the gate evidence was being measured against every Tuesday — with nothing
+recording that it had changed, and no way afterwards to say which baseline had
+judged a given session. D16 requires the Rung-0 baseline to have "its own monitor
+pins"; this is the mechanism half of that.
+
+### Where the pin lives, and what enforces it
+
+```yaml
+# config/default.yaml
+divergence:
+  baseline_pin: output/backtest_multi_20260819_183451.json
+```
+
+- **Resolution.** `scripts/ops/baseline_pin.py` turns that value into an
+  absolute path (relative paths resolve against the caller's working directory,
+  and both wrappers `cd` to the deployed checkout first). `ALGO_BASELINE_PIN`
+  overrides it for one run — useful for scoring an ad-hoc comparison against a
+  different artifact, and used by the wrapper tests. Never export it in a login
+  shell: the nightly job would then judge against whatever it points at.
+- **Invocation.** `deploy/launchd/run_divergence.sh` passes
+  `--backtest <pin> --pinned`. `--pinned` is what swaps the tolerant ad-hoc
+  semantics for pinned ones.
+- **Ad-hoc runs are unchanged.** Without `--pinned`, `--backtest` is optional and
+  recency remains the documented default. That is deliberate: making the strict
+  behaviour global would break every local run against an older artifact, which
+  is not what the pin buys.
+
+### The two ways a pinned run refuses to judge
+
+Both exit **3** — the same outage code as a non-comparable baseline, because it
+is the same outage: no drift detection is running. Both print a stable token that
+`scripts/ops/divergence_alert.py` reads back so the Telegram names the actual
+reason instead of the generic "not comparable" text, and **neither writes a
+report or an evidence-store row** — a session that was never scored must not
+land in the store as a `NO_DATA` observation, because the epoch clock reads
+`NO_DATA` as "the monitor ran and could not judge".
+
+| Token | When | What to do |
+|---|---|---|
+| `BASELINE_PIN_MISSING` | The pinned path is absent, unreadable, or no pin is configured at all | Fix `divergence.baseline_pin`, or produce the artifact it names |
+| `BASELINE_SHAPE_MISMATCH` | The pinned baseline's sleeve set differs from the live book's | Re-pin to a baseline of the live book's shape (see below) |
+
+There is deliberately **no fallback to recency** on `BASELINE_PIN_MISSING`. A
+job that ran, reported success and meant nothing is the 2026-08-13 failure
+pattern — the 04:15 and 04:45 jobs both aborted silently for two days and
+2026-08-13 is a permanent hole in the gate evidence. The wrapper does not decide
+either: it hands the empty pin to the monitor and lets the monitor be the single
+authority on whether the run can mean anything.
+
+**Why the shape check exists.** `is_like_for_like` checks the baseline's
+*execution* assumptions — fills, the commission floor, the point-in-time
+universe, the coverage state — and has no opinion on its *shape*. A six-sleeve,
+27×-capital artifact scored against a one-sleeve Rung-0 book passes every one of
+those requirements and still is not a comparison: the aggregate sums only dates
+present in *every* portfolio, and a per-sleeve verdict that exists on one side
+only is silently skipped. The check compares the baseline's `portfolios` keys
+against the live `portfolio_config` rows, dropping synthetic sleeves on both
+sides (`is_excluded_portfolio` — see
+[drill-evidence-isolation.md](drill-evidence-isolation.md)), and it runs on the
+**full** live set before `--portfolio` narrows anything, so a scoped ad-hoc run
+cannot report a clean sleeve out of a book the pin does not describe.
+
+### Which baseline judged a session
+
+Every `divergence_daily` row records the pinned artifact's basename in
+`baseline_id`, and `(sleeve, session_date, baseline_id)` is the uniqueness key —
+so verdicts scored against different book shapes sit in different rows rather
+than overwriting each other, and the evidence the gate reads can be filtered to
+one baseline.
+
+### Re-pinning at a rung change
+
+Re-pin deliberately; it is a change to what the evidence means.
+
+1. Produce the new baseline (*Regenerating the headline baseline* above) and
+   check `config.coverage.state` is `OK`.
+2. Confirm its `portfolios` keys match the live book's sleeves — otherwise the
+   first pinned run exits 3 with `BASELINE_SHAPE_MISMATCH`.
+3. Set `divergence.baseline_pin` to the new path and land it through a PR.
+4. Redeploy the wrappers (`deploy/launchd/deploy.sh`) if they changed — the
+   config is read from the repo checkout, so a config-only change takes effect at
+   the next 04:45 run without a redeploy.
+5. Run the monitor by hand once and confirm the log line `baseline pin: <path>`
+   and a non-3 exit before trusting the next night's verdict.
+
+### The weekly refresh cannot delete the pin
+
+`run_backtest_refresh.sh` prunes `output/backtest_multi_*.json` older than 90
+days. Once pinned, the baseline of record is the one artifact in `output/` that
+*stops* being rewritten — so it is guaranteed to age past that cutoff and be
+deleted by the job whose purpose is to keep the monitor working. The prune now
+excludes it (`find ... ! -samefile "$PIN"`, an inode comparison so the spelling
+of the path cannot matter), and **skips itself entirely** when the pin cannot be
+resolved: disk is cheap and the artifact is not reproducible, since its coverage
+numbers depend on which bars IB served that week.
+
+### Staleness now measures "has not been re-pinned"
+
+A consequence worth stating rather than discovering. The KAN-56 staleness check
+(exit **4** past `--max-baseline-age-days`, default 14) was written when the
+monitor followed recency, so it meant *the weekly refresh has stopped producing
+artifacts*. Under a pin the refresh no longer moves what the monitor reads, so
+the same check now means *this pin has not been re-pinned in 14 days* — which for
+a baseline deliberately fixed for the duration of an epoch is expected, not a
+fault. Two things keep that from becoming nightly noise today: exit 3 outranks
+exit 4, and the current pin is `coverage.state: BLOCKED` (see
+[KAN-59](https://huiliang.atlassian.net/browse/KAN-59)), so the monitor exits 3
+regardless. Revisit the threshold when the Rung-0 baseline is pinned for real
+(P2-24); the refresh's own dead-man switch, not this check, is what covers "the
+refresh died".
+
+---
+
 ## Regenerating the headline baseline
 
 Run these yourself; they need IB Gateway and write into `output/`.
@@ -261,11 +383,12 @@ omitted. Treat any headline number produced without it as indicative only.
 `deploy/launchd/run_backtest_refresh.sh` (Tuesdays 05:00 SGT) reruns the same
 backtest so the baseline stays current. It passes `--universe-snapshots`, and
 **aborts with exit 2 and a Telegram alert if the snapshot file is missing**
-rather than running without it. That guard is the point: the monitor
-auto-selects the *newest* `output/backtest_multi_*.json`, so one refresh
-without the flag would write a survivorship-biased artifact that supersedes the
-rebaselined one and revert the monitor to exit 3 — undoing the rebaseline
-within a week, silently. Producing nothing is strictly better.
+rather than running without it. Producing nothing is strictly better than
+producing a survivorship-biased artifact. The pin has narrowed that guard's blast
+radius without removing it: such an artifact no longer becomes the baseline of
+record by being newest, but it still sits in `output/` looking like a candidate
+at the next re-pin, and an operator who picks it reverts the monitor to exit 3 —
+undoing the rebaseline, just later.
 
 Exit codes: `1` = IB Gateway unreachable, `2` = membership snapshot missing,
 `124` = exceeded the deadline and was killed, otherwise the backtest's own code.
@@ -351,8 +474,8 @@ the trainer is purged by holding period and embargoed by 5 days, and reports
 1. Check `config.coverage.state` in the new artifact. If it is `BLOCKED`, the
    baseline is not usable — chase the bars for the tickers in
    `excluded_tickers` (highest membership-day counts first) and re-run.
-2. Point the divergence monitor at the new file (it picks the latest
-   `output/backtest_multi_*.json` automatically) and confirm the header no
-   longer says `[NOT LIKE-FOR-LIKE]`.
+2. Point the divergence monitor at the new file by re-pinning it — see *The
+   pinned baseline of record* above; the monitor does **not** pick it up by being
+   newest. Confirm the header no longer says `[NOT LIKE-FOR-LIKE]`.
 3. Re-check the IPS's stated expectations against the new numbers — if the
    strategy's justification moved, the IPS has to move with it.

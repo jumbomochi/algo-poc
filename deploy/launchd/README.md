@@ -340,7 +340,9 @@ launchctl list | grep local.algo-gateway-watchdog
 
 Runs `run_backtest_refresh.sh` every **Tuesday 05:00 SGT** — full 10yr
 backtest so the [divergence monitor](../../docs/operations/divergence-monitor.md)
-baseline stays current (it auto-picks the newest `output/backtest_multi_*.json`;
+baseline stays current (the monitor scores against the artifact named by
+`divergence.baseline_pin`, not the newest one — re-pinning is deliberate, see
+docs/operations/backtest-baseline.md;
 without refreshes the live equity dates never overlap the baseline and every
 portfolio reads `NO_DATA`).
 

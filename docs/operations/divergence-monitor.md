@@ -63,7 +63,8 @@ python scripts/divergence_monitor.py \
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--backtest` | latest `output/backtest_multi_*.json` | Source of expected equity series |
+| `--backtest` | latest `output/backtest_multi_*.json` | Source of expected equity series. The nightly job passes the pin instead — see below |
+| `--pinned` | off | Treat `--backtest` as the baseline of record: no recency fallback, and exit 3 on a missing pin or a sleeve-shape mismatch |
 | `--window` | 30 | Trading days in the rolling comparison window |
 | `--threshold` | 0.20 | Relative divergence warning threshold (20%) |
 | `--portfolio` | (all) | Limit to one named portfolio |
@@ -113,7 +114,7 @@ transient or overwritten, so they are reports, not evidence.
 | 0 | All portfolios OK or WARNING (or genuinely no overlapping history yet) | None |
 | 1 | At least one portfolio BREACH | Alert (Slack/email) |
 | 2 | Hard error (DB unreachable, backtest missing, invalid args) | Page on-call |
-| 3 | Baseline not comparable — **the monitor is blind**, no drift detection is running | Alert; regenerate the baseline ([backtest-baseline.md](backtest-baseline.md)) |
+| 3 | Baseline not comparable, **or** the pin is missing / describes a differently-shaped book — **the monitor is blind**, no drift detection is running | Alert; regenerate or re-pin the baseline ([backtest-baseline.md](backtest-baseline.md)) |
 | 4 | Baseline **stale** — the verdicts are real, but the artifact they were scored against is older than `--max-baseline-age-days` | Alert; the fault is upstream in the weekly refresh, not in divergence |
 
 Precedence is worst-outage-first: **1 > 2 > 3 > 4**. A breach outranks code 3
@@ -122,6 +123,18 @@ non-comparable baseline forces every status to `NO_DATA` and there is nothing
 left to breach, which is exactly why code 3 must not be 0. Code 3 outranks
 code 4 for the same kind of reason: *blind* means no drift detection is running
 at all, *stale* means it is running against old expectations.
+
+### The baseline is pinned, not picked (code 3)
+
+Production passes `--backtest <pin> --pinned`, where the pin comes from
+`divergence.baseline_pin` in `config/default.yaml` via
+`scripts/ops/baseline_pin.py` (KAN-51). Two failures land on exit 3 with a named
+token on stdout — `BASELINE_PIN_MISSING` and `BASELINE_SHAPE_MISMATCH` — and
+neither writes a report or an evidence-store row, since a session that was never
+scored must not appear in the store as a `NO_DATA` observation. There is no
+fallback to filename recency, deliberately. The full contract, and the re-pin
+procedure, are in
+[backtest-baseline.md](backtest-baseline.md#the-pinned-baseline-of-record).
 
 ### Baseline staleness (code 4)
 
