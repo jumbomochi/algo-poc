@@ -198,6 +198,24 @@ class CurrencyConfig(BaseModel):
     minimum_commission_usd: float = Field(default=1.0, ge=0.0)
 
 
+class DivergenceConfig(BaseModel):
+    """How the nightly divergence monitor picks the baseline it judges against.
+
+    ``baseline_pin`` is the *baseline of record* (KAN-51): the artifact the
+    monitor scores live equity against, stated here rather than discovered by
+    filename recency in ``output/``. Recency made the baseline a filesystem
+    accident — the weekly refresh writes a new artifact every Tuesday and
+    silently became the thing the gate evidence was measured against.
+
+    A relative path is resolved against the working directory of whoever reads
+    it; the launchd wrapper cds to the deployed checkout first. ``None`` means
+    unpinned, which ``run_divergence.sh`` deliberately does NOT treat as
+    "fall back to recency" — see ``scripts/ops/baseline_pin.py``.
+    """
+
+    baseline_pin: str | None = None
+
+
 class ResearchConfig(BaseModel):
     shadow_enabled: bool = False
     factor_ids: list[str] = Field(
@@ -229,6 +247,7 @@ class AppConfig(BaseModel):
     capital: CapitalConfig = Field(default_factory=CapitalConfig)
     currency: CurrencyConfig = Field(default_factory=CurrencyConfig)
     research: ResearchConfig = Field(default_factory=ResearchConfig)
+    divergence: DivergenceConfig = Field(default_factory=DivergenceConfig)
 
     @model_validator(mode="after")
     def validate_live_currency_safety(self) -> AppConfig:
