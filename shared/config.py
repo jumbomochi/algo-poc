@@ -114,6 +114,13 @@ class DataIngestionConfig(BaseModel):
 class UniverseConfig(BaseModel):
     watchlist_source: str = "sp500"
     custom_tickers: list[str] = Field(default_factory=list)
+    # What data_ingestion KEEPS bars for, as opposed to what it trades
+    # (KAN-58). Deliberately wider than watchlist_source and deliberately a
+    # separate setting: bars for a name that later leaves the index cannot be
+    # fetched back afterwards, so capture has to cover the whole index from
+    # today, while widening the trading universe stays its own decision. Takes
+    # the same values as watchlist_source, plus "none" to disable capture.
+    capture_source: str = "membership"
 
 
 class IBConfig(BaseModel):

@@ -48,6 +48,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from shared.halt_state import HaltStateRepository  # noqa: E402
+from shared.models.market_data import OHLCVDaily  # noqa: E402
 from shared.models.order_ledger import (  # noqa: E402
     ExecutionFill,
     OrderIntent,
@@ -83,9 +84,22 @@ class RunFacts:
     fills: int
     risk_rejected: int
     submission_failed: int
+    # KAN-58. Distinct tickers whose bars landed in ``ohlcv_daily`` this run,
+    # against the size of the capture universe. Capture is forward-only — a
+    # session that silently writes 400 of 503 names leaves a hole no vendor
+    # will sell back, and one that looks complete years from now. Both zero
+    # when capture is disabled.
+    capture_written: int = 0
+    capture_expected: int = 0
 
 
-def collect_facts(session: Session, *, since: datetime, mode: str) -> RunFacts:
+def collect_facts(
+    session: Session,
+    *,
+    since: datetime,
+    mode: str,
+    capture_expected: int = 0,
+) -> RunFacts:
     """Read the run's facts from the ledger tables.
 
     ``since`` bounds fills by ``executed_at`` and rejections by ``created_at``
@@ -118,6 +132,16 @@ def collect_facts(session: Session, *, since: datetime, mode: str) -> RunFacts:
         ).all()
     )
 
+    # Counted by ``ingested_at``, not by the bar's own date: a row stays in the
+    # table forever, so only when it was written separates this run's capture
+    # from a previous one. Distinct tickers rather than rows — the figure is
+    # coverage of the universe, and a backfill writing many dates for one name
+    # must not read as many names captured.
+    captured = session.scalar(
+        select(func.count(func.distinct(OHLCVDaily.ticker)))
+        .where(OHLCVDaily.ingested_at >= since)
+    ) or 0
+
     return RunFacts(
         halt_active=halt is not None,
         halt_source=halt.source if halt else None,
@@ -125,6 +149,8 @@ def collect_facts(session: Session, *, since: datetime, mode: str) -> RunFacts:
         fills=int(fills),
         risk_rejected=int(rejected.get(OrderStatus.RISK_REJECTED, 0)),
         submission_failed=int(rejected.get(OrderStatus.SUBMISSION_FAILED, 0)),
+        capture_written=int(captured),
+        capture_expected=int(capture_expected),
     )
 
 
@@ -142,11 +168,40 @@ def render_summary(facts: RunFacts) -> str:
     else:
         halt = "halt: clear"
 
-    return (
+    line = (
         f"{halt} · fills:{facts.fills}"
         f" · rejected: risk {facts.risk_rejected}"
         f" / broker {facts.submission_failed}"
     )
+
+    # Omitted entirely when capture is disabled: a permanent "0/0" is noise,
+    # and a field the operator learns to skip is worse than no field.
+    if facts.capture_expected:
+        short = facts.capture_expected - facts.capture_written
+        line += f" · capture: {facts.capture_written}/{facts.capture_expected}"
+        if short > 0:
+            line += f" ⚠ short {short}"
+
+    return line
+
+
+def _capture_expected() -> int:
+    """Size of the capture universe data_ingestion is configured to keep.
+
+    Reported as 0 — i.e. the capture field is omitted — if the config or the
+    membership snapshot cannot be read. A digest that prints nothing about
+    capture is recoverable; one that refuses to print at all would cost the
+    operator the halt and fill lines too, which are the reason this job exists.
+    """
+    try:
+        from shared.config import load_config
+        from shared.universe import resolve_capture_universe
+
+        config = load_config(str(_REPO_ROOT / "config" / "default.yaml"))
+        return len(resolve_capture_universe(config.universe.capture_source))
+    except Exception as exc:  # noqa: BLE001 — capture must not sink the digest
+        print(f"capture universe unavailable: {_redact(str(exc))}", file=sys.stderr)
+        return 0
 
 
 def _local_midnight() -> datetime:
@@ -167,17 +222,33 @@ def main(argv: list[str] | None = None) -> int:
         help="ISO-8601 lower bound for fills/rejections; defaults to local midnight",
     )
     parser.add_argument("--mode", default=os.environ.get("ALGO_MODE", "paper"))
+    parser.add_argument(
+        "--capture-expected",
+        type=int,
+        default=None,
+        help="size of the capture universe; defaults to universe.capture_source",
+    )
     args = parser.parse_args(argv)
 
     if not args.database_url:
         parser.error("no --database-url and no $ALGO_DATABASE_URL")
     since = datetime.fromisoformat(args.since) if args.since else _local_midnight()
+    capture_expected = (
+        args.capture_expected
+        if args.capture_expected is not None
+        else _capture_expected()
+    )
 
     try:
         engine = create_engine(args.database_url)
         try:
             with Session(engine) as session:
-                facts = collect_facts(session, since=since, mode=args.mode)
+                facts = collect_facts(
+                    session,
+                    since=since,
+                    mode=args.mode,
+                    capture_expected=capture_expected,
+                )
         finally:
             engine.dispose()
     except Exception as exc:  # noqa: BLE001 — the wrapper needs a clean exit code

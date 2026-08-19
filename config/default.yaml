@@ -24,6 +24,14 @@ universe:
   # custom_tickers are additive for non-custom sources.
   watchlist_source: sleeves
   custom_tickers: []
+  # What bars are KEPT in ohlcv_daily, as opposed to what is traded (KAN-58).
+  # membership = every current member of data/universe/sp500_membership.json
+  # (503), so a name's history is already on disk by the time it leaves the
+  # index — IB will not serve a departed name's bars back afterwards, which is
+  # what left the point-in-time re-run BLOCKED at 11.28% coverage. Capture-only
+  # names are persisted but NOT published to stream:market_data, so this does
+  # not widen what signal_generation scores. Set to "none" to disable.
+  capture_source: membership
 
 data_ingestion:
   market_data_source: ib

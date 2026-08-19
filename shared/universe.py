@@ -14,8 +14,16 @@ import bisect
 import json
 from collections.abc import Collection, Iterable, Mapping
 from datetime import date
+from pathlib import Path
 
 from shared.historical_sectors import HISTORICAL_SECTOR_MAP
+
+# The committed point-in-time index snapshot, pinned to THIS checkout rather
+# than to the process cwd: data_ingestion runs from a container workdir and the
+# launchd jobs run from ~/ibc, so a relative path resolves differently in each.
+MEMBERSHIP_SNAPSHOT_PATH = (
+    Path(__file__).resolve().parents[1] / "data" / "universe" / "sp500_membership.json"
+)
 
 # Top 50 S&P 500 by market cap **as of early 2025**.
 #
@@ -233,6 +241,35 @@ def get_union_universe(strategy_names: list[str]) -> list[str]:
     return result
 
 
+def current_index_members(
+    snapshot_path: str | Path = MEMBERSHIP_SNAPSHOT_PATH,
+    as_of: date | None = None,
+) -> list[str]:
+    """Constituents of the committed membership snapshot effective ``as_of``.
+
+    This is the *capture* universe (KAN-58): the whole index, so a name's bars
+    keep accumulating and are still there after it departs. The sleeve union is
+    the trading universe and is deliberately a different, smaller set —
+    conflating the two is what left ``ohlcv_daily`` empty of exactly the names
+    a point-in-time baseline needs (KAN-52 came back BLOCKED at 11.28%
+    coverage because IB will not serve delisted history retroactively).
+
+    Raises if the snapshot has no members effective ``as_of`` — a stale file
+    must abort the capture universe loudly rather than resolve to nothing and
+    look like a healthy zero.
+    """
+    calendar = MembershipCalendar.from_json_file(str(snapshot_path))
+    day = as_of or date.today()
+    members = calendar.members_as_of(day)
+    if not members:
+        raise ValueError(
+            f"membership snapshot {snapshot_path} has no members effective "
+            f"{day.isoformat()} (first snapshot {calendar.first_snapshot_date}); "
+            "regenerate with scripts/ops/build_membership_snapshot.py"
+        )
+    return sorted(members)
+
+
 def resolve_watchlist(watchlist_source: str, custom_tickers: list[str]) -> list[str]:
     """Resolve the data-ingestion watchlist from config.
 
@@ -240,6 +277,8 @@ def resolve_watchlist(watchlist_source: str, custom_tickers: list[str]) -> list[
         - ``sleeves``: union universe of the active sleeves (the default —
           ingest exactly what the strategies trade)
         - ``sp500``: SP500_TOP100
+        - ``membership``: every current member of the committed index
+          snapshot — the capture universe, see :func:`current_index_members`
         - ``custom``: only ``custom_tickers``
 
     ``custom_tickers`` are additive for the non-custom sources.
@@ -249,15 +288,36 @@ def resolve_watchlist(watchlist_source: str, custom_tickers: list[str]) -> list[
         base = get_union_universe(ACTIVE_SLEEVES)
     elif watchlist_source == "sp500":
         base = list(SP500_TOP100)
+    elif watchlist_source == "membership":
+        base = current_index_members()
     elif watchlist_source == "custom":
         base = []
     else:
         raise ValueError(
             f"Unknown universe.watchlist_source {watchlist_source!r}; "
-            "expected 'sleeves', 'sp500', or 'custom'"
+            "expected 'sleeves', 'sp500', 'membership', or 'custom'"
         )
     seen = set(base)
     return base + [t for t in custom_tickers if t not in seen]
+
+
+def resolve_capture_universe(capture_source: str) -> list[str]:
+    """Names whose daily bars are *kept*, from ``universe.capture_source``.
+
+    ``none`` (or empty) disables capture. Anything else goes through
+    :func:`resolve_watchlist`, so an unknown source raises rather than
+    silently resolving to nothing — a typo here would look exactly like a
+    healthy zero-capture day, and the bars it failed to keep cannot be
+    fetched back later.
+
+    Lives beside the watchlist resolver rather than in the data_ingestion
+    service because the daily digest has to report capture *expected* against
+    the same universe the service captured, and it must be able to do that
+    without importing the IB client.
+    """
+    if not capture_source or capture_source == "none":
+        return []
+    return resolve_watchlist(capture_source, [])
 
 
 # Sector labels for individual equities (GICS-style buckets). Lives here —
