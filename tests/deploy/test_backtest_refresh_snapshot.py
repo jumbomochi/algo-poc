@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -69,7 +70,7 @@ def test_the_wrapper_honours_the_test_overrides():
 
 def _drive(tmp_path, *, snapshot=True, gateway=True, backtest_exit=0,
            backtest_sleep=0, timeout_seconds=600, curl_exit=0,
-           deadman_url=DEADMAN_URL):
+           deadman_url=DEADMAN_URL, pin=None, resolve_pin=True):
     """Run the wrapper with everything it reaches out to stubbed.
 
     ``ALGO_DIR`` points at a scratch tree that *symlinks* the repo's ``deploy``
@@ -83,10 +84,14 @@ def _drive(tmp_path, *, snapshot=True, gateway=True, backtest_exit=0,
     home = tmp_path / "home"
     home.mkdir()
     algo_dir = tmp_path / "algo"
-    algo_dir.mkdir()
+    # exist_ok: a test may stage artifacts into output/ before driving the
+    # wrapper (see _stage_old_artifacts).
+    algo_dir.mkdir(exist_ok=True)
     (algo_dir / "deploy").symlink_to(REPO / "deploy")
     (algo_dir / "scripts").symlink_to(REPO / "scripts")
-    (algo_dir / "output").mkdir()
+    # The pin resolver reads config/default.yaml relative to the wrapper's cwd.
+    (algo_dir / "config").symlink_to(REPO / "config")
+    (algo_dir / "output").mkdir(exist_ok=True)
     (algo_dir / "data" / "universe").mkdir(parents=True)
 
     membership = algo_dir / "data" / "universe" / "sp500_membership.json"
@@ -126,7 +131,15 @@ exit {curl_exit}
 """)
     # Records the backtest's argv and writes a plausible artifact, exactly as
     # the real run does — the wrapper greps the log and names the newest file.
+    # The pin resolver is dispatched to the REAL script under this interpreter:
+    # it is the seam the prune guard depends on, so stubbing it would leave the
+    # thing under test untested. ``resolve_pin=False`` reproduces "nothing is
+    # pinned" — exit 1, empty stdout, exactly what resolve_pin() does then.
+    resolver = "exit 1" if not resolve_pin else f'exec {sys.executable} "$@"'
     fake_python = stub("fake-python", f"""#!/bin/bash
+case "$1" in
+  *baseline_pin.py) {resolver} ;;
+esac
 {{ for a in "$@"; do printf '%s\\n' "$a"; done; printf -- '---END---\\n'; }} >> {argv_log}
 sleep {backtest_sleep}
 echo "AGGREGATE"
@@ -147,6 +160,13 @@ exit {backtest_exit}
         ALGO_KEYCHAIN_SERVICE="algo-poc-absent-test-service",
         ALGO_REFRESH_TIMEOUT_SECONDS=str(timeout_seconds),
     )
+    if pin is not None:
+        env["ALGO_BASELINE_PIN"] = str(pin)
+    else:
+        # Otherwise the committed pin would resolve against this scratch tree's
+        # output/, which is harmless but makes the assertions depend on a path
+        # that only exists on the deployment host.
+        env.pop("ALGO_BASELINE_PIN", None)
     result = subprocess.run(
         [str(RUN_REFRESH)], capture_output=True, text=True,
         timeout=180, env=env, cwd=str(REPO),
@@ -385,3 +405,92 @@ def test_the_ping_url_is_never_written_to_the_log_verbatim(tmp_path):
 
     assert DEADMAN_URL not in log
     assert "hc.example.test" in log, "too redacted to debug a typo'd host"
+
+
+# ---------------------------------------------------------------------------
+# The pinned baseline survives the refresh (KAN-51)
+#
+# KAN-23 hardened this wrapper against *writing* a biased artifact. It said
+# nothing about the artifact it removes: the success path prunes
+# output/backtest_multi_*.json older than 90 days, and the baseline of record is
+# exactly the file that stops being rewritten once it is pinned — so it is the
+# one guaranteed to age past the cutoff and be deleted by the job whose purpose
+# is to keep the monitor working.
+# ---------------------------------------------------------------------------
+
+#: Older than the wrapper's 90-day prune cutoff.
+_STALE_MTIME = (1_600_000_000, 1_600_000_000)
+
+
+def _stage_old_artifacts(tmp_path):
+    """Two 200-day-old artifacts in the stub tree: the pin, and a bystander.
+
+    The bystander is what makes the assertion meaningful — without it a passing
+    test could equally mean "the prune never ran".
+    """
+    output = tmp_path / "algo" / "output"
+    output.mkdir(parents=True, exist_ok=True)
+    pinned = output / "backtest_multi_20260601_000000.json"
+    bystander = output / "backtest_multi_20260602_000000.json"
+    pinned.write_text('{"pinned": true}')
+    bystander.write_text('{"pinned": false}')
+    os.utime(pinned, _STALE_MTIME)
+    os.utime(bystander, _STALE_MTIME)
+    return pinned, bystander
+
+
+def test_the_prune_leaves_the_pinned_baseline_byte_identical(tmp_path):
+    """AC6."""
+    pinned, bystander = _stage_old_artifacts(tmp_path)
+    before = pinned.read_bytes()
+
+    result, _, _, log, _ = _drive(tmp_path, pin=pinned)
+
+    assert result.returncode == 0, result.stderr
+    assert pinned.exists(), "the weekly refresh deleted the baseline of record"
+    assert pinned.read_bytes() == before
+    # Proves the prune actually ran, so the survival above is the exclusion
+    # working rather than the prune being skipped.
+    assert not bystander.exists(), log
+
+
+def test_an_unresolvable_pin_skips_the_prune_rather_than_risking_it(tmp_path):
+    """Disk is cheap; the baseline of record is not reproducible — the coverage
+    numbers depend on which bars IB served that week. So when the wrapper cannot
+    tell which artifact is pinned it deletes nothing and says so."""
+    pinned, bystander = _stage_old_artifacts(tmp_path)
+
+    result, _, _, log, _ = _drive(tmp_path, resolve_pin=False)
+
+    assert result.returncode == 0, result.stderr
+    assert pinned.exists() and bystander.exists()
+    assert "prune" in log.lower(), log
+
+
+def test_a_pin_outside_the_output_directory_does_not_disable_the_prune(tmp_path):
+    """An operator may pin an artifact kept elsewhere. That must not turn the
+    prune off — nothing in output/ is then protected, and nothing needs to be."""
+    _, bystander = _stage_old_artifacts(tmp_path)
+    elsewhere = tmp_path / "keep" / "backtest_multi_20260601_000000.json"
+    elsewhere.parent.mkdir()
+    elsewhere.write_text('{"pinned": true}')
+
+    result, _, _, log, _ = _drive(tmp_path, pin=elsewhere)
+
+    assert result.returncode == 0, result.stderr
+    assert elsewhere.exists()
+    assert not bystander.exists(), log
+
+
+def test_a_configured_pin_that_does_not_exist_yet_still_prunes(tmp_path):
+    """Between a re-pin and the run that produces the artifact the pin names a
+    file that is not there. The monitor is what complains about that (exit 3);
+    the refresh must not wedge its own housekeeping over it."""
+    _, bystander = _stage_old_artifacts(tmp_path)
+
+    result, _, _, log, _ = _drive(
+        tmp_path, pin=tmp_path / "algo" / "output" / "not_written_yet.json",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not bystander.exists(), log

@@ -1,7 +1,8 @@
 #!/bin/bash
 # Daily divergence monitor for algo-poc
 # Runs at 4:45 AM SGT, ~30 min after run_paper.sh (4:15) has written the day's
-# equity_snapshots row. Compares live paper equity to the latest backtest.
+# equity_snapshots row. Compares live paper equity to the PINNED backtest
+# baseline (see "THE BASELINE IS PINNED" below) — not to the latest artifact.
 #
 # Exit-code contract (from scripts/divergence_monitor.py):
 #   0 = all portfolios OK or WARNING       -> no action

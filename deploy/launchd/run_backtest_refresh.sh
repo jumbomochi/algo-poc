@@ -1,10 +1,12 @@
 #!/bin/bash
 # Weekly backtest refresh for algo-poc — Tuesdays 05:00 SGT.
 #
-# Re-runs the full 10yr backtest so the divergence monitor's baseline stays
-# current (it auto-picks the newest output/backtest_multi_*.json; without a
-# refresh the live equity dates never overlap the baseline and every
-# portfolio reads NO_DATA forever).
+# Re-runs the full 10yr backtest so a *current* artifact is always available to
+# pin (without a refresh the live equity dates eventually stop overlapping any
+# baseline and every portfolio reads NO_DATA forever). Since KAN-51 the monitor
+# scores against the artifact named by divergence.baseline_pin, not the newest
+# one, so a refresh no longer changes what the monitor judges against — re-pinning
+# is a deliberate act, documented in docs/operations/backtest-baseline.md.
 #
 # Tuesday, not the runbook's original Monday: IBKR's historical-data farm is
 # routinely dead through Monday pre-market (observed 2026-07-05/06 — down
@@ -17,6 +19,17 @@
 #   2 = point-in-time membership snapshot missing, nothing run (KAN-23)
 # 124 = the backtest exceeded ALGO_REFRESH_TIMEOUT_SECONDS and was killed
 #   * = the backtest's own exit code
+#
+# WHY THE PRUNE HAS TO KNOW ABOUT THE PIN (KAN-51)
+# ------------------------------------------------
+# The divergence monitor no longer takes the newest artifact — it takes the one
+# pinned in config/default.yaml. Which means the baseline of record is the one
+# file in output/ that STOPS being rewritten, so it is guaranteed to age past
+# this job's 90-day cutoff and be deleted by the job whose whole purpose is to
+# keep the monitor working. The prune below excludes it, and skips itself
+# entirely when the pin cannot be resolved: disk is cheap, and the artifact is
+# not reproducible — its coverage numbers depend on which bars IB served that
+# week.
 #
 # WHY THIS JOB ALSO HAS A DEAD-MAN SWITCH (KAN-56)
 # ------------------------------------------------
@@ -88,14 +101,15 @@ if [ -f "$CANON" ] && ! cmp -s "$0" "$CANON"; then
     echo "$(date): WARNING - $(basename "$0") differs from repo canonical ($CANON); run deploy/launchd/deploy.sh to resync" >> "$LOG_FILE"
 fi
 
-# Checked BEFORE the gateway, and fatal rather than best-effort. The monitor
-# auto-selects the newest output/backtest_multi_*.json, so a refresh that ran
-# without --universe-snapshots would write a survivorship-biased artifact that
-# supersedes the rebaselined one and revert the monitor to exit 3 (BLIND) —
-# undoing KAN-23 within a week, silently. Producing nothing is strictly better
-# than producing that, and a local misconfiguration must not be masked by
-# whatever IB happens to be doing at 05:00. Exit 2 keeps it distinct from the
-# gateway's exit 1 in the launchd log.
+# Checked BEFORE the gateway, and fatal rather than best-effort. A refresh that
+# ran without --universe-snapshots writes a survivorship-biased artifact, and
+# producing nothing is strictly better than producing that. The pin (KAN-51) has
+# narrowed the blast radius but not removed it: such an artifact no longer
+# supersedes the baseline of record by being newest, but it is still sitting in
+# output/ looking like a candidate at the next re-pin, and an operator picking it
+# reverts the monitor to exit 3 (BLIND) — undoing KAN-23, just later. A local
+# misconfiguration must also not be masked by whatever IB happens to be doing at
+# 05:00. Exit 2 keeps it distinct from the gateway's exit 1 in the launchd log.
 if [ ! -f "$MEMBERSHIP_SNAPSHOT" ]; then
     echo "$(ts): ERROR - membership snapshot missing at $MEMBERSHIP_SNAPSHOT;" \
          "refusing to write a survivorship-biased baseline" >> "$LOG_FILE"
@@ -168,8 +182,30 @@ if [ "$EXIT_CODE" -eq 0 ]; then
     SUMMARY=$(grep -A6 "AGGREGATE" "$LOG_FILE" | grep -E "Total Return|Sharpe|Max Drawdown" | head -3 | tr -s ' ' | tr '\n' ' ')
     echo "$(ts): refresh OK -> $NEWEST" >> "$LOG_FILE"
     telegram "✅ Weekly backtest refreshed: $(basename "${NEWEST:-unknown}") — ${SUMMARY:-see log}. Divergence monitor baseline is now current."
-    # Prune baselines older than 90 days (~64MB each); the monitor only uses the newest.
-    find "$ALGO_DIR/output" -name "backtest_multi_*.json" -mtime +90 -delete 2>/dev/null
+    # Prune baselines older than 90 days (~64MB each) — except the pinned one.
+    # See "WHY THE PRUNE HAS TO KNOW ABOUT THE PIN" in the header. Resolved here
+    # rather than at the top of the script so a resolver failure cannot touch the
+    # abort paths above, which have nothing to prune.
+    BASELINE_PIN=$("$VENV" "$ALGO_DIR/scripts/ops/baseline_pin.py" 2>>"$LOG_FILE")
+    if [ -z "$BASELINE_PIN" ]; then
+        echo "$(ts): WARNING - could not resolve the divergence baseline pin;" \
+             "skipping the 90-day prune of output/ rather than risk deleting the" \
+             "baseline of record. Check divergence.baseline_pin in" \
+             "config/default.yaml" >> "$LOG_FILE"
+    elif [ -f "$BASELINE_PIN" ]; then
+        # -samefile, not a path match: the pin, this script and the monitor may
+        # each spell the same artifact differently (absolute, relative, through
+        # a symlinked checkout) and an inode comparison is right under all of them.
+        echo "$(ts): prune keeping pinned baseline $BASELINE_PIN" >> "$LOG_FILE"
+        find "$ALGO_DIR/output" -name "backtest_multi_*.json" -mtime +90 \
+             ! -samefile "$BASELINE_PIN" -delete 2>/dev/null
+    else
+        # A re-pin names the artifact before the run that produces it exists.
+        # Nothing in output/ needs protecting yet, and the monitor is what
+        # complains about the gap (exit 3, BASELINE_PIN_MISSING).
+        echo "$(ts): pinned baseline $BASELINE_PIN not present yet; pruning normally" >> "$LOG_FILE"
+        find "$ALGO_DIR/output" -name "backtest_multi_*.json" -mtime +90 -delete 2>/dev/null
+    fi
 else
     echo "$(ts): refresh FAILED (exit $EXIT_CODE)" >> "$LOG_FILE"
     telegram "❌ Weekly backtest refresh FAILED (exit $EXIT_CODE) — divergence baseline is getting stale. See ~/ibc/logs/$(basename "$LOG_FILE")."
