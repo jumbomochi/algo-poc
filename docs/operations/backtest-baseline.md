@@ -296,16 +296,212 @@ removed the bias. `scripts/run_backtest.py` prints a `failed:` list at the end
 of the fetch, and the artifact's `config.coverage.excluded_tickers` records the
 membership-day cost of each one.
 
-After a regeneration, record the exclusions here, per name, with their
-membership-day cost — a bare percentage hides whether the 3% missing is one
-long-lived name or forty brief ones:
+**Measured 2026-08-19 (KAN-52), the first PIT regeneration:**
+`output/backtest_multi_20260819_183451.json`, 826 tickers requested,
+**`coverage.state: BLOCKED`** — 142,856 of 1,265,893 membership-days excluded
+(**11.28%** against the 5.0% floor) across **164 names**.
+
+The dominant failure mode is not a stale symbol and not a missing
+`primaryExchange`. IB keeps a contract record for a delisted name but attaches
+it to the pseudo-exchange `VALUE`, and its historical service refuses that
+exchange outright:
+
+```
+Error 200: No security definition has been found for the request,
+           contract: Stock(symbol='AVB', exchange='SMART', currency='USD')
+Error 162: No data of type EODChart is available for the exchange 'VALUE'
+           and the security type 'Stock'
+```
+
+Both were reproduced by hand against the paper gateway on 2026-08-19. Neither
+`SMART` routing, nor an explicit `conId`, nor `exchange='VALUE'` recovers a
+single bar — the conId form qualifies the contract and *then* returns 162. So
+**there is no contract-construction fix**: IB cannot supply delisted-name
+history on this account, and a coverage-`OK` PIT baseline is unreachable from
+IB alone. Closing the gap needs a survivorship-free vendor for the excluded
+names, which is not yet ticketed.
+
+| Failure mode | Names | Membership-days | Share of exclusion |
+|---|---:|---:|---:|
+| Error 200 — no active listing; resolves only on `VALUE` | 132 | 127,819 | 89.5% |
+| Error 162 — resolves, HMDS returns no data | 24 | 14,809 | 10.4% |
+| Partial window — priced for part of its membership only | 8 | 228 | 0.2% |
+
+Per name, with their membership-day cost — a bare percentage hides whether the
+3% missing is one long-lived name or forty brief ones:
 
 | Ticker | Membership days lost | Why IB cannot price it |
-|---|---|---|
-| _(none recorded yet — fill in from the first PIT regeneration)_ | | |
+|---|---:|---|
+| `AVB` | 2,511 | no active listing — resolves only on `VALUE` (err 200) |
+| `EQR` | 2,511 | no active listing — resolves only on `VALUE` (err 200) |
+| `EA` | 2,509 | no active listing — resolves only on `VALUE` (err 200) |
+| `BK` | 2,477 | no active listing — resolves only on `VALUE` (err 200) |
+| `HOLX` | 2,477 | no active listing — resolves only on `VALUE` (err 200) |
+| `IPG` | 2,354 | no active listing — resolves only on `VALUE` (err 200) |
+| `K` | 2,354 | no active listing — resolves only on `VALUE` (err 200) |
+| `HES` | 2,290 | no active listing — resolves only on `VALUE` (err 200) |
+| `JNPR` | 2,290 | no active listing — resolves only on `VALUE` (err 200) |
+| `WBA` | 2,290 | no active listing — resolves only on `VALUE` (err 200) |
+| `DFS` | 2,226 | no active listing — resolves only on `VALUE` (err 200) |
+| `MRO` | 2,104 | no active listing — resolves only on `VALUE` (err 200) |
+| `ANSS` | 2,073 | no active listing — resolves only on `VALUE` (err 200) |
+| `WRK` | 2,040 | no active listing — resolves only on `VALUE` (err 200) |
+| `CMA` | 1,976 | no active listing — resolves only on `VALUE` (err 200) |
+| `PXD` | 1,976 | no active listing — resolves only on `VALUE` (err 200) |
+| `ATVI` | 1,852 | no active listing — resolves only on `VALUE` (err 200) |
+| `SEE` | 1,852 | no active listing — resolves only on `VALUE` (err 200) |
+| `ABC` | 1,789 | no active listing — resolves only on `VALUE` (err 200) |
+| `COO` | 1,756 | resolves, HMDS returns no data (err 162) |
+| `PKI` | 1,726 | no active listing — resolves only on `VALUE` (err 200) |
+| `FBHS` | 1,602 | no active listing — resolves only on `VALUE` (err 200) |
+| `NLSN` | 1,602 | no active listing — resolves only on `VALUE` (err 200) |
+| `DISH` | 1,572 | no active listing — resolves only on `VALUE` (err 200) |
+| `RE` | 1,572 | no active listing — resolves only on `VALUE` (err 200) |
+| `CTXS` | 1,539 | no active listing — resolves only on `VALUE` (err 200) |
+| `ANTM` | 1,475 | no active listing — resolves only on `VALUE` (err 200) |
+| `BLL` | 1,475 | no active listing — resolves only on `VALUE` (err 200) |
+| `CERN` | 1,475 | no active listing — resolves only on `VALUE` (err 200) |
+| `DISCA` | 1,475 | no active listing — resolves only on `VALUE` (err 200) |
+| `DISCK` | 1,475 | no active listing — resolves only on `VALUE` (err 200) |
+| `FB` | 1,475 | resolves, HMDS returns no data (err 162) |
+| `PBCT` | 1,475 | no active listing — resolves only on `VALUE` (err 200) |
+| `FLT` | 1,445 | no active listing — resolves only on `VALUE` (err 200) |
+| `GPS` | 1,413 | no active listing — resolves only on `VALUE` (err 200) |
+| `WLTW` | 1,413 | no active listing — resolves only on `VALUE` (err 200) |
+| `XLNX` | 1,413 | no active listing — resolves only on `VALUE` (err 200) |
+| `COG` | 1,351 | no active listing — resolves only on `VALUE` (err 200) |
+| `HBI` | 1,351 | no active listing — resolves only on `VALUE` (err 200) |
+| `KSU` | 1,351 | no active listing — resolves only on `VALUE` (err 200) |
+| `DRE` | 1,322 | no active listing — resolves only on `VALUE` (err 200) |
+| `ALXN` | 1,287 | no active listing — resolves only on `VALUE` (err 200) |
+| `LB` | 1,287 | resolves, HMDS returns no data (err 162) |
+| `SIVB` | 1,260 | no active listing — resolves only on `VALUE` (err 200) |
+| `FLIR` | 1,223 | no active listing — resolves only on `VALUE` (err 200) |
+| `VAR` | 1,223 | no active listing — resolves only on `VALUE` (err 200) |
+| `INFO` | 1,196 | resolves, HMDS returns no data (err 162) |
+| `CXO` | 1,160 | no active listing — resolves only on `VALUE` (err 200) |
+| `TIF` | 1,160 | no active listing — resolves only on `VALUE` (err 200) |
+| `ABMD` | 1,134 | no active listing — resolves only on `VALUE` (err 200) |
+| `TWTR` | 1,134 | no active listing — resolves only on `VALUE` (err 200) |
+| `CTRA` | 1,126 | no active listing — resolves only on `VALUE` (err 200) |
+| `ETFC` | 1,099 | no active listing — resolves only on `VALUE` (err 200) |
+| `MYL` | 1,099 | no active listing — resolves only on `VALUE` (err 200) |
+| `NBL` | 1,099 | no active listing — resolves only on `VALUE` (err 200) |
+| `ODFL` | 1,093 | resolves, HMDS returns no data (err 162) |
+| `FRC` | 1,071 | no active listing — resolves only on `VALUE` (err 200) |
+| `PEAK` | 1,067 | no active listing — resolves only on `VALUE` (err 200) |
+| `ADS` | 1,035 | no active listing — resolves only on `VALUE` (err 200) |
+| `CTL` | 1,035 | no active listing — resolves only on `VALUE` (err 200) |
+| `JWN` | 1,035 | no active listing — resolves only on `VALUE` (err 200) |
+| `CTLT` | 1,005 | no active listing — resolves only on `VALUE` (err 200) |
+| `AGN` | 971 | no active listing — resolves only on `VALUE` (err 200) |
+| `RTN` | 971 | no active listing — resolves only on `VALUE` (err 200) |
+| `UTX` | 971 | no active listing — resolves only on `VALUE` (err 200) |
+| `XEC` | 908 | no active listing — resolves only on `VALUE` (err 200) |
+| `ARNC` | 879 | no active listing — resolves only on `VALUE` (err 200) |
+| `CBS` | 846 | no active listing — resolves only on `VALUE` (err 200) |
+| `CELG` | 846 | no active listing — resolves only on `VALUE` (err 200) |
+| `HCP` | 846 | no active listing — resolves only on `VALUE` (err 200) |
+| `JEC` | 846 | no active listing — resolves only on `VALUE` (err 200) |
+| `STI` | 846 | resolves, HMDS returns no data (err 162) |
+| `SYMC` | 846 | no active listing — resolves only on `VALUE` (err 200) |
+| `VIAB` | 846 | no active listing — resolves only on `VALUE` (err 200) |
+| `APC` | 782 | resolves, HMDS returns no data (err 162) |
+| `FL` | 782 | no active listing — resolves only on `VALUE` (err 200) |
+| `RHT` | 782 | no active listing — resolves only on `VALUE` (err 200) |
+| `TMK` | 782 | no active listing — resolves only on `VALUE` (err 200) |
+| `TSS` | 782 | no active listing — resolves only on `VALUE` (err 200) |
+| `NLOK` | 756 | no active listing — resolves only on `VALUE` (err 200) |
+| `HFC` | 755 | no active listing — resolves only on `VALUE` (err 200) |
+| `HRS` | 718 | no active listing — resolves only on `VALUE` (err 200) |
+| `LLL` | 718 | no active listing — resolves only on `VALUE` (err 200) |
+| `MXIM` | 693 | no active listing — resolves only on `VALUE` (err 200) |
+| `ESRX` | 655 | no active listing — resolves only on `VALUE` (err 200) |
+| `KORS` | 655 | no active listing — resolves only on `VALUE` (err 200) |
+| `NFX` | 655 | resolves, HMDS returns no data (err 162) |
+| `SCG` | 655 | no active listing — resolves only on `VALUE` (err 200) |
+| `FOX` | 642 | resolves, HMDS returns no data (err 162) |
+| `FOXA` | 642 | resolves, HMDS returns no data (err 162) |
+| `CDAY` | 626 | no active listing — resolves only on `VALUE` (err 200) |
+| `AET` | 594 | no active listing — resolves only on `VALUE` (err 200) |
+| `CA` | 594 | no active listing — resolves only on `VALUE` (err 200) |
+| `COL` | 594 | no active listing — resolves only on `VALUE` (err 200) |
+| `PX` | 594 | no active listing — resolves only on `VALUE` (err 200) |
+| `SRCL` | 594 | no active listing — resolves only on `VALUE` (err 200) |
+| `NWL` | 580 | resolves, HMDS returns no data (err 162) |
+| `VIAC` | 567 | no active listing — resolves only on `VALUE` (err 200) |
+| `BHGE` | 566 | no active listing — resolves only on `VALUE` (err 200) |
+| `DPS` | 531 | no active listing — resolves only on `VALUE` (err 200) |
+| `GGP` | 531 | no active listing — resolves only on `VALUE` (err 200) |
+| `XL` | 531 | no active listing — resolves only on `VALUE` (err 200) |
+| `UAL` | 516 | resolves, HMDS returns no data (err 162) |
+| `DAY` | 502 | no active listing — resolves only on `VALUE` (err 200) |
+| `EVHC` | 502 | no active listing — resolves only on `VALUE` (err 200) |
+| `CSRA` | 468 | resolves, HMDS returns no data (err 162) |
+| `LUK` | 468 | no active listing — resolves only on `VALUE` (err 200) |
+| `MON` | 468 | no active listing — resolves only on `VALUE` (err 200) |
+| `TWX` | 468 | no active listing — resolves only on `VALUE` (err 200) |
+| `WYN` | 468 | no active listing — resolves only on `VALUE` (err 200) |
+| `DWDP` | 438 | no active listing — resolves only on `VALUE` (err 200) |
+| `BCR` | 404 | no active listing — resolves only on `VALUE` (err 200) |
+| `CBG` | 404 | no active listing — resolves only on `VALUE` (err 200) |
+| `CHK` | 404 | no active listing — resolves only on `VALUE` (err 200) |
+| `HCN` | 404 | no active listing — resolves only on `VALUE` (err 200) |
+| `PCLN` | 404 | resolves, HMDS returns no data (err 162) |
+| `PDCO` | 404 | no active listing — resolves only on `VALUE` (err 200) |
+| `SNI` | 404 | no active listing — resolves only on `VALUE` (err 200) |
+| `PARA` | 388 | resolves, HMDS returns no data (err 162) |
+| `WCG` | 377 | no active listing — resolves only on `VALUE` (err 200) |
+| `COH` | 343 | no active listing — resolves only on `VALUE` (err 200) |
+| `DLPH` | 343 | no active listing — resolves only on `VALUE` (err 200) |
+| `LVLT` | 343 | no active listing — resolves only on `VALUE` (err 200) |
+| `XEL` | 343 | resolves, HMDS returns no data (err 162) |
+| `PEP` | 336 | resolves, HMDS returns no data (err 162) |
+| `PFG` | 334 | resolves, HMDS returns no data (err 162) |
+| `BBBY` | 280 | no active listing — resolves only on `VALUE` (err 200) |
+| `BHI` | 280 | no active listing — resolves only on `VALUE` (err 200) |
+| `DOW` | 280 | resolves, HMDS returns no data (err 162) |
+| `MNK` | 280 | no active listing — resolves only on `VALUE` (err 200) |
+| `RAI` | 280 | no active listing — resolves only on `VALUE` (err 200) |
+| `SPLS` | 280 | resolves, HMDS returns no data (err 162) |
+| `TSO` | 280 | no active listing — resolves only on `VALUE` (err 200) |
+| `WFM` | 280 | no active listing — resolves only on `VALUE` (err 200) |
+| `DD` | 260 | resolves, HMDS returns no data (err 162) |
+| `ANDV` | 251 | no active listing — resolves only on `VALUE` (err 200) |
+| `DNB` | 217 | no active listing — resolves only on `VALUE` (err 200) |
+| `MJN` | 217 | no active listing — resolves only on `VALUE` (err 200) |
+| `SWN` | 217 | no active listing — resolves only on `VALUE` (err 200) |
+| `TGNA` | 217 | no active listing — resolves only on `VALUE` (err 200) |
+| `YHOO` | 217 | no active listing — resolves only on `VALUE` (err 200) |
+| `IR` | 182 | partial window — 2329 bars (err none) |
+| `ENDP` | 154 | no active listing — resolves only on `VALUE` (err 200) |
+| `FTR` | 154 | no active listing — resolves only on `VALUE` (err 200) |
+| `HAR` | 154 | no active listing — resolves only on `VALUE` (err 200) |
+| `LLTC` | 154 | no active listing — resolves only on `VALUE` (err 200) |
+| `SE` | 154 | resolves, HMDS returns no data (err 162) |
+| `STJ` | 154 | no active listing — resolves only on `VALUE` (err 200) |
+| `LM` | 92 | no active listing — resolves only on `VALUE` (err 200) |
+| `Q` | 63 | resolves, HMDS returns no data (err 162) |
+| `UA C` | 63 | no active listing — resolves only on `VALUE` (err 200) |
+| `SATS` | 62 | no active listing — resolves only on `VALUE` (err 200) |
+| `AA` | 40 | partial window — 2471 bars (err none) |
+| `CPGX` | 29 | no active listing — resolves only on `VALUE` (err 200) |
+| `DO` | 29 | no active listing — resolves only on `VALUE` (err 200) |
+| `EMC` | 29 | resolves, HMDS returns no data (err 162) |
+| `HOT` | 29 | no active listing — resolves only on `VALUE` (err 200) |
+| `TYC` | 29 | no active listing — resolves only on `VALUE` (err 200) |
+| `AVGO` | 1 | partial window — 2510 bars (err none) |
+| `EXPD` | 1 | partial window — 2510 bars (err none) |
+| `FI` | 1 | partial window — 2510 bars (err none) |
+| `FITB` | 1 | partial window — 2510 bars (err none) |
+| `LUMN` | 1 | partial window — 2508 bars (err none) |
+| `SLG` | 1 | partial window — 2510 bars (err none) |
 
 Total excluded must stay at or below the 5.0% floor or the artifact reads
-`coverage.state: BLOCKED` and the monitor exits 3.
+`coverage.state: BLOCKED` and the monitor exits 3. **This regeneration is over
+the floor, so it is not a baseline of record** — see
+[rung0-economics.md](rung0-economics.md) §1 for what may and may not be quoted
+from it.
 
 ### Comparing old to new
 
