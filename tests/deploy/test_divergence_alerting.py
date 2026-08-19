@@ -146,6 +146,84 @@ def test_blind_alerts_even_with_an_unreadable_report():
     assert "BLIND" in msg
 
 
+# --- the pinned baseline's two named refusals (KAN-51) ---------------------
+#
+# Both exit 3, and neither writes a report — the monitor returns before it has
+# scored anything, precisely so a session that was never judged does not land in
+# the evidence store as a NO_DATA observation. So the reason has to come from the
+# log, the way the exit-4 age line already does.
+
+
+def test_blind_names_a_missing_pin_instead_of_saying_not_comparable():
+    """"the baseline backtest is not comparable to live" is wrong for this
+    failure and sends the operator to regenerate an artifact that is fine. The
+    pin is what is broken."""
+    msg = render_alert(
+        3, None,
+        log_tail=(
+            "  Backtest source: output/backtest_multi_20260819_183451.json\n"
+            "  \u26a0 BASELINE_PIN_MISSING: the pinned baseline "
+            "output/backtest_multi_20260819_183451.json is absent or unreadable. "
+            "Refusing to fall back to the newest artifact in output/.\n"
+        ),
+    )
+
+    assert "BLIND" in msg
+    assert "BASELINE_PIN_MISSING" in msg
+    assert "backtest_multi_20260819_183451.json" in msg
+    assert "not comparable to live" not in msg
+
+
+def test_blind_names_a_shape_mismatch_and_both_sleeve_counts():
+    msg = render_alert(
+        3, None,
+        log_tail=(
+            "  \u26a0 BASELINE_SHAPE_MISMATCH: the pinned baseline describes 6 "
+            "sleeve(s) and the live book has 1 (baseline sleeves absent from "
+            "live: earnings_drift, momentum).\n"
+        ),
+    )
+
+    assert "BLIND" in msg
+    assert "BASELINE_SHAPE_MISMATCH" in msg
+    assert "6 sleeve(s)" in msg and "earnings_drift" in msg
+
+
+def test_a_pin_failure_line_from_an_earlier_run_is_not_narrated_as_this_one():
+    """The log-offset the wrapper passes already bounds the tail to this run, so
+    the renderer only ever sees this run's lines. Guard that the *last* one wins
+    when a single run somehow logs both."""
+    msg = render_alert(
+        3, None,
+        log_tail=(
+            "  \u26a0 BASELINE_PIN_MISSING: an earlier line\n"
+            "  \u26a0 BASELINE_SHAPE_MISMATCH: the live book has 1\n"
+        ),
+    )
+
+    assert "BASELINE_SHAPE_MISMATCH" in msg
+    assert "BASELINE_PIN_MISSING" not in msg
+
+
+def test_the_ordinary_blind_message_is_unchanged_without_a_pin_failure():
+    """Regression guard: the pre-existing exit-3 text is what a genuinely
+    non-comparable baseline still gets."""
+    msg = render_alert(
+        3,
+        _report(
+            _portfolio(
+                "momentum", "NO_DATA", baseline_comparable=False,
+                notes=["baseline is not comparable: stale universe"],
+            ),
+        ),
+        log_tail="  Backtest source: output/backtest_multi_20260819_183451.json\n",
+    )
+
+    assert "not comparable to live" in msg
+    assert "stale universe" in msg
+    assert "BASELINE_PIN_MISSING" not in msg
+
+
 def test_cli_prints_nothing_on_exit_zero(tmp_path):
     report = tmp_path / "divergence.json"
     report.write_text(json.dumps(_report(_portfolio("momentum", "OK"))))
