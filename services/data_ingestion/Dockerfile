@@ -17,5 +17,11 @@ COPY shared/ shared/
 COPY services/__init__.py services/__init__.py
 COPY services/data_ingestion/ services/data_ingestion/
 COPY config/ config/
+# The capture universe (KAN-58). shared/universe.py resolves this snapshot from
+# a path pinned to the package root — /app in this image — and data_ingestion
+# resolves its capture universe at startup. Without this COPY the lookup fails
+# and, with restart: unless-stopped, the container crash-loops. Not covered by
+# CI, which never builds images: see tests/deploy/test_capture_deployment.py.
+COPY data/universe/ data/universe/
 
 ENTRYPOINT ["python", "-m", "services.data_ingestion.runner"]

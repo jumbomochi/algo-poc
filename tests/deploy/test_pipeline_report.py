@@ -21,7 +21,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -34,6 +34,7 @@ from scripts.ops.pipeline_report_summary import (
     render_summary,
 )
 from shared.models import Base
+from shared.models.market_data import OHLCVDaily
 from shared.models.order_ledger import ExecutionFill, OrderIntent, OrderStatus
 from shared.models.system_halt import SystemHaltState
 
@@ -84,8 +85,10 @@ def _intent(session, *, status, at=DURING, mode="paper"):
     session.commit()
 
 
-def _facts(session, *, mode="paper"):
-    return collect_facts(session, since=SINCE, mode=mode)
+def _facts(session, *, mode="paper", capture_expected=0):
+    return collect_facts(
+        session, since=SINCE, mode=mode, capture_expected=capture_expected
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +175,88 @@ def test_activity_before_the_window_is_excluded(session):
 def test_an_intent_from_another_mode_is_excluded(session):
     _intent(session, status=OrderStatus.RISK_REJECTED, mode="live")
     assert "risk 0" in render_summary(_facts(session, mode="paper"))
+
+
+# ---------------------------------------------------------------------------
+# Capture health (KAN-58 AC6)
+# ---------------------------------------------------------------------------
+
+def _bar(session, ticker, *, at=DURING, day=date(2026, 8, 16)):
+    session.add(OHLCVDaily(
+        ticker=ticker, date=day, open=1.0, high=2.0, low=0.5, close=1.5,
+        volume=100, ingested_at=at,
+    ))
+    session.commit()
+
+
+def test_capture_reports_tickers_written_against_expected(session):
+    """A capture that quietly writes 2 of 3 names leaves a hole that cannot be
+    backfilled later — so the count has to be on the day's message, not
+    discoverable only by querying the table by hand."""
+    _bar(session, "AAPL")
+    _bar(session, "MSFT")
+    summary = render_summary(_facts(session, capture_expected=3))
+    assert "capture: 2/3" in summary
+
+
+def test_a_capture_shortfall_is_marked(session):
+    _bar(session, "AAPL")
+    summary = render_summary(_facts(session, capture_expected=3))
+    assert "⚠" in summary
+    assert "short 2" in summary
+
+
+def test_a_complete_capture_is_not_marked_as_short(session):
+    _bar(session, "AAPL")
+    _bar(session, "MSFT")
+    summary = render_summary(_facts(session, capture_expected=2))
+    assert "capture: 2/2" in summary
+    assert "short" not in summary
+
+
+def test_each_ticker_counts_once_however_many_bars_it_wrote(session):
+    """A backfill session writes several dates for one name; the figure is
+    about coverage of the universe, not row count."""
+    _bar(session, "AAPL", day=date(2026, 8, 14))
+    _bar(session, "AAPL", day=date(2026, 8, 15))
+    _bar(session, "AAPL", day=date(2026, 8, 16))
+    assert "capture: 1/2" in render_summary(_facts(session, capture_expected=2))
+
+
+def test_bars_written_before_the_window_are_not_this_run(session):
+    """Yesterday's capture must not make today's silent failure look healthy —
+    the row stays in the table forever, so only ``ingested_at`` separates
+    them."""
+    _bar(session, "AAPL", at=BEFORE)
+    assert "capture: 0/1" in render_summary(_facts(session, capture_expected=1))
+
+
+def test_capture_is_omitted_when_it_is_disabled(session):
+    """``capture_source: none`` means there is nothing to be short of, and a
+    permanent '0/0' would train the operator to ignore the field."""
+    assert "capture" not in render_summary(_facts(session, capture_expected=0))
+
+
+def test_an_unreadable_capture_universe_reports_unknown_not_healthy(session):
+    """"capture is fine" and "we could not work out what capture should be"
+    must not look the same. The wrapper's own rule: absence of evidence is not
+    evidence of absence."""
+    _bar(session, "AAPL")
+    summary = render_summary(_facts(session, capture_expected=-1))
+    assert "capture: unknown" in summary
+    assert "⚠" in summary
+
+
+def test_writing_more_than_expected_is_flagged_as_drift(session):
+    """A count above expected means the digest and the service disagree about
+    the universe — which silently disables the shortfall alarm, so it has to be
+    as visible as a shortfall."""
+    _bar(session, "AAPL")
+    _bar(session, "MSFT")
+    _bar(session, "NVDA")
+    summary = render_summary(_facts(session, capture_expected=2))
+    assert "capture: 3/2" in summary
+    assert "⚠" in summary
 
 
 # ---------------------------------------------------------------------------

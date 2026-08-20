@@ -16,6 +16,7 @@ def _make_runner(
     redis_client=None,
     db_session=None,
     events_source=None,
+    capture_universe=None,
 ):
     config = config or _make_config()
     ib_client = ib_client or MagicMock()
@@ -28,7 +29,20 @@ def _make_runner(
         redis_client=redis_client,
         db_session=db_session,
         events_source=events_source,
+        capture_universe=capture_universe,
     )
+
+
+def _stub_pipelines(runner, *, bars_per_ticker: int = 1):
+    """Replace the three pipelines with mocks, market data returning a count."""
+    runner._market_data = MagicMock()
+    runner._market_data.ingest = AsyncMock(return_value=bars_per_ticker)
+    runner._market_data.capture = AsyncMock(return_value=bars_per_ticker)
+    runner._fundamentals = MagicMock()
+    runner._fundamentals.ingest = AsyncMock()
+    runner._events = MagicMock()
+    runner._events.ingest = AsyncMock()
+    return runner
 
 
 class TestDataIngestionRunner:
@@ -149,3 +163,117 @@ class TestDataIngestionRunner:
         await runner.shutdown()
 
         assert runner._running is False
+
+
+class TestCaptureUniverse:
+    """KAN-58 — the capture universe is wider than the trading universe.
+
+    Bars for the whole index have to accumulate from today so a future
+    baseline is point-in-time by construction, but widening what
+    signal_generation scores is a separate decision. So the extra names are
+    fetched and kept without being published.
+    """
+
+    @pytest.mark.asyncio
+    async def test_capture_only_tickers_are_persisted_not_published(self):
+        runner = _stub_pipelines(_make_runner(capture_universe=["AAPL", "ABNB"]))
+
+        await runner.run_cycle(["AAPL"])
+
+        assert [c[0][0] for c in runner._market_data.ingest.call_args_list] == ["AAPL"]
+        assert [c[0][0] for c in runner._market_data.capture.call_args_list] == ["ABNB"]
+
+    @pytest.mark.asyncio
+    async def test_capture_only_tickers_skip_fundamentals_and_events(self):
+        """Capture is about price history. Running the other two pipelines over
+        the extra 363 names would triple the IB load for data nothing reads."""
+        runner = _stub_pipelines(_make_runner(capture_universe=["AAPL", "ABNB"]))
+
+        await runner.run_cycle(["AAPL"])
+
+        assert [c[0][0] for c in runner._fundamentals.ingest.call_args_list] == ["AAPL"]
+        assert [c[0][0] for c in runner._events.ingest.call_args_list] == ["AAPL"]
+
+    @pytest.mark.asyncio
+    async def test_a_ticker_in_both_universes_is_fetched_once(self):
+        runner = _stub_pipelines(_make_runner(capture_universe=["AAPL", "MSFT"]))
+
+        await runner.run_cycle(["AAPL", "MSFT"])
+
+        assert runner._market_data.ingest.call_count == 2
+        runner._market_data.capture.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_cycle_reports_capture_health(self):
+        runner = _stub_pipelines(_make_runner(capture_universe=["AAPL", "ABNB", "NVDA"]))
+
+        health = await runner.run_cycle(["AAPL"])
+
+        assert health.tickers_expected == 3
+        assert health.tickers_written == 3
+        assert health.shortfall == 0
+
+    @pytest.mark.asyncio
+    async def test_a_failing_ticker_shows_up_as_a_shortfall(self):
+        """Silent partial capture is the failure this figure exists to catch:
+        a series with holes looks complete years from now and is not."""
+        runner = _stub_pipelines(_make_runner(capture_universe=["AAPL", "ABNB", "NVDA"]))
+        runner._market_data.capture = AsyncMock(side_effect=[Exception("IB timeout"), 1])
+
+        health = await runner.run_cycle(["AAPL"])
+
+        assert health.tickers_expected == 3
+        assert health.tickers_written == 2
+        assert health.shortfall == 1
+        # The failure must not stop the remaining names.
+        assert runner._market_data.capture.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_a_ticker_with_no_bars_is_not_counted_as_written(self):
+        runner = _stub_pipelines(_make_runner(capture_universe=["AAPL", "ABNB"]))
+        runner._market_data.capture = AsyncMock(return_value=0)
+
+        health = await runner.run_cycle(["AAPL"])
+
+        assert health.tickers_expected == 2
+        assert health.tickers_written == 1
+
+    @pytest.mark.asyncio
+    async def test_capture_runs_even_with_an_empty_trading_watchlist(self):
+        runner = _stub_pipelines(_make_runner(capture_universe=["ABNB"]))
+
+        health = await runner.run_cycle([])
+
+        runner._market_data.capture.assert_called_once()
+        runner._fundamentals.ingest.assert_not_called()
+        assert health.tickers_expected == 1
+
+
+class TestResolveCaptureUniverse:
+    """The service reads its capture universe from config, separately from
+    the trading watchlist, so widening capture never widens what trades."""
+
+    def test_defaults_to_the_whole_index(self):
+        from shared.universe import resolve_capture_universe
+
+        config = _make_config()
+        assert config.universe.capture_source == "membership"
+        assert len(resolve_capture_universe(config.universe.capture_source)) == 503
+
+    def test_capture_is_wider_than_the_trading_watchlist(self):
+        from shared.universe import resolve_capture_universe, resolve_watchlist
+
+        capture = set(resolve_capture_universe("membership"))
+        trading = set(resolve_watchlist("sleeves", []))
+        assert capture - trading, "capture must cover names the sleeves never trade"
+
+    def test_none_disables_capture(self):
+        from shared.universe import resolve_capture_universe
+
+        assert resolve_capture_universe("none") == []
+
+    def test_an_unknown_source_raises_rather_than_capturing_nothing(self):
+        from shared.universe import resolve_capture_universe
+
+        with pytest.raises(ValueError):
+            resolve_capture_universe("membershp")

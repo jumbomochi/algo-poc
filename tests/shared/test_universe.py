@@ -76,6 +76,32 @@ class TestResolveWatchlist:
         with pytest.raises(ValueError, match="watchlist_source"):
             resolve_watchlist("sp5000", [])
 
+    def test_membership_source_returns_the_whole_index(self):
+        """KAN-58 AC4. Capture has to follow the index, not the sleeves —
+        140 (sleeves) or 99 (sp500) misses precisely the names that later
+        depart, which is the only history no vendor will sell back."""
+        result = resolve_watchlist("membership", [])
+        assert len(result) == 503, (
+            f"membership resolved {len(result)} tickers; the committed "
+            "snapshot's newest date lists 503"
+        )
+        assert "AAPL" in result
+        # In the index but in neither SP500_TOP100 nor the sleeve union.
+        assert "ABNB" in result
+
+    def test_membership_source_takes_the_snapshot_effective_today(self):
+        calendar = MembershipCalendar.from_json_file(
+            str(REPO_ROOT / "data/universe/sp500_membership.json")
+        )
+        assert set(resolve_watchlist("membership", [])) == set(
+            calendar.members_as_of(date.today())
+        )
+
+    def test_membership_tickers_are_additive_with_custom(self):
+        result = resolve_watchlist("membership", ["AAPL", "ZZZTEST"])
+        assert result.count("AAPL") == 1
+        assert result[-1] == "ZZZTEST"
+
 
 class TestSectorLookup:
     def test_equity_resolves_from_sector_map(self):
