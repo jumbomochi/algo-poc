@@ -136,3 +136,16 @@ research:
     - high_52w
     - low_volatility_63d
     - liquidity_20d
+
+divergence:
+  # The baseline of record: the artifact scripts/divergence_monitor.py scores
+  # live paper equity against (KAN-51). Stated here rather than discovered by
+  # filename recency in output/ — recency made the baseline a filesystem
+  # accident, replaced every Tuesday by the weekly refresh with nothing saying
+  # so. deploy/launchd/run_divergence.sh passes this as --backtest --pinned; an
+  # absent or shape-mismatched pin exits 3 and alerts rather than quietly
+  # scoring against whatever is newest.
+  #
+  # Re-pin at a rung change. See docs/operations/backtest-baseline.md,
+  # "The pinned baseline of record".
+  baseline_pin: output/backtest_multi_20260819_183451.json

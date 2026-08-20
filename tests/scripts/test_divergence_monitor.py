@@ -16,6 +16,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from scripts.divergence_monitor import (
+    BASELINE_PIN_MISSING,
+    BASELINE_SHAPE_MISMATCH,
     BASELINE_STALE_WARNING,
     DEFAULT_MAX_BASELINE_AGE_DAYS,
     EXIT_BASELINE_NOT_COMPARABLE,
@@ -1385,3 +1387,290 @@ def test_the_staleness_check_can_be_turned_off_for_an_ad_hoc_run(
     )
     capsys.readouterr()
     assert code == EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# The pinned baseline (KAN-51)
+#
+# Recency selection is not a pin. `find_latest_backtest_json` picks whatever
+# sorts last in output/, and the weekly refresh writes a new artifact every
+# Tuesday — so the baseline the gate evidence is measured against changed by
+# itself, weekly, with nothing recording that it had. `--pinned` says "the
+# --backtest path IS the baseline of record": there is no fallback, and both
+# ways the pin can be wrong (absent, or describing a differently-shaped book)
+# stop the run with a named reason instead of producing a verdict.
+# ---------------------------------------------------------------------------
+
+
+def _live_and_baseline(tmp_path: Path, name: str, *, label: str = "20260525_000000"):
+    """A matched pair: a seeded sqlite book and a baseline of the same shape."""
+    return _comparable_backtest(tmp_path, label=label), _evidence_db(tmp_path, name)
+
+
+def test_a_pin_is_used_even_when_a_newer_artifact_exists(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """The regression the pin exists to prevent.
+
+    A newer `backtest_multi_*.json` in output/ is exactly what the Tuesday
+    refresh produces. Under recency it would silently become the baseline; under
+    the pin it is ignored.
+    """
+    pinned, db_url = _live_and_baseline(tmp_path, "pinned", label="20260525_000000")
+    newer = _comparable_backtest(tmp_path, label="20260901_000000")
+    # Stand where the monitor would find the newer one by recency.
+    output_dir = tmp_path / "cwd" / "output"
+    output_dir.mkdir(parents=True)
+    (output_dir / newer.name).write_text(newer.read_text())
+    monkeypatch.chdir(tmp_path / "cwd")
+
+    report = tmp_path / "divergence.json"
+    code = _run_monitor_main(
+        monkeypatch, backtest=pinned, db_url=db_url, output=report,
+        extra=["--pinned"],
+    )
+
+    assert code == EXIT_OK, capsys.readouterr().out
+    assert json.loads(report.read_text())["backtest_source"] == str(pinned)
+
+
+def test_an_absent_pin_exits_three_and_names_itself(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """AC3. Not exit 2, and above all not a recency fallback: a job that ran,
+    reported success and meant nothing is the 2026-08-13 failure pattern."""
+    _, db_url = _live_and_baseline(tmp_path, "absent")
+    # A perfectly good artifact sits in output/ — the point is it is not used.
+    output_dir = tmp_path / "cwd" / "output"
+    output_dir.mkdir(parents=True)
+    recent = _comparable_backtest(tmp_path, label="20260901_000000")
+    (output_dir / recent.name).write_text(recent.read_text())
+    monkeypatch.chdir(tmp_path / "cwd")
+
+    report = tmp_path / "divergence.json"
+    code = _run_monitor_main(
+        monkeypatch, backtest=tmp_path / "never_written.json", db_url=db_url,
+        output=report, extra=["--pinned"],
+    )
+
+    assert code == EXIT_BASELINE_NOT_COMPARABLE
+    out = capsys.readouterr().out
+    assert BASELINE_PIN_MISSING in out, out
+    assert "never_written.json" in out, out
+    assert not report.exists(), "an unusable pin must not leave a verdict behind"
+
+
+def test_pinned_with_no_path_at_all_exits_three(tmp_path: Path, monkeypatch, capsys):
+    """The wrapper substitutes the resolver's output straight into --backtest, so
+    an unconfigured pin arrives as an empty string. It must land here, not on
+    the recency path."""
+    from scripts import divergence_monitor
+
+    _, db_url = _live_and_baseline(tmp_path, "nopath")
+    output_dir = tmp_path / "cwd" / "output"
+    output_dir.mkdir(parents=True)
+    recent = _comparable_backtest(tmp_path, label="20260901_000000")
+    (output_dir / recent.name).write_text(recent.read_text())
+    monkeypatch.chdir(tmp_path / "cwd")
+
+    monkeypatch.setattr(divergence_monitor.sys, "argv", [
+        "divergence_monitor.py",
+        "--backtest", "",
+        "--pinned",
+        "--db-url", db_url,
+        "--max-baseline-age-days", "0",
+        "--no-output",
+    ])
+
+    assert divergence_monitor.main() == EXIT_BASELINE_NOT_COMPARABLE
+    assert BASELINE_PIN_MISSING in capsys.readouterr().out
+
+
+def test_an_absent_backtest_without_the_pin_still_exits_two(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """AC8: the unpinned ad-hoc contract is untouched. A bad --backtest path is
+    an argument error (2), not the baseline-not-comparable outage (3)."""
+    _, db_url = _live_and_baseline(tmp_path, "adhoc")
+
+    code = _run_monitor_main(
+        monkeypatch, backtest=tmp_path / "absent.json", db_url=db_url,
+        output=tmp_path / "divergence.json",
+    )
+
+    assert code == EXIT_ERROR
+    assert BASELINE_PIN_MISSING not in capsys.readouterr().out
+
+
+def test_recency_still_resolves_the_baseline_for_an_unpinned_run(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """Recency stays the documented default for ad-hoc local runs; only the
+    nightly job is pinned."""
+    from scripts import divergence_monitor
+
+    db_url = _evidence_db(tmp_path, "recency")
+    newest = _comparable_backtest(tmp_path, label="20260901_000000")
+    output_dir = tmp_path / "cwd" / "output"
+    output_dir.mkdir(parents=True)
+    (output_dir / newest.name).write_text(newest.read_text())
+    monkeypatch.chdir(tmp_path / "cwd")
+
+    report = tmp_path / "divergence.json"
+    monkeypatch.setattr(divergence_monitor.sys, "argv", [
+        "divergence_monitor.py",
+        "--db-url", db_url,
+        "--window", "5",
+        "--max-baseline-age-days", "0",
+        "--output", str(report),
+    ])
+
+    assert divergence_monitor.main() == EXIT_OK, capsys.readouterr().out
+    assert Path(json.loads(report.read_text())["backtest_source"]).name == newest.name
+
+
+# --- shape mismatch (AC4) --------------------------------------------------
+
+
+def _drop_sleeve(path: Path, sleeve: str) -> Path:
+    data = json.loads(path.read_text())
+    del data["portfolios"][sleeve]
+    path.write_text(json.dumps(data))
+    return path
+
+
+def _add_sleeve(path: Path, sleeve: str) -> Path:
+    data = json.loads(path.read_text())
+    template = next(iter(data["portfolios"].values()))
+    data["portfolios"][sleeve] = json.loads(json.dumps(template))
+    path.write_text(json.dumps(data))
+    return path
+
+
+def test_a_pin_missing_a_live_sleeve_exits_three_without_a_verdict(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """AC4. `is_like_for_like` cannot catch this: the execution model is fine,
+    the shapes are not. The aggregate sums only dates present in every
+    portfolio, so a two-sleeve live book scored against a one-sleeve baseline is
+    arithmetic, not a comparison."""
+    pinned, db_url = _live_and_baseline(tmp_path, "shape_missing")
+    _drop_sleeve(pinned, "sector_rotation")
+
+    report = tmp_path / "divergence.json"
+    code = _run_monitor_main(
+        monkeypatch, backtest=pinned, db_url=db_url, output=report,
+        extra=["--pinned"],
+    )
+
+    assert code == EXIT_BASELINE_NOT_COMPARABLE
+    out = capsys.readouterr().out
+    assert BASELINE_SHAPE_MISMATCH in out, out
+    assert "sector_rotation" in out, out
+    assert not report.exists()
+    assert _verdict_rows(db_url) == []
+
+
+def test_a_pin_carrying_an_extra_sleeve_exits_three(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """The Rung-0 case in the direction doc: a one-sleeve live book against a
+    six-sleeve baseline. Detected from the baseline's side too, because that is
+    the direction a rung change moves in."""
+    pinned, db_url = _live_and_baseline(tmp_path, "shape_extra")
+    _add_sleeve(pinned, "earnings_drift")
+
+    code = _run_monitor_main(
+        monkeypatch, backtest=pinned, db_url=db_url,
+        output=tmp_path / "divergence.json", extra=["--pinned"],
+    )
+
+    assert code == EXIT_BASELINE_NOT_COMPARABLE
+    out = capsys.readouterr().out
+    assert BASELINE_SHAPE_MISMATCH in out, out
+    assert "earnings_drift" in out, out
+
+
+def test_the_shape_check_is_not_masked_by_a_single_portfolio_run(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """`--portfolio` narrows what is *scored*, never what is *compared* — else
+    an ad-hoc run could report a clean sleeve out of a book the baseline does
+    not describe."""
+    pinned, db_url = _live_and_baseline(tmp_path, "shape_scoped")
+    _drop_sleeve(pinned, "sector_rotation")
+
+    code = _run_monitor_main(
+        monkeypatch, backtest=pinned, db_url=db_url,
+        output=tmp_path / "divergence.json",
+        extra=["--pinned", "--portfolio", "momentum"],
+    )
+
+    assert code == EXIT_BASELINE_NOT_COMPARABLE
+    assert BASELINE_SHAPE_MISMATCH in capsys.readouterr().out
+
+
+def test_an_unpinned_run_still_tolerates_a_sleeve_the_baseline_lacks(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """AC8 again: the ad-hoc path keeps skipping-with-a-warning. Making the
+    shape fatal everywhere would break every local run against an older
+    artifact, which is not what this story buys."""
+    adhoc, db_url = _live_and_baseline(tmp_path, "shape_adhoc")
+    _drop_sleeve(adhoc, "sector_rotation")
+
+    code = _run_monitor_main(
+        monkeypatch, backtest=adhoc, db_url=db_url,
+        output=tmp_path / "divergence.json",
+    )
+
+    out = capsys.readouterr().out
+    assert code == EXIT_OK, out
+    assert "Skipping 'sector_rotation'" in out
+    assert BASELINE_SHAPE_MISMATCH not in out
+
+
+def test_a_matching_pin_stamps_every_verdict_with_the_pinned_baseline_id(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """AC5. The evidence store already carries baseline_id; what the pin adds is
+    that the value is the artifact of record, so rows judged against a different
+    book shape are distinguishable by that column rather than merged into it."""
+    pinned, db_url = _live_and_baseline(tmp_path, "stamped")
+
+    code = _run_monitor_main(
+        monkeypatch, backtest=pinned, db_url=db_url,
+        output=tmp_path / "divergence.json", extra=["--pinned"],
+    )
+
+    assert code == EXIT_OK, capsys.readouterr().out
+    rows = _verdict_rows(db_url)
+    assert {r.sleeve for r in rows} == {"momentum", "sector_rotation"}
+    assert {r.baseline_id for r in rows} == {pinned.name}
+
+
+def test_shape_mismatch_ignores_synthetic_sleeves(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """A drill books into `__drill__`, which is in the live tables and can never
+    be in a baseline. Counting it would make every pinned run a mismatch — the
+    exclusion contract in docs/operations/drill-evidence-isolation.md applies
+    here like everywhere else."""
+    pinned, db_url = _live_and_baseline(tmp_path, "synthetic")
+    session = sessionmaker(bind=create_engine(db_url))()
+    now = datetime.now(timezone.utc)
+    session.add(PortfolioConfig(
+        portfolio=DRILL_PORTFOLIO, capital=100.0, cash=100.0,
+        created_at=now, updated_at=now,
+    ))
+    session.commit()
+    session.close()
+
+    code = _run_monitor_main(
+        monkeypatch, backtest=pinned, db_url=db_url,
+        output=tmp_path / "divergence.json", extra=["--pinned"],
+    )
+
+    out = capsys.readouterr().out
+    assert code == EXIT_OK, out
+    assert BASELINE_SHAPE_MISMATCH not in out

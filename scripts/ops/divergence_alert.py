@@ -35,6 +35,10 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from backtest.divergence import ExecutionModel  # noqa: E402
+from scripts.divergence_monitor import (  # noqa: E402
+    BASELINE_PIN_MISSING,
+    BASELINE_SHAPE_MISMATCH,
+)
 
 DOC_HINT = "Regenerate per docs/operations/backtest-baseline.md"
 
@@ -135,6 +139,26 @@ def _cap(text: str) -> str:
     return text[:keep].rstrip() + _TRUNCATION_NOTE
 
 
+#: Ordered so a later, more specific refusal wins if a run somehow logged both.
+_PIN_FAILURE_TOKENS = (BASELINE_PIN_MISSING, BASELINE_SHAPE_MISMATCH)
+
+
+def _pin_failure_line(log_tail: str) -> str:
+    """The last ``BASELINE_PIN_MISSING`` / ``BASELINE_SHAPE_MISMATCH`` line, if any.
+
+    Read from the log rather than the report because there is no report: both
+    refusals return before the monitor has scored anything, which is the point —
+    a session that was never judged must not land in the evidence store as a
+    NO_DATA observation. The wrapper's ``--log-offset`` already bounds the tail
+    to this run, so a line found here belongs to this run.
+    """
+    hits = [
+        line.strip() for line in log_tail.splitlines()
+        if any(token in line for token in _PIN_FAILURE_TOKENS)
+    ]
+    return _redact(hits[-1].lstrip("\u26a0 ").strip()) if hits else ""
+
+
 def _last_error_line(log_tail: str) -> str:
     errors = [
         line.strip() for line in log_tail.splitlines()
@@ -180,6 +204,16 @@ def _render(
         return f"🚨 Divergence monitor HARD ERROR (exit 2).\n{detail}"
 
     if exit_code == 3:
+        # A broken pin is a different failure from a non-comparable artifact, and
+        # the generic text would send the operator to regenerate a baseline that
+        # is fine. Checked first for that reason.
+        pin_failure = _pin_failure_line(log_tail)
+        if pin_failure:
+            return (
+                "⚠️ Divergence monitor is BLIND (exit 3): the pinned baseline "
+                "could not be used, so nothing was scored and no drift "
+                f"detection is running.\n• {pin_failure}"
+            )
         reasons = _blind_reasons(report)
         body = "\n".join(reasons) if reasons else (
             "• reason not recorded in the report — see the log"

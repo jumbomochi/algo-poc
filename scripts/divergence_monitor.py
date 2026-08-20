@@ -38,7 +38,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from glob import glob
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -78,6 +78,20 @@ EXIT_BASELINE_NOT_COMPARABLE = 3
 # refreshed. Between 2026-07-28 and 2026-08-18 that was silently true for
 # three weeks — the weekly refresh missed twice, once without alerting at all.
 EXIT_BASELINE_STALE = 4
+
+
+# ---------------------------------------------------------------------------
+# The pinned baseline of record (KAN-51)
+# ---------------------------------------------------------------------------
+
+#: Stable tokens naming *why* a pinned run refused to judge. Both map onto exit
+#: 3, because both are the same outage — no drift detection is running — but the
+#: operator needs to know which, and "not comparable" (the pre-existing exit-3
+#: text) describes neither. Constants because scripts/ops/divergence_alert.py
+#: greps the log for them to render the Telegram, exactly as it does for
+#: BASELINE_STALE_WARNING.
+BASELINE_PIN_MISSING = "BASELINE_PIN_MISSING"
+BASELINE_SHAPE_MISMATCH = "BASELINE_SHAPE_MISMATCH"
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +276,53 @@ def load_backtest_equity_series(
     }
     aggregate = _series(data["aggregate"]["portfolio_values"])
     return per_portfolio, aggregate
+
+
+def scoreable_sleeves(names: Iterable[str]) -> set[str]:
+    """The real sleeves among ``names`` — synthetic portfolios dropped.
+
+    Takes names rather than a path so the baseline side can be fed the mapping
+    ``load_backtest_equity_series`` already returned: a baseline JSON is tens of
+    megabytes and main() parses it twice already, so a third parse to recover a
+    set of keys it is holding would be pure cost at 04:45.
+
+    Used on both sides of the shape comparison, so the exclusion contract in
+    docs/operations/drill-evidence-isolation.md ("_aggregate", "__drill__",
+    "__liquidation__") holds here like everywhere else.
+    """
+    return {name for name in names if not is_excluded_portfolio(name)}
+
+
+def shape_mismatch_reason(
+    baseline_sleeves: set[str], live_sleeves: set[str]
+) -> str | None:
+    """Why a pinned baseline does not describe the live book, or None if it does.
+
+    ``is_like_for_like`` checks the baseline's *execution* assumptions and has no
+    opinion on its *shape*: it passes a six-sleeve, 27x-capital artifact being
+    scored against a one-sleeve Rung-0 book. That is not a comparison — the
+    aggregate sums only dates present in every portfolio (``load_live_aggregate
+    _series``), and a per-sleeve verdict that exists on one side only is simply
+    skipped with a warning. Both directions are named because a rung change
+    moves in both: sleeves leave the live book, and a re-pin can bring a baseline
+    that still carries them.
+    """
+    missing = sorted(live_sleeves - baseline_sleeves)
+    extra = sorted(baseline_sleeves - live_sleeves)
+    if not missing and not extra:
+        return None
+    parts = []
+    if missing:
+        parts.append(f"live sleeves absent from the baseline: {', '.join(missing)}")
+    if extra:
+        parts.append(f"baseline sleeves absent from live: {', '.join(extra)}")
+    return (
+        f"{BASELINE_SHAPE_MISMATCH}: the pinned baseline describes "
+        f"{len(baseline_sleeves)} sleeve(s) and the live book has "
+        f"{len(live_sleeves)} ({'; '.join(parts)}). Scoring across a shape "
+        "change is not a comparison — re-pin per "
+        "docs/operations/backtest-baseline.md, 'The pinned baseline of record'."
+    )
 
 
 def load_backtest_execution_model(backtest_path: str) -> ExecutionModel:
@@ -747,6 +808,16 @@ def main() -> int:
         help="Path to backtest results JSON. Default: latest output/backtest_multi_*.json",
     )
     parser.add_argument(
+        "--pinned", action="store_true",
+        help=(
+            "Treat --backtest as the pinned baseline of record: never fall back "
+            "to filename recency, and exit "
+            f"{EXIT_BASELINE_NOT_COMPARABLE} with a named reason if the pin is "
+            "absent or describes a differently-shaped book. Set by "
+            "deploy/launchd/run_divergence.sh; omit it for ad-hoc local runs."
+        ),
+    )
+    parser.add_argument(
         "--window", type=int, default=DEFAULT_WINDOW_DAYS,
         help=f"Rolling window size in trading days (default {DEFAULT_WINDOW_DAYS}).",
     )
@@ -787,14 +858,36 @@ def main() -> int:
     args = parser.parse_args()
 
     # --- Resolve inputs ---
-    backtest_path = args.backtest or find_latest_backtest_json()
-    if backtest_path is None:
-        print("ERROR: No backtest JSON found. Pass --backtest or run scripts/run_backtest.py first.")
-        return EXIT_ERROR
-    if not Path(backtest_path).is_file():
-        print(f"ERROR: Backtest file not found: {backtest_path}")
-        return EXIT_ERROR
-    print(f"  Backtest source: {backtest_path}")
+    if args.pinned:
+        # No `or find_latest_backtest_json()` here, and that omission is the
+        # whole story: the wrapper substitutes the resolver's output straight
+        # into --backtest, so an unconfigured pin arrives as an empty string,
+        # and falling back would hand the nightly job whatever the last refresh
+        # happened to write. A job that ran, reported success and meant nothing
+        # is the 2026-08-13 pattern. Exit 3 rather than 2 because this is the
+        # same outage as a non-comparable baseline — no drift detection is
+        # running — and the wrapper already alerts on 3.
+        backtest_path = (args.backtest or "").strip()
+        if not backtest_path or not Path(backtest_path).is_file():
+            print(
+                f"  ⚠ {BASELINE_PIN_MISSING}: the pinned baseline "
+                f"{backtest_path or '(none configured)'} is absent or "
+                "unreadable. Refusing to fall back to the newest artifact in "
+                "output/ — that is how a baseline changes itself. Check "
+                "divergence.baseline_pin in config/default.yaml and see "
+                "docs/operations/backtest-baseline.md, 'The pinned baseline of "
+                "record'."
+            )
+            return EXIT_BASELINE_NOT_COMPARABLE
+    else:
+        backtest_path = args.backtest or find_latest_backtest_json()
+        if backtest_path is None:
+            print("ERROR: No backtest JSON found. Pass --backtest or run scripts/run_backtest.py first.")
+            return EXIT_ERROR
+        if not Path(backtest_path).is_file():
+            print(f"ERROR: Backtest file not found: {backtest_path}")
+            return EXIT_ERROR
+    print(f"  Backtest source: {backtest_path}" + ("  [PINNED]" if args.pinned else ""))
 
     # Staleness is judged here, at the point of consumption, rather than by the
     # job that produces the artifact — a producer that never ran cannot report
@@ -845,6 +938,25 @@ def main() -> int:
         return EXIT_ERROR
 
     portfolios = state.get_portfolio_names()
+
+    # Checked on the FULL live set, before --portfolio narrows it: --portfolio
+    # limits what is scored, never what is compared, so an ad-hoc scoped run
+    # cannot report a clean sleeve out of a book the pin does not describe.
+    # Only under a pin — an unpinned run against an older artifact keeps
+    # skipping-with-a-warning, which is what makes local iteration usable.
+    if args.pinned:
+        mismatch = shape_mismatch_reason(
+            scoreable_sleeves(bt_per_portfolio),
+            scoreable_sleeves(portfolios),
+        )
+        if mismatch is not None:
+            # Returned before any report is built or written: "exit 3 with a
+            # named reason, not a verdict". A NO_DATA report here would land in
+            # the evidence store as an observation of a session that was never
+            # actually scored.
+            print(f"  ⚠ {mismatch}")
+            return EXIT_BASELINE_NOT_COMPARABLE
+
     if args.portfolio:
         if args.portfolio not in portfolios:
             print(
