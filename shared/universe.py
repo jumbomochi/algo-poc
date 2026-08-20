@@ -310,6 +310,10 @@ def resolve_capture_universe(capture_source: str) -> list[str]:
     healthy zero-capture day, and the bars it failed to keep cannot be
     fetched back later.
 
+    ``custom`` is rejected outright: it resolves from ``custom_tickers``, which
+    belong to the trading watchlist, so as a capture source it can only ever
+    mean "capture nothing" while looking deliberate.
+
     Lives beside the watchlist resolver rather than in the data_ingestion
     service because the daily digest has to report capture *expected* against
     the same universe the service captured, and it must be able to do that
@@ -317,7 +321,35 @@ def resolve_capture_universe(capture_source: str) -> list[str]:
     """
     if not capture_source or capture_source == "none":
         return []
+    if capture_source == "custom":
+        raise ValueError(
+            "universe.capture_source 'custom' carries no tickers of its own; "
+            "use 'membership' for the whole index or 'none' to disable capture"
+        )
     return resolve_watchlist(capture_source, [])
+
+
+def capture_expected_universe(
+    watchlist_source: str,
+    custom_tickers: list[str],
+    capture_source: str,
+) -> list[str]:
+    """Every name a capture cycle is expected to write: trading ∪ capture.
+
+    The trading watchlist is persisted too — ``ingest`` writes as well as
+    publishes — and it is not a subset of the index: 41 of the sleeves' names
+    are sector, thematic and inverse ETFs that no membership snapshot lists. So
+    the capture source alone understates what a healthy session writes, and a
+    digest measuring against it would render a nonsensical "544/503" on a good
+    day and stay silent while every ETF failed.
+
+    Both the runner and the daily digest resolve their expected count through
+    here so the two cannot drift.
+    """
+    trading = resolve_watchlist(watchlist_source, custom_tickers)
+    capture = resolve_capture_universe(capture_source)
+    seen = set(trading)
+    return trading + [t for t in capture if t not in seen]
 
 
 # Sector labels for individual equities (GICS-style buckets). Lives here —

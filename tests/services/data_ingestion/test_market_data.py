@@ -155,6 +155,90 @@ class TestCapture:
         assert [(r.ticker, r.date) for r in rows] == [("ABNB", session_day)]
 
     @pytest.mark.asyncio
+    async def test_the_still_open_session_is_not_persisted(self, db_session):
+        """A bar for today, fetched during market hours, is a partial: its
+        close, high, low and volume are whatever the session had reached. The
+        cycle only runs while the market is open, so nothing would ever correct
+        it — it would freeze as a wrong daily bar in a table whose entire
+        purpose is being right about history."""
+        today = datetime.now(timezone.utc).date()
+        yesterday = date.fromordinal(today.toordinal() - 1)
+        pipeline = MarketDataPipeline(
+            ib_client=ib_returning(bar(yesterday), bar(today, close=999.0)),
+            redis_client=AsyncMock(),
+            db_session=db_session,
+        )
+
+        written = await pipeline.capture("AAPL", yesterday, today)
+
+        rows = db_session.scalars(select(OHLCVDaily)).all()
+        assert [r.date for r in rows] == [yesterday]
+        assert written == 1, "the open session must not count toward capture"
+
+    @pytest.mark.asyncio
+    async def test_the_open_session_is_still_published(self, db_session):
+        """Skipping the partial bar is about what is KEPT. signal_generation
+        has always scored intraday bars and must keep receiving them."""
+        mock_redis = AsyncMock()
+        today = datetime.now(timezone.utc).date()
+        pipeline = MarketDataPipeline(
+            ib_client=ib_returning(bar(today)),
+            redis_client=mock_redis,
+            db_session=db_session,
+        )
+
+        await pipeline.ingest("AAPL", today, today)
+
+        mock_redis.publish.assert_called_once()
+        assert db_session.scalars(select(OHLCVDaily)).all() == []
+
+    @pytest.mark.asyncio
+    async def test_a_failed_commit_does_not_suppress_publishing(self, db_session):
+        """The stream is the trading path and the table is the archive. Before
+        capture existed, publishing did not depend on Postgres being up; it
+        must not start depending on it now."""
+        mock_redis = AsyncMock()
+        pipeline = MarketDataPipeline(
+            ib_client=ib_returning(bar(date(2025, 1, 6))),
+            redis_client=mock_redis,
+            db_session=db_session,
+        )
+        db_session.commit = MagicMock(side_effect=Exception("connection dropped"))
+
+        written = await pipeline.ingest("AAPL", date(2025, 1, 6), date(2025, 1, 6))
+
+        assert written == 0
+        mock_redis.publish.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_commit_is_rolled_back_so_the_next_ticker_survives(
+        self, db_session
+    ):
+        """SQLAlchemy deactivates the transaction after a failed flush, and
+        every later use raises PendingRollbackError until someone rolls back.
+        The session here lives for the life of the process, so one dropped
+        connection would otherwise stop capture permanently — behind a green
+        healthcheck, since the runner logs per-ticker errors and keeps looping.
+        """
+        pipeline = MarketDataPipeline(
+            ib_client=ib_returning(bar(date(2025, 1, 6))),
+            redis_client=AsyncMock(),
+            db_session=db_session,
+        )
+        real_commit = db_session.commit
+        db_session.commit = MagicMock(side_effect=Exception("connection dropped"))
+
+        assert await pipeline.capture("AAPL", date(2025, 1, 6), date(2025, 1, 6)) == 0
+
+        # The connection "comes back" — the next ticker must write normally.
+        db_session.commit = real_commit
+        pipeline._ib.get_daily_bars = AsyncMock(return_value=[bar(date(2025, 1, 6))])
+        assert await pipeline.capture("MSFT", date(2025, 1, 6), date(2025, 1, 6)) == 1
+
+        tickers = db_session.scalars(select(OHLCVDaily.ticker)).all()
+        assert tickers == ["MSFT"]
+
+    @pytest.mark.asyncio
     async def test_a_row_survives_its_ticker_leaving_the_universe(self, db_session):
         """AC5 — retention is the entire point. Nothing on the ingest path may
         delete, so a later cycle that no longer covers a departed name leaves

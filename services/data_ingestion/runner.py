@@ -15,6 +15,13 @@ from services.data_ingestion.events import EventsPipeline, EventsSourceProtocol
 
 logger = get_logger("data_ingestion_runner")
 
+# How far back each cycle re-fetches. Costs no extra IB requests (duration
+# is derived from the window, one request per ticker either way) and is what
+# lets a completed session land at all, plus lets a gap self-heal. Must stay
+# comfortably longer than the longest market closure plus any plausible
+# outage — a session that falls out of the window is unrecoverable.
+CAPTURE_LOOKBACK_DAYS = 7
+
 
 @dataclass(frozen=True)
 class CaptureHealth:
@@ -96,7 +103,8 @@ class DataIngestionRunner:
 
         Returns the session's :class:`CaptureHealth`.
         """
-        capture_only = [t for t in self._capture_universe if t not in set(tickers)]
+        trading = set(tickers)
+        capture_only = [t for t in self._capture_universe if t not in trading]
         expected = len(tickers) + len(capture_only)
 
         if not expected:
@@ -111,7 +119,17 @@ class DataIngestionRunner:
 
         now = datetime.now(timezone.utc)
         today = now.date()
-        yesterday = date.fromordinal(today.toordinal() - 1)
+        # A lookback window, not just yesterday. `IBClient.get_daily_bars`
+        # derives durationStr from (end - start), so a wider window is the SAME
+        # number of requests — one per ticker — and buys two things a two-day
+        # window cannot. First, completed sessions actually land: the cycle runs
+        # only while the market is open, so today's bar is skipped as a partial
+        # (see MarketDataPipeline._persist) and a session is written on a later
+        # day. A two-day window from a Monday reaches back only to Sunday, so
+        # Friday's bar would never be fetched at all. Second, a gap self-heals —
+        # after an outage or a redeploy the missed sessions are still inside the
+        # window and get upserted on the next cycle.
+        start = date.fromordinal(today.toordinal() - CAPTURE_LOOKBACK_DAYS)
         written = 0
 
         for ticker in tickers:
@@ -121,7 +139,7 @@ class DataIngestionRunner:
 
             # Market data
             try:
-                if await self._market_data.ingest(ticker, yesterday, today):
+                if await self._market_data.ingest(ticker, start, today):
                     written += 1
             except Exception:
                 logger.exception("market_data_error", ticker=ticker)
@@ -146,7 +164,7 @@ class DataIngestionRunner:
                 logger.info("run_cycle_interrupted", reason="shutdown_requested")
                 break
             try:
-                if await self._market_data.capture(ticker, yesterday, today):
+                if await self._market_data.capture(ticker, start, today):
                     written += 1
             except Exception:
                 logger.exception("capture_error", ticker=ticker)
@@ -216,7 +234,11 @@ if __name__ == "__main__":
         # to all three pipelines since the service was written, but nothing was
         # connected to the other end — so ohlcv_daily sat at 0 rows and every
         # bar this service ever fetched was published and then dropped.
-        engine = create_engine(config.database.url)
+        # pool_pre_ping: this session outlives any single connection. The
+        # nightly db backup and any `docker compose restart postgres` drop the
+        # pooled one, and without a pre-ping the next cycle fails on a stale
+        # handle rather than transparently reconnecting.
+        engine = create_engine(config.database.url, pool_pre_ping=True)
         db_session = sessionmaker(bind=engine)()
 
         from shared.universe import resolve_capture_universe, resolve_watchlist
@@ -224,7 +246,20 @@ if __name__ == "__main__":
         tickers = resolve_watchlist(
             config.universe.watchlist_source, config.universe.custom_tickers
         )
-        capture_universe = resolve_capture_universe(config.universe.capture_source)
+        # Capture must not be able to take the service down. If the membership
+        # snapshot is missing or unreadable the right outcome is an ingest
+        # service that still feeds the trading path, with the lost capture loud
+        # in the log and visible as a shortfall on the daily digest — not a
+        # crash loop under `restart: unless-stopped` that stops market data too.
+        try:
+            capture_universe = resolve_capture_universe(config.universe.capture_source)
+        except Exception:
+            logger.exception(
+                "capture_universe_unavailable",
+                capture_source=config.universe.capture_source,
+                consequence="capture disabled for this process; trading path unaffected",
+            )
+            capture_universe = []
         runner = DataIngestionRunner(
             config=config,
             ib_client=ib_client,

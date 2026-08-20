@@ -174,13 +174,23 @@ def render_summary(facts: RunFacts) -> str:
         f" / broker {facts.submission_failed}"
     )
 
-    # Omitted entirely when capture is disabled: a permanent "0/0" is noise,
-    # and a field the operator learns to skip is worse than no field.
-    if facts.capture_expected:
+    # Omitted entirely when capture is disabled (expected 0): a permanent "0/0"
+    # is noise, and a field the operator learns to skip is worse than no field.
+    # A negative expected means the universe could not be resolved — reported
+    # as "unknown" rather than as a healthy number, since a digest that cannot
+    # say what capture should be must not imply that capture is fine.
+    if facts.capture_expected < 0:
+        line += " · capture: unknown ⚠"
+    elif facts.capture_expected:
         short = facts.capture_expected - facts.capture_written
         line += f" · capture: {facts.capture_written}/{facts.capture_expected}"
         if short > 0:
             line += f" ⚠ short {short}"
+        elif short < 0:
+            # More written than expected means this script and the service
+            # disagree about the universe, which silently disables the
+            # shortfall alarm above — as bad as a shortfall, so as loud.
+            line += f" ⚠ over {-short}, universe drift"
 
     return line
 
@@ -195,13 +205,23 @@ def _capture_expected() -> int:
     """
     try:
         from shared.config import load_config
-        from shared.universe import resolve_capture_universe
+        from shared.universe import capture_expected_universe
 
         config = load_config(str(_REPO_ROOT / "config" / "default.yaml"))
-        return len(resolve_capture_universe(config.universe.capture_source))
+        return len(
+            capture_expected_universe(
+                config.universe.watchlist_source,
+                config.universe.custom_tickers,
+                config.universe.capture_source,
+            )
+        )
     except Exception as exc:  # noqa: BLE001 — capture must not sink the digest
-        print(f"capture universe unavailable: {_redact(str(exc))}", file=sys.stderr)
-        return 0
+        print(
+            f"capture universe unavailable: "
+            f"{_redact(type(exc).__name__)}: {_redact(str(exc))}",
+            file=sys.stderr,
+        )
+        return -1
 
 
 def _local_midnight() -> datetime:

@@ -237,6 +237,28 @@ def test_capture_is_omitted_when_it_is_disabled(session):
     assert "capture" not in render_summary(_facts(session, capture_expected=0))
 
 
+def test_an_unreadable_capture_universe_reports_unknown_not_healthy(session):
+    """"capture is fine" and "we could not work out what capture should be"
+    must not look the same. The wrapper's own rule: absence of evidence is not
+    evidence of absence."""
+    _bar(session, "AAPL")
+    summary = render_summary(_facts(session, capture_expected=-1))
+    assert "capture: unknown" in summary
+    assert "⚠" in summary
+
+
+def test_writing_more_than_expected_is_flagged_as_drift(session):
+    """A count above expected means the digest and the service disagree about
+    the universe — which silently disables the shortfall alarm, so it has to be
+    as visible as a shortfall."""
+    _bar(session, "AAPL")
+    _bar(session, "MSFT")
+    _bar(session, "NVDA")
+    summary = render_summary(_facts(session, capture_expected=2))
+    assert "capture: 3/2" in summary
+    assert "⚠" in summary
+
+
 # ---------------------------------------------------------------------------
 # The CLI
 # ---------------------------------------------------------------------------
