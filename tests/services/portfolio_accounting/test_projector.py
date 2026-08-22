@@ -4,10 +4,12 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import create_engine, func, select
+from sqlalchemy.exc import DataError, OperationalError
 from sqlalchemy.orm import Session
 
 from services.portfolio_accounting.projector import (
     FillConflictError,
+    FillProjectionError,
     FillProjector,
     InvalidFillError,
     UnattributedFillError,
@@ -719,3 +721,83 @@ def test_material_partial_then_done_stays_partial_not_filled(session, projector)
     session.rollback()
     assert intent.status == OrderStatus.PARTIALLY_FILLED.value
     session.rollback()
+
+
+def test_column_overflow_is_audited_and_raised_not_crashed(projector, session):
+    """A DataError from sleeve accounting must behave like any unprojectable fill.
+
+    KAN-61: ``trades.recommendation_id`` was varchar(50) while ids reached 60
+    characters, so ``_apply_fill_accounting`` raised
+    ``StringDataRightTruncation``. ``DataError`` was in neither the projector's
+    nor the runner's except clause, so it escaped ``apply()`` and killed the
+    process: an empty ``trades`` table and an empty DLQ at the same time, because
+    the service died before it could quarantine anything.
+
+    The contract this restores is the one the class docstring already promises:
+    the immutable execution row survives as audit, and the error is raised only
+    after that audit transaction commits.
+    """
+    seed_intent(session)
+    fill = make_fill()
+
+    def overflow(*args, **kwargs):
+        # Write first, then fail. A real overflow raises from flush() with
+        # accounting changes already pending in the savepoint, so the property
+        # under test is that those get rolled back while the audit row outside
+        # the savepoint still commits. Raising on entry would prove only that
+        # the except clause names DataError.
+        session.add(
+            Position(
+                account_id="DU12345",
+                ticker="AAPL",
+                portfolio="momentum",
+                quantity=10,
+                avg_entry_price=100,
+                current_price=100,
+                peak_price=100,
+                highest_price_since_entry=100,
+                opened_at=NOW,
+                status="open",
+            )
+        )
+        session.flush()
+        raise DataError(
+            "INSERT INTO trades (...) VALUES (...)",
+            {},
+            Exception("value too long for type character varying(50)"),
+        )
+
+    projector._paper_state._apply_fill_accounting = overflow
+
+    with pytest.raises(FillProjectionError):
+        projector.apply(fill)
+
+    # The audit row is the whole point: it must outlive the failure.
+    assert fill_count(session) == 1
+    execution = session.scalar(select(ExecutionFill))
+    assert execution.projection_applied is not True
+    # And no sleeve state moved.
+    assert get_position(session) is None
+    assert get_cash(session) == 10_000
+
+
+def test_an_infrastructure_error_still_escapes_rather_than_being_audited(
+    projector, session
+):
+    """The narrow catch matters: OperationalError must NOT be treated as bad data.
+
+    A DataError means this message can never be stored. An OperationalError
+    means the database is unreachable, and quarantining a perfectly good fill
+    because Postgres blinked would be silent data loss. It must propagate so the
+    message stays pending and the container restarts.
+    """
+    seed_intent(session)
+    fill = make_fill()
+
+    def unreachable(*args, **kwargs):
+        raise OperationalError("SELECT 1", {}, Exception("server closed connection"))
+
+    projector._paper_state._apply_fill_accounting = unreachable
+
+    with pytest.raises(OperationalError):
+        projector.apply(fill)

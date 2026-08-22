@@ -10,6 +10,7 @@ from sqlalchemy import (
     Index,
     JSON,
     String,
+    Text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -66,8 +67,13 @@ class Trade(Base):
     entry_price: Mapped[float] = mapped_column(Float, nullable=False)
     entry_date: Mapped[date] = mapped_column(Date, nullable=False)
     order_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    recommendation_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
-    exit_reason: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # 255 to match the same identifier on order_intents and execution_fills
+    # (shared/models/order_ledger.py:52 and :110). At String(50) this column
+    # rejected every account-scoped id and crash-looped the projector (KAN-61).
+    recommendation_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Text, not a wider String: this is populated from OrderIntent.reason, which
+    # is itself Text and unbounded, so any varchar bound here is a guess.
+    exit_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     pnl: Mapped[float] = mapped_column(Float, nullable=False)
     entry_signals: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     bar_features: Mapped[dict | None] = mapped_column(JSON, nullable=True)
