@@ -5,7 +5,7 @@ from math import isclose, isfinite
 from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.orm import Session
 
 from scripts.paper_state import PaperTradingState
@@ -135,9 +135,23 @@ class FillProjector:
                     )
                     execution.projection_applied = True
                     self.session.flush()
-            except (FillProjectionError, ValueError) as exc:
+            except (FillProjectionError, ValueError, DataError) as exc:
                 # Do not raise inside the transaction: the immutable execution
                 # row is the durable audit record and must survive the failure.
+                #
+                # DataError is here because a value that does not fit its column
+                # is unprojectable in exactly the same way as one that fails a
+                # business rule -- the message can never be stored, no matter how
+                # often it is retried. Before KAN-61 it was in neither this
+                # clause nor the runner's, so it escaped apply() entirely and
+                # killed the process. That is why the crash loop left the DLQ
+                # empty: send_to_dead_letter was never reached, so the poison
+                # message was retried forever instead of being quarantined.
+                #
+                # Deliberately NOT SQLAlchemyError. An OperationalError means the
+                # database is unreachable, and quarantining a good fill because
+                # Postgres blinked would be silent data loss; that must propagate
+                # so the message stays pending and the container restarts.
                 projection_error = (
                     exc if isinstance(exc, FillProjectionError)
                     else InvalidFillError(str(exc))

@@ -31,20 +31,42 @@ held constant, the A↔B difference is attributable to capital rather than to th
 sizing change. Arm C is the shape every published baseline has been run in, and
 is reported only so the two are not confused.
 
-> **Universe caveat — read before quoting any number here.** These runs replay
-> the cached 138-ticker static universe from
-> `output/backtest_multi_20260804_075705.json`, **not** the point-in-time
-> membership calendar KAN-23 delivered. No PIT-universe bar set exists yet:
-> building one needs ~830 names fetched from IB Gateway, which is an operator
-> step measured in hours. So these numbers carry survivorship bias and the
-> per-sleeve returns are indicative.
+**§3–§5 were re-measured on the point-in-time universe on 2026-08-19 (KAN-52).**
+Arms A and B now replay `output/backtest_multi_20260819_183451.json` — 826
+names resolved from `data/universe/sp500_membership.json`, fetched over 5.5
+hours of IB Gateway time — not the cached 138-ticker static set the first
+version of this memo used. Arm C is unchanged and remains the static
+fractional reference.
+
+> **Universe caveat — read before quoting any number here.** The PIT re-run
+> did **not** clear the survivorship problem, and the reason is worth stating
+> precisely rather than softening. IB returned bars for only **576 of the 826**
+> names requested; the remaining 250 returned nothing at all. The artifact
+> reads **`coverage.state: BLOCKED`**, with **142,856 of 1,265,893
+> membership-days (11.28%) excluded across 164 names** — names unpriceable for
+> some or all of their time in the index — against a
+> 5.0% floor. The excluded names are overwhelmingly the delistings — the exact
+> names whose absence *is* survivorship bias — so what §5 measures is a
+> universe of historical members that survived long enough for IB to still
+> serve their history.
 >
-> The headline is nonetheless robust to that, because fill feasibility is a
-> comparison between a sleeve's position budget and a share price — it does not
-> depend on which names were in the index in 2018. Survivorship bias flatters
-> returns; it does not make a $34 budget able to buy a $170 share. **Re-run on
-> the PIT universe before the decision is logged** (§6), and expect the
-> feasibility percentages to move by a point or two, not to reverse.
+> This is not a fixable fetch. IB keeps a contract record for a delisted name
+> but attaches it to the pseudo-exchange `VALUE`, whose historical service
+> returns *"No data of type EODChart is available for the exchange 'VALUE'"*.
+> Neither `SMART` routing, nor an explicit `conId`, nor `exchange='VALUE'`
+> recovers a bar. A coverage-`OK` baseline is therefore **unreachable from IB
+> alone** and needs a survivorship-free vendor. Per-name costs and the
+> reproduction are in
+> [backtest-baseline.md](backtest-baseline.md#names-ib-cannot-price).
+>
+> **What this permits and forbids.** §3 fill feasibility and §4 commission drag
+> are comparisons between a sleeve's position budget and a share price. They do
+> not depend on which names were in the index in 2018, and the re-run confirms
+> it: the feasibility percentages moved by at most 1.3 points, exactly the
+> "point or two, not a reversal" this memo predicted before the run. Quote
+> them. **§5 returns remain survivorship-inflated and are still indicative
+> only** — the D16 hard bar on quoting a Rung-0 return figure or divergence
+> threshold (§9.6(3)) is **not** lifted by this run and stays in force.
 
 ---
 
@@ -64,7 +86,11 @@ Recomputed from the committed weights in `scripts/run_backtest.py:main()`
 
 ¹ Names whose latest close is at or below the position budget, i.e. where one
 whole share can be bought. The universe's median latest close is **$171.61** —
-above every sleeve's entire per-position budget.
+above every sleeve's entire per-position budget. Counted over the 138-name
+present-day sleeve union, deliberately: this column asks what is buyable
+*today*, and delisted historical members are not. §3 quotes the corresponding
+figure over the point-in-time universe (13.3% for `quality_value`), which is
+larger because the historical universe contains more low-priced names.
 
 These reproduce the direction doc's $34–119 range exactly.
 
@@ -79,30 +105,32 @@ because the budget could not buy one whole share.
 
 | Sleeve | signals sized | **unfillable** | **% unfillable** | closed trades | open at end |
 |---|---:|---:|---:|---:|---:|
-| `quality_value` | 7,395 | **7,395** | **100.0%** | **0** | 0 |
-| `tail_risk_hedge` | 5,956 | 5,952 | 99.9% | 3 | 0 |
-| `earnings_drift` | 2,904 | 2,768 | 95.3% | 105 | 0 |
-| `momentum` | 5,952 | 5,665 | 95.2% | 233 | 0 |
-| `thematic_momentum` | 2,426 | 2,071 | 85.4% | 269 | 0 |
-| `sector_rotation` | 741 | 606 | 81.8% | 104 | 2 |
+| `quality_value` | 7,560 | **7,560** | **100.0%** | **0** | 0 |
+| `tail_risk_hedge` | 6,198 | 6,193 | 99.9% | 4 | 0 |
+| `earnings_drift` | 2,868 | 2,735 | 95.4% | 103 | 0 |
+| `momentum` | 5,776 | 5,426 | 93.9% | 293 | 1 |
+| `thematic_momentum` | 2,469 | 2,113 | 85.6% | 269 | 0 |
+| `sector_rotation` | 762 | 624 | 81.9% | 102 | 3 |
 
 ### Arm B — USD 100,000, whole shares (control)
 
 | Sleeve | signals sized | unfillable | % unfillable | closed trades | open at end |
 |---|---:|---:|---:|---:|---:|
-| `quality_value` | 128 | 13 | 10.2% | 71 | 17 |
-| `earnings_drift` | 1,258 | 413 | 32.8% | 626 | 0 |
-| `thematic_momentum` | 978 | 3 | 0.3% | 716 | 6 |
-| `momentum` | 584 | 2 | 0.3% | 464 | 7 |
-| `sector_rotation` | 169 | 12 | 7.1% | 117 | 4 |
-| `tail_risk_hedge` | 449 | 56 | 12.5% | 292 | 1 |
+| `quality_value` | 126 | 15 | 11.9% | 75 | 16 |
+| `earnings_drift` | 1,245 | 410 | 32.9% | 618 | 0 |
+| `thematic_momentum` | 976 | 6 | 0.6% | 711 | 6 |
+| `momentum` | 847 | 13 | 1.5% | 671 | 7 |
+| `sector_rotation` | 170 | 11 | 6.5% | 116 | 5 |
+| `tail_risk_hedge` | 525 | 63 | 12.0% | 360 | 1 |
 
-**`quality_value` posts 7,395 entry signals and executes none of them.** Its
-$34.14 budget clears one share of 8% of the universe, and the composite
-quality-value score does not preferentially rank cheap shares. At Rung 0 the
+**`quality_value` posts 7,560 entry signals and executes none of them.** Its
+$34.14 budget clears one share of 13.3% of the point-in-time universe
+(1,123,037 priceable member-days measured), and the composite quality-value
+score does not preferentially rank cheap shares — a wider, cheaper historical
+universe does not help a sleeve that never ranks by price. At Rung 0 the
 sleeve is a no-op that still consumes 15.4% of the account.
 
-`tail_risk_hedge` is effectively as dead — 3 trades in ten years — and worse
+`tail_risk_hedge` is effectively as dead — 4 trades in ten years — and worse
 than its $118.68 headline suggests, because the regime allocation multiplies
 the budget again (a 0.10 weight on `GLD` in a bear regime is an $11.87
 position).
@@ -121,14 +149,14 @@ excluded and counted in §3 above.
 
 | Sleeve | **Arm A drag (bps)** | Arm B drag (bps) | A ÷ B |
 |---|---:|---:|---:|
-| `sector_rotation` | 236 | 17 | 13.6× |
-| `momentum` | 264 | 11 | 23.4× |
-| `earnings_drift` | 489 | 27 | 18.4× |
-| `tail_risk_hedge` | 523 | 25 | 21.2× |
-| `thematic_momentum` | 632 | 12 | 54.0× |
-| `quality_value` | — (no trades) | 27 | — |
+| `sector_rotation` | 237 | 19 | 12.8× |
+| `momentum` | 307 | 25 | 12.4× |
+| `tail_risk_hedge` | 448 | 26 | 17.3× |
+| `earnings_drift` | 489 | 26 | 18.6× |
+| `thematic_momentum` | 629 | 11 | 56.8× |
+| `quality_value` | — (no trades) | 34 | — |
 
-**Round-trip drag at Rung 0 is 236–632 bps: 2.4% to 6.3% of notional per
+**Round-trip drag at Rung 0 is 237–629 bps: 2.4% to 6.3% of notional per
 completed trade.** The direction doc quotes 84–293 bps. That figure is the
 **one-way** number — commission is charged on entry *and* exit, so the doc's
 range must be doubled to 168–586 bps before it is comparable, and the measured
@@ -139,52 +167,87 @@ The aggregate statement of the same fact:
 
 | | Arm A (3,700) |
 |---|---:|
-| Gross P&L before commission | **+$1,766.35** |
-| Commissions paid | **−$1,428.00** |
-| Net P&L | **+$338.35** |
-| Commissions as % of starting capital | **38.6%** |
+| Gross P&L before commission | **+$1,114.56** |
+| Commissions paid | **−$1,542.00** |
+| Net P&L | **−$427.44** |
+| Commissions as % of starting capital | **41.7%** |
 
-**Commission consumes 81% of gross profit over ten years.** Per sleeve the
-picture is starker: `thematic_momentum` earns **+$118.90 gross** and pays
-**$538.00** in commission, finishing at **−$419.10**. It is not a losing
-strategy at Rung 0; it is a winning strategy sold to the broker.
+**Commission consumes 138% of gross profit over ten years — Rung 0 does not
+merely underperform, it finishes below where it started.** This is the one
+headline the PIT re-run moved materially: on the static universe the same
+arithmetic left **+$338.35** of net profit (81% of gross paid away), and on the
+point-in-time universe it leaves **−$427.44**. Gross profit fell (fewer
+survivors to ride) while commissions rose (more signals, so more $1.00 floors),
+and the two crossed.
+
+Per sleeve, ten years at Rung-0 capital:
+
+| Sleeve | gross | commission | **net** |
+|---|---:|---:|---:|
+| `sector_rotation` | +$321.63 | $204.00 | **+$117.63** |
+| `quality_value` | $0.00 | $0.00 | **$0.00** |
+| `tail_risk_hedge` | −$0.39 | $8.00 | **−$8.39** |
+| `momentum` | +$551.15 | $586.00 | **−$34.85** |
+| `earnings_drift` | +$122.34 | $206.00 | **−$83.66** |
+| `thematic_momentum` | +$119.84 | $538.00 | **−$418.16** |
+
+`thematic_momentum` remains the clearest case: it earns **+$119.84 gross**, pays
+**$538.00** in commission, and finishes at **−$418.16**. It is not a losing
+strategy at Rung 0; it is a winning strategy sold to the broker. **Four of the
+six sleeves are now net-negative after commission, and `sector_rotation` is the
+only one that finishes ahead.**
 
 ---
 
 ## 5. Return vs the control
 
+All three arms below replay the same point-in-time bars, so the comparison is
+like-for-like. **Read them against the §1 caveat: these returns are still
+survivorship-inflated by the 11.28% of membership-days IB could not price, and
+remain indicative only.**
+
 | | Arm A (3,700, whole) | **Arm B (100k, whole — control)** | Arm C (100k, fractional) |
 |---|---:|---:|---:|
-| Total return | **+9.07%** | **+84.33%** | +83.87% |
-| Sharpe | 0.22 | 0.88 | 0.87 |
-| Max drawdown | 11.56% | 12.27% | 12.35% |
-| Win rate | 26.3% | 40.0% | — |
-| Total trades | 714 | 2,286 | 2,298 |
+| Total return | **−11.08%** | **+79.00%** | +78.57% |
+| Sharpe | −0.22 | 0.72 | 0.70 |
+| Max drawdown | 21.30% | 11.28% | 11.28% |
+| Win rate | 28.4% | 39.2% | 38.0% |
+| Total trades | 771 | 2,551 | 2,554 |
 
 Per sleeve (total return %):
 
 | Sleeve | Arm A | Arm B |
 |---|---:|---:|
-| `momentum` | +75.48 | +201.15 |
-| `sector_rotation` | +34.98 | +90.73 |
-| `quality_value` | 0.00 (no trades) | +9.71 |
-| `tail_risk_hedge` | −1.82 | −19.64 |
-| `earnings_drift` | −11.27 | +42.21 |
-| `thematic_momentum` | **−80.33** | +119.59 |
+| `sector_rotation` | **+20.63** | +84.55 |
+| `quality_value` | 0.00 (no trades) | +18.99 |
+| `tail_risk_hedge` | −1.77 | −16.05 |
+| `momentum` | **−2.01** | +171.44 |
+| `earnings_drift` | −11.76 | +39.14 |
+| `thematic_momentum` | **−80.15** | +127.95 |
 
-**Rung 0 retains about one-ninth of the control's ten-year return** (9.07% vs
-84.33%), on a strategy that loses two of its six sleeves entirely and inverts
-the sign on two more. B and C landing within 0.5 points of each other (84.33%
-vs 83.87%) confirms the control is doing its job: whole-share rounding is
-nearly free at $100k, so the A↔B gap is capital, not rounding.
+**Rung 0 does not retain a fraction of the control's ten-year return — it
+inverts it**: −11.08% against +79.00%, with a max drawdown nearly twice the
+control's (21.30% vs 11.28%). On the static universe Rung 0 still cleared
++9.07%; on the point-in-time universe it is loss-making. Two of six sleeves
+never trade or barely trade, and three of the four that do finish negative.
+
+B and C landing within 0.43 points of each other (79.00% vs 78.57%) confirms
+the control is doing its job: whole-share rounding is nearly free at $100k, so
+the A↔B gap is capital, not rounding.
+
+The single most consequential change from the static run is `momentum`, the
+sleeve D8 selected: **+75.48% → −2.01%** at Rung-0 capital, while the named
+fallback `sector_rotation` goes **+34.98% → +20.63%** and becomes the only
+sleeve with a positive Rung-0 return. §9.2 treats this.
 
 ---
 
 ## 6. Incidental finding: the fractional model books lots no broker would fill
 
-Arm C's mean drag reads 115,428 bps for `earnings_drift` against a median of 13
-bps. The outliers are trades of **0.0001 shares** — $0.0031 of notional paying
-$2.00 of commission.
+Arm C's mean drag reads 94,506 bps for `earnings_drift` against a median of 13
+bps. The outliers are trades of **0.0001 shares** — e.g. `XOM` entered at
+$42.56 for $0.0043 of notional, paying $2.00 of commission. 56 of the sleeve's
+616 closed lots are sub-one-share, with a median size of 0.008 shares.
 
 They come from the risk engine, not the sizing sites. `RiskEngine.check_entry`
 caps an oversized entry and returns `adjusted_quantity` floored to four decimal
@@ -197,10 +260,10 @@ and do not move the return, but they corrupt any per-trade cost statistic.
 
 KAN-34 closes this on the whole-share path: truncation is applied after risk
 sizing as well as at the signal (`backtest/runner.py`), which is why arm B's
-`earnings_drift` shows 413 unfillable signals even at $100k: with the sleeve's
+`earnings_drift` shows 410 unfillable signals even at $100k: with the sleeve's
 exposure limit nearly consumed, risk approves only the residual headroom, and
-that sliver is a fraction of a share (median **0.14 shares**; e.g. `NOW` at
-$64.40 approved for 0.2131 shares — $13.72 of room). Fractionally that books a
+that sliver is a fraction of a share (median **0.16 shares**; e.g. `MMC` at
+$132.21 approved for 0.1601 shares — $21.17 of room). Fractionally that books a
 lot; live it is an `OrderSkippedError`. On the fractional path the behaviour is
 unchanged by design. Making whole-share the default is a separate decision
 (out of scope here) but the evidence now favours it.
@@ -213,8 +276,8 @@ The direction doc offers three options. Measured against these numbers:
 
 **(a) Accept the drag with a capital-specific baseline — not viable.** This
 option assumes the sleeves trade and merely trade expensively. They do not
-trade: `quality_value` fills 0 of 7,395 signals and `tail_risk_hedge` 4 of
-5,956. There is no baseline to regenerate for a sleeve with no trades, and
+trade: `quality_value` fills 0 of 7,560 signals and `tail_risk_hedge` 4 of
+6,198. There is no baseline to regenerate for a sleeve with no trades, and
 D16 would require a second baseline artifact plus a second set of monitor pins
 to describe a book that is 100%-cash in two of six sleeves.
 
@@ -264,10 +327,21 @@ Two constraints on adopting this:
 
 ## 8. Operator steps — not run by the agent
 
-1. **Regenerate the PIT-universe bar set and re-run all three arms**, so the
-   decision is logged against a non-survivorship-biased universe. Needs IB
-   Gateway on `127.0.0.1:7497`; hours, and it contends with the 04:15 paper run
-   for historical-data pacing.
+1. ~~**Regenerate the PIT-universe bar set and re-run all three arms**~~ —
+   **DONE 2026-08-19 (KAN-52).** Ran 13:09–18:34 SGT, outside the 04:15 paper
+   window; 826 names requested, **5.5 hours** of gateway time, artifact
+   `output/backtest_multi_20260819_183451.json`. All three arms were re-run
+   from those bars via `--bars-from-json`, so the gateway was held once. §3–§5
+   now carry the PIT figures and §9.9 records the decision review.
+
+   **It did not achieve a non-survivorship-biased universe, and cannot.** IB
+   priced 576 of the 826 names; the artifact is `coverage.state: BLOCKED` at
+   11.28% of membership-days excluded against a 5.0% floor. The missing names
+   are the delistings, and IB serves no history for them by any contract
+   construction (§1). Closing this needs a survivorship-free data vendor — it
+   is *not* a matter of re-running the command below. Note also that at 5.5
+   hours this run would have come within ~30 minutes of the weekly job's 6-hour
+   `ALGO_REFRESH_TIMEOUT_SECONDS` kill deadline.
 
    ```bash
    python scripts/run_backtest.py --years 10 \
@@ -339,9 +413,9 @@ measure; fill rate buys exercised code paths, which is the actual deliverable.
 
 Selected on **operational criteria, explicitly not on backtest return**:
 
-- **Signal frequency** — 5,952 signals reaching sizing over ten years
-  (joint-highest), 233 closed trades at Rung 0 (second only to
-  `thematic_momentum`'s 269, which is gross-profitable but fee-killed, §4).
+- **Signal frequency** — 5,776 signals reaching sizing over ten years
+  (joint-highest), 293 closed trades at Rung 0 (the most of any sleeve, ahead
+  of `thematic_momentum`'s 269, which is gross-profitable but fee-killed, §4).
   Frequency is what exercises the ops loop inside a two-month window.
 - **Smallest departure from the committed book** — at 0.2308 it already holds
   the largest weight, so concentrating on it is the least violent overlay
@@ -352,10 +426,17 @@ Selected on **operational criteria, explicitly not on backtest return**:
 - **Carries the bear tickers** — `SH`/`PSQ` are in its eligible universe
   (`shared/universe.py:40,71`), so the sleeve is not structurally long-only.
 
-**Not** selected for posting the highest Arm A return (+75.48%). That figure is
-survivorship-biased (§1) and selecting on it would add a further trial on top of
-the eight-candidate → six-sleeve search of 2026-05-26. Every ground above is
-independent of realised return.
+**Not** selected for posting the highest Arm A return. On the static universe
+that return was +75.48% and this section already declined to rely on it,
+because the figure was survivorship-biased (§1) and selecting on it would add a
+further trial on top of the eight-candidate → six-sleeve search of 2026-05-26.
+
+**The PIT re-run vindicates that refusal rather than undermining it.** On
+point-in-time bars `momentum`'s Rung-0 return is **−2.01%**, and the sleeve
+with the highest Arm A return is now `sector_rotation` at **+20.63%**. Had this
+decision been taken on realised return it would have selected `momentum` on the
+static run and would have to reverse itself now. Every ground above is
+independent of realised return, so none of them moved. See §9.9.
 
 ### 9.4 What this decision deliberately does not change
 
@@ -448,13 +529,70 @@ record:
 - **The named fallback is `sector_rotation`** — the rehearsal's cleanest DSR, and
   at 100% of Rung 0 it sizes to **$740 per position, 95.7% of the universe
   fillable (132/138), ~27 bps round-trip drag**, all better than `momentum`'s.
-  The cost is operational: 741 sized signals over ten years against
-  `momentum`'s 5,952, so a two-month window exercises the ops loop roughly an
+  The cost is operational: 762 sized signals over ten years against
+  `momentum`'s 5,776, so a two-month window exercises the ops loop roughly an
   order of magnitude less. That trade-off is re-decided at the time, on the
   verdicts of record, not pre-committed here.
+
+  On PIT bars the fallback's case strengthens on return — `sector_rotation` is
+  the only sleeve with a positive Rung-0 net result (**+$117.63**, §4) and the
+  highest Arm A return (**+20.63%**, §5) — and is unchanged on the two grounds
+  that actually decided D8: it still sizes to $740 per position and still posts
+  762 sized signals against `momentum`'s 5,776. The return evidence is the part
+  §1 forbids relying on, so it does not by itself move the decision.
 - **If neither passes, Rung 0 does not arm at all** — a decision the ladder
   already provides for, and a better outcome than arming on a sleeve the
   framework rejected.
+
+### 9.9 Does D8 survive the PIT re-run? — yes, on its stated grounds
+
+Recorded 2026-08-19 (KAN-52) against
+`output/backtest_multi_20260819_183451.json`. The test is the one KAN-52 set:
+whether **fill feasibility or drag** moved enough to change the ranking. They
+did not.
+
+| Ground D8 rested on | Static | PIT | Moved? |
+|---|---|---|---|
+| `quality_value` unfillable | 100.0% | 100.0% | no |
+| `tail_risk_hedge` unfillable | 99.9% | 99.9% | no |
+| Rung-0 drag range | 236–632 bps | 237–629 bps | no |
+| `momentum` signals sized | 5,952 | 5,776 | −3%, still joint-highest |
+| `momentum` closed trades at Rung 0 | 233 | 293 | +26%, now the most of any sleeve |
+
+**The decision stands as written: Rung 0 runs `momentum`, 100%.** The two
+sleeves D8 suspended for being unfillable are unfillable at the same rates; the
+drag range that made six-way allocation untenable is within two basis points of
+its static value; and the frequency argument that selected `momentum` is intact
+and slightly stronger on closed trades.
+
+**What did move, and why it does not reopen D8.** Rung 0's aggregate return
+turns negative (−11.08%, §5), `momentum`'s Rung-0 return falls from +75.48% to
+−2.01%, and `sector_rotation` becomes the only sleeve with a positive Rung-0
+return (+20.63%) and the only positive net P&L (+$117.63, §4). Under §9.6(3)
+and §9.7 these are exactly the figures this memo is forbidden to decide on: §5
+returns remain survivorship-inflated by the 11.28% of membership-days IB cannot
+price (§1), and Rung 0 was never sized to produce a return verdict. Reversing a
+decision made on feasibility, using return numbers the memo itself marks
+unquotable, is the error §9.3 exists to avoid.
+
+**Two consequences are recorded, not decided, here.**
+
+1. **The §9.8 fallback improved on every axis, including the unusable one.** If
+   `momentum` fails its verdict of record, the case for `sector_rotation` is
+   stronger than when §9.8 was written. That does not pre-empt the verdicts; it
+   lowers the cost of the swap if they call for it.
+2. **The commission finding hardened into a sign change.** §4's "commission
+   consumes 81% of gross" is now **138%** — Rung 0 pays more in fees than it
+   earns before them. This does not bear on *which* sleeve Rung 0 runs, but it
+   sharpens §9.7: a clean Rung 0 can demonstrate the machine works while losing
+   money, and nobody should read a positive Rung-0 P&L as the expected case.
+
+**Still owed, and not closed by this run.** The PIT bars exist and all three
+arms were re-run on them, but the artifact is `coverage.state: BLOCKED` (§1).
+The D16 hard bar on quoting a Rung-0 return figure or divergence threshold
+therefore **remains in force**, and the capital-specific divergence baseline
+(§9.6(2)) must **not** be built from this artifact. Lifting either needs
+delisted-name history IB does not serve.
 
 ---
 
@@ -463,6 +601,30 @@ record:
 Everything in §2–§6 comes from the three arms above. The weekly refresh
 (`deploy/launchd/run_backtest_refresh.sh`) is unaffected: `--whole-shares`
 defaults off, so every existing invocation stays fractional and byte-identical.
+
+As of 2026-08-19 the arms replay the point-in-time bar set. Step 1 holds the
+gateway for ~5.5 hours; steps 2–4 need no gateway at all.
+
+```bash
+# 1. the PIT bar set (operator step — see §8)
+python scripts/run_backtest.py --years 10 \
+    --universe-snapshots data/universe/sp500_membership.json \
+    --output-dir output
+# 2-4. the three arms, off those bars
+BARS=output/backtest_multi_20260819_183451.json
+python scripts/run_backtest.py --capital 3700   --whole-shares \
+    --bars-from-json $BARS --universe-snapshots data/universe/sp500_membership.json
+python scripts/run_backtest.py --capital 100000 --whole-shares \
+    --bars-from-json $BARS --universe-snapshots data/universe/sp500_membership.json
+python scripts/run_backtest.py --capital 100000 \
+    --bars-from-json $BARS --universe-snapshots data/universe/sp500_membership.json
+```
+
+Arm C is re-run on the PIT bars too. KAN-52 only required arms A and B, but
+re-running C keeps §5's B↔C control comparison like-for-like — with C left on
+the static bars the "whole-share rounding is nearly free at $100k" argument
+would have been confounded by the universe change rather than isolating the
+sizing change.
 
 That last claim was verified rather than assumed. Arm C was run twice on the
 same cached bars — once on this branch, once on `origin/develop` (84f8c7d) —

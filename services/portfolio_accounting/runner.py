@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from pydantic import ValidationError
+from sqlalchemy.exc import DataError
 
 from services.portfolio_accounting.projector import FillProjectionError, FillProjector
 from shared.heartbeat import write_heartbeat
@@ -40,7 +41,12 @@ class PortfolioAccountingRunner:
         try:
             fill = FillMessage.from_stream_dict(message.data)
             self._projector.apply(fill)
-        except (ValidationError, FillProjectionError) as exc:
+        # DataError is the backstop for an overflow raised outside the projector's
+        # own nested block (e.g. by the execution_fills insert). Narrow on purpose:
+        # SQLAlchemyError would sweep up OperationalError too and dead-letter every
+        # fill in flight during a Postgres restart. See KAN-61 and
+        # test_database_outage_is_not_mistaken_for_bad_data.
+        except (ValidationError, FillProjectionError, DataError) as exc:
             logger.exception(
                 "Fill projection failed; sending to DLQ",
                 message_id=message.message_id,

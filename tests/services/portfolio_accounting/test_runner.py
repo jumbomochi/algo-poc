@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from unittest.mock import ANY, AsyncMock, MagicMock, call
 
 import pytest
+from sqlalchemy.exc import DataError, OperationalError
 
 from services.portfolio_accounting.projector import UnattributedFillError
 from services.portfolio_accounting.runner import (
@@ -118,6 +119,54 @@ async def test_unexpected_database_failure_remains_pending(redis_client):
 
     with pytest.raises(RuntimeError, match="database unavailable"):
         await runner.process_message(raw_fill())
+
+    redis_client.send_to_dead_letter.assert_not_awaited()
+    redis_client.ack.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_column_overflow_is_dlqd_and_acked(redis_client):
+    """A DataError reaching the runner is a poison pill, not an outage.
+
+    The projector converts an overflow raised by sleeve accounting into a
+    FillProjectionError, so this is the backstop for one raised anywhere else
+    in apply() -- e.g. by the execution_fills insert itself. Either way the
+    message can never be stored, so it must be quarantined rather than retried
+    until the process dies (KAN-61).
+    """
+    projector = MagicMock()
+    projector.apply.side_effect = DataError(
+        "INSERT INTO trades (...) VALUES (...)",
+        {},
+        Exception("value too long for type character varying(50)"),
+    )
+    runner = PortfolioAccountingRunner(redis_client, projector)
+    message = raw_fill("overflow-1")
+
+    await runner.process_message(message)
+
+    redis_client.send_to_dead_letter.assert_awaited_once()
+    redis_client.ack.assert_awaited_once_with(
+        FILLS_STREAM, CONSUMER_GROUP, message.message_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_database_outage_is_not_mistaken_for_bad_data(redis_client):
+    """OperationalError must stay pending. Quarantining it would lose good fills.
+
+    This is the boundary that keeps the DataError catch honest: broadening it to
+    SQLAlchemyError would dead-letter every fill in flight during a Postgres
+    restart and silently drop them.
+    """
+    projector = MagicMock()
+    projector.apply.side_effect = OperationalError(
+        "SELECT 1", {}, Exception("server closed the connection unexpectedly")
+    )
+    runner = PortfolioAccountingRunner(redis_client, projector)
+
+    with pytest.raises(OperationalError):
+        await runner.process_message(raw_fill("outage-1"))
 
     redis_client.send_to_dead_letter.assert_not_awaited()
     redis_client.ack.assert_not_awaited()
