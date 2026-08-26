@@ -936,3 +936,108 @@ def test_a_dead_database_still_produces_a_message(cal):
     assert "MISSING SOURCES" in rendered
     assert "Epoch unavailable" in rendered
     assert "ConnectionError" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Accepted absences (KAN-67) — a gap with a recorded cause is a footnote, and
+# a gap without one is the alarm. 2026-08-18 looked like the first for three
+# days while actually being the second.
+# ---------------------------------------------------------------------------
+
+MIXED_GAPS = """\
+🚨 BLIND — the monitor saw nothing on 1 of 5 sessions (2026-08-11)
+◻️ ABSENT (accepted) — 2 of 5 sessions have a recorded cause (2026-08-13, 2026-08-18)
+Epoch v2 — week 3 of 6 · RUNNING
+  divergence green · drawdown green · safety green · drills green · quantum green
+Equity 5,012.34 USD (+1.2% wk)
+  momentum OK 0.80/5.00 · sector_rotation OK 1.10/5.00
+DLQ clear · alerts 3 (2 high, 1 info) · drills due: none"""
+
+
+def test_accepted_absences_are_counted_apart_from_the_blind_alarm():
+    snapshot = _snapshot(
+        blind=BlindReport(
+            blind_sessions=[date(2026, 8, 11), date(2026, 8, 13), date(2026, 8, 18)],
+            total_sessions=5,
+            absent_sessions=[date(2026, 8, 13), date(2026, 8, 18)],
+        )
+    )
+    assert render_digest(snapshot) == MIXED_GAPS
+
+
+ONLY_ACCEPTED = """\
+◻️ ABSENT (accepted) — 2 of 5 sessions have a recorded cause (2026-08-13, 2026-08-18)
+Epoch v2 — week 3 of 6 · RUNNING
+  divergence green · drawdown green · safety green · drills green · quantum green
+Equity 5,012.34 USD (+1.2% wk)
+  momentum OK 0.80/5.00 · sector_rotation OK 1.10/5.00
+DLQ clear · alerts 3 (2 high, 1 info) · drills due: none"""
+
+
+def test_a_week_whose_every_gap_is_accepted_raises_no_blind_alarm():
+    """The 🚨 is for gaps nobody has accounted for; these have a cause on file."""
+    snapshot = _snapshot(
+        blind=BlindReport(
+            blind_sessions=[date(2026, 8, 13), date(2026, 8, 18)],
+            total_sessions=5,
+            absent_sessions=[date(2026, 8, 13), date(2026, 8, 18)],
+        )
+    )
+    assert render_digest(snapshot) == ONLY_ACCEPTED
+
+
+ONE_ACCEPTED = """\
+◻️ ABSENT (accepted) — 1 of 5 session has a recorded cause (2026-08-18)
+Epoch v2 — week 3 of 6 · RUNNING
+  divergence green · drawdown green · safety green · drills green · quantum green
+Equity 5,012.34 USD (+1.2% wk)
+  momentum OK 0.80/5.00 · sector_rotation OK 1.10/5.00
+DLQ clear · alerts 3 (2 high, 1 info) · drills due: none"""
+
+
+def test_a_single_accepted_absence_reads_as_one_session():
+    snapshot = _snapshot(
+        blind=BlindReport(
+            blind_sessions=[date(2026, 8, 18)],
+            total_sessions=5,
+            absent_sessions=[date(2026, 8, 18)],
+        )
+    )
+    assert render_digest(snapshot) == ONE_ACCEPTED
+
+
+def test_the_no_pins_fallback_classifies_accepted_absences_too(db, cal):
+    """The same date must not render 🚨 on one path and ◻️ on the other.
+
+    The window 2026-08-10..2026-08-17 contains 2026-08-13, which the registry
+    accounts for. Before Rung 0 there is no epoch and this fallback is the path
+    that actually runs, so it is the one an operator sees.
+    """
+    sources = build_sources(
+        db, redis=None, as_of=AS_OF, window_start=WINDOW_START, calendar=cal
+    )
+    report = sources.blind()
+
+    assert report is not None
+    assert date(2026, 8, 13) in report.blind_sessions
+    assert report.absent_sessions == [date(2026, 8, 13)]
+
+
+def test_the_accepted_absence_footnote_ranks_below_the_missing_sources_caveat():
+    """Loudest first. A gap with a cause on record is the quietest line here."""
+    snapshot = _snapshot(
+        blind=BlindReport(
+            blind_sessions=[date(2026, 8, 11), date(2026, 8, 13)],
+            total_sessions=5,
+            absent_sessions=[date(2026, 8, 13)],
+        ),
+        dlq=None,
+        missing=["dlq (ConnectionError: redis unreachable)"],
+    )
+
+    lines = render_digest(snapshot).splitlines()
+    positions = [
+        next(i for i, line in enumerate(lines) if line.startswith(marker))
+        for marker in ("🚨 BLIND", "⚠️ MISSING SOURCES", "◻️ ABSENT")
+    ]
+    assert positions == sorted(positions)

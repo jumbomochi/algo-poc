@@ -65,6 +65,7 @@ from services.notifications.channels import (  # noqa: E402
     TELEGRAM_MAX_BODY,
     TelegramChannel,
 )
+from shared.absent_sessions import absent_sessions_in  # noqa: E402
 from shared.evidence_store import (  # noqa: E402
     EXCLUDED_PORTFOLIO_PREFIX,
     _passing_drill_types,
@@ -125,6 +126,12 @@ class BlindReport:
 
     blind_sessions: list[date]
     total_sessions: int
+    #: The subset of ``blind_sessions`` that ``shared/absent_sessions.py``
+    #: accepts as permanently absent, with a cause on record. Split out so the
+    #: 🚨 counts only the gaps nobody has accounted for — the state 2026-08-18
+    #: sat in, indistinguishable from its two accepted neighbours, for three
+    #: days (KAN-67).
+    absent_sessions: list[date] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -194,12 +201,34 @@ def _epoch_lines(epoch: EpochLine | None, failed: frozenset[str] = frozenset()) 
 
 
 def _blind_line(blind: BlindReport | None) -> list[str]:
+    """The alarm, for unaccounted-for gaps only.
+
+    An accepted absence is reported by :func:`_absent_line` instead. A week
+    whose only gaps are accepted therefore raises no 🚨 — that is the whole
+    point of registering them, and the reason a NEW gap still stands out.
+    """
     if blind is None or not blind.blind_sessions:
         return []
-    days = ", ".join(day.isoformat() for day in blind.blind_sessions)
+    accepted = set(blind.absent_sessions)
+    unexplained = [day for day in blind.blind_sessions if day not in accepted]
+    if not unexplained:
+        return []
+    days = ", ".join(day.isoformat() for day in unexplained)
     return [
-        f"🚨 BLIND — the monitor saw nothing on {len(blind.blind_sessions)} "
+        f"🚨 BLIND — the monitor saw nothing on {len(unexplained)} "
         f"of {blind.total_sessions} sessions ({days})"
+    ]
+
+
+def _absent_line(blind: BlindReport | None) -> list[str]:
+    if blind is None or not blind.absent_sessions:
+        return []
+    count = len(blind.absent_sessions)
+    noun = "session has" if count == 1 else "sessions have"
+    days = ", ".join(day.isoformat() for day in blind.absent_sessions)
+    return [
+        f"◻️ ABSENT (accepted) — {count} of {blind.total_sessions} {noun} "
+        f"a recorded cause ({days})"
     ]
 
 
@@ -298,13 +327,16 @@ def _truncate(lines: list[str], limit: int) -> list[str]:
 def render_digest(snapshot: DigestSnapshot) -> str:
     """Render the whole digest. Pure: no I/O, no clock, no globals.
 
-    Line order IS the design. Blindness first, then the caveat about the
-    message's own completeness, then the epoch clock, then the detail. A reader
-    who takes in only the first line must get the most alarming true fact.
+    Line order IS the design. Unaccounted-for blindness first, then the caveat
+    about the message's own completeness, then the accepted absences — a
+    deliberately-not-alarming footnote, so it ranks below both — then the epoch
+    clock, then the detail. A reader who takes in only the first line must get
+    the most alarming true fact.
     """
     lines: list[str] = [
         *_blind_line(snapshot.blind),
         *_missing_line(snapshot.missing),
+        *_absent_line(snapshot.blind),
         *_epoch_lines(snapshot.epoch, snapshot.failed),
         *_equity_lines(snapshot.equity, snapshot.sleeves),
         _tail_line(snapshot),
@@ -431,7 +463,11 @@ def blind_source(
             return None
         resolved = _resolve_calendar(calendar)
         total = len(resolved.trading_sessions(window_start, as_of))
-        return BlindReport(blind_sessions=blind_days, total_sessions=total)
+        return BlindReport(
+            blind_sessions=blind_days,
+            total_sessions=total,
+            absent_sessions=list(report.absent_sessions),
+        )
 
     return _read
 
@@ -739,6 +775,13 @@ def build_sources(
         return BlindReport(
             blind_sessions=missing_days,
             total_sessions=len(resolved.trading_sessions(window_start, as_of)),
+            # Classified here too, or the same date would render as 🚨 on this
+            # path and ◻️ on the pinned one.
+            absent_sessions=[
+                entry.session_date
+                for entry in absent_sessions_in(window_start, as_of)
+                if entry.session_date in set(missing_days)
+            ],
         )
 
     return Sources(

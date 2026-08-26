@@ -921,6 +921,12 @@ def evaluate_epoch(
         progress={
             "sessions_elapsed": progress.sessions_elapsed,
             "sessions_paused": progress.sessions_paused,
+            # A SUBSET of sessions_paused, not a separate bucket: the accepted
+            # absences are the paused sessions that have a cause on record. Do
+            # not sum the two. Stated even when zero (KAN-67 AC6), because a
+            # count that only appears once it is nonzero is a count nobody
+            # notices changing.
+            "sessions_absent": progress.sessions_absent,
             "round_trips": progress.round_trips,
             "exposure_session_pct": round(progress.exposure_session_pct, 2),
             "max_drawdown_pct": round(progress.max_drawdown_pct, 2),
