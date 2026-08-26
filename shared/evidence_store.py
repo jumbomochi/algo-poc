@@ -49,6 +49,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from shared.absent_sessions import absent_session, absent_sessions_in
 from shared.models.equity_snapshot import EquitySnapshot
 from shared.models.evidence import (
     DivergenceDaily,
@@ -151,8 +152,30 @@ class Blindness:
     #: it as blindness would pause the whole clock over one sleeve, letting a
     #: partial outage extend an epoch indefinitely.
     partial_sessions: list[date]
+    #: The subset of the blind and NO_DATA sessions that
+    #: :mod:`shared.absent_sessions` accepts as permanently absent, with a
+    #: recorded cause. A subset, not a separate bucket: a registered session is
+    #: still blind and still counts everywhere blindness counts, including the
+    #: consecutive-blindness safety incident. Registration classifies the gap;
+    #: it never excuses it, or a real outage could be laundered by editing a
+    #: file.
+    absent_sessions: list[date]
     longest_consecutive: int
     is_safety_incident: bool
+
+    @property
+    def unexplained_sessions(self) -> list[date]:
+        """Blind sessions nobody has accounted for — the ones needing a human.
+
+        2026-08-18 sat in this state for three days looking exactly like the
+        two accepted gaps around it, which is why the split exists.
+        """
+        known = set(self.absent_sessions)
+        return [
+            day
+            for day in sorted({*self.blind_sessions, *self.no_data_sessions})
+            if day not in known
+        ]
 
 
 @dataclass(frozen=True)
@@ -166,6 +189,10 @@ class EpochProgress:
     state: str
     sessions_elapsed: int
     sessions_paused: int
+    #: How many of the paused sessions are accepted absences with a recorded
+    #: cause. Reported so a third gap cannot accumulate unnoticed the way
+    #: 2026-08-18 did (KAN-67 AC6).
+    sessions_absent: int
     round_trips: int
     exposure_session_pct: float
     max_drawdown_pct: float
@@ -447,10 +474,16 @@ def blindness(
             run = 0
         longest = max(longest, run)
 
+    unobserved = {*blind_sessions, *no_data_sessions}
     return Blindness(
         blind_sessions=blind_sessions,
         no_data_sessions=no_data_sessions,
         partial_sessions=partial_sessions,
+        absent_sessions=[
+            entry.session_date
+            for entry in absent_sessions_in(start, end)
+            if entry.session_date in unobserved
+        ],
         longest_consecutive=longest,
         # Strictly greater: the rule is "blindness exceeding 5 consecutive
         # sessions", so 5 is not an incident and 6 is.
@@ -646,10 +679,38 @@ def epoch_progress(
             calendar=calendar,
         )
     else:
-        blind = Blindness([], [], [], 0, False)
+        blind = Blindness([], [], [], [], 0, False)
 
     sessions_paused = len(blind.blind_sessions) + len(blind.no_data_sessions)
     sessions_elapsed = len(sessions) - sessions_paused
+
+    # The paused sessions split two ways, and the split is the point: an
+    # accepted absence has a cause on record, an unexplained one is waiting for
+    # someone to notice. 2026-08-18 was the latter for three days.
+    absent = [absent_session(day) for day in blind.absent_sessions]
+    sessions_absent = len(absent)
+    if absent:
+        blocking.append(
+            f"{sessions_absent} of {len(sessions)} sessions in this epoch are "
+            "accepted absences with a cause on record — they pause the clock "
+            "like any unobserved session and still count toward the blindness "
+            "safety bound: "
+            + "; ".join(entry.describe() for entry in absent)
+            + ". The reasoning is in shared/absent_sessions.py."
+        )
+    # The session in flight is excluded: at 04:52 the day's own divergence row
+    # may legitimately not be written yet, and reporting it as unaccounted-for
+    # would put this note on nearly every routine run — turning the one signal
+    # that a gap is going unnoticed into noise.
+    overdue = [day for day in blind.unexplained_sessions if day < effective_as_of]
+    if overdue:
+        blocking.append(
+            f"{len(overdue)} session(s) before {effective_as_of} produced no "
+            "verdict and have no recorded cause; each is an unexplained hole in "
+            "the evidence and needs investigating: "
+            + ", ".join(day.isoformat() for day in overdue)
+            + "."
+        )
 
     # ---- divergence (D11: full-window scoring only) ------------------------
     scoring_floor = scoring_floor_for(
@@ -791,6 +852,7 @@ def epoch_progress(
         state=state,
         sessions_elapsed=max(sessions_elapsed, 0),
         sessions_paused=sessions_paused,
+        sessions_absent=sessions_absent,
         round_trips=round_trips,
         exposure_session_pct=exposure_session_pct,
         max_drawdown_pct=max_drawdown,

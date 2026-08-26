@@ -395,6 +395,38 @@ so the obstacle is the runner, not the market data. The choice between accepting
 the gap and building dated replay is
 [KAN-67](https://huiliang.atlassian.net/browse/KAN-67).
 
+### DECIDED 2026-08-26 — 08-18 is accepted as permanent (KAN-67)
+
+Option A. No dated replay was built and no row was synthesised. Reasoning: a
+`--as-of` flag would put look-ahead risk into the one runner whose output *is*
+the gate evidence, and the row it produced would be a simulation three days
+late, with different provenance from every other row in `equity_snapshots`. An
+acknowledged absence is stronger evidence than a reconstructed presence. Dated
+replay remains worth building as a capability if it is wanted for its own sake —
+never as a backfill.
+
+The decision lives in code, not only here: **`shared/absent_sessions.py`** is
+the registry of accepted absences, and it is what `shared/evidence_store.py`
+reads. Consequences:
+
+- 08-13 and 08-18 both pause the epoch clock. Any streak or continuity
+  computation spanning 08-11..08-21 sees seven observed sessions out of nine —
+  the two are absent, neither present nor zero.
+- Registration changes no grade. A listed session still counts toward the
+  consecutive-blindness safety incident, so a real outage cannot be laundered by
+  adding a line to that file.
+- `epoch_progress` states the absent count and names the causes, `record_epoch
+  evaluate` carries `sessions_absent` in its JSON even when zero, and the weekly
+  digest reports accepted absences on a separate quiet line. A **new** gap
+  therefore raises the 🚨 alone instead of blending into these two — which is
+  exactly how 08-18 hid for three days.
+- An unobserved session with **no** recorded cause is named in the epoch report
+  as an unexplained hole. The session in flight is excluded, since at 04:52 the
+  day's own divergence row may legitimately not be written yet.
+
+Adding a date to the registry is a reviewed claim about the past. It is the only
+sanctioned way to accept a gap.
+
 ---
 
 ## Recovery, in order

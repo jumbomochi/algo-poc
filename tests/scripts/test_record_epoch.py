@@ -824,3 +824,17 @@ def test_cli_drill_records_a_failure(cli, capsys):
     with _read(cli) as db:
         outcome = db.scalars(select(DrillOutcome)).one()
         assert (outcome.drill_type, outcome.passed) == ("synthetic_stop", False)
+
+
+def test_evaluate_reports_the_absent_session_count(session, cal, repo):
+    """AC6 (KAN-67): the gate's own report states how many sessions are absent.
+
+    Without this the count lives only in a prose note, and a third accepted gap
+    could accumulate in a report nobody diffs — which is how 2026-08-18 went
+    unnoticed for three days.
+    """
+    _green_epoch(session, cal, repo)
+
+    payload = _evaluate(session, cal, repo).to_json()
+
+    assert payload["progress"]["sessions_absent"] == 0
