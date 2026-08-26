@@ -11,11 +11,15 @@ import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
-from scripts.ops.gate_data_source import GateDataUnavailable, PostgresGateDataSource
+from scripts.ops.gate_data_source import (
+    _MAX_RECONCILIATION_AGE_DAYS,
+    GateDataUnavailable,
+    PostgresGateDataSource,
+)
 from scripts.ops.go_live_gate import (
     GateResult,
     GoLiveGateChecker,
@@ -198,19 +202,37 @@ class TestRendering:
 
 class TestCommandLine:
     def _seed(self, database_url: str) -> None:
+        """Seed a book that is *current* as of the wall clock.
+
+        Every timestamp here is an offset from a single reading of the wall
+        clock. The gates measure evidence age against ``datetime.now`` and the
+        CLI gives them no seam to inject a fixed one — ``main`` constructs
+        ``PostgresGateDataSource`` without a ``now=`` — so a hardcoded date does
+        not fail on the day it is written. It passes until real time drifts past
+        some gate's window, and then fails forever.
+
+        That is exactly what happened on 2026-08-24: ``ReconciliationReport
+        .created_at`` was pinned to ``NOW`` (2026-08-16) and silently aged past
+        ``gate_data_source._MAX_RECONCILIATION_AGE_DAYS`` (7). Gate 6 flipped
+        from "measured and passing" to "evidence unavailable", and ``main`` went
+        red on a tree that had been green the day before. Nothing in the repo
+        had changed.
+
+        The module-level ``NOW`` is still correct for ``TestRenderers``, which
+        only formats it and never compares it against a clock.
+        """
         engine = create_engine(database_url)
         Base.metadata.create_all(engine)
+        now = datetime.now(timezone.utc)
         with sessionmaker(bind=engine)() as session:
             session.add(
                 EquitySnapshot(
                     portfolio="momentum",
-                    # Relative to the wall clock the gate reads: a fixed date
-                    # would make this assertion drift a day every day.
-                    date=datetime.now(timezone.utc).date() - timedelta(days=1),
+                    date=now.date() - timedelta(days=1),
                     equity=5000.0,
                     cash=0.0,
                     market_value=5000.0,
-                    created_at=NOW,
+                    created_at=now,
                 )
             )
             session.add(
@@ -220,7 +242,7 @@ class TestCommandLine:
                     status="ok",
                     entries_allowed=True,
                     result={},
-                    created_at=NOW,
+                    created_at=now,
                 )
             )
             session.add(
@@ -230,8 +252,8 @@ class TestCommandLine:
                     priority="low",
                     message="daily run finished",
                     context={},
-                    raised_at=NOW - timedelta(days=1),
-                    recorded_at=NOW - timedelta(days=1),
+                    raised_at=now - timedelta(days=1),
+                    recorded_at=now - timedelta(days=1),
                 )
             )
             session.commit()
@@ -304,3 +326,49 @@ class TestCommandLine:
         assert code == 1
         assert "NOT READY" in out
         assert "model_governance" in out
+
+    def test_the_seeded_book_cannot_age_out_of_the_gates_windows(self, tmp_path):
+        """Guard on the 2026-08-24 breakage: `_seed` must track the wall clock.
+
+        The failure mode this prevents is nasty because it is delayed. A
+        timestamp pinned to a literal date passes CI on the day it is written
+        and keeps passing, then crosses a gate's freshness window weeks later
+        and fails on every branch at once, with nothing in the diff to explain
+        it. `main` went red exactly this way on a tree that had been green the
+        day before.
+
+        Asserting the seeded evidence is minutes old, not merely inside the
+        7-day window, is what makes a reintroduced literal fail *immediately*
+        rather than becoming the same time bomb with a later fuse.
+        """
+        database_url = f"sqlite:///{tmp_path / 'freshness.db'}"
+        self._seed(database_url)
+
+        with sessionmaker(bind=create_engine(database_url))() as session:
+            reconciliation = session.execute(
+                select(ReconciliationReport.created_at)
+            ).scalar_one()
+            alert = session.execute(select(AlertRecord.raised_at)).scalar_one()
+            snapshot = session.execute(select(EquitySnapshot.date)).scalar_one()
+
+        now = datetime.now(timezone.utc)
+
+        def age_of(stamp: datetime) -> timedelta:
+            # sqlite hands back naive datetimes; the gate treats those as UTC.
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            return now - stamp
+
+        age = age_of(reconciliation)
+        assert age < timedelta(minutes=5), (
+            f"the seeded reconciliation is {age} old, so it was pinned to a "
+            "literal date rather than derived from the wall clock. It will age "
+            "past gate_data_source._MAX_RECONCILIATION_AGE_DAYS and take gate 6 "
+            "red on a tree nobody touched — see this test's docstring."
+        )
+        # Well inside the limit the gate actually enforces, read from the code
+        # so a change to the limit cannot silently invalidate this guard.
+        assert age.days <= _MAX_RECONCILIATION_AGE_DAYS
+
+        assert age_of(alert) < timedelta(days=1, minutes=5)
+        assert snapshot == now.date() - timedelta(days=1)
