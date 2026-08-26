@@ -30,7 +30,53 @@ def test_error_1100_writes_marker_with_epoch(tmp_path: Path) -> None:
 
     marker = tmp_path / MARKER_NAME
     assert marker.exists()
-    assert int(marker.read_text().strip()) > 0
+    assert int(marker.read_text().splitlines()[0].strip()) > 0
+
+
+def test_line_one_stays_a_bare_epoch_any_reader_can_parse(tmp_path: Path) -> None:
+    """KAN-63 added a `key=value` tail. It has to be a tail.
+
+    The watchdog reads this file with `head -1`, and so would any deployed copy
+    of it predating the change — including one that has drifted, which is
+    exactly the state the per-wrapper drift guard exists to warn about rather
+    than to prevent. Putting the epoch anywhere but line 1, or prefixing it with
+    a key, turns a stale deployed reader into one that computes a garbage age.
+    """
+    ex = _executor(tmp_path)
+    ex._on_ib_error(reqId=-1, errorCode=1100, errorString="lost", contract=None)
+
+    lines = (tmp_path / MARKER_NAME).read_text().splitlines()
+    assert lines[0].isdigit(), lines
+    assert "=" not in lines[0]
+
+
+def test_the_marker_records_who_wrote_it_and_which_gateway(tmp_path: Path) -> None:
+    """KAN-63 AC1, the half execution can actually observe.
+
+    A 1100 that outlives the Gateway session that raised it is not evidence of
+    anything, and on 2026-08-21 one was re-alerted for 20h07m across a full
+    Gateway process replacement. Execution runs in a container and cannot see
+    the host Gateway's pid or start time, so it records the endpoint and its own
+    authorship; the watchdog stamps `gateway_pid` / `gateway_started_at` on
+    first observation, being the only party that can.
+    """
+    ex = IBExecutor("gw-host", 7497, 1, state_dir=tmp_path)
+    ex._on_ib_error(reqId=-1, errorCode=1100, errorString="lost", contract=None)
+
+    text = (tmp_path / MARKER_NAME).read_text()
+    assert "writer=execution" in text, text
+    assert "gateway_endpoint=gw-host:7497" in text, text
+
+
+def test_a_second_1100_rewrites_rather_than_appends(tmp_path: Path) -> None:
+    """Two losses in one session must not leave two epochs in the file, or
+    `head -1` starts reporting the older one forever."""
+    ex = _executor(tmp_path)
+    ex._on_ib_error(reqId=-1, errorCode=1100, errorString="lost", contract=None)
+    ex._on_ib_error(reqId=-1, errorCode=1100, errorString="lost again", contract=None)
+
+    lines = [ln for ln in (tmp_path / MARKER_NAME).read_text().splitlines() if ln]
+    assert sum(1 for ln in lines if ln.isdigit()) == 1, lines
 
 
 @pytest.mark.parametrize("restore_code", [1101, 1102])

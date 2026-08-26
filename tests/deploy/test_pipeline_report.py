@@ -341,7 +341,8 @@ RUN_REPORT = DEPLOY_DIR / "run_pipeline_report.sh"
 
 
 def _drive_wrapper(tmp_path, *, paper_log="paper run finished, exit code: 0\n",
-                   seed=None, database_url=None, curl_exit=0):
+                   seed=None, database_url=None, curl_exit=0,
+                   launchd_installed=(), launchd_loaded=()):
     """Run run_pipeline_report.sh end-to-end against stubs.
 
     Everything it reaches out to is stubbed on PATH: ``docker`` (compose logs
@@ -376,6 +377,22 @@ def _drive_wrapper(tmp_path, *, paper_log="paper run finished, exit code: 0\n",
         p.write_text(body)
         p.chmod(0o755)
         return p
+
+    # launchd wiring (KAN-64). Injected rather than read off the developer's
+    # real host, so these tests are hermetic and run on the Linux CI where
+    # `launchctl list` means nothing. The default — nothing installed, nothing
+    # loaded — is a quiet host, so the existing single-message assertions hold.
+    agents = home / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True)
+    for label in launchd_installed:
+        (agents / f"{label}.plist").write_text("<plist/>")
+    launchctl = stub(
+        "launchctl-stub",
+        "#!/bin/bash\n"
+        'if [ "${1:-}" = "list" ]; then\ncat <<\'EOF\'\n'
+        + "\n".join(["PID\tStatus\tLabel"] + [f"-\t0\t{l}" for l in launchd_loaded])
+        + "\nEOF\nfi\nexit 0\n",
+    )
 
     stub("osascript", "#!/bin/bash\nexit 0\n")
     stub("docker", f"#!/bin/bash\necho ' {datetime.now():%Y-%m-%d} | 1 | 1000.00'\nexit 0\n")
@@ -412,6 +429,7 @@ exit 0
         ALGO_SECURITY_BIN=str(bin_dir / "security"),
         ALGO_OSASCRIPT_BIN=str(bin_dir / "osascript"),
         ALGO_KEYCHAIN_SERVICE="algo-poc-absent-test-service",
+        ALGO_LAUNCHCTL_BIN=str(launchctl),
     )
     res = subprocess.run(
         [str(RUN_REPORT)], capture_output=True, text=True,
@@ -648,3 +666,87 @@ def test_the_wrapper_records_the_log_length_before_the_run(tmp_path):
     run_at = body.index('"$VENV" scripts/run_paper.py')
 
     assert offset_at < run_at
+
+
+# ---------------------------------------------------------------------------
+# KAN-64 — launchd wiring, end-to-end through the wrapper that carries it
+# ---------------------------------------------------------------------------
+# The reconciliation logic itself is covered in
+# tests/deploy/test_launchd_wiring_reconciliation.py. What is asserted here is
+# that the 04:52 report — the job chosen precisely because it is verifiably
+# running every day — actually calls it, puts the roster in the log, and raises
+# an ALERT rather than a log line. A section in a file nobody opens would
+# reproduce the failure mode it exists to remove: silence by construction.
+
+WIRING_JOBS = [
+    "local.algo-paper-trading",
+    "local.algo-divergence-monitor",
+    "local.algo-pipeline-report",
+    "local.algo-evidence-digest",
+]
+
+
+def test_the_report_lists_every_installed_plist_and_whether_it_is_loaded(tmp_path):
+    """AC1."""
+    _, _, log = _drive_wrapper(
+        tmp_path, launchd_installed=WIRING_JOBS, launchd_loaded=WIRING_JOBS
+    )
+
+    assert "===== launchd wiring (installed vs loaded) =====" in log, log
+    for job in WIRING_JOBS:
+        assert f"{job}: loaded" in log
+
+
+def test_an_installed_but_unloaded_job_raises_an_alert_not_just_a_log_line(tmp_path):
+    """AC2, and the whole point of the story.
+
+    This is the 2026-08-17 state: the evidence digest installed, six days of
+    green tests, and the job never firing. The operator has to be *told*.
+    """
+    loaded = [j for j in WIRING_JOBS if j != "local.algo-evidence-digest"]
+    _, sends, log = _drive_wrapper(
+        tmp_path, launchd_installed=WIRING_JOBS, launchd_loaded=loaded
+    )
+
+    assert "local.algo-evidence-digest: NOT LOADED" in log
+    bodies = [
+        line[len("text="):]
+        for send in sends
+        for line in send.splitlines()
+        if line.startswith("text=")
+    ]
+    alerts = [b for b in bodies if "INSTALLED BUT NOT LOADED" in b]
+    assert alerts, bodies
+    assert "local.algo-evidence-digest" in alerts[0]
+    assert "will never run" in alerts[0]
+    # And the credential-free channel too, for the same reason every other
+    # abort path uses both: a locked keychain must not mean silence.
+    assert "INSTALLED BUT NOT LOADED" in (tmp_path / "home" / "ibc" / "logs" / "ALERTS.log").read_text()
+
+
+def test_a_loaded_job_with_no_plist_in_the_repo_is_reported(tmp_path):
+    """AC3: the reverse drift. `deploy.sh` can only sync what is in the repo, so
+    a job running from an untracked definition is lost on the next rebuild."""
+    _, sends, _ = _drive_wrapper(
+        tmp_path,
+        launchd_installed=WIRING_JOBS,
+        launchd_loaded=WIRING_JOBS + ["local.algo-ad-hoc-experiment"],
+    )
+
+    bodies = [
+        line[len("text="):]
+        for send in sends
+        for line in send.splitlines()
+        if line.startswith("text=")
+    ]
+    assert any("local.algo-ad-hoc-experiment" in b for b in bodies), bodies
+
+
+def test_a_fully_wired_host_adds_no_extra_message(tmp_path):
+    """AC4's other half. The daily heartbeat must stay one line, or the
+    operator learns to skim it."""
+    _, sends, _ = _drive_wrapper(
+        tmp_path, launchd_installed=WIRING_JOBS, launchd_loaded=WIRING_JOBS
+    )
+
+    assert len(sends) == 1, sends
