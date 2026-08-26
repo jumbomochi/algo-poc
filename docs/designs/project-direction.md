@@ -211,14 +211,19 @@ Three years is the first point at which a window is both long enough to be worth
 re-running and clears the floor honestly — the 3-year window sits at 5.69% today,
 and forward capture drives that toward ~0%.
 
-**Capture start date: NOT YET STARTED as of 2026-08-26.** `ohlcv_daily` is empty
-(0 rows, 0 tickers). KAN-58 built the writer, but `data_ingestion` never dials IB,
-so nothing feeds it; the connect fix is open as PR #91. **The 3-year clock starts
-at the first captured session, and that date must be recorded here when it happens.**
+**Capture start date: WIRED, AWAITING FIRST SESSION as of 2026-08-26.** KAN-58
+built the writer and PR #91 connected `data_ingestion` to IB, so the mechanism is
+in place end-to-end. `ohlcv_daily` is still empty (0 rows, 0 tickers, verified
+2026-08-26) because the change has not reached a running container yet: the
+deployed image predates it. **The 3-year clock starts at the first captured
+session, and that date must be recorded here, replacing this paragraph, when it
+happens.**
 
-Until then this bias is documented but *not* time-bounded, which is the property
-the decision depends on. PR #91 is therefore on D18's critical path, not merely a
-fix for a dark feature.
+This is an intermediate state, and the distinction matters. The bias is not yet
+time-bounded — a wired mechanism that has never run bounds nothing — but the
+remaining step is a deploy rather than a code change, so D18 is no longer waiting
+on engineering. Until a session is captured, treat the bias as documented and
+*not* bounded.
 
 ### Citation requirement
 
