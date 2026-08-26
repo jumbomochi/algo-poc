@@ -58,6 +58,13 @@ ALGO_SECRETS_ENV_FILE="$ALGO_DIR/.env"   # regular-file fallback only
 ALGO_JOB_LABEL="pipeline report"
 # shellcheck source=deploy/launchd/lib/telegram.sh
 . "$ALGO_DIR/deploy/launchd/lib/telegram.sh"
+# launchd wiring reconciliation (KAN-64). This report is the natural home for
+# it: it is a job that is verifiably running every day, it already reads job
+# logs and already alerts, and it runs after the daily chain. The check cannot
+# live in pytest (CI has no launchd) and it cannot live in the evidence digest,
+# which is the job that was not loaded.
+# shellcheck source=deploy/launchd/lib/launchd_wiring.sh
+. "$ALGO_DIR/deploy/launchd/lib/launchd_wiring.sh"
 
 ts() { date "+%Y-%m-%d %H:%M:%S %Z"; }
 
@@ -131,6 +138,15 @@ except Exception as e:
     print("IB check failed:", e)
 PYEOF
 
+    echo; echo "===== launchd wiring (installed vs loaded) ====="
+    # A tracked, copied plist is not a loaded job. local.algo-evidence-digest
+    # sat in ~/Library/LaunchAgents from 2026-08-17 and never fired once,
+    # because nobody ran the bootstrap deploy.sh printed — and every existing
+    # guard stayed green while it did not run.
+    algo_launchd_wiring_check
+    printf '%s' "$ALGO_LAUNCHD_REPORT"
+    [ -n "$ALGO_LAUNCHD_UNLOADED" ] && algo_launchd_bootstrap_hint
+
     echo; echo "===== equity snapshots (record continuity) ====="
     docker compose exec -T postgres psql -U algo -d algo_poc -t -c \
       "SELECT date, COUNT(*), ROUND(SUM(equity)::numeric,2) FROM equity_snapshots WHERE portfolio NOT LIKE '\_%' GROUP BY date ORDER BY date DESC LIMIT 7;" 2>&1
@@ -163,6 +179,20 @@ DIV=$(grep -oE "Divergence monitor OK|BREACH|hard error" \
 RESTING=$(grep -oE "[0-9]+ resting orders" "$LOG_FILE" | tail -1)
 SNAP=$(grep -q "$(date +%Y-%m-%d)" "$LOG_FILE" && echo "today's snapshot ✓" \
        || echo "today's snapshot MISSING")
+
+# launchd wiring is alert-worthy, not a log line: the failure mode is silence
+# by construction, so a section in a log nobody opens would reproduce it.
+WIRING=""
+if [ -n "$ALGO_LAUNCHD_UNLOADED" ]; then
+    WIRING="🚨 launchd: INSTALLED BUT NOT LOADED — $ALGO_LAUNCHD_UNLOADED (these jobs will never run; bootstrap them)"
+fi
+if [ -n "$ALGO_LAUNCHD_ORPHANED" ]; then
+    WIRING="${WIRING:+$WIRING | }⚠️ launchd: loaded with no plist in deploy/launchd/ — $ALGO_LAUNCHD_ORPHANED"
+fi
+if [ -n "$WIRING" ]; then
+    algo_alert_local "$WIRING"
+    telegram "$WIRING"
+fi
 
 telegram "$SUMMARY | $RUN_STATUS | divergence: ${DIV:-no log} | ${RESTING:-IB check failed} | $SNAP"
 

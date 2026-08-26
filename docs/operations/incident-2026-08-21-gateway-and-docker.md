@@ -117,22 +117,37 @@ and did nothing:
 - **Line 114** sets `REALERT_SECS` to 12h. After the 23:59:56 alert the next
   Telegram was not due until roughly 11:59 the following day. The operator got
   exactly one message, 4h16m before the run, then silence.
-- **Line 128** runs `rm -f "$MARKER"` on every pass through the auth branch —
+- **Line 128** ran `rm -f "$MARKER"` on every pass through the auth branch —
   clearing the two-strike counter that belongs to the *kickstart* path. So when
   the auth condition finally cleared at 08:19, the watchdog restarted counting
   from zero: it logged `port 7497 down (1st check)` at 08:20:09, adding a cycle of
   downtime on top of the outage it had just waited out.
 
-The refusal is right. The **scheduling around it** is what makes the refusal
-expensive: `AutoRestartTime=11:55 PM` (`~/ibc/config.ini:52`) sits 4h20m before the
-04:15 run, so a failed re-login lands in the window where nobody is awake and
+The refusal is right. The **scheduling around it** is what made the refusal
+expensive: `AutoRestartTime=11:55 PM` (`~/ibc/config.ini:52`) sat 4h20m before the
+04:15 run, so a failed re-login landed in the window where nobody is awake and
 nothing is allowed to act.
 
 `ColdRestartTime=08:00` (`~/ibc/config.ini:56`) is **weekly, not daily** — the
 08-21 session logged "Gateway will be cold restarted at 2026/08/23 08:00", a
 Sunday. On a weekday there is no automatic cold-restart backstop at all.
 
-Fix: [KAN-62](https://huiliang.atlassian.net/browse/KAN-62).
+> **Resolved 2026-08-26 — [KAN-62](https://huiliang.atlassian.net/browse/KAN-62).**
+> The two paragraphs above are now historical and describe the code as it stood
+> during this incident. Three things changed:
+>
+> - `AutoRestartTime` is **`2:00 PM`**, recorded with its reasoning in
+>   `deploy/launchd/README.md` and pinned by
+>   `tests/deploy/test_gateway_watchdog.py::test_auto_restart_time_is_outside_the_scheduled_job_window`,
+>   so a future edit cannot silently move it back into the overnight window.
+>   A rejected re-login now surfaces in the middle of the working day with ~14h
+>   before the run that depends on it.
+> - The flat 12h re-alert is gone. While the auth condition holds the interval
+>   tightens as 04:15 approaches — 12h / 1h / 30m / 15m — with a 15-minute floor
+>   inside the final hour, so a warning always lands within 60 minutes of the
+>   run rather than 4h16m before it.
+> - The auth branch no longer touches `$MARKER`. The extra grace pass described
+>   above cannot recur.
 
 ---
 
@@ -202,6 +217,23 @@ Load average was 4.15 across 56 shell sessions, which is a plausible
 resource-pressure story with **no evidence behind it**. Do not repeat it as a
 cause.
 
+> **Detection closed 2026-08-26 — [KAN-66](https://huiliang.atlassian.net/browse/KAN-66).**
+> The cause is still unknown and this story did not try to find it; what changed
+> is that a recurrence is now visible enough to investigate. The gateway
+> watchdog's 300s cycle checks `docker info` — succeeding, never a process-name
+> match, because the Docker Desktop processes above were *present* while the
+> daemon was gone — and compares the expected compose services against what is
+> actually running, so the "10 of 11 came up and portfolio-accounting is
+> crash-looping" state is named rather than called healthy. One alert, 12h
+> re-alert, recovery alert, and **no automatic remediation**: a dead engine
+> needed process kills and an app relaunch, which is not safe to automate
+> against a live trading host on a five-minute timer.
+>
+> The two wrappers that wait on 55432 also stopped naming only the port. When
+> the daemon itself is unreachable they now say so, which is the difference
+> between the operator reading "postgres did not come up" and reading "the whole
+> stack is down".
+
 ---
 
 ## The interaction: a false 20-hour Error 1100
@@ -258,8 +290,23 @@ itself, with no manual intervention.
 ```
 
 The generalisable lesson: **a latch whose only clearer shares a failure domain
-with the fault it describes will report that fault forever.** Fix:
-[KAN-63](https://huiliang.atlassian.net/browse/KAN-63).
+with the fault it describes will report that fault forever.**
+
+> **Resolved 2026-08-26 — [KAN-63](https://huiliang.atlassian.net/browse/KAN-63).**
+> The watchdog no longer trusts the latch beyond the things that maintain it.
+> Line 1 of the marker is still the bare loss epoch, so every existing reader is
+> unaffected; the watchdog appends `gateway_pid` / `gateway_started_at` on first
+> observation, being the only party that can see them. A latch whose recorded
+> identity does not match the running Gateway is dropped, logged as stale, and
+> not alerted on — and any outstanding alert gets its all-clear. For an
+> unstamped or legacy marker the same question is asked directly: a Gateway that
+> *started after* the loss was recorded cannot be in that outage. Before
+> alerting on a sustained 1100 the watchdog also checks that the execution
+> service is running, and reports **that** when it is not, because "the
+> execution service is down" is both true and actionable where a duration
+> nothing is maintaining is neither. Past 24h the reported figure is stated as a
+> floor rather than a measurement. On the 08-21 timeline, guard one alone
+> suppresses the 08:25 page; guard two replaces it with the correct one.
 
 ---
 
@@ -306,7 +353,13 @@ happened was follow-up, because both mechanisms designed to catch it are inert:
   `local.algo-evidence-digest.plist` was copied into `~/Library/LaunchAgents` on
   2026-08-17 00:17 and never bootstrapped. It is absent from `launchctl list`
   while the other seven `local.algo-*` jobs are present.
-  ([KAN-64](https://huiliang.atlassian.net/browse/KAN-64))
+  ([KAN-64](https://huiliang.atlassian.net/browse/KAN-64) — **closed
+  2026-08-26**: the digest is bootstrapped and all eight jobs are loaded, and
+  the 04:52 pipeline report now reconciles the plists in
+  `~/Library/LaunchAgents` against `launchctl list` every morning and *alerts*
+  on any that is installed but not loaded. `deploy.sh` prints the outstanding
+  bootstrap commands by name. It still never runs `launchctl` itself — that
+  stays a human step — it just stops the omission being silent.)
 - **No dead-man switch is armed.** All six URLs declared at
   `deploy/launchd/secrets.sh:106` are absent from the login keychain, so nothing
   outside this host can report an *absent* run. Existence check, values never
@@ -382,14 +435,14 @@ loudest one was false.
 
 ## Standing defects opened
 
-| Ticket | Defect |
-|---|---|
-| [KAN-62](https://huiliang.atlassian.net/browse/KAN-62) | The 23:55 auto-restart sits 4h20m before the run; a rejected re-login eats the window |
-| [KAN-63](https://huiliang.atlassian.net/browse/KAN-63) | The Error 1100 latch outlives the outage; its only clearer dies with the containers |
-| [KAN-64](https://huiliang.atlassian.net/browse/KAN-64) | A tracked, copied plist is not a loaded job; the evidence digest has never run |
-| [KAN-65](https://huiliang.atlassian.net/browse/KAN-65) | All six dead-man switches unarmed; no external observer exists |
-| [KAN-66](https://huiliang.atlassian.net/browse/KAN-66) | Nothing watches the Docker engine |
-| [KAN-67](https://huiliang.atlassian.net/browse/KAN-67) | 2026-08-18 is unrecorded and cannot be backfilled |
+| Ticket | Defect | Status |
+|---|---|---|
+| [KAN-62](https://huiliang.atlassian.net/browse/KAN-62) | The 23:55 auto-restart sits 4h20m before the run; a rejected re-login eats the window | **Closed 2026-08-26** |
+| [KAN-63](https://huiliang.atlassian.net/browse/KAN-63) | The Error 1100 latch outlives the outage; its only clearer dies with the containers | **Closed 2026-08-26** |
+| [KAN-64](https://huiliang.atlassian.net/browse/KAN-64) | A tracked, copied plist is not a loaded job; the evidence digest has never run | **Closed 2026-08-26** |
+| [KAN-65](https://huiliang.atlassian.net/browse/KAN-65) | All six dead-man switches unarmed; no external observer exists | Open |
+| [KAN-66](https://huiliang.atlassian.net/browse/KAN-66) | Nothing watches the Docker engine | **Closed 2026-08-26** |
+| [KAN-67](https://huiliang.atlassian.net/browse/KAN-67) | 2026-08-18 is unrecorded and cannot be backfilled | Open |
 
 Pre-existing, re-verified during this investigation and still live:
 [KAN-61](https://huiliang.atlassian.net/browse/KAN-61) —

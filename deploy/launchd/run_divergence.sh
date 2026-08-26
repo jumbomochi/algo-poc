@@ -92,6 +92,11 @@ ALGO_JOB_LABEL="divergence monitor"
 # Dead-man ping helper (KAN-15), likewise sourced by path and never deployed.
 # shellcheck source=deploy/launchd/deadman.sh
 . "$ALGO_DIR/deploy/launchd/deadman.sh"
+# Docker engine liveness (KAN-66), so a failed port wait can say whether the
+# daemon is gone or only this container. Alert-only: the lib never restarts
+# anything.
+# shellcheck source=deploy/launchd/lib/docker_health.sh
+. "$ALGO_DIR/deploy/launchd/lib/docker_health.sh"
 
 # Render the alert body from the monitor's own JSON report, so the message
 # names the breaching sleeves / the unmet baseline requirement rather than just
@@ -165,8 +170,12 @@ fi
 
 # Wait up to 5 min for the dockerized paper DB before hard-erroring (exit 2).
 if ! wait_for_port 127.0.0.1 55432 "paper DB (docker compose up?)" 300; then
-    algo_alert_local "divergence monitor aborted — paper DB never came up on 55432"
-    telegram "🚨 Divergence monitor ABORTED: paper DB not reachable on 55432 after 5 min (docker compose up?)."
+    # Name the daemon, not just the port (KAN-66) — this is the exact abort the
+    # dead docker engine produced on 2026-08-21, and it named postgres.
+    DOCKER_HINT="$(algo_docker_wait_hint)"
+    echo "$(date): ERROR - $DOCKER_HINT" >> "$LOG_FILE"
+    algo_alert_local "divergence monitor aborted — paper DB never came up on 55432: $DOCKER_HINT"
+    telegram "🚨 Divergence monitor ABORTED: paper DB not reachable on 55432 after 5 min — $DOCKER_HINT."
     exit 2
 fi
 

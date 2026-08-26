@@ -259,7 +259,22 @@ class IBExecutor:
             return
         try:
             self._conn_marker.parent.mkdir(parents=True, exist_ok=True)
-            self._conn_marker.write_text(str(int(time.time())))
+            # Line 1 is the bare loss epoch and must stay that way: every reader
+            # of this file, including any deployed copy of the watchdog older
+            # than KAN-63, parses it with a plain `head -1`. The `key=value`
+            # tail is additive.
+            #
+            # Execution runs in a container and cannot see the host Gateway's
+            # process identity, so it records only what it can observe: who
+            # wrote the marker and which Gateway endpoint the 1100 came from.
+            # The watchdog stamps `gateway_pid` / `gateway_started_at` on first
+            # observation — it is the only party that can — and uses them to
+            # drop a latch that has outlived the session that raised it.
+            self._conn_marker.write_text(
+                f"{int(time.time())}\n"
+                f"writer=execution\n"
+                f"gateway_endpoint={self._host}:{self._port}\n"
+            )
             self._logger.warning(
                 "IB connectivity lost (Error 1100) — wrote watchdog marker",
                 marker=str(self._conn_marker),

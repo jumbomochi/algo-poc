@@ -25,6 +25,11 @@ ALGO_JOB_LABEL="paper run"
 # KAN-15: the external dead-man switch. Sourced by path for the same reason.
 # shellcheck source=deploy/launchd/deadman.sh
 . "$ALGO_DIR/deploy/launchd/deadman.sh"
+# Docker engine liveness (KAN-66), so a failed port wait can say whether the
+# daemon is gone or only this container. Alert-only: the lib never restarts
+# anything.
+# shellcheck source=deploy/launchd/lib/docker_health.sh
+. "$ALGO_DIR/deploy/launchd/lib/docker_health.sh"
 
 # AC#17: create the log directory before the first write. Every other wrapper
 # does this; run_paper.sh did not, so on a fresh host the opening line (and the
@@ -88,8 +93,14 @@ fi
 
 # Wait up to 5 min for the dockerized paper DB (docker compose stack coming up).
 if ! wait_for_port 127.0.0.1 55432 "paper DB (docker compose up?)" 300; then
-    algo_alert_local "paper run aborted — paper DB never came up on 55432"
-    telegram "🚨 Paper trading run ABORTED: paper DB not reachable on 55432 after 5 min (docker compose up?)."
+    # Name the daemon, not just the port (KAN-66). On 2026-08-21 this abort read
+    # "not reachable on 127.0.0.1:55432 after 300s" while the docker ENGINE was
+    # dead with its GUI still alive, and the operator worked backwards from
+    # postgres to a dead hypervisor.
+    DOCKER_HINT="$(algo_docker_wait_hint)"
+    echo "$(date): ERROR - $DOCKER_HINT" >> "$LOG_FILE"
+    algo_alert_local "paper run aborted — paper DB never came up on 55432: $DOCKER_HINT"
+    telegram "🚨 Paper trading run ABORTED: paper DB not reachable on 55432 after 5 min — $DOCKER_HINT."
     exit 1
 fi
 

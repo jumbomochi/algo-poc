@@ -15,6 +15,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 DEPLOY_DIR = Path("deploy/launchd")
 DEPLOY_SCRIPT = DEPLOY_DIR / "deploy.sh"
 RUN_PAPER = DEPLOY_DIR / "run_paper.sh"
@@ -257,3 +259,92 @@ def test_divergence_wrapper_handles_the_blind_baseline_exit_code():
     text = RUN_DIVERGENCE.read_text()
     assert "3)" in text
     assert "BLIND" in text
+
+
+# ---------------------------------------------------------------------------
+# KAN-66 AC6 — a port wait that fails must name the daemon, not just the port
+# ---------------------------------------------------------------------------
+# On 2026-08-21 the docker ENGINE was dead with its Electron GUI still alive, and
+# both of these wrappers aborted correctly — the divergence monitor with
+# "paper DB (docker compose up?) not reachable on 127.0.0.1:55432 after 300s".
+# That is accurate and points at postgres. The operator had to work backwards
+# from a missing container to a dead hypervisor while two other alerts, equally
+# accurate about their own symptoms, pointed elsewhere.
+
+DOCKER_HEALTH_LIB = DEPLOY_DIR / "lib" / "docker_health.sh"
+
+
+def _abort_block(wrapper: Path) -> str:
+    """Cut the 55432 abort branch out of the real wrapper.
+
+    Extracted rather than paraphrased, so what runs below is the shipped code —
+    the same technique test_pipeline_report.py uses for the RUN_STATUS branch.
+    """
+    text = wrapper.read_text()
+    start = text.index('if ! wait_for_port 127.0.0.1 55432')
+    end = text.index("\nfi\n", start) + len("\nfi\n")
+    return text[start:end]
+
+
+def _run_abort_block(tmp_path, wrapper: Path, *, daemon_up: bool) -> str:
+    """Run that branch with the port wait failing, and return what it said."""
+    docker = tmp_path / "docker"
+    docker.write_text(
+        "#!/bin/bash\n"
+        + ('exit 0\n' if daemon_up else 'exit 1\n')
+    )
+    docker.chmod(0o755)
+
+    sent = tmp_path / "sent.txt"
+    script = f"""
+set -uo pipefail
+ALGO_DOCKER_BIN={docker}
+. {DOCKER_HEALTH_LIB}
+LOG_FILE={tmp_path}/job.log
+wait_for_port() {{ return 1; }}
+algo_alert_local() {{ printf 'LOCAL: %s\\n' "$1" >> {sent}; }}
+telegram() {{ printf 'TELEGRAM: %s\\n' "$1" >> {sent}; }}
+{_abort_block(wrapper)}
+"""
+    res = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, timeout=60
+    )
+    assert res.returncode != 0, "the wrapper must still abort"
+    return sent.read_text() if sent.exists() else ""
+
+
+@pytest.mark.parametrize("wrapper", PORT_WAITING_WRAPPERS, ids=lambda p: p.name)
+def test_a_failed_port_wait_names_the_dead_daemon(tmp_path, wrapper):
+    """AC6. "the docker daemon is NOT RESPONDING" is actionable in a way that
+    "55432 not reachable after 300s" is not."""
+    out = _run_abort_block(tmp_path, wrapper, daemon_up=False)
+
+    assert "docker daemon is NOT RESPONDING" in out, out
+    assert "the whole stack is down" in out
+    # Through both channels, like every other abort in these wrappers: a locked
+    # keychain must not turn a dead engine into silence.
+    assert "LOCAL:" in out and "TELEGRAM:" in out
+    # The port is still named — the operator needs both facts, not a swap.
+    assert "55432" in out
+
+
+@pytest.mark.parametrize("wrapper", PORT_WAITING_WRAPPERS, ids=lambda p: p.name)
+def test_a_failed_port_wait_with_a_live_daemon_says_so_instead(tmp_path, wrapper):
+    """The distinction is the whole value. If the engine is fine, blaming it
+    would send the operator to the wrong place just as surely."""
+    out = _run_abort_block(tmp_path, wrapper, daemon_up=True)
+
+    assert "docker daemon is up" in out, out
+    assert "NOT RESPONDING" not in out
+
+
+def test_the_sourced_libs_are_not_deployed_as_editable_decoys():
+    """lib/*.sh are sourced BY PATH from the repo, so a copy in ~/ibc would
+    never execute — an operator could edit it and see no effect, which is the
+    stale-copy trap that broke the 2026-08-11 cold boot. deploy.sh's glob is
+    `"$SRC"/*.sh`, which lib/ is below, so this holds by construction; the test
+    pins it against someone flattening the directory.
+    """
+    for lib in (DEPLOY_DIR / "lib").glob("*.sh"):
+        assert lib.parent.name == "lib", f"{lib} would be deployed to ~/ibc"
+        assert _is_git_tracked(lib), f"{lib.name} must be tracked in the repo"

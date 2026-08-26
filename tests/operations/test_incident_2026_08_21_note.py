@@ -19,11 +19,13 @@ Four ways this record rots:
   "fixes" the plists to Mon-Fri, that whole section becomes actively misleading
   rather than merely stale;
 
-* the note records two findings it deliberately did NOT fix, each owned by its
+* the note recorded two findings it deliberately did NOT fix, each owned by its
   own ticket: the auth branch of ``gateway_watchdog.sh`` clearing the two-strike
   marker (KAN-62), and ``run_paper.py`` having no as-of date, which is why
   2026-08-18 cannot be backfilled (KAN-67). Closing either makes the note's
-  analysis historical, and it should be corrected in the same change;
+  analysis historical, and it should be corrected in the same change. KAN-62
+  landed on 2026-08-26, so its guard is now inverted: the note carries a
+  "Resolved" block, and the defect must not come back;
 
 * the note claims **all six** dead-man switches are unarmed and lists them by
   name. Add a seventh and "all six" is false, so the roster is read out of
@@ -125,12 +127,19 @@ def test_tuesday_to_saturday_is_still_the_schedule() -> None:
         )
 
 
-def test_open_finding_the_auth_branch_still_clears_the_strike_marker() -> None:
-    """KAN-62's defect. Closing it makes the note's watchdog analysis historical.
+def test_the_auth_branch_no_longer_clears_the_strike_marker() -> None:
+    """KAN-62's defect, closed 2026-08-26 — and it must stay closed.
 
-    The note explains that the auth-failure branch runs ``rm -f "$MARKER"`` and
-    so resets the two-strike counter belonging to the kickstart path, costing an
-    extra cycle every time the auth condition clears.
+    The note explained that the auth-failure branch ran ``rm -f "$MARKER"`` and
+    so reset the two-strike counter belonging to the kickstart path, costing an
+    extra cycle every time the auth condition cleared. This guard used to assert
+    the defect was still present, so that closing it would force the note to be
+    corrected. It has been, so the assertion is now the other way round: the
+    line must not come back, and the note must still say so.
+
+    The behavioural proof lives in
+    tests/deploy/test_gateway_watchdog.py::test_a_port_down_then_auth_then_clear_sequence_needs_no_extra_grace_pass.
+    This one guards the *record*.
     """
     text = WATCHDOG.read_text()
     # Isolate the auth branch precisely. Slicing only on the trailing comment
@@ -156,10 +165,16 @@ def test_open_finding_the_auth_branch_still_clears_the_strike_marker() -> None:
         "line 128 from line 72 and must be rewritten"
     )
 
-    assert 'rm -f "$MARKER"' in auth_branch, (
-        "the auth-failure branch of gateway_watchdog.sh no longer clears "
-        "$MARKER — KAN-62 has landed, so the 'Why the watchdog did not fix it' "
-        f"section of {NOTE.name} is stale and should be marked resolved"
+    assert 'rm -f "$MARKER"' not in auth_branch, (
+        "the auth-failure branch of gateway_watchdog.sh is clearing $MARKER "
+        "again. That counter belongs to the kickstart path; clearing it here "
+        "cost an extra ~5 min cycle of downtime on 2026-08-21 (KAN-62)."
+    )
+
+    resolved = NOTE.read_text().split("Why the watchdog did not fix it")[1]
+    assert "Resolved 2026-08-26" in resolved.split("## ")[0], (
+        f"{NOTE.name}'s watchdog analysis describes the pre-KAN-62 code and no "
+        "longer says so. A reader will take it as current."
     )
 
 

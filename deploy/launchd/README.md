@@ -213,6 +213,45 @@ startup and logs a loud `WARNING - … differs from repo canonical` line if it
 was launched from a drifted copy, so drift surfaces the same morning instead of
 failing silently at 04:15.
 
+### A copied plist is not a loaded job (KAN-64)
+
+`deploy.sh` copies plists and **prints** the bootstrap commands; it must never
+run them, because `launchctl bootout/bootstrap` is reserved for a human
+(CLAUDE.md, and `test_launchd_deploy_hardening.py` enforces it). That leaves a
+gap between "tracked" and "running" that nothing checked:
+`local.algo-evidence-digest.plist` sat in `~/Library/LaunchAgents` from
+2026-08-17 and **never fired once**, because nobody ran the printed commands.
+Both existing guards stayed green the whole time — the plist really was tracked,
+and `deploy.sh` really did refuse to run launchctl. Two Monday digests were
+missed, and the 2026-08-18 evidence gap went unnoticed for three days as a
+direct result: the digest is what should have surfaced it.
+
+`lib/launchd_wiring.sh` reconciles the three sets — plists in the repo, plists
+installed in `~/Library/LaunchAgents`, and labels present in `launchctl list` —
+and reports both directions:
+
+- **installed but NOT LOADED** — launchd will never run it. This is
+  alert-worthy, not a log line, because the failure mode is silence by
+  construction.
+- **loaded but not in `deploy/launchd/`** — the job-level equivalent of the
+  per-wrapper `cmp -s "$0" "$CANON"` drift guard, which only ever covered
+  scripts.
+
+It is called from two places. `deploy.sh` calls it so its reload hint names the
+labels that are *actually* outstanding rather than only the ones whose file
+happened to change — it still only ever reads `launchctl list`, and still only
+prints bootout/bootstrap. And the **04:52 pipeline report** calls it every day,
+because the check has to live in a job that is verifiably running: it cannot
+live in pytest (CI has no launchd, and a test that shelled out to `launchctl`
+would fail there or be skipped — the same blind spot in a new costume), and it
+obviously cannot live in the evidence digest, which is the job that was not
+loaded.
+
+Scope is `local.algo-*`. `local.ibc-gateway` is deliberately excluded: its plist
+belongs to IBC rather than this repo, and its failure mode is not silent — an
+unloaded Gateway job means port 7497 goes unreachable, which the watchdog, the
+04:15 run and the Tuesday refresh all already alert on.
+
 ## Daily divergence monitor
 
 Runs `scripts/divergence_monitor.py` at **04:45 SGT, Tue–Sat** — ~30 min after
@@ -297,8 +336,49 @@ cold-restart blips instead of fighting them.
 checked for `Unrecognized Username or Password` / `Too many failed login
 attempts`. If present, the watchdog **refuses to restart** (restarting loops
 failed logins into an IB rate-limit — the 2026-07-01 incident: 30 rejected
-attempts), sends **one Telegram alert**, and waits for a human re-login. It
-alerts again on recovery.
+attempts), alerts, and waits for a human re-login. It alerts again on recovery.
+
+**Escalating re-alert while the login is rejected (KAN-62).** The refusal is
+right; the flat 12h re-alert around it was not. On 2026-08-20 the auto-restart's
+re-login was rejected at 23:55, the watchdog alerted once at 23:59:56, and the
+next message was not due until roughly noon the following day — so the
+operator's last warning arrived **4h16m before the 04:15 run**, which aborted at
+04:25 and cost a session of gate evidence. The same sequence had already cost
+2026-08-18. The interval now tightens as the run approaches:
+
+| Time until the 04:15 paper run | Re-alert every |
+|---|---|
+| more than 6h | 12h |
+| 6h–3h | 1h |
+| 3h–1h | 30 min |
+| under 1h | 15 min |
+
+The 15-minute floor is what makes the guarantee hold: the job runs every 300s,
+so inside the final hour an alert is always either newer than 15 minutes or
+re-sent — **a warning always lands within 60 minutes of the run**. The auth
+branch also no longer runs `rm -f "$MARKER"`: that marker is the *kickstart*
+path's two-strike counter and this branch does not own it. Clearing it meant
+that when the auth condition cleared on 2026-08-21 at 08:19 the watchdog
+restarted counting from zero, adding a whole extra cycle of downtime.
+
+### `AutoRestartTime` — why it is 2:00 PM, not 11:55 PM
+
+`~/ibc/config.ini:52` is **`AutoRestartTime=2:00 PM`** (SGT). This is the other
+half of KAN-62 and it is a host config file, not a repo file, so it is recorded
+here: a future edit that moves it back inside the job window is the failure
+being guarded against, and
+`tests/deploy/test_gateway_watchdog.py::test_auto_restart_time_is_outside_the_scheduled_job_window`
+pins it.
+
+The daily chain is 04:15 (paper run), 04:45 (divergence), 04:52 (pipeline
+report), 05:15 (DB backup), all SGT. At 23:55 a rejected re-login had 4h20m to
+be noticed by a human who was asleep, and no automated path at all — the
+watchdog is forbidden from kickstarting into an auth failure, and
+`ColdRestartTime=08:00` is **weekly, not daily** (the 08-21 session logged "cold
+restarted at 2026/08/23 08:00", a Sunday), so on a weekday there is no automatic
+backstop. 2:00 PM SGT puts a failed re-login in the middle of the operator's
+working day and roughly **14 hours** ahead of the next run that depends on it,
+and it is clear of both the job window and IB's own overnight reset.
 
 **Telegram alerts** (best-effort) are sent on: auth-failure refusal, kickstart
 action, and recovery. Credentials come from the login keychain
@@ -317,12 +397,70 @@ needs no credential, so the "nothing can alert" hole is closed.
   `~/ibc/logs/gateway-watchdog-launchd.log`.
 - **State markers:** `~/ibc/.gateway_down_marker` (one strike pending),
   `~/ibc/.gateway_auth_failure_alerted` (alert already sent; cleared on
-  recovery).
+  recovery), `~/ibc/.gateway_connectivity_alerted` (Error 1100 alert sent),
+  `~/ibc/.docker_stack_alerted` (stack-liveness alert sent).
 - **For live:** change `PORT=7497` to `7496` in the script.
 
 > Note: when the Gateway is kickstarted, in-flight IB API sessions drop.
 > `ib_insync` in the execution service reconnects automatically, but verify
 > after any watchdog-triggered restart.
+
+### Error 1100: a latch is trusted only as far as its writer (KAN-63)
+
+`~/ibc/state/gateway_connectivity_lost` is written by the **execution service**
+on IB Error 1100 (the API port stays open during a 1100, so the port check is
+blind to it) and can only be removed by the execution service, on a 1101/1102.
+Execution runs in a container — so the clearer and the outage share a failure
+domain. When the docker engine died on 2026-08-20 the latch froze, and the
+watchdog spent **20h07m re-alerting a growing outage that had already ended**,
+across a Gateway cold restart that fixed everything. The 08:25 alert claimed
+"~1207 min" while a direct probe of 7497 found IB entirely healthy.
+
+Three guards, all in the watchdog:
+
+1. **The latch cannot outlive its Gateway session.** Line 1 of the marker is
+   still the bare loss epoch (any older reader still parses it with `head -1`);
+   the watchdog appends `gateway_pid` / `gateway_started_at` on first
+   observation, because only the host can see them. If the running Gateway no
+   longer matches, the latch is dropped, the drop is logged, no 1100 alert is
+   sent, and any outstanding alert gets its all-clear. For an unstamped or
+   legacy marker the backstop is the same question asked directly: a Gateway
+   that *started after* the loss was recorded cannot be in that outage.
+2. **A latch whose writer is down is not evidence.** Before alerting on a
+   sustained 1100 the watchdog asks whether the `execution` service is actually
+   running. If it is not, the alert says so — which is both true and actionable
+   — instead of quoting a duration nothing is maintaining.
+3. **The reported duration is bounded.** Past 24h the message says the number is
+   a floor rather than a measurement, because an unbounded, ever-growing figure
+   in an alert is itself the signal that nothing is measuring it.
+
+### Docker engine + stack liveness (KAN-66)
+
+The same 300s cycle now checks that the container runtime everything else
+depends on is actually alive. On 2026-08-20 the docker **engine** died while
+Docker Desktop's Electron GUI stayed up: `docker ps` failed, every container was
+gone, the socket file was still there (dated ten days earlier), and the app
+looked healthy. Three jobs failed the next morning, each alerting accurately
+about its own symptom — port 55432, a missing postgres container, a 1100 latch —
+and none naming the cause.
+
+- The check is **`docker info` succeeding**, never a process-name match: the
+  Docker Desktop processes were present and the daemon was not.
+- `docker info` alone is not enough. After the restart, 10 of 11 containers came
+  up and `portfolio-accounting` was left crash-looping (KAN-61), which a
+  daemon-only check calls healthy. The expected compose services are compared
+  against what is running, and anything not running or not healthy is **named**.
+- **It never remediates.** A dead engine needed process kills and an app
+  relaunch; that is not something to automate against a live trading host on a
+  five-minute timer. `lib/docker_health.sh` contains no restart, kill or open
+  invocation and a test asserts it stays that way.
+- One alert, 12h re-alert while unresolved, and a recovery alert when the daemon
+  and every service return — the same discipline as the other watchdog alerts.
+- `run_paper.sh` and `run_divergence.sh` both wait on 55432 and both abort
+  correctly, but they named the *port*. When the daemon itself is unreachable
+  they now say so: "the docker daemon is NOT RESPONDING … the whole stack is
+  down, not just this port" is actionable in a way that "55432 not reachable
+  after 300s" is not.
 
 ### Install / reload
 
