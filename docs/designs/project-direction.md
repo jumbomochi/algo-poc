@@ -142,6 +142,99 @@ Weekly Telegram evidence digest (rides `run_pipeline_report` + the verified bot)
 | D15 | Store persists derived truth | Observations-only store; blindness derived from calendar absence; one shared query helper |
 | D16 | Capital semantics / DD limit / precedence / ladder end | All four pinned (cumulative-funding governs; 12% Gate-3 USD NAV; halt→demote→de-scale; amendment-only rungs + IPS 30% ceiling + tax closure) |
 | D17c | ML decision mis-categorized; WIP gameable | ML = architecture decision on own rubric; WIP = two OPEN threads (edge framework + sentiment); factors/regime queued |
+| D18 | PIT baseline cannot meet the coverage floor from IB data | **DECIDED 2026-08-26: accept the bias, documented and time-bounded** (KAN-59). No vendor purchase. Coverage floor unchanged at 5.00%; artifacts stay `BLOCKED`. Re-evidence after 3 years of forward capture. See [The accepted PIT coverage bias](#the-accepted-pit-coverage-bias-d18) below |
+
+## The accepted PIT coverage bias (D18)
+
+**Decided 2026-08-26.** The point-in-time baseline the ladder depends on cannot be
+built from IB Gateway alone. Rather than buy vendor history, the bias is accepted
+in writing, bounded by forward capture, and cited wherever it is spent.
+
+This is consistent with the standing direction, not an exception to it: *"Additional
+brokers or data vendors — single-broker (IB) simplicity is a feature at this scale"*
+(NOT in scope, below).
+
+### The number being accepted
+
+Measured on `output/backtest_multi_20260819_183451.json` (KAN-52, run 2026-08-19):
+
+```
+total membership-days    : 1,265,893
+excluded membership-days :   142,856   (164 tickers)
+excluded_pct             :     11.28%
+floor_pct                :      5.00%
+state                    : BLOCKED
+```
+
+Of the 11.28%, **10.38%** is genuine index departures (146 tickers) and **0.91%** is
+resolution failures on names still in the index (18 tickers). Recovering every one of
+the latter still leaves 10.38%, so the gap is not repairable in code. IB serves no
+bars for departed names by symbol *or* by `conId` — probed 2026-08-20: four of five
+resolve a `conId` and return zero bars, every match a `primaryExchange=VALUE` stub.
+
+Shortening the window does not rescue it either. Only a 1-year window clears the
+floor (4.26%); 2y is 5.04% and 3y is 5.69%. A 1-year backtest cannot carry the DSR
+and holdout evidence, which is already marginal at DSR 0.868 against a 0.95 threshold.
+
+### What it means for anything resting on this baseline
+
+The baseline prices only names IB still serves, so it is **survivorship-biased
+upward by an unmeasured amount**. Index departures skew toward underperformers;
+excluding roughly a tenth of membership-days therefore flatters backtest returns
+rather than merely adding noise. Every conclusion drawn from it — Rung-0 economics,
+the D10 verdicts, any divergence comparison — inherits that optimism.
+
+"Unmeasured" is exact and not hedging: the size of the bias cannot be estimated from
+this data, because estimating it would require the very history that is missing.
+
+### The floor is not moved
+
+`backtest/membership.py`'s `DEFAULT_COVERAGE_FLOOR_PCT` stays at **5.0**, and
+affected artifacts continue to report `state: BLOCKED` with `is_like_for_like`
+False. The bias is accepted in this record, **not** by relaxing the gate.
+
+That distinction is the whole point. `is_like_for_like` gates both the divergence
+monitor and `run_sleeve_evaluation.py`, so moving the floor would silently change
+what every future run accepts as evidence — the exact failure the "never silently
+degraded" rule exists to prevent. A reader who opens a `BLOCKED` artifact should
+see that it is blocked and come here to find out why it was spent anyway.
+
+### Re-evidence trigger
+
+**When forward capture has accumulated 3 years of continuous daily bars for the
+whole index, re-run the baseline over that window and re-evidence.** Forward
+capture ends this problem structurally: bars are captured while a name is still a
+member, so its history is already held when it later departs, and IB's refusal to
+serve delisted history stops mattering for any window beginning after capture starts.
+
+Three years is the first point at which a window is both long enough to be worth
+re-running and clears the floor honestly — the 3-year window sits at 5.69% today,
+and forward capture drives that toward ~0%.
+
+**Capture start date: NOT YET STARTED as of 2026-08-26.** `ohlcv_daily` is empty
+(0 rows, 0 tickers). KAN-58 built the writer, but `data_ingestion` never dials IB,
+so nothing feeds it; the connect fix is open as PR #91. **The 3-year clock starts
+at the first captured session, and that date must be recorded here when it happens.**
+
+Until then this bias is documented but *not* time-bounded, which is the property
+the decision depends on. PR #91 is therefore on D18's critical path, not merely a
+fix for a dark feature.
+
+### Citation requirement
+
+**The D10 verdicts of record (KAN-55) must cite this limitation** — naming the
+11.28% figure and stating that the verdict rests on a survivorship-biased baseline.
+A verdict that spends the single-use `incumbent_sleeves_2026` holdout without that
+citation is not a valid verdict.
+
+### A note on "D14"
+
+Two different decisions are numbered D14 in this repo. This one concerns the
+coverage floor, defined at
+`docs/superpowers/plans/2026-08-12-readiness-closure-story-backlog.md:24`
+("Baseline coverage floor (D14)"). The **D14 in the table above** is the
+two-person-gate substitute and is unrelated. This decision is recorded as **D18**
+to avoid deepening that collision.
 
 ## Dream State Delta
 
