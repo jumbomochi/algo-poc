@@ -114,11 +114,35 @@ now_epoch() { echo "${ALGO_NOW_EPOCH:-$(date +%s)}"; }
 # stat(1) and date(1) diverge between BSD and GNU, and the test suite runs on
 # ubuntu-latest while production is macOS. Both spellings are tried so the
 # shipped code is the code under test rather than a paraphrase of it.
+#
+# THE OUTPUT IS VALIDATED, NOT THE EXIT CODE. `stat -f %m` on GNU coreutils
+# means "filesystem status" and prints a FOUR-LINE filesystem dump to stdout
+# while exiting 1 — so a plain `stat -f %m || stat -c %Y` chain appends the real
+# mtime to that dump and hands back garbage. Every arithmetic comparison on it
+# then fails, and because `need_alert` reads that comparison as "not due yet",
+# EVERY THROTTLED ALERT SILENTLY STOPS FIRING. A helper that fails by returning
+# nonsense instead of failing loudly is how a monitor goes quiet, so these two
+# check the shape of what they got and only then trust it.
 algo_mtime() {
-    stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
+    local m
+    m="$(stat -f %m "$1" 2>/dev/null)"                       # BSD / macOS
+    case "$m" in ''|*[!0-9]*) m="$(stat -c %Y "$1" 2>/dev/null)" ;; esac  # GNU
+    case "$m" in ''|*[!0-9]*) m=0 ;; esac
+    printf '%s\n' "$m"
 }
-algo_date_fmt() {  # $1 = epoch, $2 = strftime format
-    date -r "$1" "+$2" 2>/dev/null || date -d "@$1" "+$2" 2>/dev/null || echo ""
+
+# Local wall-clock "HH MM SS" for an epoch, or non-zero if it cannot be read.
+# Deliberately narrower than a general strftime wrapper: a fixed output shape is
+# what makes the validation above possible.
+algo_local_hms() {
+    local out
+    for out in "$(date -r "$1" '+%H %M %S' 2>/dev/null)" \
+               "$(date -d "@$1" '+%H %M %S' 2>/dev/null)"; do
+        case "$out" in
+            [0-9][0-9]" "[0-9][0-9]" "[0-9][0-9]) printf '%s\n' "$out"; return 0 ;;
+        esac
+    done
+    return 1
 }
 
 # Drift guard: warn loudly if this deployed copy has fallen behind the repo
@@ -154,8 +178,12 @@ PAPER_RUN_MIN=15
 # BSD-only and this has to run under the Linux CI that tests it.
 secs_to_paper_run() {
     local hms h m s sod run delta
-    hms="$(algo_date_fmt "$(now_epoch)" '%H %M %S')"
-    [ -n "$hms" ] || { echo "$REALERT_MAX_SECS"; return 0; }
+    # Cannot read the clock → fall back to the slowest cadence rather than
+    # inventing an urgency, and say so in the log.
+    if ! hms="$(algo_local_hms "$(now_epoch)")"; then
+        echo "$(ts): WARNING - could not read the local time of day; re-alert cadence falls back to ${REALERT_MAX_SECS}s" >> "$LOG_FILE"
+        echo "$REALERT_MAX_SECS"; return 0
+    fi
     read -r h m s <<< "$hms"
     sod=$(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
     run=$(( PAPER_RUN_HOUR * 3600 + PAPER_RUN_MIN * 60 ))

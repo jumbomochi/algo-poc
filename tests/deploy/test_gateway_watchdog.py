@@ -285,6 +285,72 @@ def host(tmp_path) -> Host:
 
 
 # ---------------------------------------------------------------------------
+# The portability helpers every throttled alert depends on
+# ---------------------------------------------------------------------------
+# These exist because production is macOS and CI is ubuntu-latest. They get
+# their own tests because their failure mode is uniquely nasty: `stat -f %m` on
+# GNU coreutils means "filesystem status" and prints a FOUR-LINE filesystem dump
+# to stdout while exiting 1, so a `stat -f %m || stat -c %Y` chain hands back
+# that dump with the real mtime appended. Every arithmetic comparison on it then
+# fails, `need_alert` reads the failure as "not due yet", and EVERY THROTTLED
+# ALERT SILENTLY STOPS FIRING — the watchdog goes quiet with no error anywhere.
+# That is exactly what this suite caught on the first CI run.
+
+
+def _helper(name: str, *args: str) -> subprocess.CompletedProcess:
+    """Run one helper lifted verbatim out of the shipped watchdog."""
+    body = WATCHDOG.read_text()
+    start = body.index(f"{name}() {{")
+    end = body.index("\n}\n", start) + len("\n}\n")
+    quoted = " ".join(f'"{a}"' for a in args)
+    return subprocess.run(
+        ["bash", "-c", f"{body[start:end]}\n{name} {quoted}"],
+        capture_output=True, text=True, timeout=60,
+    )
+
+
+def test_the_mtime_helper_returns_a_bare_epoch(tmp_path):
+    target = tmp_path / "marker"
+    target.touch()
+    os.utime(target, (1_700_000_000, 1_700_000_000))
+
+    res = _helper("algo_mtime", str(target))
+    out = res.stdout.strip()
+
+    assert out.isdigit(), f"algo_mtime returned {out!r}, which no arithmetic can use"
+    assert out == "1700000000", out
+
+
+def test_the_mtime_helper_never_leaks_a_filesystem_dump(tmp_path):
+    """The GNU trap, pinned. `stat -f` there describes the *filesystem*."""
+    target = tmp_path / "marker"
+    target.touch()
+
+    out = _helper("algo_mtime", str(target)).stdout
+
+    assert "\n" not in out.strip(), f"multi-line mtime: {out!r}"
+    for leak in ("Block size", "Inodes", "Namelen", "File:"):
+        assert leak not in out, f"algo_mtime leaked `stat -f` filesystem output: {out!r}"
+
+
+def test_the_mtime_helper_degrades_to_zero_for_a_missing_file(tmp_path):
+    """Absent marker → 0 → "infinitely old" → alert. Failing towards alerting is
+    the only safe direction for a throttle."""
+    res = _helper("algo_mtime", str(tmp_path / "nope"))
+
+    assert res.stdout.strip() == "0", res.stdout
+
+
+def test_the_local_time_helper_returns_hh_mm_ss():
+    res = _helper("algo_local_hms", str(int(RUN_AT)))
+
+    assert res.returncode == 0, res.stderr
+    assert re.fullmatch(r"\d{2} \d{2} \d{2}", res.stdout.strip()), res.stdout
+    # It is the paper-run instant, so it must read back as the run time.
+    assert res.stdout.split()[:2] == ["04", "15"], res.stdout
+
+
+# ---------------------------------------------------------------------------
 # KAN-66 — docker engine + stack liveness
 # ---------------------------------------------------------------------------
 
