@@ -35,10 +35,14 @@ class CaptureHealth:
 
     tickers_expected: int
     tickers_written: int
+    # Names the per-cycle request budget held back. Scheduled work, not
+    # failure: a later cycle picks them up and the lookback window means the
+    # session is still in range when it does.
+    tickers_deferred: int = 0
 
     @property
     def shortfall(self) -> int:
-        return self.tickers_expected - self.tickers_written
+        return self.tickers_expected - self.tickers_written - self.tickers_deferred
 
 
 class DataIngestionRunner:
@@ -69,6 +73,11 @@ class DataIngestionRunner:
         self._calendar = MarketCalendar()
         self._running = True
         self._capture_universe = list(capture_universe or [])
+        self._ib_client = ib_client
+        # Where the next cycle resumes in the capture universe. Without a
+        # cursor a budgeted cycle would restart from the top every time and the
+        # tail of the universe would never be fetched at all.
+        self._capture_cursor = 0
 
         self._market_data = MarketDataPipeline(
             ib_client=ib_client,
@@ -91,6 +100,42 @@ class DataIngestionRunner:
             redis_client=redis_client,
             db_session=db_session,
         )
+
+    async def ensure_ib_connected(self) -> bool:
+        """Connect to IB if not already connected. Returns whether we are.
+
+        The service constructed an ``IBClient`` and never dialled it, so
+        ``_ib`` stayed ``None`` and every ``get_daily_bars`` raised
+        ``AttributeError`` — which is what the "~21 error lines against one
+        ``run_cycle_complete``" in the container logs was. Nothing was ever
+        published or captured.
+
+        Never raises. The gateway restarts nightly and drops the API on an
+        error 1100, so a connect failure has to leave the process alive to
+        retry on the next cycle; raising here would be a crash loop under
+        ``restart: unless-stopped``. Only connects when disconnected — a second
+        ``connectAsync`` on the same client id makes IB evict the older
+        session, so a reconnect every cycle would fight itself.
+        """
+        try:
+            if self._ib_client.is_connected():
+                return True
+            await self._ib_client.connect()
+        except Exception:
+            logger.exception(
+                "ib_connect_failed",
+                host=self._config.ib.host,
+                client_id=self._config.ib.data_client_id,
+                consequence="no bars this cycle; will retry on the next one",
+            )
+            return False
+        logger.info(
+            "ib_connected",
+            host=self._config.ib.host,
+            client_id=self._config.ib.data_client_id,
+            readonly=True,
+        )
+        return True
 
     async def run_cycle(self, tickers: list[str]) -> CaptureHealth:
         """Run all three pipelines for each ticker, then capture the rest.
@@ -159,7 +204,13 @@ class DataIngestionRunner:
         # Capture-only names: persisted, never published. Fundamentals and
         # events are deliberately skipped — nothing downstream reads them for
         # a name no sleeve trades, and running them would triple the IB load.
-        for ticker in capture_only:
+        #
+        # Budgeted, and resumed from a cursor so successive cycles walk the
+        # whole universe instead of re-fetching its head. The trading watchlist
+        # above is deliberately NOT budgeted: signal_generation depends on it
+        # every cycle.
+        due, deferred = self._capture_slice(capture_only)
+        for ticker in due:
             if not self._running:
                 logger.info("run_cycle_interrupted", reason="shutdown_requested")
                 break
@@ -169,15 +220,39 @@ class DataIngestionRunner:
             except Exception:
                 logger.exception("capture_error", ticker=ticker)
 
-        health = CaptureHealth(tickers_expected=expected, tickers_written=written)
+        health = CaptureHealth(
+            tickers_expected=expected,
+            tickers_written=written,
+            tickers_deferred=deferred,
+        )
         logger.info(
             "run_cycle_complete",
             ticker_count=len(tickers),
             capture_expected=health.tickers_expected,
             capture_written=health.tickers_written,
+            capture_deferred=health.tickers_deferred,
             capture_shortfall=health.shortfall,
         )
         return health
+
+    def _capture_slice(self, capture_only: list[str]) -> tuple[list[str], int]:
+        """The capture-only names due this cycle, and how many were deferred.
+
+        Walks the universe from a persistent cursor so each cycle takes the
+        next slice and the tail is reached, wrapping when it runs off the end.
+        A budget of 0 means no cap.
+        """
+        budget = self._config.data_ingestion.capture_max_requests_per_cycle
+        if budget <= 0 or len(capture_only) <= budget:
+            self._capture_cursor = 0
+            return capture_only, 0
+
+        start = self._capture_cursor % len(capture_only)
+        due = capture_only[start : start + budget]
+        if len(due) < budget:  # wrapped
+            due += capture_only[: budget - len(due)]
+        self._capture_cursor = (start + budget) % len(capture_only)
+        return due, len(capture_only) - len(due)
 
     def is_market_active(self) -> bool:
         """Check if the market is currently open using MarketCalendar."""
@@ -185,9 +260,20 @@ class DataIngestionRunner:
         return self._calendar.is_market_open(now)
 
     async def shutdown(self) -> None:
-        """Signal a graceful shutdown of the runner."""
+        """Signal a graceful shutdown of the runner and release the IB session.
+
+        Dropping the session matters on restart: it holds ``data_client_id``,
+        and a new process connecting with the same id would otherwise race the
+        one it just left behind.
+        """
         logger.info("shutdown_requested")
         self._running = False
+        try:
+            await self._ib_client.disconnect()
+        except Exception:
+            # Shutdown must complete. A gateway that has already gone away is
+            # the common case here, not an error worth propagating.
+            logger.exception("ib_disconnect_failed")
 
 
 class _StubEventsSource:
@@ -277,7 +363,21 @@ if __name__ == "__main__":
         )
         while True:
             if runner.is_market_active() or config.mode == "backtest":
-                await runner.run_cycle(tickers)
+                # Dial IB before each cycle. Connecting once at startup is not
+                # enough: the gateway restarts nightly and drops the API on an
+                # error 1100, and this loop outlives both. `ensure_ib_connected`
+                # is a no-op when the session is already up.
+                if await runner.ensure_ib_connected():
+                    await runner.run_cycle(tickers)
+                else:
+                    # Skip rather than run: without a connection every one of
+                    # the 544 names would raise and bury the real cause under a
+                    # wall of per-ticker tracebacks.
+                    logger.warning(
+                        "cycle_skipped_no_ib",
+                        ticker_count=len(tickers),
+                        capture_ticker_count=len(capture_universe),
+                    )
             # T6: heartbeat file for the container healthcheck (see
             # docker-compose.yml) — proves this loop is still iterating, not
             # wedged. Written once per poll cycle since this loop's own

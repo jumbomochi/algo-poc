@@ -109,6 +109,13 @@ class DataIngestionConfig(BaseModel):
     polling_interval_minutes: int = 15
     ib_rate_limit_per_sec: int = 45
     backfill_years: int = 10
+    # Most capture-only names fetched per cycle (KAN-58). IB's historical-data
+    # ceiling is ~60 requests per rolling 10 minutes; the capture universe is
+    # 503 names on a 15-minute cycle, so fetching all of them every cycle would
+    # sit an order of magnitude over it and earn pacing violations. A deferred
+    # name is picked up by a later cycle and the lookback window means nothing
+    # is lost. 0 disables the cap (fetch everything every cycle).
+    capture_max_requests_per_cycle: int = 40
 
 
 class UniverseConfig(BaseModel):

@@ -249,6 +249,199 @@ class TestCaptureUniverse:
         assert health.tickers_expected == 1
 
 
+class TestIBConnection:
+    """The service constructed an IBClient and never dialled it.
+
+    `IBClient._ib` stayed None, so every `get_daily_bars` raised
+    AttributeError and the service published nothing and captured nothing —
+    which is what the '~21 error lines against one run_cycle_complete' in the
+    logs actually was. Connecting is what makes capture do anything at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_it_connects_when_not_yet_connected(self):
+        ib = MagicMock()
+        ib.is_connected = MagicMock(return_value=False)
+        ib.connect = AsyncMock()
+        runner = _make_runner(ib_client=ib)
+
+        assert await runner.ensure_ib_connected() is True
+        ib.connect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_it_does_not_reconnect_when_already_connected(self):
+        """A second connectAsync on the same client id makes IB drop the older
+        session — reconnecting every cycle would fight itself."""
+        ib = MagicMock()
+        ib.is_connected = MagicMock(return_value=True)
+        ib.connect = AsyncMock()
+        runner = _make_runner(ib_client=ib)
+
+        assert await runner.ensure_ib_connected() is True
+        ib.connect.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_connect_is_reported_not_raised(self):
+        """The gateway restarts nightly and drops the API on a 1100. A connect
+        failure has to leave the service alive to retry, not kill the process
+        — under restart: unless-stopped that would be a crash loop."""
+        ib = MagicMock()
+        ib.is_connected = MagicMock(return_value=False)
+        ib.connect = AsyncMock(side_effect=OSError("connection refused"))
+        runner = _make_runner(ib_client=ib)
+
+        assert await runner.ensure_ib_connected() is False
+
+    @pytest.mark.asyncio
+    async def test_it_reconnects_after_the_gateway_drops_the_session(self):
+        ib = MagicMock()
+        ib.connect = AsyncMock()
+        ib.is_connected = MagicMock(side_effect=[False, True, False])
+        runner = _make_runner(ib_client=ib)
+
+        await runner.ensure_ib_connected()   # connects
+        await runner.ensure_ib_connected()   # already up, no-op
+        await runner.ensure_ib_connected()   # dropped, reconnects
+
+        assert ib.connect.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_shutdown_disconnects_the_client(self):
+        """Leaving the session open holds data_client_id, so a restart races
+        its own previous session for the same id."""
+        ib = MagicMock()
+        ib.disconnect = AsyncMock()
+        ib.is_connected = MagicMock(return_value=True)
+        runner = _make_runner(ib_client=ib)
+
+        await runner.shutdown()
+
+        ib.disconnect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_survives_a_disconnect_failure(self):
+        ib = MagicMock()
+        ib.is_connected = MagicMock(return_value=True)
+        ib.disconnect = AsyncMock(side_effect=OSError("already gone"))
+        runner = _make_runner(ib_client=ib)
+
+        await runner.shutdown()  # must not raise
+
+        assert runner._running is False
+
+
+class TestCaptureRequestBudget:
+    """Capture must not out-shout the trading path on the shared gateway.
+
+    IB's historical-data ceiling is roughly 60 requests per rolling 10 minutes.
+    The capture universe is 503 names on a 15-minute cycle, so fetching all of
+    them every cycle would sit an order of magnitude over the limit — earning
+    pacing violations whose per-ticker errors are exactly the silent holes this
+    feature exists to prevent. The lookback window means a name deferred now is
+    picked up by a later cycle with nothing lost.
+    """
+
+    @pytest.mark.asyncio
+    async def test_capture_stops_at_the_per_cycle_budget(self):
+        config = _make_config()
+        config.data_ingestion.capture_max_requests_per_cycle = 2
+        runner = _stub_pipelines(
+            _make_runner(config=config, capture_universe=["A", "B", "C", "D", "E"])
+        )
+
+        await runner.run_cycle([])
+
+        assert runner._market_data.capture.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_deferred_names_are_reported_and_not_counted_as_missing(self):
+        """A deferred name is scheduled work, not a failure — reporting it as a
+        shortfall would cry wolf on every cycle of a healthy catch-up."""
+        config = _make_config()
+        config.data_ingestion.capture_max_requests_per_cycle = 2
+        runner = _stub_pipelines(
+            _make_runner(config=config, capture_universe=["A", "B", "C", "D", "E"])
+        )
+
+        health = await runner.run_cycle([])
+
+        assert health.tickers_expected == 5
+        assert health.tickers_written == 2
+        assert health.tickers_deferred == 3
+        assert health.shortfall == 0
+
+    @pytest.mark.asyncio
+    async def test_a_real_failure_is_still_a_shortfall_while_deferring(self):
+        config = _make_config()
+        config.data_ingestion.capture_max_requests_per_cycle = 2
+        runner = _stub_pipelines(
+            _make_runner(config=config, capture_universe=["A", "B", "C", "D"])
+        )
+        runner._market_data.capture = AsyncMock(side_effect=[Exception("pacing"), 1])
+
+        health = await runner.run_cycle([])
+
+        assert health.tickers_written == 1
+        assert health.tickers_deferred == 2
+        assert health.shortfall == 1
+
+    @pytest.mark.asyncio
+    async def test_successive_cycles_advance_through_the_universe(self):
+        """Restarting from the top every cycle would starve the tail forever."""
+        config = _make_config()
+        config.data_ingestion.capture_max_requests_per_cycle = 2
+        runner = _stub_pipelines(
+            _make_runner(config=config, capture_universe=["A", "B", "C", "D", "E"])
+        )
+
+        await runner.run_cycle([])
+        await runner.run_cycle([])
+
+        fetched = [c[0][0] for c in runner._market_data.capture.call_args_list]
+        assert fetched == ["A", "B", "C", "D"]
+
+    @pytest.mark.asyncio
+    async def test_the_cursor_wraps_around(self):
+        config = _make_config()
+        config.data_ingestion.capture_max_requests_per_cycle = 2
+        runner = _stub_pipelines(_make_runner(config=config, capture_universe=["A", "B", "C"]))
+
+        await runner.run_cycle([])
+        await runner.run_cycle([])
+        await runner.run_cycle([])
+
+        fetched = [c[0][0] for c in runner._market_data.capture.call_args_list]
+        assert fetched == ["A", "B", "C", "A", "B", "C"]
+
+    @pytest.mark.asyncio
+    async def test_a_budget_of_zero_disables_the_cap_rather_than_capture(self):
+        """A misread of the setting must not silently stop capture entirely."""
+        config = _make_config()
+        config.data_ingestion.capture_max_requests_per_cycle = 0
+        runner = _stub_pipelines(_make_runner(config=config, capture_universe=["A", "B", "C"]))
+
+        health = await runner.run_cycle([])
+
+        assert runner._market_data.capture.await_count == 3
+        assert health.tickers_deferred == 0
+
+    @pytest.mark.asyncio
+    async def test_the_trading_watchlist_is_never_deferred(self):
+        """The budget throttles capture only. What the sleeves trade has to be
+        fetched every cycle — signal_generation depends on it."""
+        config = _make_config()
+        config.data_ingestion.capture_max_requests_per_cycle = 1
+        runner = _stub_pipelines(
+            _make_runner(config=config, capture_universe=["AAPL", "X", "Y"])
+        )
+
+        health = await runner.run_cycle(["AAPL", "MSFT", "NVDA"])
+
+        assert runner._market_data.ingest.await_count == 3
+        assert health.tickers_written == 4  # 3 traded + 1 captured
+        assert health.tickers_deferred == 1
+
+
 class TestResolveCaptureUniverse:
     """The service reads its capture universe from config, separately from
     the trading watchlist, so widening capture never widens what trades."""
