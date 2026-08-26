@@ -18,17 +18,19 @@ That decision is only safe while three things stay true, so each is pinned here:
   CI cannot re-derive them from the artifact — they are pinned here instead, and
   the doc must carry them;
 
-* **the clock is honest.** The decision calls the bias "time-bounded", but that
-  rests on forward capture having started, and it has not: ``data_ingestion``
-  still never dials IB (PR #91), so ``ohlcv_daily`` stays empty. The doc says so
-  explicitly. When #91 lands, the capture-start test below fails on purpose, to
-  force the real start date into the document rather than leaving a stale
-  "NOT YET STARTED" behind.
+* **the clock is honest.** The decision calls the bias "time-bounded", but
+  that rests on forward capture having started. PR #91 connected
+  ``data_ingestion`` to IB, so the mechanism is wired end-to-end — but
+  ``ohlcv_daily`` is still empty (verified 2026-08-26) because the change has
+  not reached a running container. The capture-clock test below tracks all
+  three states (dark / wired / running), so the document can never claim more
+  than the mechanism has actually done — nor less.
 """
 
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 from backtest.membership import DEFAULT_COVERAGE_FLOOR_PCT
@@ -144,32 +146,77 @@ def _awaits_a_connect_call(path: Path) -> bool:
     return False
 
 
-def test_capture_has_not_started_so_the_doc_must_still_say_so() -> None:
-    """Open finding. This test failing is GOOD NEWS and means: update the doc.
+#: What D18 must say while the connect exists but no session has been captured.
+CAPTURE_WIRED_MARKER = "WIRED, AWAITING FIRST SESSION"
 
-    D18 calls the bias time-bounded, which is only true once forward capture is
-    running. It is not: ``data_ingestion`` constructs an ``IBClient`` and never
-    dials it, so ``ohlcv_daily`` sits at 0 rows (verified 2026-08-26). PR #91 is
-    the fix.
+#: What D18 must say while ``data_ingestion`` still cannot dial IB at all.
+CAPTURE_DARK_MARKER = "NOT YET STARTED"
 
-    When #91 lands, this fails — deliberately. Record the first captured
-    session's date in D18 as the start of the 3-year clock, and replace the
-    "NOT YET STARTED" wording. Do not simply delete this test: change it to pin
-    the recorded start date instead.
+
+def _recorded_capture_start(text: str) -> str | None:
+    """Return the ISO date D18 records as the capture start, or None.
+
+    A real date is the terminal state: once one is written down the clock is
+    running and both interim markers must be gone.
+    """
+    m = re.search(r"Capture start date:\s*(\d{4}-\d{2}-\d{2})", text)
+    return m.group(1) if m else None
+
+
+def test_the_capture_clock_state_matches_the_code() -> None:
+    """D18's capture-clock wording must track reality, in three states.
+
+    The bias is only "time-bounded" once forward capture is actually running, so
+    the document is not allowed to drift ahead of the mechanism. Three states,
+    each pinned:
+
+    1. **dark** — ``data_ingestion`` cannot dial IB. D18 must say NOT YET STARTED
+       and name the fix. (Regression guard: if the connect is ever reverted, the
+       document has to go back with it.)
+    2. **wired, never run** — the connect exists but no session has been
+       captured, so the remaining step is a deploy. D18 must say
+       WIRED, AWAITING FIRST SESSION, and must NOT still claim NOT YET STARTED.
+    3. **running** — a real ``Capture start date: YYYY-MM-DD`` is recorded. Both
+       interim markers must be gone, and that date is the start of the 3-year
+       re-evidence clock.
+
+    State 3 cannot be asserted from CI — ``ohlcv_daily`` is not reachable here —
+    so it is enforced negatively: the moment a date appears, the interim wording
+    must not survive alongside it.
     """
     connects = _awaits_a_connect_call(INGEST_RUNNER)
     text = _prose(DIRECTION)
+    recorded = _recorded_capture_start(text)
+
+    if recorded is not None:
+        # State 3: the clock is running.
+        assert CAPTURE_DARK_MARKER not in text, (
+            f"D18 records a capture start date ({recorded}) but still says "
+            f"{CAPTURE_DARK_MARKER!r} — one of the two is wrong"
+        )
+        assert CAPTURE_WIRED_MARKER not in text, (
+            f"D18 records a capture start date ({recorded}) but still says "
+            f"{CAPTURE_WIRED_MARKER!r}; the interim wording must be replaced, "
+            "not appended to"
+        )
+        return
 
     if connects:
-        raise AssertionError(
-            "services/data_ingestion/runner.py now connects to IB, so forward "
-            "capture can start and D18's 'NOT YET STARTED' is stale. Record the "
-            "first captured session date in docs/designs/project-direction.md "
-            "as the start of the 3-year re-evidence clock, then update this test."
+        # State 2: wired, awaiting a session.
+        assert CAPTURE_WIRED_MARKER in text, (
+            "services/data_ingestion/runner.py now connects to IB, so capture is "
+            f"wired and D18 must say {CAPTURE_WIRED_MARKER!r}. The remaining step "
+            "is a deploy, not a code change."
         )
+        assert CAPTURE_DARK_MARKER not in text, (
+            f"capture is wired, so {CAPTURE_DARK_MARKER!r} is stale — D18 would "
+            "understate how far the mechanism has got"
+        )
+        return
 
-    assert "NOT YET STARTED" in text, (
-        "capture still has not started, so D18 must continue to say so — "
-        "otherwise the decision reads as time-bounded when it is open-ended"
+    # State 1: dark.
+    assert CAPTURE_DARK_MARKER in text, (
+        "capture is not wired, so D18 must continue to say so — otherwise the "
+        "decision reads as time-bounded when it is open-ended"
     )
     assert "PR #91" in text
