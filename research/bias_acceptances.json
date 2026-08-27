@@ -1,0 +1,19 @@
+{
+  "note": "Formally accepted baseline biases (KAN-68). An entry here lets backtest.bias_acceptance resolve VALID_WITH_ACCEPTED_BIAS for ONE artifact, pinned by source_sha256, and only for the coverage floor -- same-bar fills, a missing commission floor and a static present-day universe are refused with an acceptance in hand. `accepted_at` is caller-supplied and therefore backdatable: the evidence that a bias was accepted BEFORE it was spent is this file's git commit date, not the field. Adding an entry is a decision, so it belongs in the same commit as the written decision it cites. An acceptance never widens: a re-run produces a new sha256 and needs a new, deliberate entry.",
+  "version": 1,
+  "acceptances": [
+    {
+      "decision": "D18",
+      "requirement": "coverage_floor",
+      "source_sha256": "19e130ad8d572ea9eb167df499a3a94b6545f86acb392785a69498b65f480136",
+      "source": "output/backtest_multi_20260819_183451.json",
+      "excluded_pct": 11.28,
+      "floor_pct": 5.0,
+      "accepted_at": "2026-08-26",
+      "direction": "survivorship-biased upward by an unmeasured amount -- index departures skew toward underperformers, so excluding roughly a tenth of membership-days flatters returns rather than merely adding noise",
+      "re_evidence": "3 years of continuous forward-captured daily bars for the whole index, then re-run the baseline over that window",
+      "doc": "docs/designs/project-direction.md",
+      "note": "The PIT baseline cannot meet the 5.00% coverage floor from IB data: 142,856 of 1,265,893 membership-days are unpriceable across 164 tickers. 10.38% is genuine index departures and 0.91% is resolution failures, so recovering every one of the latter still leaves 10.38% -- the gap is not repairable in code, and IB serves no bars for departed names by symbol or conId. Shortening the window does not rescue it either: only 1y clears the floor, and a 1-year backtest cannot carry DSR/holdout evidence already marginal at DSR 0.868 against 0.95. The floor is NOT moved and this artifact still reports BLOCKED with is_like_for_like false; the bias is accepted in the record, not at the gate."
+    }
+  ]
+}

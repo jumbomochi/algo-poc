@@ -33,6 +33,11 @@ import ast
 import re
 from pathlib import Path
 
+from backtest.bias_acceptance import (
+    ACCEPTANCE_REGISTRY_PATH,
+    REQUIREMENT_COVERAGE_FLOOR,
+    load_acceptances,
+)
 from backtest.membership import DEFAULT_COVERAGE_FLOOR_PCT
 
 
@@ -220,3 +225,73 @@ def test_the_capture_clock_state_matches_the_code() -> None:
         "decision reads as time-bounded when it is open-ended"
     )
     assert "PR #91" in text
+
+
+# ---------------------------------------------------------------------------
+# The acceptance registry (KAN-68) -- where the decision became executable
+# ---------------------------------------------------------------------------
+
+
+def test_the_acceptance_registry_carries_the_same_numbers_as_the_decision() -> None:
+    """The registry is the machine-readable half of D18; they must agree.
+
+    D18's prose is what a human reads before spending the holdout; the registry
+    is what ``run_sleeve_evaluation.py`` reads before letting them. If the two
+    drift, the run is admitted on one set of figures and cited on another --
+    and because the registry is what gates, the *doc* would be the lie.
+    """
+    entries = [a for a in load_acceptances(ACCEPTANCE_REGISTRY_PATH)
+               if a.decision == "D18"]
+
+    assert len(entries) == 1, (
+        "expected exactly one D18 acceptance in "
+        f"{ACCEPTANCE_REGISTRY_PATH.name}; a second one would make it ambiguous "
+        "which figures were accepted"
+    )
+    entry = entries[0]
+    assert entry.requirement == REQUIREMENT_COVERAGE_FLOOR, (
+        "D18 accepted the coverage floor and nothing else. An acceptance for a "
+        "different requirement would excuse a defect nobody decided about."
+    )
+    assert f"{entry.excluded_pct:.2f}" == EXCLUDED_PCT, (
+        f"the registry accepts {entry.excluded_pct:.2f}% but D18 states "
+        f"{EXCLUDED_PCT}% — the accepted bias and the documented bias must be "
+        "the same number"
+    )
+    assert entry.floor_pct == FLOOR_PCT, (
+        f"the registry accepts a {entry.floor_pct}% floor but the decision "
+        f"rests on the floor staying at {FLOOR_PCT}%"
+    )
+    assert RE_EVIDENCE_YEARS in entry.re_evidence, (
+        f"the registry must carry D18's re-evidence trigger ({RE_EVIDENCE_YEARS} "
+        "of forward capture), or an accepted bias has no recorded end"
+    )
+
+
+def test_the_accepted_bias_is_pinned_to_one_artifact() -> None:
+    """An acceptance that names no artifact would bless every future baseline.
+
+    The sha256 is what makes re-accepting a re-run a deliberate act rather than
+    something that happens by default the next time the baseline is rebuilt.
+    """
+    entry = [a for a in load_acceptances(ACCEPTANCE_REGISTRY_PATH)
+             if a.decision == "D18"][0]
+
+    assert len(entry.source_sha256) == 64, (
+        "the D18 acceptance must pin a full sha256 of the baseline artifact"
+    )
+    assert int(entry.source_sha256, 16) != 0, "placeholder sha256 in the registry"
+
+
+def test_the_decision_and_the_registry_point_at_each_other() -> None:
+    """A reader who finds one must be able to find the other."""
+    entry = [a for a in load_acceptances(ACCEPTANCE_REGISTRY_PATH)
+             if a.decision == "D18"][0]
+
+    assert "project-direction" in entry.doc, (
+        "the registry entry must cite the decision it implements"
+    )
+    assert "bias_acceptances.json" in _prose(DIRECTION), (
+        "D18 must name the registry that now enforces it, or the decision reads "
+        "as prose-only and the next person re-derives the code path"
+    )

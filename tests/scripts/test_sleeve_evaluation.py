@@ -14,6 +14,7 @@ than against a hand-written expectation.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from datetime import date, datetime, timedelta, timezone
@@ -21,6 +22,11 @@ from datetime import date, datetime, timedelta, timezone
 import pandas as pd
 import pytest
 
+from backtest.bias_acceptance import (
+    ADMISSIBLE,
+    ADMISSIBLE_WITH_ACCEPTED_BIAS,
+    INADMISSIBLE,
+)
 from backtest.metrics import BacktestMetrics
 from research.evaluation import metrics as research_metrics
 from scripts.run_sleeve_evaluation import (
@@ -654,7 +660,7 @@ def test_stability_artifacts_are_attached_to_the_sleeve_that_produced_them(
     assert momentum["is_plateau"] is True
     assert momentum["center"] == float(SLEEVE_PARAMETERS["momentum"].shipped_value)
     assert result["sleeves"]["quality_value"]["stability"]["available"] is False
-    assert result["gate_valid"] is True
+    assert result["gate_valid"] == ADMISSIBLE
 
 
 @pytest.mark.parametrize(
@@ -754,7 +760,7 @@ def test_a_survivorship_biased_surface_taints_the_run(
     assert result["sleeves"]["momentum"]["stability"]["available"] is True
     assert result["sleeves"]["momentum"]["stability"]["admissible"] is False
     assert result["inadmissible_stability_surfaces"] == ["momentum"]
-    assert result["gate_valid"] is False
+    assert result["gate_valid"] == INADMISSIBLE
 
 
 def test_demotion_is_one_stage_at_a_time_and_never_deletion():
@@ -787,7 +793,11 @@ def test_cli_refuses_a_baseline_that_is_not_like_for_like(tmp_path, capsys):
 
     assert code == 3
     out = capsys.readouterr().out
-    assert "not like-for-like" in out
+    # "not like-for-like" is no longer the reason for refusing: since KAN-68 a
+    # baseline can be not-like-for-like and still admissible, so the refusal
+    # names admissibility instead.
+    assert "not admissible evidence" in out
+    assert "same_bar" in out
     assert not (tmp_path / "out").exists()
 
 
@@ -815,7 +825,7 @@ def test_cli_writes_a_mapping_and_an_evaluation(
 
     evaluation = json.loads(evaluation_files[0].read_text())
     assert evaluation["n_trials"] == 8
-    assert evaluation["gate_valid"] is True
+    assert evaluation["gate_valid"] == ADMISSIBLE
     assert evaluation["mapping"] == str(mapping_files[0])
     assert set(evaluation["sleeves"]) == set(ACTIVE_SLEEVES)
     assert "divergence-fidelity is not edge" in evaluation["disclaimer"]
@@ -844,7 +854,7 @@ def test_cli_taints_the_output_when_the_override_is_used(tmp_path, holdout_regis
 
     assert code == 0
     evaluation = json.loads(next(out_dir.glob("sleeve_evaluation_*.json")).read_text())
-    assert evaluation["gate_valid"] is False
+    assert evaluation["gate_valid"] == INADMISSIBLE
     assert evaluation["baseline"]["is_like_for_like"] is False
 
 
@@ -900,3 +910,181 @@ def test_cli_refuses_a_trial_count_below_the_declared_search(
 
     assert excinfo.value.code == 2
     assert json.loads(holdout_registry.read_text())["evaluations"] == []
+
+
+# --------------------------------------------------------------------------
+# Accepted bias (KAN-68) -- the narrow path between refusal and the blanket
+# override
+# --------------------------------------------------------------------------
+
+#: Like-for-like in every respect except the coverage floor. These are the real
+#: figures D18 accepted, measured on the KAN-52 PIT baseline.
+BLOCKED_CONFIG = {
+    **LIKE_FOR_LIKE_CONFIG,
+    "coverage": {
+        "state": "BLOCKED",
+        "total_membership_days": 1_265_893,
+        "excluded_membership_days": 142_856,
+        "excluded_pct": 11.284998021159765,
+        "floor_pct": 5.0,
+    },
+}
+
+
+@pytest.fixture
+def blocked_artifact(tmp_path):
+    path = tmp_path / "backtest_multi_20260819_183451.json"
+    path.write_text(json.dumps(_artifact(config=BLOCKED_CONFIG)))
+    return path
+
+
+def _acceptance_registry(tmp_path, artifact, **overrides):
+    """A committed-shaped registry accepting ``artifact``'s coverage bias."""
+    entry = {
+        "decision": "D18",
+        "requirement": "coverage_floor",
+        "source_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        "excluded_pct": 11.28,
+        "floor_pct": 5.0,
+        "accepted_at": "2026-08-26",
+        "direction": "survivorship-biased upward by an unmeasured amount",
+        "re_evidence": "3 years of forward capture",
+        "doc": "docs/designs/project-direction.md",
+    }
+    entry.update(overrides)
+    path = tmp_path / "bias_acceptances.json"
+    path.write_text(
+        json.dumps({"note": "the commit is the evidence", "version": 1,
+                    "acceptances": [entry]})
+    )
+    return path
+
+
+def test_cli_refuses_a_coverage_blocked_baseline_with_no_acceptance(
+    blocked_artifact, tmp_path, capsys
+):
+    """The pre-KAN-68 refusal is unchanged when nothing accepts the bias."""
+    empty = tmp_path / "empty_acceptances.json"
+    empty.write_text(json.dumps({"note": "none", "version": 1, "acceptances": []}))
+
+    code = main(
+        [
+            "--backtest", str(blocked_artifact),
+            "--output-dir", str(tmp_path / "out"),
+            "--holdout-registry", str(tmp_path / "missing.json"),
+            "--bias-acceptances", str(empty),
+        ]
+    )
+
+    assert code == 3
+    assert not (tmp_path / "out").exists()
+
+
+def test_cli_evaluates_a_coverage_blocked_baseline_the_registry_accepts(
+    blocked_artifact, holdout_registry, tmp_path, capsys
+):
+    """The whole point of the story: this run is admissible, and says why."""
+    out_dir = tmp_path / "out"
+
+    code = main(
+        [
+            "--backtest", str(blocked_artifact),
+            "--output-dir", str(out_dir),
+            "--holdout-registry", str(holdout_registry),
+            "--bias-acceptances", str(_acceptance_registry(tmp_path, blocked_artifact)),
+        ]
+    )
+
+    assert code == 0
+    evaluation = json.loads(next(out_dir.glob("sleeve_evaluation_*.json")).read_text())
+    assert evaluation["gate_valid"] == ADMISSIBLE_WITH_ACCEPTED_BIAS
+
+    # D18: the bias is accepted in the record, NOT by relaxing the gate.
+    assert evaluation["baseline"]["is_like_for_like"] is False
+    assert evaluation["baseline"]["coverage_state"] == "BLOCKED"
+
+    stamp = evaluation["baseline"]["accepted_bias"]
+    assert stamp["decision"] == "D18"
+    assert stamp["excluded_pct"] == pytest.approx(11.28, abs=0.01)
+    assert stamp["floor_pct"] == 5.0
+    assert "survivorship-biased upward" in stamp["direction"]
+
+    out = capsys.readouterr().out
+    assert "ACCEPTED BIAS" in out
+    assert "D18" in out
+    assert "11.28" in out
+
+
+def test_cli_refuses_an_acceptance_pinned_to_a_different_artifact(
+    blocked_artifact, tmp_path, capsys
+):
+    """An acceptance is spent on one artifact; it cannot bless the next one."""
+    registry = _acceptance_registry(
+        tmp_path, blocked_artifact, source_sha256="0" * 64
+    )
+
+    code = main(
+        [
+            "--backtest", str(blocked_artifact),
+            "--output-dir", str(tmp_path / "out"),
+            "--holdout-registry", str(tmp_path / "missing.json"),
+            "--bias-acceptances", str(registry),
+        ]
+    )
+
+    assert code == 3
+    assert "sha256" in capsys.readouterr().out
+
+
+def test_cli_refuses_a_same_bar_baseline_even_when_an_acceptance_matches(
+    tmp_path, capsys
+):
+    """The narrowing rule, end to end.
+
+    A same-bar baseline holding a valid coverage acceptance must still be
+    refused: what was accepted was the coverage floor, not "whatever else is
+    wrong with this artifact".
+    """
+    artifact = tmp_path / "backtest_multi_same_bar.json"
+    artifact.write_text(
+        json.dumps(_artifact(config={**BLOCKED_CONFIG, "fill_model": "same_bar"}))
+    )
+
+    code = main(
+        [
+            "--backtest", str(artifact),
+            "--output-dir", str(tmp_path / "out"),
+            "--holdout-registry", str(tmp_path / "missing.json"),
+            "--bias-acceptances", str(_acceptance_registry(tmp_path, artifact)),
+        ]
+    )
+
+    assert code == 3
+    assert not (tmp_path / "out").exists()
+
+
+def test_the_gate_invalid_banner_still_prints_now_that_the_state_is_a_string(
+    tmp_path, holdout_registry, capsys
+):
+    """Regression guard on the bool -> string change.
+
+    ``_print_summary`` used to read ``if not evaluation["gate_valid"]``. Every
+    one of the three states is a non-empty string, so a naive migration leaves
+    that condition permanently false and silently stops printing the banner
+    that exists to stop an inadmissible run being cited.
+    """
+    artifact = tmp_path / "backtest_multi_legacy.json"
+    artifact.write_text(json.dumps(_artifact(config={"slippage_bps": 10.0})))
+
+    code = main(
+        [
+            "--backtest", str(artifact),
+            "--output-dir", str(tmp_path / "out"),
+            "--holdout-registry", str(holdout_registry),
+            "--allow-non-comparable-baseline",
+        ]
+    )
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "GATE-INVALID" in out

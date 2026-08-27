@@ -199,6 +199,43 @@ what every future run accepts as evidence — the exact failure the "never silen
 degraded" rule exists to prevent. A reader who opens a `BLOCKED` artifact should
 see that it is blocked and come here to find out why it was spent anyway.
 
+### How the decision is enforced (KAN-68)
+
+D18 shipped as prose and doc-guards, with no representation in the type that
+gates on it. That left the D10 verdicts (KAN-55) unable to run at all: their
+precondition wanted `coverage.state == OK`, which this decision made
+permanently unreachable, and the only override —
+`--allow-non-comparable-baseline` — stamps the run gate-invalid and refuses to
+spend the holdout of record. Both doors were shut.
+
+`research/bias_acceptances.json` is what makes the decision executable.
+`backtest/bias_acceptance.py` resolves a baseline to one of three states rather
+than a bool:
+
+| State | Meaning |
+|---|---|
+| `VALID` | Nothing needed excusing |
+| `VALID_WITH_ACCEPTED_BIAS` | Coverage is `BLOCKED`, and this decision accepts it **for this exact artifact** |
+| `INVALID` | Everything else |
+
+The value is in how little the middle state excuses. An acceptance applies only
+when the artifact is like-for-like in every *other* respect, so a same-bar
+baseline, a missing commission floor, or a static present-day universe is
+refused with a valid acceptance in hand — those are different defects that
+nobody decided about. Acceptance is pinned to one `source_sha256` and
+cross-checked against the artifact's own coverage figures, so it cannot bless
+the next re-run, and it lapses automatically if the measured bias drifts away
+from the 11.28% recorded here. `MISSING` coverage can never be accepted: you
+can only accept a bias you measured.
+
+`ExecutionModel.is_like_for_like` is deliberately untouched by all of this, and
+the divergence monitor keeps gating on it — so this decision cannot un-blind
+daily drift reporting as a side effect. That remains a separate, open question.
+
+Acceptance is a commit, not a keystroke: like `research/holdout_registry.json`,
+the registry's git history — not its caller-supplied `accepted_at` field — is
+the evidence that a bias was accepted *before* it was spent.
+
 ### Re-evidence trigger
 
 **When forward capture has accumulated 3 years of continuous daily bars for the
