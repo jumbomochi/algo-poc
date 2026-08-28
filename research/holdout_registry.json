@@ -11,5 +11,11 @@
       "note": "Formal edge evaluation of the six incumbent sleeves (KAN-40, direction doc D10). The six-sleeve set was fixed on 2026-05-26 when mean_reversion and short_term_mr were dropped, so no bar from 2026-06-01 onward was part of the search that produced it. TWO LIMITS. (1) Registered 2026-08-16, after the window opened: this is out-of-SEARCH-sample, not out-of-sight-sample -- the paper book ran over it and was watched daily. (2) Valid for the six sleeves ONLY. The native factor catalog was specified 2026-08-02, inside the window, so spending this split on a factor evaluation would be contaminated; register a separate split with a later boundary for that. The window is short and grows with every trading day; report its length alongside the result."
     }
   ],
-  "evaluations": []
+  "evaluations": [
+    {
+      "split_id": "incumbent_sleeves_2026",
+      "label": "KAN-40 incumbent sleeve evaluation",
+      "evaluated_at": "2026-08-28T03:37:47.371775+00:00"
+    }
+  ]
 }

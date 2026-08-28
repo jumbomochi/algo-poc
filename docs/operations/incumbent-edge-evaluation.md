@@ -1,7 +1,9 @@
 # Incumbent Sleeve Edge Evaluation
 
-**Status:** protocol adopted 2026-08-17 (KAN-40); verdicts of record PENDING the
-regenerated baseline — see [Verdicts](#verdicts).
+**Status:** protocol adopted 2026-08-17 (KAN-40); verdicts of record **RECORDED
+2026-08-28 — all six sleeves FAIL**, on a baseline carrying the accepted D18
+coverage bias. The `incumbent_sleeves_2026` holdout is spent. See
+[Verdicts](#verdicts).
 **Owner:** Huiliang Lui (operator)
 **Governs:** the six sleeves in `shared/universe.py::ACTIVE_SLEEVES`
 **Rule this implements:** [project-direction.md](../designs/project-direction.md)
@@ -203,19 +205,98 @@ stops the evaluation from being renegotiated when a favourite sleeve fails.
 
 ## Verdicts
 
-**PENDING.** The verdicts of record require a like-for-like baseline, and one
-does not exist yet.
+**RECORDED 2026-08-28. All six sleeves FAIL.** The single-use
+`incumbent_sleeves_2026` holdout was spent on this run and cannot be spent
+again; the burn is recorded in `research/holdout_registry.json`.
 
-The newest saved baseline, `output/backtest_multi_20260804_075705.json`, ran
-`same_bar` fills, no per-order commission floor, a static present-day universe
-and no measured coverage — the same four failures that currently have the
-divergence monitor reporting BLIND. An edge evaluation of that artifact
-measures the survivorship bias, not the edge, and it would spend the single-use
-holdout doing it. `run_sleeve_evaluation.py` therefore **refuses** such a
-baseline (exit 3) unless `--allow-non-comparable-baseline` is passed, which
-stamps `gate_valid: INVALID` on the output — and even then it requires an
-explicit `--holdout-registry`, so a look at gate-invalid numbers cannot spend
-the split of record by default.
+### The limitation this verdict rests on (D18)
+
+**Every number below comes from a survivorship-biased baseline, and the
+verdicts inherit that bias.** Per [D18](../designs/project-direction.md), the
+point-in-time baseline cannot meet the coverage floor from IB data: 142,856 of
+1,265,893 membership-days (11.28%, across 164 tickers) could not be priced
+against a **5.00%** floor. `output/backtest_multi_20260819_183451.json`
+therefore reports `coverage.state: BLOCKED` and `is_like_for_like` False, and
+the floor was deliberately *not* moved to make it pass.
+
+Index departures skew toward underperformers, so excluding roughly a tenth of
+membership-days **flatters** these returns rather than merely adding noise —
+survivorship-biased upward by an unmeasured amount. "Unmeasured" is exact:
+sizing the bias would require the very history that is missing.
+
+This run was admissible **only** because that bias was accepted in writing
+beforehand, pinned to this artifact's sha256 in
+`research/bias_acceptances.json`. `gate_valid` reads
+`VALID_WITH_ACCEPTED_BIAS`, not `VALID`. Re-evidence after 3 years of
+continuous forward-captured daily bars for the whole index.
+
+The bias runs **against** these verdicts, not with them: a flattered baseline
+makes a sleeve easier to pass, and all six failed anyway. Correcting for it
+would push the numbers down, not up — so the FAILs are, if anything,
+understated. A future PASS on a comparable baseline would be the finding that
+needs re-examining, not these.
+
+### Provenance
+
+| | |
+|---|---|
+| Baseline | `output/backtest_multi_20260819_183451.json` (sha256 `19e130ad…f480136`) |
+| Artifact | `output/edge/sleeve_evaluation_20260828_033747.json` |
+| Git revision | `c31233ab5c204a2658183044fc890e6d0709091b` |
+| `gate_valid` | `VALID_WITH_ACCEPTED_BIAS` |
+| Trials deflated against | 8 (`n_trials`), DSR threshold 0.95, BH-FDR q = 0.10 |
+| Holdout | `incumbent_sleeves_2026`, 2026-06-01 → 2026-08-18, **55 sessions**, 42-session purge/embargo gap |
+
+### The verdicts
+
+| Sleeve | Sharpe (full) | Max DD | PSR | DSR | FDR | In-sample SR | Holdout SR (55 sessions) | Stability | Verdict | Recommended stage |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `momentum` | 0.59 | −24.0% | 0.967 | 0.358 | pass | 0.55 | +0.24 | plateau | **FAIL** | `shadow` |
+| `sector_rotation` | 0.62 | −21.5% | 0.974 | 0.401 | pass | 0.60 | −0.26 | plateau | **FAIL** | `shadow` |
+| `thematic_momentum` | 0.68 | −36.9% | 0.983 | 0.473 | pass | 0.62 | −0.90 | not swept | **FAIL** | `shadow` |
+| `quality_value` | 0.32 | −17.9% | 0.848 | 0.113 | fail | 0.03 | +4.63 | not swept | **FAIL** | `shadow` |
+| `earnings_drift` | 0.50 | −14.4% | 0.942 | 0.262 | pass | 0.54 | +0.88 | not swept | **FAIL** | `shadow` |
+| `tail_risk_hedge` | −0.60 | −20.0% | 0.030 | 0.000 | fail | −0.54 | −4.78 | not swept | **FAIL** | `shadow` |
+
+`Sharpe (full)` is the whole sample and *contains* the holdout; `In-sample SR`
+is the purged training span and is the honest comparator for `Holdout SR`.
+Verdict is `passes_dsr AND passes_fdr`.
+
+### How to read this
+
+**DSR is what kills them, and it kills them by a distance.** Every sleeve lands
+between 0.000 and 0.473 against a 0.95 threshold. This is not a set of
+borderline calls: no sleeve is one good quarter away from passing. Four of six
+clear BH-FDR and still fail, which is the same pattern the rehearsal showed —
+FDR is close to inert across six sleeves with a decade of data, and DSR carries
+the decision.
+
+**The 55-session holdout is too short to carry weight in either direction.**
+The driver says so itself, and the column proves it: `quality_value` posts a
+holdout SR of **+4.63** against an in-sample 0.03, which is not a sleeve that
+works but a 55-session window doing what short windows do. The four negative
+holdout SRs are weak evidence for the same reason. Read the holdout column as
+context, not as the verdict — the verdicts rest on DSR.
+
+**Four of six have no stability surface.** `run_stability_sweep.py` covers only
+the sleeves whose signals need nothing but bars; `thematic_momentum`,
+`quality_value`, `earnings_drift` and `tail_risk_hedge` additionally need the
+regime series, the fundamentals cache or the earnings cache. Their `Stability`
+is unmeasured, not passed. It changes no verdict here — all four fail on DSR
+regardless — but a future re-run that turns a FAIL into a PASS cannot lean on
+an unmeasured surface.
+
+**Nothing moves automatically.** Per direction D3.3 and the ladder above, the
+recommended stage is one step down (`paper → shadow`) for each, never
+retirement. The operator decides; a demoted sleeve may re-earn promotion.
+
+### How a non-admissible baseline is refused
+
+Retained as reference, since the distinction is what made this run possible. A
+baseline that is not like-for-like is **refused** with exit 3 unless
+`--allow-non-comparable-baseline` is passed, which stamps `gate_valid: INVALID`
+on the output — and even then it requires an explicit `--holdout-registry`, so
+a look at gate-invalid numbers cannot spend the split of record by default.
 
 There is one narrow exception, and it is not that flag. A baseline whose *only*
 unmet requirement is the coverage floor, and whose bias is accepted for that
@@ -225,18 +306,6 @@ exact artifact in `research/bias_acceptances.json`, resolves
 override is blanket and never citable, the acceptance is pinned to one sha256
 and excuses nothing but coverage. A same-bar baseline holding a valid
 acceptance is still refused.
-
-Fill this section from the first admissible run — `gate_valid` reading either
-`VALID` or `VALID_WITH_ACCEPTED_BIAS` — one row per sleeve:
-
-| Sleeve | Sharpe (full) | Max DD | PSR | DSR | FDR | In-sample SR | Holdout SR | Stability | Verdict | Recommended stage |
-|---|---|---|---|---|---|---|---|---|---|---|
-| `momentum` | | | | | | | | | | |
-| `sector_rotation` | | | | | | | | | | |
-| `thematic_momentum` | | | | | | | | | | |
-| `quality_value` | | | | | | | | | | |
-| `earnings_drift` | | | | | | | | | | |
-| `tail_risk_hedge` | | | | | | | | | | |
 
 ### Rehearsal — not evidence, not citable
 
@@ -348,6 +417,7 @@ Stated plainly so the gate review is not surprised by it:
   measurements are not.
 
 Neither gap is silent: the driver reports `stability.available: false` per
-sleeve, and this document's verdict table stays empty until an admissible run
-(`gate_valid` of `VALID` or `VALID_WITH_ACCEPTED_BIAS`) fills it. **Rung 0 does
-not arm on an empty table.**
+sleeve, and the verdict table records those four as `not swept` rather than as
+passed. The table was filled on 2026-08-28 by an admissible run
+(`gate_valid: VALID_WITH_ACCEPTED_BIAS`); **Rung 0 does not arm on an empty
+table**, and it does not arm on this one either — all six sleeves failed.

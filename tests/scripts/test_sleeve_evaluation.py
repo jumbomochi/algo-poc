@@ -870,6 +870,12 @@ def test_cli_will_not_spend_the_registry_of_record_on_a_gate_invalid_run(
     artifact = tmp_path / "backtest_multi_legacy.json"
     artifact.write_text(json.dumps(_artifact(config={"slippage_bps": 10.0})))
 
+    # Snapshot rather than assert-empty: the split of record is *meant* to be
+    # spent eventually (KAN-55 spent it on 2026-08-28), and a test that pins it
+    # to `== []` would fail on that legitimate burn while claiming the override
+    # had leaked. What this test guards is that *this call* writes nothing.
+    before = HOLDOUT_REGISTRY_PATH.read_bytes()
+
     code = main(
         [
             "--backtest",
@@ -882,7 +888,7 @@ def test_cli_will_not_spend_the_registry_of_record_on_a_gate_invalid_run(
 
     assert code == 3
     assert "REFUSING the override too" in capsys.readouterr().out
-    assert json.loads(HOLDOUT_REGISTRY_PATH.read_text())["evaluations"] == []
+    assert HOLDOUT_REGISTRY_PATH.read_bytes() == before
 
 
 def test_cli_refuses_a_trial_count_below_the_declared_search(
