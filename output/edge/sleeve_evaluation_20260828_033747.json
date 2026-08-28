@@ -1,0 +1,304 @@
+{
+  "version": 1,
+  "generated_at": "2026-08-28T03:37:47.374641+00:00",
+  "git_revision": "c31233ab5c204a2658183044fc890e6d0709091b",
+  "source": "output/backtest_multi_20260819_183451.json",
+  "n_trials": 8,
+  "n_trials_source": "docs/strategies/mean-reversion-failure-analysis.md",
+  "fdr_q": 0.1,
+  "dsr_threshold": 0.95,
+  "baseline": {
+    "fill_model": "next_open",
+    "slippage_bps": 10.0,
+    "commission_per_share": 0.005,
+    "commission_minimum": 1.0,
+    "point_in_time_universe": true,
+    "coverage_state": "BLOCKED",
+    "is_like_for_like": false,
+    "unmet_requirements": [
+      "universe coverage below the floor (BLOCKED): too much of the point-in-time membership could not be priced, so the delisted names are missing from the result"
+    ],
+    "admissibility": "VALID_WITH_ACCEPTED_BIAS",
+    "accepted_bias": {
+      "decision": "D18",
+      "requirement": "coverage_floor",
+      "coverage_state": "BLOCKED",
+      "excluded_pct": 11.28,
+      "floor_pct": 5.0,
+      "source_sha256": "19e130ad8d572ea9eb167df499a3a94b6545f86acb392785a69498b65f480136",
+      "accepted_at": "2026-08-26",
+      "direction": "survivorship-biased upward by an unmeasured amount -- index departures skew toward underperformers, so excluding roughly a tenth of membership-days flatters returns rather than merely adding noise",
+      "re_evidence": "3 years of continuous forward-captured daily bars for the whole index, then re-run the baseline over that window",
+      "doc": "docs/designs/project-direction.md"
+    },
+    "admissibility_notes": []
+  },
+  "inadmissible_stability_surfaces": [],
+  "gate_valid": "VALID_WITH_ACCEPTED_BIAS",
+  "holdout": {
+    "split_id": "incumbent_sleeves_2026",
+    "holdout_start": "2026-06-01",
+    "registered_at": "2026-08-16T00:00:00+00:00",
+    "horizon": 21,
+    "embargo": 21,
+    "gap": 42,
+    "n_sessions": 55,
+    "first_session": "2026-06-01",
+    "last_session": "2026-08-18",
+    "note": "Formal edge evaluation of the six incumbent sleeves (KAN-40, direction doc D10). The six-sleeve set was fixed on 2026-05-26 when mean_reversion and short_term_mr were dropped, so no bar from 2026-06-01 onward was part of the search that produced it. TWO LIMITS. (1) Registered 2026-08-16, after the window opened: this is out-of-SEARCH-sample, not out-of-sight-sample -- the paper book ran over it and was watched daily. (2) Valid for the six sleeves ONLY. The native factor catalog was specified 2026-08-02, inside the window, so spending this split on a factor evaluation would be contaminated; register a separate split with a later boundary for that. The window is short and grows with every trading day; report its length alongside the result."
+  },
+  "sleeves": {
+    "momentum": {
+      "sharpe": 0.5876942062737404,
+      "max_drawdown": -0.24048349570719518,
+      "total_return": 1.7258122369217586,
+      "n_observations": 2511,
+      "sr_per_period": 0.03702125516080506,
+      "skew": -0.4154551662353661,
+      "kurtosis": 5.347349260123772,
+      "probabilistic_sharpe": 0.9670652900702682,
+      "p_value": 0.0329347099297318,
+      "deflated_sharpe": 0.3578065380586212,
+      "passes_dsr": false,
+      "passes_fdr": true,
+      "survives_multiple_testing": false,
+      "in_sample": {
+        "n_sessions": 2414,
+        "sharpe": 0.5463218487020929
+      },
+      "holdout": {
+        "n_sessions": 55,
+        "sharpe": 0.23944770017690817,
+        "max_drawdown": -0.052096873107177255,
+        "total_return": 0.005013782129590805
+      },
+      "stability": {
+        "available": true,
+        "parameter": "lookback_days",
+        "center": 126.0,
+        "source": "output/stability/momentum-lookback_days.json",
+        "point_in_time_universe": true,
+        "admissible": true,
+        "is_plateau": true,
+        "relative_degradation": 0.1811256690626771,
+        "verdict_reason": "the neighborhood mean 0.501267 over 4 neighbors is within 30.0% of the center metric 0.612142 (degradation 18.1%) and no neighbor loses money"
+      },
+      "parameter": {
+        "name": "lookback_days",
+        "shipped_value": 126,
+        "why": "the ranking window is the signal; every holding decision is a function of the 126-day return and nothing else"
+      },
+      "verdict": "FAIL",
+      "current_stage": "paper",
+      "recommended_stage": "shadow",
+      "recommendation": "recorded as failing the edge framework; the recommended stage is shadow, one step down the ladder. Nothing is deleted and nothing moves automatically -- the operator decides, per direction doc D3.3."
+    },
+    "sector_rotation": {
+      "sharpe": 0.6237967892172877,
+      "max_drawdown": -0.2148989864173223,
+      "total_return": 0.8422225053665828,
+      "n_observations": 2511,
+      "sr_per_period": 0.03929550411689335,
+      "skew": -0.6709339809251172,
+      "kurtosis": 9.126054467723296,
+      "probabilistic_sharpe": 0.9738276531784914,
+      "p_value": 0.026172346821508596,
+      "deflated_sharpe": 0.4013745506182464,
+      "passes_dsr": false,
+      "passes_fdr": true,
+      "survives_multiple_testing": false,
+      "in_sample": {
+        "n_sessions": 2414,
+        "sharpe": 0.6041502206412734
+      },
+      "holdout": {
+        "n_sessions": 55,
+        "sharpe": -0.2581137127552806,
+        "max_drawdown": -0.027422590697159577,
+        "total_return": -0.0035669320312957664
+      },
+      "stability": {
+        "available": true,
+        "parameter": "lookback_days",
+        "center": 63.0,
+        "source": "output/stability/sector_rotation-lookback_days.json",
+        "point_in_time_universe": true,
+        "admissible": true,
+        "is_plateau": true,
+        "relative_degradation": 0.07682017330525491,
+        "verdict_reason": "the neighborhood mean 0.633574 over 4 neighbors is within 30.0% of the center metric 0.686296 (degradation 7.7%) and no neighbor loses money"
+      },
+      "parameter": {
+        "name": "lookback_days",
+        "shipped_value": 63,
+        "why": "same ranking window, one quarter long -- it decides which three sector ETFs are held"
+      },
+      "verdict": "FAIL",
+      "current_stage": "paper",
+      "recommended_stage": "shadow",
+      "recommendation": "recorded as failing the edge framework; the recommended stage is shadow, one step down the ladder. Nothing is deleted and nothing moves automatically -- the operator decides, per direction doc D3.3."
+    },
+    "thematic_momentum": {
+      "sharpe": 0.6825262985999047,
+      "max_drawdown": -0.36946103618343473,
+      "total_return": 1.2895623274101151,
+      "n_observations": 2511,
+      "sr_per_period": 0.042995115460875234,
+      "skew": -0.6282867487155807,
+      "kurtosis": 9.808428254834238,
+      "probabilistic_sharpe": 0.983053126288044,
+      "p_value": 0.016946873711956023,
+      "deflated_sharpe": 0.4732653034379531,
+      "passes_dsr": false,
+      "passes_fdr": true,
+      "survives_multiple_testing": false,
+      "in_sample": {
+        "n_sessions": 2414,
+        "sharpe": 0.6201218391375691
+      },
+      "holdout": {
+        "n_sessions": 55,
+        "sharpe": -0.8965942182425977,
+        "max_drawdown": -0.10173495639642172,
+        "total_return": -0.03428617947922474
+      },
+      "stability": {
+        "available": false,
+        "parameter": "lookback_days",
+        "center": 63,
+        "reason": "no sweep artifact for thematic_momentum.lookback_days; run scripts/run_stability_sweep.py --sleeve thematic_momentum --parameter lookback_days --center 63"
+      },
+      "parameter": {
+        "name": "lookback_days",
+        "shipped_value": 63,
+        "why": "ranks the thematic ETF basket; the replacement policy only reshuffles what this window already scored"
+      },
+      "verdict": "FAIL",
+      "current_stage": "paper",
+      "recommended_stage": "shadow",
+      "recommendation": "recorded as failing the edge framework; the recommended stage is shadow, one step down the ladder. Nothing is deleted and nothing moves automatically -- the operator decides, per direction doc D3.3."
+    },
+    "quality_value": {
+      "sharpe": 0.32376425283999716,
+      "max_drawdown": -0.179018314738577,
+      "total_return": 0.1680340166339409,
+      "n_observations": 2511,
+      "sr_per_period": 0.020395230867315952,
+      "skew": 1.0916407666629917,
+      "kurtosis": 73.37733629254843,
+      "probabilistic_sharpe": 0.8483571195034393,
+      "p_value": 0.15164288049656072,
+      "deflated_sharpe": 0.11327483501721836,
+      "passes_dsr": false,
+      "passes_fdr": false,
+      "survives_multiple_testing": false,
+      "in_sample": {
+        "n_sessions": 2414,
+        "sharpe": 0.02645115530930125
+      },
+      "holdout": {
+        "n_sessions": 55,
+        "sharpe": 4.634228437929406,
+        "max_drawdown": -0.01838192662413829,
+        "total_return": 0.10273583445579204
+      },
+      "stability": {
+        "available": false,
+        "parameter": "top_n",
+        "center": 15,
+        "reason": "no sweep artifact for quality_value.top_n; run scripts/run_stability_sweep.py --sleeve quality_value --parameter top_n --center 15"
+      },
+      "parameter": {
+        "name": "top_n",
+        "shipped_value": 15,
+        "why": "the sleeve is a fundamental ranking with no lookback -- breadth is the knob that decides how far down the ranking capital goes"
+      },
+      "verdict": "FAIL",
+      "current_stage": "paper",
+      "recommended_stage": "shadow",
+      "recommendation": "recorded as failing the edge framework; the recommended stage is shadow, one step down the ladder. Nothing is deleted and nothing moves automatically -- the operator decides, per direction doc D3.3."
+    },
+    "earnings_drift": {
+      "sharpe": 0.5007585115726367,
+      "max_drawdown": -0.14364905973071118,
+      "total_return": 0.3843689521920488,
+      "n_observations": 2511,
+      "sr_per_period": 0.03154482115523944,
+      "skew": -0.30231183633246955,
+      "kurtosis": 16.344876492228835,
+      "probabilistic_sharpe": 0.9417860308530552,
+      "p_value": 0.058213969146944766,
+      "deflated_sharpe": 0.26189483583176165,
+      "passes_dsr": false,
+      "passes_fdr": true,
+      "survives_multiple_testing": false,
+      "in_sample": {
+        "n_sessions": 2414,
+        "sharpe": 0.5395455329937171
+      },
+      "holdout": {
+        "n_sessions": 55,
+        "sharpe": 0.8773870298252581,
+        "max_drawdown": -0.025134333740165715,
+        "total_return": 0.011875943385861731
+      },
+      "stability": {
+        "available": false,
+        "parameter": "surprise_threshold_pct",
+        "center": 5.0,
+        "reason": "no sweep artifact for earnings_drift.surprise_threshold_pct; run scripts/run_stability_sweep.py --sleeve earnings_drift --parameter surprise_threshold_pct --center 5"
+      },
+      "parameter": {
+        "name": "surprise_threshold_pct",
+        "shipped_value": 5.0,
+        "why": "the surprise cutoff *is* the entry signal; every other parameter shapes an already-taken position"
+      },
+      "verdict": "FAIL",
+      "current_stage": "paper",
+      "recommended_stage": "shadow",
+      "recommendation": "recorded as failing the edge framework; the recommended stage is shadow, one step down the ladder. Nothing is deleted and nothing moves automatically -- the operator decides, per direction doc D3.3."
+    },
+    "tail_risk_hedge": {
+      "sharpe": -0.5981957319017321,
+      "max_drawdown": -0.1999970175315562,
+      "total_return": -0.1851982346613399,
+      "n_observations": 2511,
+      "sr_per_period": -0.03768278909410119,
+      "skew": -0.019993567788410768,
+      "kurtosis": 9.257736326849782,
+      "probabilistic_sharpe": 0.029657495553633395,
+      "p_value": 0.9703425044463666,
+      "deflated_sharpe": 2.0164665187172304e-05,
+      "passes_dsr": false,
+      "passes_fdr": false,
+      "survives_multiple_testing": false,
+      "in_sample": {
+        "n_sessions": 2414,
+        "sharpe": -0.5360926830030088
+      },
+      "holdout": {
+        "n_sessions": 55,
+        "sharpe": -4.777251383257136,
+        "max_drawdown": -0.022180967055471124,
+        "total_return": -0.021636901066383496
+      },
+      "stability": {
+        "available": false,
+        "parameter": "position_size_pct",
+        "center": 0.25,
+        "reason": "no sweep artifact for tail_risk_hedge.position_size_pct; run scripts/run_stability_sweep.py --sleeve tail_risk_hedge --parameter position_size_pct --center 0.25"
+      },
+      "parameter": {
+        "name": "position_size_pct",
+        "shipped_value": 0.25,
+        "why": "entries are driven by the external regime series, so hedge size is the only parameter the sleeve itself owns"
+      },
+      "verdict": "FAIL",
+      "current_stage": "paper",
+      "recommended_stage": "shadow",
+      "recommendation": "recorded as failing the edge framework; the recommended stage is shadow, one step down the ladder. Nothing is deleted and nothing moves automatically -- the operator decides, per direction doc D3.3."
+    }
+  },
+  "disclaimer": "divergence-fidelity is not edge, and edge is not divergence-fidelity. The divergence monitor establishes that live execution reproduces the baseline backtest; this evaluation establishes whether the baseline had an edge to reproduce. Neither substitutes for the other, and a sleeve needs both.",
+  "mapping": "output/edge/sleeve_returns_20260828_033747.json"
+}

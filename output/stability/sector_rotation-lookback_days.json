@@ -1,0 +1,98 @@
+{
+  "sleeve": "sector_rotation",
+  "parameter": "lookback_days",
+  "center": 63.0,
+  "metric": "sharpe_ratio",
+  "capital": 15380.0,
+  "bars_source": "output/backtest_multi_20260819_183451.json",
+  "point_in_time_universe": true,
+  "tickers": [
+    "XLB",
+    "XLC",
+    "XLE",
+    "XLF",
+    "XLI",
+    "XLK",
+    "XLP",
+    "XLRE",
+    "XLU",
+    "XLV",
+    "XLY"
+  ],
+  "results": {
+    "42.0": 0.8363597556523353,
+    "52.0": 0.6766490671963707,
+    "63.0": 0.6862955092856546,
+    "74.0": 0.42729188766323456,
+    "84.0": 0.5939959667829092
+  },
+  "runs": [
+    {
+      "value": 42.0,
+      "total_return": 1.2831532202589107,
+      "sharpe_ratio": 0.8363597556523353,
+      "max_drawdown": 0.20850245260402592,
+      "win_rate": 0.5813953488372093,
+      "avg_holding_period_days": 163.97674418604652,
+      "total_trades": 129
+    },
+    {
+      "value": 52.0,
+      "total_return": 0.9026863979355684,
+      "sharpe_ratio": 0.6766490671963707,
+      "max_drawdown": 0.19342207159750593,
+      "win_rate": 0.5161290322580645,
+      "avg_holding_period_days": 141.26612903225808,
+      "total_trades": 124
+    },
+    {
+      "value": 63.0,
+      "total_return": 1.0271543657519535,
+      "sharpe_ratio": 0.6862955092856546,
+      "max_drawdown": 0.23506337505841501,
+      "win_rate": 0.512396694214876,
+      "avg_holding_period_days": 157.4297520661157,
+      "total_trades": 121
+    },
+    {
+      "value": 74.0,
+      "total_return": 0.5025219958649566,
+      "sharpe_ratio": 0.42729188766323456,
+      "max_drawdown": 0.2588269184582447,
+      "win_rate": 0.4166666666666667,
+      "avg_holding_period_days": 170.12037037037038,
+      "total_trades": 108
+    },
+    {
+      "value": 84.0,
+      "total_return": 0.8136758861484427,
+      "sharpe_ratio": 0.5939959667829092,
+      "max_drawdown": 0.24837869412975788,
+      "win_rate": 0.475,
+      "avg_holding_period_days": 154.15,
+      "total_trades": 120
+    }
+  ],
+  "stability": {
+    "parameter": "lookback_days",
+    "center": 63.0,
+    "neighborhood": [
+      42.0,
+      52.0,
+      74.0,
+      84.0
+    ],
+    "metrics": [
+      0.8363597556523353,
+      0.6766490671963707,
+      0.42729188766323456,
+      0.5939959667829092
+    ],
+    "center_metric": 0.6862955092856546,
+    "neighborhood_mean": 0.6335741693237125,
+    "neighborhood_std": 0.17038804212032885,
+    "relative_degradation": 0.07682017330525491,
+    "is_plateau": true,
+    "verdict_reason": "the neighborhood mean 0.633574 over 4 neighbors is within 30.0% of the center metric 0.686296 (degradation 7.7%) and no neighbor loses money"
+  }
+}
