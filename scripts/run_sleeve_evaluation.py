@@ -77,6 +77,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from backtest.bias_acceptance import (
+    ACCEPTANCE_REGISTRY_PATH,
+    ADMISSIBLE_WITH_ACCEPTED_BIAS,
+    INADMISSIBLE,
+    BiasAcceptance,
+    load_acceptances,
+    resolve_admissibility,
+)
 from backtest.divergence import execution_model_from_backtest_config
 from research.evaluation.holdout import (
     DEFAULT_REGISTRY_PATH as HOLDOUT_REGISTRY_PATH,
@@ -309,6 +317,7 @@ def build_mapping(
     payload: dict,
     source_path: str,
     sleeves: Sequence[str] = ACTIVE_SLEEVES,
+    acceptances: Sequence[BiasAcceptance] | None = None,
 ) -> dict:
     """Convert a saved multi-portfolio backtest into a sleeve-returns mapping.
 
@@ -327,6 +336,16 @@ def build_mapping(
         )
 
     model = execution_model_from_backtest_config(payload.get("config"))
+    source_sha256 = _checksum(source_path)
+    # Admissibility is resolved once, here, so the artifact records the answer
+    # rather than each reader re-deriving it from a registry that may since
+    # have changed.
+    admissibility = resolve_admissibility(
+        model,
+        source_sha256=source_sha256,
+        coverage=(payload.get("config") or {}).get("coverage"),
+        acceptances=load_acceptances() if acceptances is None else acceptances,
+    )
     mapping_sleeves: dict[str, dict] = {}
     reference: tuple[str, list] | None = None
     for name in sleeves:
@@ -363,7 +382,7 @@ def build_mapping(
         "generated_at": _now(),
         "git_revision": _git_revision(),
         "source": source_path,
-        "source_sha256": _checksum(source_path),
+        "source_sha256": source_sha256,
         "conventions": {
             "returns": (
                 "daily simple returns; returns[i] is the return of dates[i], "
@@ -384,8 +403,14 @@ def build_mapping(
             "commission_minimum": model.commission_minimum,
             "point_in_time_universe": model.point_in_time_universe,
             "coverage_state": model.coverage_state,
+            # Kept verbatim and still strict: D18 accepted the coverage bias
+            # in the record, not at the gate, so a reader who opens this file
+            # still sees False and can go find out why it was spent anyway.
             "is_like_for_like": model.is_like_for_like,
             "unmet_requirements": model.unmet_requirements(),
+            "admissibility": admissibility.state,
+            "accepted_bias": admissibility.accepted_bias,
+            "admissibility_notes": admissibility.notes,
         },
         "sleeves": mapping_sleeves,
     }
@@ -726,8 +751,11 @@ def evaluate_mapping(
         "dsr_threshold": dsr_threshold,
         "baseline": dict(mapping["baseline"]),
         "inadmissible_stability_surfaces": biased_surfaces,
-        "gate_valid": bool(
-            mapping["baseline"]["is_like_for_like"] and not biased_surfaces
+        # Tri-state, not a bool: VALID_WITH_ACCEPTED_BIAS has to survive into
+        # the artifact, because a reader who finds ``true`` learns nothing
+        # about what was excused to get there.
+        "gate_valid": (
+            INADMISSIBLE if biased_surfaces else mapping["baseline"]["admissibility"]
         ),
         "holdout": holdout_summary,
         "sleeves": results,
@@ -785,7 +813,21 @@ def _print_summary(evaluation: dict) -> None:
             f"Recommended stage {demote_one_stage(CURRENT_STAGE)} for each; "
             "nothing is deleted and nothing moves automatically."
         )
-    if not evaluation["gate_valid"]:
+    accepted = evaluation["baseline"].get("accepted_bias")
+    if evaluation["gate_valid"] == ADMISSIBLE_WITH_ACCEPTED_BIAS and accepted:
+        print(
+            f"\nACCEPTED BIAS ({accepted['decision']}): this run is admissible "
+            f"only because {accepted['decision']} accepted its coverage bias in "
+            f"writing. {accepted['excluded_pct']:.2f}% of point-in-time "
+            f"membership-days could not be priced against a "
+            f"{accepted['floor_pct']:.2f}% floor, leaving the baseline "
+            f"{accepted['direction']}. Every verdict citing this run must cite "
+            f"that limitation -- see {accepted['doc']}."
+        )
+    # Compared against the state, never for truthiness: all three states are
+    # non-empty strings, so ``if not evaluation["gate_valid"]`` would be
+    # permanently false and this banner would silently stop printing.
+    if evaluation["gate_valid"] == INADMISSIBLE:
         reasons = list(evaluation["baseline"]["unmet_requirements"])
         for name in evaluation["inadmissible_stability_surfaces"]:
             reasons.append(
@@ -832,6 +874,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--fdr-q", type=float, default=0.10)
     parser.add_argument("--dsr-threshold", type=float, default=0.95)
     parser.add_argument(
+        "--bias-acceptances", default=None,
+        help="Accepted-bias registry path. Defaults to "
+             f"{ACCEPTANCE_REGISTRY_PATH.name} -- an entry there admits ONE "
+             "artifact, pinned by sha256, and only for the coverage floor. "
+             "Point this elsewhere to rehearse against a copy.",
+    )
+    parser.add_argument(
         "--allow-non-comparable-baseline", action="store_true",
         help="Evaluate anyway against a baseline live execution could not "
              "match, stamping the output gate_valid=false. Requires an "
@@ -852,18 +901,26 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     payload = json.loads(Path(args.backtest).read_text())
-    mapping = build_mapping(payload, args.backtest)
+    mapping = build_mapping(
+        payload,
+        args.backtest,
+        acceptances=load_acceptances(
+            args.bias_acceptances or ACCEPTANCE_REGISTRY_PATH
+        ),
+    )
 
-    if not mapping["baseline"]["is_like_for_like"]:
+    if mapping["baseline"]["admissibility"] == INADMISSIBLE:
         reasons = "; ".join(mapping["baseline"]["unmet_requirements"])
         print(
-            f"REFUSING: {args.backtest} is not like-for-like — {reasons}.\n"
+            f"REFUSING: {args.backtest} is not admissible evidence — {reasons}.\n"
             "An edge evaluation of a survivorship-biased or same-bar baseline "
             "measures the bias, not the edge, and it would spend the "
             "single-use holdout doing it. Regenerate the baseline (see "
             "docs/operations/backtest-baseline.md), or pass "
             "--allow-non-comparable-baseline to produce a gate-invalid run."
         )
+        for note in mapping["baseline"]["admissibility_notes"]:
+            print(f"  note: {note}")
         if not args.allow_non_comparable_baseline:
             return EXIT_NOT_LIKE_FOR_LIKE
         if args.holdout_registry is None:
