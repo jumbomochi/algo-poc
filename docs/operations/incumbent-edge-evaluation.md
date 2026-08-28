@@ -213,11 +213,21 @@ divergence monitor reporting BLIND. An edge evaluation of that artifact
 measures the survivorship bias, not the edge, and it would spend the single-use
 holdout doing it. `run_sleeve_evaluation.py` therefore **refuses** such a
 baseline (exit 3) unless `--allow-non-comparable-baseline` is passed, which
-stamps `gate_valid: false` on the output — and even then it requires an
+stamps `gate_valid: INVALID` on the output — and even then it requires an
 explicit `--holdout-registry`, so a look at gate-invalid numbers cannot spend
 the split of record by default.
 
-Fill this section from the first `gate_valid: true` run, one row per sleeve:
+There is one narrow exception, and it is not that flag. A baseline whose *only*
+unmet requirement is the coverage floor, and whose bias is accepted for that
+exact artifact in `research/bias_acceptances.json`, resolves
+`VALID_WITH_ACCEPTED_BIAS` and may be evaluated — see
+[D18](../designs/project-direction.md). The two are not interchangeable: the
+override is blanket and never citable, the acceptance is pinned to one sha256
+and excuses nothing but coverage. A same-bar baseline holding a valid
+acceptance is still refused.
+
+Fill this section from the first admissible run — `gate_valid` reading either
+`VALID` or `VALID_WITH_ACCEPTED_BIAS` — one row per sleeve:
 
 | Sleeve | Sharpe (full) | Max DD | PSR | DSR | FDR | In-sample SR | Holdout SR | Stability | Verdict | Recommended stage |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -261,8 +271,15 @@ DSR plus the holdout carry the decision.
 ## Producing the verdicts of record
 
 1. Regenerate the baseline with next-open fills, the commission floor and a
-   point-in-time universe — [backtest-baseline.md](backtest-baseline.md). Check
-   `config.coverage.state` is `OK`; anything else is not a pass.
+   point-in-time universe — [backtest-baseline.md](backtest-baseline.md).
+
+   `config.coverage.state` will read **`BLOCKED`, not `OK`**, and that is
+   expected: D18 accepted the PIT coverage bias permanently and deliberately
+   left the 5.00% floor unmoved, so `OK` is unreachable from IB data. What must
+   be true instead is that `research/bias_acceptances.json` carries an
+   acceptance pinned to *this* artifact's sha256 whose figures still match its
+   coverage block. A `BLOCKED` baseline with no matching acceptance is still not
+   a pass, and the driver refuses it with exit 3.
 2. Sweep the two available parameters:
    ```
    python scripts/run_stability_sweep.py --sleeve momentum \
@@ -288,8 +305,16 @@ DSR plus the holdout carry the decision.
    re-run rather than the split. It refuses a surface centered anywhere but the
    shipped value, and taints `gate_valid` if a surface was swept without
    `--universe-snapshots`.
-4. Confirm `gate_valid: true` in the artifact. If it is false, the run is not
-   admissible for Rung 0, whatever the numbers say.
+4. Confirm `gate_valid` in the artifact reads `VALID` or
+   `VALID_WITH_ACCEPTED_BIAS`. `INVALID` means the run is not admissible for
+   Rung 0, whatever the numbers say — and note that all three are non-empty
+   strings, so this is a comparison, never a truthiness check.
+
+   A `VALID_WITH_ACCEPTED_BIAS` run is citable **only with the citation**. The
+   artifact's `baseline.accepted_bias` block carries what that citation needs:
+   the decision (D18), the 11.28% exclusion, the 5.00% floor, and the direction
+   of the bias. Per D18, a verdict that spends the single-use holdout without
+   citing the limitation is not a valid verdict.
 5. Fill the verdict table above from the artifact, and commit both it and the
    holdout burn in `research/holdout_registry.json`.
 6. Record the result against the gate. **Rung 0 does not arm without this
@@ -323,5 +348,6 @@ Stated plainly so the gate review is not surprised by it:
   measurements are not.
 
 Neither gap is silent: the driver reports `stability.available: false` per
-sleeve, and this document's verdict table stays empty until a `gate_valid: true`
-run fills it. **Rung 0 does not arm on an empty table.**
+sleeve, and this document's verdict table stays empty until an admissible run
+(`gate_valid` of `VALID` or `VALID_WITH_ACCEPTED_BIAS`) fills it. **Rung 0 does
+not arm on an empty table.**
