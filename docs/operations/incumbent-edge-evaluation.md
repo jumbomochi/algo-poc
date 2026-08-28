@@ -240,12 +240,27 @@ needs re-examining, not these.
 
 | | |
 |---|---|
-| Baseline | `output/backtest_multi_20260819_183451.json` (sha256 `19e130ad…f480136`) |
-| Artifact | `output/edge/sleeve_evaluation_20260828_033747.json` |
+| Evaluation artifact | [`output/edge/sleeve_evaluation_20260828_033747.json`](../../output/edge/sleeve_evaluation_20260828_033747.json) — **tracked** |
+| Returns mapping | [`output/edge/sleeve_returns_20260828_033747.json`](../../output/edge/sleeve_returns_20260828_033747.json) — **tracked** |
+| Stability surfaces | [`momentum`](../../output/stability/momentum-lookback_days.json), [`sector_rotation`](../../output/stability/sector_rotation-lookback_days.json) — **tracked** |
+| Baseline | `output/backtest_multi_20260819_183451.json` (sha256 `19e130ad…f480136`) — **not tracked**, 249MB |
 | Git revision | `c31233ab5c204a2658183044fc890e6d0709091b` |
 | `gate_valid` | `VALID_WITH_ACCEPTED_BIAS` |
 | Trials deflated against | 8 (`n_trials`), DSR threshold 0.95, BH-FDR q = 0.10 |
 | Holdout | `incumbent_sleeves_2026`, 2026-06-01 → 2026-08-18, **55 sessions**, 42-session purge/embargo gap |
+
+**Why these four are committed despite `output/` being gitignored.** A single-use
+holdout was spent to produce them and cannot be spent again, so they are not
+regenerable output — re-running the driver on this window is no longer possible.
+They are force-added as evidence of record, and `.gitignore` documents the
+exception. The 249MB baseline stays out; the returns mapping carries its
+`source_sha256`, so the chain from baseline to verdict is checkable in-repo even
+though the baseline itself is not.
+
+The one thing this does **not** preserve: with the baseline absent, the returns
+mapping cannot be re-derived from source here. Verifying that the mapping
+faithfully represents the baseline requires the operator's copy of the 249MB
+artifact, matched by sha256.
 
 ### The verdicts
 

@@ -14,6 +14,15 @@ config/secrets.yaml
 docker-compose.override.yml
 # Local CodeGraph index — machine-specific, rebuilt on demand.
 .codegraph/
+# Backtest and research output. A few files under here are nonetheless TRACKED,
+# force-added with `git add -f` because they are evidence of record rather than
+# regenerable output: the KAN-55 edge evaluation (`output/edge/`) and the two
+# stability surfaces it cites (`output/stability/`). A single-use holdout was
+# spent to produce them and cannot be spent again, so they are not reproducible
+# by re-running. This stays a deny-by-default rule with deliberate exceptions —
+# NOT a negation pattern — so a future run does not get committed by accident.
+# The 249MB baseline they were computed from is still ignored; the artifacts
+# carry its sha256 instead. See docs/operations/incumbent-edge-evaluation.md.
 output/
 .DS_Store
 .worktrees/
