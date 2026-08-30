@@ -41,3 +41,21 @@ Deferred work with context. Added by /plan-eng-review and /plan-ceo-review 2026-
 - **Cons:** Naive round-half-up overspends every sleeve by up to half a share price, and also turns 1.9 into 2 (today it becomes 1) — so it changes sizing everywhere, not just the dropped cases. Needs tests + an execution service redeploy. `fractional_orders: false` is not the lever: IBKR paper rejects fractional API orders (Error 10243).
 - **Context:** Decided 2026-08-14 to leave as-is rather than force a discretionary 1-share ($1,209 vs the $922.83 the model asked for, +31%). LLY exposure is not actually absent — `sector_rotation` holds 2 shares. Revisit as a sizing question (should a sleeve emit an intent it cannot fill?) rather than an execution rounding tweak.
 - **Depends on / blocked by:** Nothing.
+
+## Benchmark-relative per-sleeve kill criteria
+- **What:** Add a trigger of the form "alpha vs the sleeve's own universe below X over N months" to `docs/operations/sleeve-kill-criteria.md`, which today has no benchmark-relative trigger of any kind.
+- **Why:** The 2026-08-28 CEO review added a live passive comparator to the daily digest (E4). Without a kill trigger reading it, that column is a dashboard nobody acts on — the same shape as the Prometheus gauges nobody scrapes.
+- **Pros:** Closes the loop from measurement to action; matches the D3.3 ladder (`live -> paper -> shadow`, one step, never retirement); makes "underperformed its own universe" a rule rather than an opinion.
+- **Cons:** Alpha is noisy over short windows — the 2016-2026 estimates had t-statistics of 0.32 to 1.25 over a full decade, so a monthly threshold would demote on noise. Needs a calibrated window before a threshold can be chosen honestly.
+- **Context:** Deferred by /plan-ceo-review 2026-08-28 (E5, cherry-pick ceremony). The review found the six sleeves run at beta 0.114-0.550 with alpha indistinguishable from zero against their own universes. Start once E4 has shipped and accumulated enough live sessions to calibrate a threshold against real tracking error. Full record: `~/.gstack/projects/jumbomochi-algo-poc/ceo-plans/2026-08-28-benchmark-relative-edge.md`.
+- **Effort:** S (human ~1 day / CC ~45min). **Priority:** P2.
+- **Depends on / blocked by:** E4 (benchmark column in `scripts/ops/evidence_digest.py`), which is itself gated on verifying the digest job actually runs (KAN-64 AC7).
+
+## Trial registry counts sleeves, not parameterizations
+- **What:** `n_trials = 8` counts the eight candidate sleeves that reached a backtest, not the lookbacks, thresholds and top-N values tried inside each one. Make the registry count the real search.
+- **Why:** The deflation under-corrects in a known direction: `SR*` is computed from a search smaller than the one actually run, so every DSR is too generous.
+- **Pros:** Makes the bar honest rather than known-optimistic; removes one of the four caveats currently attached to every D10 verdict.
+- **Cons:** Strictly raises `SR*`, so it makes already-failing sleeves fail harder and yields no new information today (all six already fail at the current, more generous bar). Reconstructing the historical parameter search may not be possible from git history at all — which would make the new count a guess, and a guessed deflation is worse than a documented under-correction.
+- **Context:** Deferred by /plan-ceo-review 2026-08-28 (E6). Already recorded as a known limit in `docs/operations/incumbent-edge-evaluation.md` ("Eight counts sleeves, not parameterizations"); this entry exists so the deferral rationale is discoverable alongside it. Becomes relevant only if a sleeve ever approaches passing, or when a new strategy is registered and its parameter search can be counted prospectively.
+- **Effort:** M (human ~3 days / CC ~2h). **Priority:** P3.
+- **Depends on / blocked by:** Nothing. Best done prospectively on the next new strategy rather than retroactively on the incumbents.
