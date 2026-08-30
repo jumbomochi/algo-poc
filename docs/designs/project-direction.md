@@ -248,19 +248,36 @@ Three years is the first point at which a window is both long enough to be worth
 re-running and clears the floor honestly — the 3-year window sits at 5.69% today,
 and forward capture drives that toward ~0%.
 
-**Capture start date: WIRED, AWAITING FIRST SESSION as of 2026-08-26.** KAN-58
-built the writer and PR #91 connected `data_ingestion` to IB, so the mechanism is
-in place end-to-end. `ohlcv_daily` is still empty (0 rows, 0 tickers, verified
-2026-08-26) because the change has not reached a running container yet: the
-deployed image predates it. **The 3-year clock starts at the first captured
-session, and that date must be recorded here, replacing this paragraph, when it
-happens.**
+**Capture start date: 2026-08-18.** That is the earliest session date now held in
+`ohlcv_daily`, and it is the start of the 3-year re-evidence clock: **a baseline
+re-run under this trigger takes a window beginning 2026-08-18, and the trigger
+matures no earlier than 2029-08-18.** KAN-58 built the writer, PR #91 connected
+`data_ingestion` to IB, and the change has now reached a running container —
+so the bias is time-bounded rather than open-ended, which is the distinction the
+previous wording of this paragraph turned on.
 
-This is an intermediate state, and the distinction matters. The bias is not yet
-time-bounded — a wired mechanism that has never run bounds nothing — but the
-remaining step is a deploy rather than a code change, so D18 is no longer waiting
-on engineering. Until a session is captured, treat the bias as documented and
-*not* bounded.
+Verified 2026-08-30: 4,336 rows, 542 tickers, 8 session dates 2026-08-18 through
+2026-08-27, no gaps across US trading days in that span.
+
+**Session date is not ingest date, and the gap between them is the point.** The
+first *ingest* ran 2026-08-27 16:49 UTC and the second 2026-08-28 16:57 UTC;
+between them they pulled the eight sessions above. Capture is prospective in the
+sense that matters here — every one of the 542 names was a live member when its
+bars were pulled, so none of this history depends on IB serving a delisted name
+later. The clock therefore starts at the earliest *session* held, not at the
+first ingest run.
+
+**Continuity is not yet established, and the trigger requires it.** The trigger
+above asks for 3 years of *continuous* daily bars. As of 2026-08-30 the
+2026-08-28 session (a Friday) is not present, and only two ingest runs have
+occurred in the twelve days since the first session. Eight sessions is far too
+short to demonstrate a daily cadence either way. **Until capture is observed
+running daily without gaps for a sustained period, treat the clock as started
+but the continuity requirement as unmet** — a run of bars with holes in it does
+not satisfy this trigger, and discovering that in 2029 would be the expensive
+way to find out. Any permanent capture gap must be recorded — the paper-run
+equivalent is `shared/absent_sessions.py`, the registry KAN-67 added for the
+2026-08-13 and 2026-08-18 absences; capture has no such registry yet.
 
 ### Citation requirement
 
