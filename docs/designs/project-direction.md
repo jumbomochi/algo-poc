@@ -267,17 +267,37 @@ bars were pulled, so none of this history depends on IB serving a delisted name
 later. The clock therefore starts at the earliest *session* held, not at the
 first ingest run.
 
-**Continuity is not yet established, and the trigger requires it.** The trigger
-above asks for 3 years of *continuous* daily bars. As of 2026-08-30 the
-2026-08-28 session (a Friday) is not present, and only two ingest runs have
-occurred in the twelve days since the first session. Eight sessions is far too
-short to demonstrate a daily cadence either way. **Until capture is observed
-running daily without gaps for a sustained period, treat the clock as started
-but the continuity requirement as unmet** — a run of bars with holes in it does
-not satisfy this trigger, and discovering that in 2029 would be the expensive
-way to find out. Any permanent capture gap must be recorded — the paper-run
-equivalent is `shared/absent_sessions.py`, the registry KAN-67 added for the
-2026-08-13 and 2026-08-18 absences; capture has no such registry yet.
+**What counts as a capture gap — the table lags by design, so read it correctly.**
+`ohlcv_daily` always trails the newest session by at least one trading day, and
+that is not a gap. Capture cycles run only while the market is open
+(`services/data_ingestion/runner.py` gates on `MarketCalendar.is_market_open`),
+so the current session's bar is still forming and is skipped as a partial; it is
+written on a later day. The cycle therefore fetches a **7-day lookback window**
+per ticker (`CAPTURE_LOOKBACK_DAYS`, `runner.py:23`) rather than just yesterday,
+so a missed session stays inside the window and is upserted on a later cycle via
+the `ix_ohlcv_ticker_date` unique index.
+
+**The criterion: a session is a gap only once it is still missing after the
+lookback window has passed over it** — roughly 7 calendar days of open markets.
+A `max(date)` one or two sessions behind today is the normal steady state and
+must never be recorded as an evidence gap. Worked example: Friday 2026-08-28 was
+absent through the weekend of 2026-08-29/30 and was covered by Monday's
+2026-08-24 → 2026-08-31 window. Related: Error 1100 and a dropped API session
+immediately after the US close are the nightly IBC Gateway restart, anticipated
+in `ensure_ib_connected`; the client redials on the next market-open cycle
+without needing an Error 1102.
+
+**Continuity over three years is nonetheless unproven, and the trigger requires
+it.** The trigger above asks for 3 years of *continuous* daily bars, and capture
+has been running for under two weeks. That is far too short to demonstrate a
+sustained cadence either way, so **treat the clock as started and the continuity
+requirement as not yet evidenced** — a run of bars with holes in it does not
+satisfy this trigger, and discovering that in 2029 would be the expensive way to
+find out. What is needed is a periodic check that no session older than the
+lookback window is missing, which nothing performs today. The paper-run analogue
+is `shared/absent_sessions.py` (KAN-67, for the 2026-08-13 and 2026-08-18
+absences); capture has no equivalent, and would need one keyed to the criterion
+above rather than to "is yesterday present".
 
 ### Citation requirement
 
