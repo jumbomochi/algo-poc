@@ -699,6 +699,88 @@ def _ms(day: date) -> int:
     return int(datetime.combine(day, time.min, tzinfo=timezone.utc).timestamp() * 1000)
 
 
+class LoopBoundFakeRedis(FakeRedis):
+    """A FakeRedis that binds to the event loop that first uses it.
+
+    ``redis.asyncio`` clients attach their connection pool to the loop running
+    at first use. ``FakeRedis`` does not, which is exactly why the digest's
+    "alerts unavailable" bug survived a full test suite: every existing test
+    either drives one source per ``asyncio.run`` or passes ``redis=None``, so
+    no test ever reused one client across two loops the way production does.
+
+    Modelling the affinity here is what makes the regression testable without
+    a live Redis. The error text matches what the real client raises.
+    """
+
+    def __init__(self, streams) -> None:
+        super().__init__(streams)
+        self._loop = None
+
+    def _bind(self) -> None:
+        running = asyncio.get_running_loop()
+        if self._loop is None:
+            self._loop = running
+        elif self._loop is not running:
+            raise RuntimeError("Event loop is closed")
+
+    async def keys(self, pattern: str):
+        self._bind()
+        return await super().keys(pattern)
+
+    async def xlen(self, name: str) -> int:
+        self._bind()
+        return await super().xlen(name)
+
+    async def xrange(self, name: str, min="-", max="+", count=None):
+        self._bind()
+        return await super().xrange(name, min=min, max=max, count=count)
+
+
+def test_every_async_source_gets_its_own_client_and_loop(db, cal):
+    """Two async sources must not share one loop-bound Redis client.
+
+    ``_awaited`` runs each source under its own ``asyncio.run``, which CLOSES
+    the loop when it returns. A client built once and shared therefore serves
+    the first source and raises ``RuntimeError: Event loop is closed`` for the
+    second, which the collect_snapshot guard turns into a graceful
+    "alerts unavailable" — a silent, permanent hole rather than a crash.
+
+    Observed in production 2026-08-31: "DLQ clear · alerts unavailable" with
+    MISSING SOURCES: alerts (RuntimeError: Event loop is closed), every week.
+    """
+    streams = {
+        "stream:fills:dlq": [("1-0", {})],
+        "stream:alerts": [(f"{_ms(WINDOW_START)}-0", {"priority": "high"})],
+    }
+    built = []
+
+    def redis_factory():
+        client = LoopBoundFakeRedis(streams)
+        built.append(client)
+        return client
+
+    snapshot = collect_snapshot(
+        build_sources(
+            db,
+            redis_factory=redis_factory,
+            as_of=AS_OF,
+            window_start=WINDOW_START,
+            calendar=cal,
+        ),
+        as_of=AS_OF,
+        window_start=WINDOW_START,
+    )
+
+    assert snapshot.missing == [], (
+        "an async source failed; a shared loop-bound client is the usual cause"
+    )
+    assert snapshot.dlq == {"stream:fills:dlq": 1}
+    assert snapshot.alerts is not None and snapshot.alerts.total == 1
+    assert len(built) == 2, (
+        "each async source must build its own client inside its own loop"
+    )
+
+
 def test_dlq_source_reports_every_non_empty_dead_letter_queue():
     redis = FakeRedis(
         {
@@ -854,7 +936,7 @@ def test_a_week_with_no_verdicts_at_all_is_blind_even_with_no_epoch(db, cal):
     told.
     """
     sources = build_sources(
-        db, redis=None, as_of=AS_OF, window_start=WINDOW_START, calendar=cal
+        db, redis_factory=lambda: None, as_of=AS_OF, window_start=WINDOW_START, calendar=cal
     )
     report = sources.blind()
 
@@ -925,7 +1007,7 @@ def test_a_dead_database_still_produces_a_message(cal):
     """
     sources = build_sources(
         BrokenSession(),
-        redis=None,
+        redis_factory=lambda: None,
         as_of=AS_OF,
         window_start=WINDOW_START,
         calendar=cal,
@@ -1014,7 +1096,7 @@ def test_the_no_pins_fallback_classifies_accepted_absences_too(db, cal):
     that actually runs, so it is the one an operator sees.
     """
     sources = build_sources(
-        db, redis=None, as_of=AS_OF, window_start=WINDOW_START, calendar=cal
+        db, redis_factory=lambda: None, as_of=AS_OF, window_start=WINDOW_START, calendar=cal
     )
     report = sources.blind()
 
