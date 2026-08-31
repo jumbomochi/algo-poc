@@ -736,7 +736,7 @@ def _sessions_with_no_verdict(
 
 
 def build_sources(
-    session, *, redis, as_of: date, window_start: date, calendar=None
+    session, *, redis_factory, as_of: date, window_start: date, calendar=None
 ) -> Sources:
     """Bind every reader to its connection.
 
@@ -791,23 +791,53 @@ def build_sources(
             session, window_start=window_start, as_of=as_of, calendar=resolved
         ),
         equity=equity_source(session, window_start=window_start, as_of=as_of),
-        dlq=_awaited(dlq_source(redis)),
-        alerts=_awaited(alerts_source(redis, window_start=window_start)),
+        dlq=_awaited(redis_factory, dlq_source),
+        alerts=_awaited(
+            redis_factory,
+            lambda client: alerts_source(client, window_start=window_start),
+        ),
         # Resolved at call time, inside the guard, for the same reason.
         drills=lambda: drills_source(session, epoch_id=_epoch_id())(),
     )
 
 
-def _awaited(source: Callable[[], object]) -> Callable[[], object]:
-    """Run an async source to completion so Sources stays uniformly sync.
+def _awaited(redis_factory, make_source) -> Callable[[], object]:
+    """Run one async source to completion so Sources stays uniformly sync.
 
-    collect_snapshot's guarantee is that one source's failure cannot reach the
-    others; keeping the async boundary inside each source rather than around
-    the whole collection is what preserves it.
+    ``asyncio.run`` CLOSES the loop it creates, and a ``redis.asyncio`` client
+    binds its connection pool to the loop that first uses it. One client shared
+    across two ``_awaited`` calls therefore serves the first source and raises
+    ``RuntimeError: Event loop is closed`` for the second — which is why the
+    2026-08-31 digest read "DLQ clear · alerts unavailable" with
+    ``MISSING SOURCES: alerts (RuntimeError: Event loop is closed)``. It had
+    never worked: the guard in ``collect_snapshot`` turned it into a graceful
+    degradation rather than a crash, so nothing ever surfaced it.
+
+    Each call therefore builds its own client inside its own loop and disposes
+    of it before that loop goes away. ``make_source`` takes the client and
+    returns the async reader, so the client cannot outlive the loop that owns
+    it. collect_snapshot's guarantee is that one source's failure cannot reach
+    the others; keeping the async boundary — and now the client lifetime —
+    inside each source is what preserves it.
+
+    ``redis_factory`` may return ``None`` (a dry run whose Redis is
+    unreachable); the source raises its own ``ConnectionError`` in that case
+    and the guard reports it as a missing source, which is the existing
+    contract.
     """
 
     def _run():
-        return asyncio.run(source())
+        async def _go():
+            client = redis_factory()
+            try:
+                return await make_source(client)()
+            finally:
+                # A test double need not implement the full client protocol.
+                aclose = getattr(client, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+
+        return asyncio.run(_go())
 
     return _run
 
@@ -877,18 +907,18 @@ def main(argv: list[str] | None = None) -> int:
     window_start = as_of - timedelta(days=args.window_days)
 
     session, engine = _open_session()
-    redis = None
     try:
-        if not args.dry_run:
-            redis = _open_redis()
-        else:
-            # A dry run still reports what it could not read, rather than
-            # pretending Redis was fine.
-            redis = _open_redis_quietly()
+        # A factory, not a client: each async source opens and closes its own
+        # connection inside its own event loop (see _awaited). A dry run still
+        # reports what it could not read, rather than pretending Redis was fine.
+        redis_factory = _open_redis if not args.dry_run else _open_redis_quietly
 
         snapshot = collect_snapshot(
             build_sources(
-                session, redis=redis, as_of=as_of, window_start=window_start
+                session,
+                redis_factory=redis_factory,
+                as_of=as_of,
+                window_start=window_start,
             ),
             as_of=as_of,
             window_start=window_start,
