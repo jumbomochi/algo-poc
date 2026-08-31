@@ -51,8 +51,19 @@ def _signals_fn(**overrides):
 
 
 class TestEligibleTickers:
-    def test_without_a_universe_the_sleeve_ranks_everything(self):
-        """Current (unscoped) behaviour: the thematic ETF wins the ranking."""
+    def test_omitting_the_universe_is_a_footgun_not_a_default(self):
+        """Why every caller must pass ``eligible_tickers``.
+
+        This is not "current behaviour" to be preserved — it is the hazard the
+        argument exists to prevent, kept under test so the hazard stays visible.
+        Omit the universe and the thematic ETF wins a momentum-sleeve ranking.
+
+        ``scripts/run_paper.py`` omitted it for momentum, sector_rotation and
+        earnings_drift until 2026-09-01, which is how ``sector_rotation`` came
+        to hold HUM and LLY. That the production callers now pass it is pinned
+        by ``tests/scripts/test_run_paper_sleeve_scoping.py``, which tests the
+        wiring; this only tests the function.
+        """
         signals_fn = _signals_fn()
         bars = _bars_by_ticker()
 

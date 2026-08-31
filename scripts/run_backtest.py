@@ -1174,8 +1174,6 @@ def make_thematic_momentum_signals_fn(
     tracked: dict[str, list[dict]] = {}
 
     def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
-        if ticker not in eligible:
-            return None
         min_bars = max(lookback_days + 1, ma_period + 1)
         if len(bars) < min_bars:
             return None
@@ -1247,7 +1245,14 @@ def make_thematic_momentum_signals_fn(
                     "exit_reason": exit_reason,
                 }
 
-        # Entry: in top N AND above 50-day MA
+        # Entry: in top N AND above 50-day MA. The eligibility gate sits here
+        # rather than at the top of the function so a holding that is no longer
+        # in the sleeve's universe keeps running the exit paths above — scoping
+        # must stop new entries, never strand a position the sleeve owns and is
+        # the only sleeve able to sell.
+        if ticker not in eligible:
+            return None
+
         top_tickers = rankings_by_date.get(current_date, [])
         scores = scores_by_date.get(current_date, {})
         held_tickers = (
@@ -1549,6 +1554,7 @@ def make_earnings_drift_signals_fn(
     trailing_stop_pct: float = 0.06,
     regime_by_date: dict | None = None,
     portfolio_context: PortfolioContext | None = None,
+    eligible_tickers: list[str] | None = None,
     whole_shares: bool = False,
     skip_ledger: SkipLedger | None = None,
 ):
@@ -1556,7 +1562,15 @@ def make_earnings_drift_signals_fn(
 
     Entry: Earnings surprise > threshold (beat estimate by N%+), within 2 days of announcement.
     Exit: Fixed hold period (20 trading days) or trailing stop 6%.
+
+    ``eligible_tickers`` scopes entries to this sleeve's universe. Unlike the
+    ranking sleeves this one has no top-N to crowd, so an unscoped run does not
+    fail loudly — it just buys any name the runner offers it that happened to
+    beat its estimate, which in live is the union of every sleeve's tickers.
+    Exits are deliberately *not* scoped: a position already held has to remain
+    sellable even if the universe changed underneath it.
     """
+    eligible = frozenset(eligible_tickers) if eligible_tickers is not None else None
     tracked: dict[str, dict] = {}
 
     def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
@@ -1630,7 +1644,11 @@ def make_earnings_drift_signals_fn(
 
             return None
 
-        # Entry logic: check for recent earnings event
+        # Entry logic: check for recent earnings event. Placed after every exit
+        # path above so scoping can never strand a held position.
+        if eligible is not None and ticker not in eligible:
+            return None
+
         if (
             portfolio_context
             and portfolio_context.pending_quantity(ticker, "buy") > 0
