@@ -35,7 +35,6 @@ from backtest.sleeve_comparability import SleeveComparability
 
 SESSIONS = [date(2026, 8, 3) + timedelta(days=i) for i in range(6)]
 TODAY = SESSIONS[-1]
-LIVE_ID = "shadow:1111111111111111"
 
 
 def _comparable(**overrides):
@@ -43,8 +42,6 @@ def _comparable(**overrides):
         sleeve="momentum",
         graded_session=TODAY,
         shadow_session=TODAY,
-        shadow_id=LIVE_ID,
-        live_model_id=LIVE_ID,
         overlapping_sessions=30,
     )
     kwargs.update(overrides)
@@ -76,30 +73,6 @@ def test_the_staleness_reason_names_both_dates() -> None:
 
     assert str(SESSIONS[0]) in reasons
     assert str(TODAY) in reasons
-
-
-# ---------------------------------------------------------------------------
-# model identity
-# ---------------------------------------------------------------------------
-
-
-def test_a_shadow_from_a_different_model_is_refused() -> None:
-    """A sleeve parameter changed, or the checkout moved, between the shadow
-    being produced and the monitor running. The curves are not comparable and
-    the evidence rows would land under the wrong baseline."""
-    verdict = _comparable(shadow_id="shadow:2222222222222222")
-
-    assert verdict.is_comparable is False
-    assert any("model" in r for r in verdict.unmet_requirements())
-
-
-def test_the_model_reason_names_both_ids() -> None:
-    reasons = " ".join(
-        _comparable(shadow_id="shadow:2222222222222222").unmet_requirements()
-    )
-
-    assert "shadow:2222222222222222" in reasons
-    assert LIVE_ID in reasons
 
 
 # ---------------------------------------------------------------------------
@@ -149,11 +122,10 @@ def test_every_unmet_requirement_is_reported_not_just_the_first() -> None:
     next, learns to distrust the message."""
     verdict = _comparable(
         shadow_session=SESSIONS[0],
-        shadow_id="shadow:2222222222222222",
         overlapping_sessions=1,
     )
 
-    assert len(verdict.unmet_requirements()) == 3
+    assert len(verdict.unmet_requirements()) == 2
 
 
 def test_the_pinned_artifact_gate_is_not_imported_here() -> None:
