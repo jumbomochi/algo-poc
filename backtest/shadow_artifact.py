@@ -50,6 +50,14 @@ class ShadowArtifact:
     series: dict[str, dict[date, float]]
     shadow_id: str
     window_sessions: int
+    #: The session this shadow was produced for. Carried *inside* the file
+    #: rather than inferred from its name, because a stale shadow is otherwise
+    #: indistinguishable from a fresh one: if the 04:15 run fails, yesterday's
+    #: artifact is still on disk and the monitor would grade today's live
+    #: against yesterday's model curve. Filenames cannot settle it — a copy or
+    #: a re-run rewrites them, which is the same reason ``baseline_age``
+    #: distrusts mtime for the pinned artifact.
+    session_date: date
 
 
 def shadow_id_for(portfolios: Mapping[str, Any]) -> str:
@@ -95,6 +103,7 @@ def dump_shadow(
     series: Mapping[str, Mapping[date, float]],
     shadow_id: str,
     window_sessions: int,
+    session_date: date,
 ) -> None:
     """Write the shadow artifact.
 
@@ -108,6 +117,7 @@ def dump_shadow(
     payload = {
         "shadow_id": shadow_id,
         "window_sessions": window_sessions,
+        "session_date": session_date.isoformat(),
         "series": {
             sleeve: {session.isoformat(): value for session, value in curve.items()}
             for sleeve, curve in series.items()
@@ -136,4 +146,5 @@ def load_shadow(path: str | Path) -> ShadowArtifact:
         },
         shadow_id=str(raw["shadow_id"]),
         window_sessions=int(raw["window_sessions"]),
+        session_date=date.fromisoformat(raw["session_date"]),
     )

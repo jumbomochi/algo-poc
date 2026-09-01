@@ -181,11 +181,16 @@ def produce_shadow_artifact(
         live_equity=live_equity,
         window_sessions=window_sessions,
     )
+    # The session this shadow speaks for is the last one LIVE recorded, not
+    # today's wall-clock date: a Saturday catch-up run scores Friday's session,
+    # and the monitor dates its verdicts the same way.
+    graded_sessions = {s for curve in series.values() for s in curve}
     dump_shadow(
         output_path,
         series=series,
         shadow_id=shadow_id_for(shadow_portfolios),
         window_sessions=window_sessions,
+        session_date=max(graded_sessions) if graded_sessions else date.today(),
     )
     return output_path
 

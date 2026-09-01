@@ -110,9 +110,32 @@ def test_the_id_is_prefixed_so_a_reader_knows_what_it_is() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_the_artifact_records_the_session_it_was_produced_for(tmp_path) -> None:
+    """Without this, a stale shadow is indistinguishable from a fresh one.
+
+    If the 04:15 run fails, yesterday's shadow_*.json is still on disk and the
+    monitor would grade today's live against yesterday's model curve — silently
+    and confidently. Only the filename would differ, and filenames lie: a copy
+    or a re-run rewrites them. ``baseline_age`` already learned this for the pin
+    (it prefers the filename stamp to mtime precisely because copying rewrites
+    mtime); the shadow carries the truth inside the file instead.
+    """
+    path = tmp_path / "shadow_20260807.json"
+    dump_shadow(
+        path,
+        series=SERIES,
+        shadow_id="shadow:abc123",
+        window_sessions=30,
+        session_date=date(2026, 8, 7),
+    )
+
+    assert load_shadow(path).session_date == date(2026, 8, 7)
+
+
 def test_the_series_round_trips(tmp_path) -> None:
     path = tmp_path / "shadow_20260807.json"
-    dump_shadow(path, series=SERIES, shadow_id="shadow:abc123", window_sessions=30)
+    dump_shadow(path, series=SERIES, shadow_id="shadow:abc123", window_sessions=30,
+                session_date=SESSIONS[-1])
 
     loaded = load_shadow(path)
 
@@ -121,7 +144,8 @@ def test_the_series_round_trips(tmp_path) -> None:
 
 def test_the_artifact_carries_its_identity_and_window(tmp_path) -> None:
     path = tmp_path / "shadow_20260807.json"
-    dump_shadow(path, series=SERIES, shadow_id="shadow:abc123", window_sessions=30)
+    dump_shadow(path, series=SERIES, shadow_id="shadow:abc123", window_sessions=30,
+                session_date=SESSIONS[-1])
 
     loaded = load_shadow(path)
 
@@ -132,7 +156,8 @@ def test_the_artifact_carries_its_identity_and_window(tmp_path) -> None:
 def test_dates_are_written_as_iso_strings(tmp_path) -> None:
     """The artifact is read by tools other than this one."""
     path = tmp_path / "shadow_20260807.json"
-    dump_shadow(path, series=SERIES, shadow_id="shadow:abc123", window_sessions=30)
+    dump_shadow(path, series=SERIES, shadow_id="shadow:abc123", window_sessions=30,
+                session_date=SESSIONS[-1])
 
     raw = json.loads(path.read_text())
 
@@ -142,7 +167,8 @@ def test_dates_are_written_as_iso_strings(tmp_path) -> None:
 def test_an_artifact_with_no_sleeves_round_trips_as_empty(tmp_path) -> None:
     """Every sleeve ungradeable is a real state, distinct from a missing file."""
     path = tmp_path / "shadow_20260807.json"
-    dump_shadow(path, series={}, shadow_id="shadow:abc123", window_sessions=30)
+    dump_shadow(path, series={}, shadow_id="shadow:abc123", window_sessions=30,
+                session_date=SESSIONS[-1])
 
     assert load_shadow(path).series == {}
 
