@@ -107,6 +107,45 @@ transient or overwritten, so they are reports, not evidence.
   `run_divergence.sh` exports `ALGO_REDIS_URL`. That credential is optional by
   design: an alert-path dependency must not be able to abort drift detection.
 
+### The rolling shadow (`--shadow`)
+
+A pinned artifact cannot score sessions later than its own last bar. The
+monitor intersects live dates with the baseline's, so the comparison window is
+capped there — measured across `output/divergence_20260822..20260829.json`, six
+consecutive nightly runs all reported `window_start=2026-07-10
+window_end=2026-08-14` and rewrote the same evidence row. **The monitor had not
+looked at a new session since 2026-08-14**, and a breach streak could never
+exceed 1 because only one `session_date` ever existed per baseline.
+
+`--shadow output/shadow_<YYYYMMDD>.json` replaces the feed. The 04:15 paper run
+replays each sleeve's own signal function over the bars it just fetched, seeded
+at live's NAV `--window` sessions back, and writes the resulting curve. The
+monitor grades against that, so `window_end` is the current session.
+
+- **Mutually exclusive with `--pinned`** (exit 2). The shadow is the model
+  replayed against live's own bars; the pin is a frozen artifact.
+- **No execution-model check.** Every requirement of one is satisfied by
+  construction: the runner decides on a session's close and fills the next
+  (next-open), `CostModel()` carries the $1.00 per-order floor, and no
+  membership calendar is used, so there is no point-in-time universe question
+  and no membership-days to price. The 11.28% exclusion behind D18 is a
+  property of the 10-year artifact, not of a 30-session window over live's
+  current universe.
+- **No baseline-age check.** A shadow is rebuilt nightly, so "how old is the
+  file" is meaningless. Its freshness question is *which session was it
+  produced for*, answered per sleeve against the session being graded.
+- **Comparability is per sleeve**, not per artifact: stale shadow, sleeve
+  absent from the replay, or fewer than two overlapping sessions. Each refusal
+  names its reason in the report's notes and the arithmetic is still printed,
+  so the gap stays visible.
+- **The evidence `baseline_id` is the shadow's model fingerprint**, never its
+  filename. `shadow_<date>.json` changes nightly; using the name would put every
+  session under its own baseline and no streak could ever fire.
+
+A **missing** shadow is not an empty book: it means the 04:15 run did not
+produce one, which is the blind signal `evidence_store.blindness` derives from
+absence.
+
 ### Exit codes
 
 | Code | Meaning | Cron / launchd action |
