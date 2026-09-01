@@ -135,6 +135,7 @@ def build_portfolios(
         capital=mom_cap,
         signals_fn=make_momentum_signals_fn(
             bars_by_ticker=bars_by_ticker,
+            eligible_tickers=UNIVERSE_REGISTRY["momentum"],
             top_n=5,
             lookback_days=126,
             position_size_pct=0.12,
@@ -157,6 +158,7 @@ def build_portfolios(
         capital=sec_cap,
         signals_fn=make_sector_rotation_signals_fn(
             bars_by_ticker=bars_by_ticker,
+            eligible_tickers=UNIVERSE_REGISTRY["sector_rotation"],
             top_n=3,
             lookback_days=63,
             position_size_pct=0.20,
@@ -203,6 +205,7 @@ def build_portfolios(
         capital=ed_cap,
         signals_fn=make_earnings_drift_signals_fn(
             earnings_lookup=earnings_lookup,
+            eligible_tickers=UNIVERSE_REGISTRY["earnings_drift"],
             surprise_threshold_pct=5.0,
             max_hold_days=20,
             position_size_pct=0.08,
@@ -300,6 +303,10 @@ def build_drill_portfolio(
         capital=capital,
         signals_fn=make_momentum_signals_fn(
             bars_by_ticker=bars_by_ticker,
+            # "the same liquid universe" above is a promise the code has to
+            # keep: unscoped, the drill ranks the whole fetched union and can
+            # rehearse the momentum path in another sleeve's instrument.
+            eligible_tickers=UNIVERSE_REGISTRY[DRILL_BASE_SLEEVE],
             top_n=5,
             lookback_days=126,
             position_size_pct=0.12,
