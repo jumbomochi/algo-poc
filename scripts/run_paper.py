@@ -74,6 +74,9 @@ from backtest._portfolio_state import SimplePortfolioState
 from backtest.portfolio_context import PortfolioContext
 from backtest.ranked_selection import ReplacementPolicy
 from backtest.aggregate_risk import AggregateRiskMonitor
+from backtest.divergence import DEFAULT_WINDOW_DAYS
+from backtest.shadow_artifact import dump_shadow, shadow_id_for
+from backtest.shadow_series import build_shadow_series
 from services.risk_management.engine import RiskEngine
 from services.risk_management.funding import (
     check_settled_usd_funding,
@@ -109,6 +112,82 @@ CAPITAL_ALLOCATIONS = {
     "earnings_drift": 0.1923,
     "tail_risk_hedge": 0.1283,
 }
+
+
+#: Sessions the shadow replays. Taken from the monitor's own default so the two
+#: cannot drift: producing fewer than the monitor compares would silently
+#: shorten every window. A wider ad-hoc ``--window`` still works — the monitor
+#: intersects the two sides and already prints "Only N overlapping days".
+SHADOW_WINDOW_SESSIONS = DEFAULT_WINDOW_DAYS
+
+
+def live_equity_by_sleeve(state: PaperTradingState) -> dict[str, dict[date, float]]:
+    """Live NAV by session for each graded sleeve.
+
+    Synthetic portfolios are dropped on the same contract the rest of the
+    evidence path uses (``docs/operations/drill-evidence-isolation.md``): the
+    "_aggregate" rollup is derived rather than graded, and a drill's book is not
+    the graded book.
+    """
+    out: dict[str, dict[date, float]] = {}
+    for name in state.get_portfolio_names():
+        if is_excluded_portfolio(name):
+            continue
+        curve = {
+            date.fromisoformat(row["date"]): float(row["equity"])
+            for row in state.get_equity_history(name)
+        }
+        if curve:
+            out[name] = curve
+    return out
+
+
+def produce_shadow_artifact(
+    *,
+    output_path,
+    capital: float,
+    bars_by_ticker: dict[str, list[dict]],
+    regime_by_date: dict,
+    fundamentals_lookup,
+    earnings_lookup,
+    live_equity: dict[str, dict[date, float]],
+    window_sessions: int,
+):
+    """Replay every sleeve over its rolling window and write the artifact.
+
+    This is the divergence monitor's feed. It replaces a pinned 10-year
+    backtest, which could not score sessions past its own last bar and so froze
+    the comparison window at 2026-08-14 while the monitor re-scored the same 16
+    sessions every night.
+
+    The counterfactual is built with **no live portfolio context**. Passing the
+    live positions in would re-score the book live actually holds, which is not
+    a comparison — it is the same book on both sides of it.
+
+    Returns the path written. Raises on failure: the caller decides whether a
+    shadow failure is worth stopping the paper run for, and at 04:15 it is not.
+    """
+    shadow_portfolios = build_portfolios(
+        capital=capital,
+        bars_by_ticker=bars_by_ticker,
+        regime_by_date=regime_by_date,
+        fundamentals_lookup=fundamentals_lookup,
+        earnings_lookup=earnings_lookup,
+        portfolio_contexts=None,
+    )
+    series = build_shadow_series(
+        portfolios=shadow_portfolios,
+        bars_by_ticker=bars_by_ticker,
+        live_equity=live_equity,
+        window_sessions=window_sessions,
+    )
+    dump_shadow(
+        output_path,
+        series=series,
+        shadow_id=shadow_id_for(shadow_portfolios),
+        window_sessions=window_sessions,
+    )
+    return output_path
 
 
 def _shadow_params(sleeve: str, params: dict) -> dict:
@@ -1327,6 +1406,14 @@ def _parser(default_db_url: str, default_redis_url: str) -> argparse.ArgumentPar
         help="Record observational factor snapshots for raw buy candidates",
     )
     parser.add_argument(
+        "--shadow-output-dir",
+        default="output",
+        help=(
+            "Directory for the daily shadow series the divergence monitor "
+            "grades against (default: output/)"
+        ),
+    )
+    parser.add_argument(
         "--portfolio-tag",
         default=None,
         help=(
@@ -1688,6 +1775,42 @@ def main() -> int | None:
                 contract_details=contracts,
             )
         session.commit()
+
+        # The divergence monitor's feed (04:45 reads what this writes). Placed
+        # after the commit so today's equity_snapshots row is durable and the
+        # window can include today; skipped for a tagged run, since a drill's
+        # book is excluded from the graded evidence either way.
+        #
+        # Deliberately non-fatal. This is shadow code running inside the job
+        # that trades the book, so a failure here writes no artifact and lets
+        # the run finish — the same posture the research shadow observer takes.
+        # The loss is visible rather than silent: a missing artifact is how
+        # evidence_store.blindness detects that the feed did not arrive.
+        if portfolio_tag is None:
+            try:
+                shadow_path = produce_shadow_artifact(
+                    output_path=(
+                        Path(args.shadow_output_dir)
+                        / f"shadow_{date.today():%Y%m%d}.json"
+                    ),
+                    capital=preparation.capital.deployable_capital,
+                    bars_by_ticker=bars_by_ticker,
+                    regime_by_date=regime_by_date,
+                    fundamentals_lookup=fundamentals_lookup,
+                    earnings_lookup=earnings_lookup,
+                    live_equity=live_equity_by_sleeve(state),
+                    window_sessions=SHADOW_WINDOW_SESSIONS,
+                )
+                print(f"  Shadow series written to {shadow_path}")
+            except Exception:
+                logger.exception(
+                    "Shadow series failed; paper trading is unchanged. The "
+                    "divergence monitor will report the feed as absent."
+                )
+                print(
+                    "  WARNING: shadow series failed — divergence will report "
+                    "no feed for today (paper run itself is unaffected)"
+                )
     except Exception:
         session.rollback()
         print("\nERROR: daily run failed; database changes rolled back")
