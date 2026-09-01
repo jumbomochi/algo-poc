@@ -57,6 +57,7 @@ from backtest.divergence import (
 from scripts.paper_state import PaperTradingState
 from shared.config import load_config
 from shared.models.evidence import DivergenceDaily
+from backtest.shadow_artifact import load_shadow
 from shared.universe import is_excluded_portfolio
 
 
@@ -276,6 +277,49 @@ def load_backtest_equity_series(
     }
     aggregate = _series(data["aggregate"]["portfolio_values"])
     return per_portfolio, aggregate
+
+
+def load_shadow_equity_series(
+    shadow_path: str,
+) -> tuple[dict[str, dict[date, float]], dict[date, float]]:
+    """Load per-sleeve and aggregate equity from a rolling shadow artifact.
+
+    The counterpart to :func:`load_backtest_equity_series`, and the reason the
+    comparison window can advance at all: a pinned artifact's last bar caps the
+    intersection with live, so the window froze at 2026-08-14 and every nightly
+    run re-scored the same 16 sessions. The shadow's last session is today.
+
+    The aggregate is **derived here, never read**: direction-doc D15 makes it a
+    roll-up the digest recomputes, so a stored one would be a second authority
+    able to disagree with the sum of its parts. It is summed only over sessions
+    present in every scored sleeve, matching
+    :func:`load_live_aggregate_series` on the live side — a sum that dropped a
+    sleeve on the days it is missing would step down and read as a loss the book
+    never took.
+
+    Raises:
+        FileNotFoundError: No artifact, which means the 04:15 run did not
+            produce one. That is the blind signal and must not read as an empty
+            book.
+    """
+    artifact = load_shadow(shadow_path)
+
+    per_sleeve = {
+        name: curve
+        for name, curve in artifact.series.items()
+        if not is_excluded_portfolio(name)
+    }
+    if not per_sleeve:
+        return {}, {}
+
+    shared_sessions = set.intersection(
+        *(set(curve) for curve in per_sleeve.values())
+    )
+    aggregate = {
+        session: sum(curve[session] for curve in per_sleeve.values())
+        for session in sorted(shared_sessions)
+    }
+    return per_sleeve, aggregate
 
 
 def scoreable_sleeves(names: Iterable[str]) -> set[str]:
