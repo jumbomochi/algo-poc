@@ -631,6 +631,26 @@ def baseline_id_for(backtest_path: str) -> str:
     return Path(backtest_path).name
 
 
+def shadow_baseline_id(shadow_path: str) -> str:
+    """The identity of the shadow a verdict was scored against.
+
+    Deliberately NOT :func:`baseline_id_for`. That returns the file's basename,
+    which is correct for a pinned artifact — the same file read from a worktree,
+    a deployed checkout or a backup is the same baseline — and catastrophic for a
+    shadow, whose name is ``shadow_YYYYMMDD.json`` and changes every night. Under
+    a per-night id every session would land in its own baseline,
+    ``breach_streak`` would treat each as unrelated history, and no streak could
+    reach the 10-session trigger. That is precisely the failure the frozen pin
+    already produced, reintroduced by the back door.
+
+    The shadow's identity is its **model fingerprint**: stable night to night,
+    moving only when the model moves. That is also what makes the identity check
+    unnecessary at comparability time — a model change restarts the streak
+    structurally, because the rows stop matching.
+    """
+    return load_shadow(shadow_path).shadow_id
+
+
 # Generous for two INSERTs, and short next to the job's window. The verdict
 # reaches the operator only once this process exits — the launchd wrapper sends
 # the Telegram message from the exit code — so a write blocked on a lock would

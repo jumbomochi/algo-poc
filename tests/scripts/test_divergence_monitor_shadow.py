@@ -17,13 +17,17 @@ from datetime import date, timedelta
 import pytest
 
 from backtest.shadow_artifact import dump_shadow
-from scripts.divergence_monitor import load_shadow_equity_series
+from scripts.divergence_monitor import (
+    load_shadow_equity_series,
+    shadow_baseline_id,
+)
 
 
 SESSIONS = [date(2026, 8, 3) + timedelta(days=i) for i in range(4)]
 
 
 def _write(tmp_path, series, shadow_id="shadow:abc123", window=30):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     path = tmp_path / "shadow_20260806.json"
     dump_shadow(
         path, series=series, shadow_id=shadow_id,
@@ -94,3 +98,34 @@ def test_synthetic_portfolios_are_excluded_from_the_aggregate(tmp_path) -> None:
 
     assert "__drill__" not in per_sleeve
     assert aggregate[SESSIONS[0]] == pytest.approx(20_000.0)
+
+
+# ---------------------------------------------------------------------------
+# baseline identity — the streak depends on this NOT being the filename
+# ---------------------------------------------------------------------------
+
+
+def test_the_baseline_id_is_the_model_id_not_the_filename(tmp_path) -> None:
+    """``baseline_id_for`` returns a basename, which is right for a pinned
+    artifact and catastrophic for a shadow: shadow_YYYYMMDD.json changes every
+    night, so every session would land under its own baseline, breach_streak
+    would treat each one as unrelated history, and no streak could ever reach
+    the 10-session trigger — the exact failure the frozen pin already caused.
+
+    The shadow's identity is its model fingerprint, which is stable night to
+    night and moves only when the model does.
+    """
+    path = _write(tmp_path, {"momentum": {d: 1.0 for d in SESSIONS}},
+                  shadow_id="shadow:deadbeefdeadbeef")
+
+    assert shadow_baseline_id(path) == "shadow:deadbeefdeadbeef"
+
+
+def test_two_nights_of_the_same_model_share_a_baseline_id(tmp_path) -> None:
+    """The property the streak actually needs."""
+    monday = _write(tmp_path / "mon", {"momentum": {d: 1.0 for d in SESSIONS}},
+                    shadow_id="shadow:deadbeefdeadbeef")
+    tuesday = _write(tmp_path / "tue", {"momentum": {d: 1.0 for d in SESSIONS}},
+                     shadow_id="shadow:deadbeefdeadbeef")
+
+    assert shadow_baseline_id(monday) == shadow_baseline_id(tuesday)
