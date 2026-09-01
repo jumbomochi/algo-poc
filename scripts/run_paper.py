@@ -74,6 +74,9 @@ from backtest._portfolio_state import SimplePortfolioState
 from backtest.portfolio_context import PortfolioContext
 from backtest.ranked_selection import ReplacementPolicy
 from backtest.aggregate_risk import AggregateRiskMonitor
+from backtest.divergence import DEFAULT_WINDOW_DAYS
+from backtest.shadow_artifact import dump_shadow, shadow_id_for
+from backtest.shadow_series import build_shadow_series
 from services.risk_management.engine import RiskEngine
 from services.risk_management.funding import (
     check_settled_usd_funding,
@@ -111,6 +114,109 @@ CAPITAL_ALLOCATIONS = {
 }
 
 
+#: Sessions the shadow replays. Taken from the monitor's own default so the two
+#: cannot drift: producing fewer than the monitor compares would silently
+#: shorten every window. A wider ad-hoc ``--window`` still works — the monitor
+#: intersects the two sides and already prints "Only N overlapping days".
+SHADOW_WINDOW_SESSIONS = DEFAULT_WINDOW_DAYS
+
+
+def live_equity_by_sleeve(state: PaperTradingState) -> dict[str, dict[date, float]]:
+    """Live NAV by session for each graded sleeve.
+
+    Synthetic portfolios are dropped on the same contract the rest of the
+    evidence path uses (``docs/operations/drill-evidence-isolation.md``): the
+    "_aggregate" rollup is derived rather than graded, and a drill's book is not
+    the graded book.
+    """
+    out: dict[str, dict[date, float]] = {}
+    for name in state.get_portfolio_names():
+        if is_excluded_portfolio(name):
+            continue
+        curve = {
+            date.fromisoformat(row["date"]): float(row["equity"])
+            for row in state.get_equity_history(name)
+        }
+        if curve:
+            out[name] = curve
+    return out
+
+
+def produce_shadow_artifact(
+    *,
+    output_path,
+    capital: float,
+    bars_by_ticker: dict[str, list[dict]],
+    regime_by_date: dict,
+    fundamentals_lookup,
+    earnings_lookup,
+    live_equity: dict[str, dict[date, float]],
+    window_sessions: int,
+):
+    """Replay every sleeve over its rolling window and write the artifact.
+
+    This is the divergence monitor's feed. It replaces a pinned 10-year
+    backtest, which could not score sessions past its own last bar and so froze
+    the comparison window at 2026-08-14 while the monitor re-scored the same 16
+    sessions every night.
+
+    The counterfactual is built with **no live portfolio context**. Passing the
+    live positions in would re-score the book live actually holds, which is not
+    a comparison — it is the same book on both sides of it.
+
+    Returns the path written. Raises on failure: the caller decides whether a
+    shadow failure is worth stopping the paper run for, and at 04:15 it is not.
+    """
+    shadow_portfolios = build_portfolios(
+        capital=capital,
+        bars_by_ticker=bars_by_ticker,
+        regime_by_date=regime_by_date,
+        fundamentals_lookup=fundamentals_lookup,
+        earnings_lookup=earnings_lookup,
+        portfolio_contexts=None,
+    )
+    series = build_shadow_series(
+        portfolios=shadow_portfolios,
+        bars_by_ticker=bars_by_ticker,
+        live_equity=live_equity,
+        window_sessions=window_sessions,
+    )
+    # The session this shadow speaks for is the last one LIVE recorded, not
+    # today's wall-clock date: a Saturday catch-up run scores Friday's session,
+    # and the monitor dates its verdicts the same way.
+    graded_sessions = {s for curve in series.values() for s in curve}
+    dump_shadow(
+        output_path,
+        series=series,
+        shadow_id=shadow_id_for(shadow_portfolios),
+        window_sessions=window_sessions,
+        session_date=max(graded_sessions) if graded_sessions else date.today(),
+    )
+    return output_path
+
+
+def _shadow_params(sleeve: str, params: dict) -> dict:
+    """Fingerprint inputs for one sleeve: its tuning plus what it may trade.
+
+    Consumed by ``backtest.shadow_artifact.shadow_id_for``, which derives the
+    rolling shadow's identity from this. Evidence rows key on that identity, so
+    anything in here restarts the epoch when it changes (direction doc D13) and
+    anything left out is a model change the epoch cannot see.
+
+    ``params`` is the same mapping that was spread into the sleeve's signal
+    factory, never a hand-copy of it — a fingerprint that can drift from the
+    values actually in force is worse than none, because it reads as evidence.
+
+    The capital **fraction** is included rather than the dollar amount, so a
+    deposit does not restart the epoch but a reallocation does.
+    """
+    return {
+        **params,
+        "universe": sorted(UNIVERSE_REGISTRY[sleeve]),
+        "capital_allocation": CAPITAL_ALLOCATIONS[sleeve],
+    }
+
+
 def build_portfolios(
     capital: float,
     bars_by_ticker: dict[str, list[dict]],
@@ -130,19 +236,22 @@ def build_portfolios(
     contexts = portfolio_contexts or {}
 
     mom_cap = capital * CAPITAL_ALLOCATIONS["momentum"]
+    mom_params = {
+        "top_n": 5,
+        "lookback_days": 126,
+        "position_size_pct": 0.12,
+        "trailing_stop_pct": 0.10,
+    }
     portfolios["momentum"] = PortfolioConfig(
         name="momentum",
         capital=mom_cap,
         signals_fn=make_momentum_signals_fn(
             bars_by_ticker=bars_by_ticker,
             eligible_tickers=UNIVERSE_REGISTRY["momentum"],
-            top_n=5,
-            lookback_days=126,
-            position_size_pct=0.12,
             initial_capital=mom_cap,
-            trailing_stop_pct=0.10,
             bear_tickers=BEAR_TICKERS,
             portfolio_context=contexts.get("momentum"),
+            **mom_params,
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=12.0,
@@ -150,21 +259,25 @@ def build_portfolios(
             total_exposure_limit_pct=150.0,
             max_lots_per_ticker=1,
         ),
+        shadow_params=_shadow_params("momentum", mom_params),
     )
 
     sec_cap = capital * CAPITAL_ALLOCATIONS["sector_rotation"]
+    sec_params = {
+        "top_n": 3,
+        "lookback_days": 63,
+        "position_size_pct": 0.20,
+        "trailing_stop_pct": 0.08,
+    }
     portfolios["sector_rotation"] = PortfolioConfig(
         name="sector_rotation",
         capital=sec_cap,
         signals_fn=make_sector_rotation_signals_fn(
             bars_by_ticker=bars_by_ticker,
             eligible_tickers=UNIVERSE_REGISTRY["sector_rotation"],
-            top_n=3,
-            lookback_days=63,
-            position_size_pct=0.20,
             initial_capital=sec_cap,
-            trailing_stop_pct=0.08,
             portfolio_context=contexts.get("sector_rotation"),
+            **sec_params,
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=20.0,
@@ -172,9 +285,15 @@ def build_portfolios(
             total_exposure_limit_pct=100.0,
             max_lots_per_ticker=1,
         ),
+        shadow_params=_shadow_params("sector_rotation", sec_params),
     )
 
     qv_cap = capital * CAPITAL_ALLOCATIONS["quality_value"]
+    qv_params = {
+        "top_n": 15,
+        "position_size_pct": 0.06,
+        "trailing_stop_pct": 0.12,
+    }
     portfolios["quality_value"] = PortfolioConfig(
         name="quality_value",
         capital=qv_cap,
@@ -183,13 +302,11 @@ def build_portfolios(
             sector_map=SECTOR_MAP,
             bars_by_ticker=bars_by_ticker,
             eligible_tickers=UNIVERSE_REGISTRY["quality_value"],
-            top_n=15,
-            position_size_pct=0.06,
             initial_capital=qv_cap,
-            trailing_stop_pct=0.12,
             regime_by_date=regime_by_date,
             portfolio_context=contexts.get("quality_value"),
             replacement_policy=ReplacementPolicy.TECHNICAL_ONLY,
+            **qv_params,
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=10.0,
@@ -197,22 +314,29 @@ def build_portfolios(
             total_exposure_limit_pct=100.0,
             max_lots_per_ticker=1,
         ),
+        shadow_params=_shadow_params(
+            "quality_value",
+            {**qv_params, "replacement_policy": ReplacementPolicy.TECHNICAL_ONLY.name},
+        ),
     )
 
     ed_cap = capital * CAPITAL_ALLOCATIONS["earnings_drift"]
+    ed_params = {
+        "surprise_threshold_pct": 5.0,
+        "max_hold_days": 20,
+        "position_size_pct": 0.08,
+        "trailing_stop_pct": 0.06,
+    }
     portfolios["earnings_drift"] = PortfolioConfig(
         name="earnings_drift",
         capital=ed_cap,
         signals_fn=make_earnings_drift_signals_fn(
             earnings_lookup=earnings_lookup,
             eligible_tickers=UNIVERSE_REGISTRY["earnings_drift"],
-            surprise_threshold_pct=5.0,
-            max_hold_days=20,
-            position_size_pct=0.08,
             initial_capital=ed_cap,
-            trailing_stop_pct=0.06,
             regime_by_date=regime_by_date,
             portfolio_context=contexts.get("earnings_drift"),
+            **ed_params,
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=8.0,
@@ -220,23 +344,27 @@ def build_portfolios(
             total_exposure_limit_pct=100.0,
             max_lots_per_ticker=1,
         ),
+        shadow_params=_shadow_params("earnings_drift", ed_params),
     )
 
     them_cap = capital * CAPITAL_ALLOCATIONS["thematic_momentum"]
+    them_params = {
+        "top_n": 8,
+        "lookback_days": 63,
+        "position_size_pct": 0.135,
+        "trailing_stop_pct": 0.10,
+    }
     portfolios["thematic_momentum"] = PortfolioConfig(
         name="thematic_momentum",
         capital=them_cap,
         signals_fn=make_thematic_momentum_signals_fn(
             bars_by_ticker=bars_by_ticker,
             eligible_tickers=UNIVERSE_REGISTRY["thematic_momentum"],
-            top_n=8,
-            lookback_days=63,
-            position_size_pct=0.135,
             initial_capital=them_cap,
-            trailing_stop_pct=0.10,
             regime_by_date=regime_by_date,
             portfolio_context=contexts.get("thematic_momentum"),
             replacement_policy=ReplacementPolicy.TECHNICAL_ONLY,
+            **them_params,
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=15.0,
@@ -244,17 +372,22 @@ def build_portfolios(
             total_exposure_limit_pct=120.0,
             max_lots_per_ticker=1,
         ),
+        shadow_params=_shadow_params(
+            "thematic_momentum",
+            {**them_params, "replacement_policy": ReplacementPolicy.TECHNICAL_ONLY.name},
+        ),
     )
 
     tr_cap = capital * CAPITAL_ALLOCATIONS["tail_risk_hedge"]
+    tr_params = {"position_size_pct": 0.25}
     portfolios["tail_risk_hedge"] = PortfolioConfig(
         name="tail_risk_hedge",
         capital=tr_cap,
         signals_fn=make_tail_risk_hedge_signals_fn(
             regime_by_date=regime_by_date,
-            position_size_pct=0.25,
             initial_capital=tr_cap,
             portfolio_context=contexts.get("tail_risk_hedge"),
+            **tr_params,
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=25.0,
@@ -262,6 +395,7 @@ def build_portfolios(
             total_exposure_limit_pct=100.0,
             max_lots_per_ticker=1,
         ),
+        shadow_params=_shadow_params("tail_risk_hedge", tr_params),
     )
 
     # Level 3: Crash entry freeze — block new buys during crash regime
@@ -273,6 +407,10 @@ def build_portfolios(
             capital=pc.capital,
             signals_fn=make_crash_freeze_signals_fn(pc.signals_fn, regime_by_date),
             risk_engine=pc.risk_engine,
+            # Carried explicitly: this rewrap reconstructs the whole config, so
+            # a field omitted here is lost silently — the sleeve keeps working
+            # and only the model fingerprint quietly stops tracking the model.
+            shadow_params=pc.shadow_params,
         )
 
     return portfolios
@@ -1273,6 +1411,14 @@ def _parser(default_db_url: str, default_redis_url: str) -> argparse.ArgumentPar
         help="Record observational factor snapshots for raw buy candidates",
     )
     parser.add_argument(
+        "--shadow-output-dir",
+        default="output",
+        help=(
+            "Directory for the daily shadow series the divergence monitor "
+            "grades against (default: output/)"
+        ),
+    )
+    parser.add_argument(
         "--portfolio-tag",
         default=None,
         help=(
@@ -1634,6 +1780,42 @@ def main() -> int | None:
                 contract_details=contracts,
             )
         session.commit()
+
+        # The divergence monitor's feed (04:45 reads what this writes). Placed
+        # after the commit so today's equity_snapshots row is durable and the
+        # window can include today; skipped for a tagged run, since a drill's
+        # book is excluded from the graded evidence either way.
+        #
+        # Deliberately non-fatal. This is shadow code running inside the job
+        # that trades the book, so a failure here writes no artifact and lets
+        # the run finish — the same posture the research shadow observer takes.
+        # The loss is visible rather than silent: a missing artifact is how
+        # evidence_store.blindness detects that the feed did not arrive.
+        if portfolio_tag is None:
+            try:
+                shadow_path = produce_shadow_artifact(
+                    output_path=(
+                        Path(args.shadow_output_dir)
+                        / f"shadow_{date.today():%Y%m%d}.json"
+                    ),
+                    capital=preparation.capital.deployable_capital,
+                    bars_by_ticker=bars_by_ticker,
+                    regime_by_date=regime_by_date,
+                    fundamentals_lookup=fundamentals_lookup,
+                    earnings_lookup=earnings_lookup,
+                    live_equity=live_equity_by_sleeve(state),
+                    window_sessions=SHADOW_WINDOW_SESSIONS,
+                )
+                print(f"  Shadow series written to {shadow_path}")
+            except Exception:
+                logger.exception(
+                    "Shadow series failed; paper trading is unchanged. The "
+                    "divergence monitor will report the feed as absent."
+                )
+                print(
+                    "  WARNING: shadow series failed — divergence will report "
+                    "no feed for today (paper run itself is unaffected)"
+                )
     except Exception:
         session.rollback()
         print("\nERROR: daily run failed; database changes rolled back")
