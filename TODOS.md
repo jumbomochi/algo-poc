@@ -51,6 +51,22 @@ Deferred work with context. Added by /plan-eng-review and /plan-ceo-review 2026-
 - **Effort:** S (human ~1 day / CC ~45min). **Priority:** P2.
 - **Depends on / blocked by:** E4 (benchmark column in `scripts/ops/evidence_digest.py`), which is itself gated on verifying the digest job actually runs (KAN-64 AC7).
 
+## `eligible_tickers=[]` means opposite things in sibling signal factories
+- **What:** Normalise the universe-scoping fallback across all five signal factories in `scripts/run_backtest.py` so an empty list consistently means "trade nothing", never "trade everything".
+- **Why:** The four ranking factories use `eligible = set(eligible_tickers or bars_by_ticker)` (`:881` and siblings), so `eligible_tickers=[]` falls back to the whole `bars_by_ticker` union — the exact unscoped state that let `sector_rotation` hold HUM and LLY. `make_earnings_drift_signals_fn` (`:1562`) uses `frozenset(...) if eligible_tickers is not None else None`, which treats `[]` as "nothing". Same parameter name, opposite behaviour, and the dangerous direction is the silent one.
+- **Pros:** Removes a footgun at its root rather than documenting it; one consistent rule for every future sleeve.
+- **Cons:** Touches the signal path of four sleeves, so it is a behaviour change to the backtest and wants its own diff and its own full suite run. Nothing passes an empty list today, so it is latent, not live.
+- **Context:** Raised by the /ship pre-landing review on 2026-09-01 during the sleeve-scoping fix, and deliberately deferred to keep that PR narrow. Guarded meanwhile by `tests/scripts/test_run_paper_sleeve_scoping.py::test_a_sleeve_still_trades_its_own_universe`, which fails if any sleeve ends up scoped to nothing.
+- **Depends on / blocked by:** Nothing.
+
+## `test_pipeline_report` fails inside the UTC/SGT date-boundary window
+- **What:** Make `tests/deploy/test_pipeline_report.py::test_the_message_reports_the_documented_facts_in_order` date-boundary safe.
+- **Why:** The test seeds a fill at `datetime.now(timezone.utc)` (`:458`) and then asserts `"fills:1" in msg`, but the report counts fills by local (SGT) day. During the hours where the UTC date and the SGT date differ, the seeded fill lands outside the report's window and the assertion fails. Observed failing on 2026-08-31 and passing again on 2026-09-01 with no code change in between, which is what identified it as a boundary flake rather than a break.
+- **Pros:** Removes a test that fails for ~8 hours a day on this host's timezone; a suite that is red on the clock trains people to ignore red.
+- **Cons:** Needs the report's own day-window semantics pinned down first — the fix is either seeding in local time or freezing the clock, and picking wrong just moves the flake.
+- **Context:** Found by /ship on 2026-09-01 while landing the sleeve-scoping fix; verified pre-existing by stashing the branch changes and reproducing on `develop`. Not caused by that work and left untouched (`REPO_MODE=collaborative`).
+- **Depends on / blocked by:** Nothing.
+
 ## Trial registry counts sleeves, not parameterizations
 - **What:** `n_trials = 8` counts the eight candidate sleeves that reached a backtest, not the lookbacks, thresholds and top-N values tried inside each one. Make the registry count the real search.
 - **Why:** The deflation under-corrects in a known direction: `SR*` is computed from a search smaller than the one actually run, so every DSR is too generous.
