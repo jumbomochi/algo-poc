@@ -72,6 +72,13 @@ class PortfolioConfig:
     capital: float
     signals_fn: Callable[[str, list[dict]], dict | None]
     risk_engine: RiskEngine
+    #: The parameters that determine what this sleeve would do, used by
+    #: ``backtest.shadow_artifact.shadow_id_for`` to fingerprint the model so a
+    #: parameter change restarts the epoch (direction doc D13). ``None`` is
+    #: refused there rather than defaulted, so only rosters that actually feed
+    #: the rolling shadow need to populate it — the backtest's own
+    #: constructions do not.
+    shadow_params: dict | None = None
 
 
 def _context_exit_quantity(

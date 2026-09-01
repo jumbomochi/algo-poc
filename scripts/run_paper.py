@@ -111,6 +111,28 @@ CAPITAL_ALLOCATIONS = {
 }
 
 
+def _shadow_params(sleeve: str, params: dict) -> dict:
+    """Fingerprint inputs for one sleeve: its tuning plus what it may trade.
+
+    Consumed by ``backtest.shadow_artifact.shadow_id_for``, which derives the
+    rolling shadow's identity from this. Evidence rows key on that identity, so
+    anything in here restarts the epoch when it changes (direction doc D13) and
+    anything left out is a model change the epoch cannot see.
+
+    ``params`` is the same mapping that was spread into the sleeve's signal
+    factory, never a hand-copy of it — a fingerprint that can drift from the
+    values actually in force is worse than none, because it reads as evidence.
+
+    The capital **fraction** is included rather than the dollar amount, so a
+    deposit does not restart the epoch but a reallocation does.
+    """
+    return {
+        **params,
+        "universe": sorted(UNIVERSE_REGISTRY[sleeve]),
+        "capital_allocation": CAPITAL_ALLOCATIONS[sleeve],
+    }
+
+
 def build_portfolios(
     capital: float,
     bars_by_ticker: dict[str, list[dict]],
@@ -130,19 +152,22 @@ def build_portfolios(
     contexts = portfolio_contexts or {}
 
     mom_cap = capital * CAPITAL_ALLOCATIONS["momentum"]
+    mom_params = {
+        "top_n": 5,
+        "lookback_days": 126,
+        "position_size_pct": 0.12,
+        "trailing_stop_pct": 0.10,
+    }
     portfolios["momentum"] = PortfolioConfig(
         name="momentum",
         capital=mom_cap,
         signals_fn=make_momentum_signals_fn(
             bars_by_ticker=bars_by_ticker,
             eligible_tickers=UNIVERSE_REGISTRY["momentum"],
-            top_n=5,
-            lookback_days=126,
-            position_size_pct=0.12,
             initial_capital=mom_cap,
-            trailing_stop_pct=0.10,
             bear_tickers=BEAR_TICKERS,
             portfolio_context=contexts.get("momentum"),
+            **mom_params,
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=12.0,
@@ -150,21 +175,25 @@ def build_portfolios(
             total_exposure_limit_pct=150.0,
             max_lots_per_ticker=1,
         ),
+        shadow_params=_shadow_params("momentum", mom_params),
     )
 
     sec_cap = capital * CAPITAL_ALLOCATIONS["sector_rotation"]
+    sec_params = {
+        "top_n": 3,
+        "lookback_days": 63,
+        "position_size_pct": 0.20,
+        "trailing_stop_pct": 0.08,
+    }
     portfolios["sector_rotation"] = PortfolioConfig(
         name="sector_rotation",
         capital=sec_cap,
         signals_fn=make_sector_rotation_signals_fn(
             bars_by_ticker=bars_by_ticker,
             eligible_tickers=UNIVERSE_REGISTRY["sector_rotation"],
-            top_n=3,
-            lookback_days=63,
-            position_size_pct=0.20,
             initial_capital=sec_cap,
-            trailing_stop_pct=0.08,
             portfolio_context=contexts.get("sector_rotation"),
+            **sec_params,
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=20.0,
@@ -172,9 +201,15 @@ def build_portfolios(
             total_exposure_limit_pct=100.0,
             max_lots_per_ticker=1,
         ),
+        shadow_params=_shadow_params("sector_rotation", sec_params),
     )
 
     qv_cap = capital * CAPITAL_ALLOCATIONS["quality_value"]
+    qv_params = {
+        "top_n": 15,
+        "position_size_pct": 0.06,
+        "trailing_stop_pct": 0.12,
+    }
     portfolios["quality_value"] = PortfolioConfig(
         name="quality_value",
         capital=qv_cap,
@@ -183,13 +218,11 @@ def build_portfolios(
             sector_map=SECTOR_MAP,
             bars_by_ticker=bars_by_ticker,
             eligible_tickers=UNIVERSE_REGISTRY["quality_value"],
-            top_n=15,
-            position_size_pct=0.06,
             initial_capital=qv_cap,
-            trailing_stop_pct=0.12,
             regime_by_date=regime_by_date,
             portfolio_context=contexts.get("quality_value"),
             replacement_policy=ReplacementPolicy.TECHNICAL_ONLY,
+            **qv_params,
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=10.0,
@@ -197,22 +230,29 @@ def build_portfolios(
             total_exposure_limit_pct=100.0,
             max_lots_per_ticker=1,
         ),
+        shadow_params=_shadow_params(
+            "quality_value",
+            {**qv_params, "replacement_policy": ReplacementPolicy.TECHNICAL_ONLY.name},
+        ),
     )
 
     ed_cap = capital * CAPITAL_ALLOCATIONS["earnings_drift"]
+    ed_params = {
+        "surprise_threshold_pct": 5.0,
+        "max_hold_days": 20,
+        "position_size_pct": 0.08,
+        "trailing_stop_pct": 0.06,
+    }
     portfolios["earnings_drift"] = PortfolioConfig(
         name="earnings_drift",
         capital=ed_cap,
         signals_fn=make_earnings_drift_signals_fn(
             earnings_lookup=earnings_lookup,
             eligible_tickers=UNIVERSE_REGISTRY["earnings_drift"],
-            surprise_threshold_pct=5.0,
-            max_hold_days=20,
-            position_size_pct=0.08,
             initial_capital=ed_cap,
-            trailing_stop_pct=0.06,
             regime_by_date=regime_by_date,
             portfolio_context=contexts.get("earnings_drift"),
+            **ed_params,
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=8.0,
@@ -220,23 +260,27 @@ def build_portfolios(
             total_exposure_limit_pct=100.0,
             max_lots_per_ticker=1,
         ),
+        shadow_params=_shadow_params("earnings_drift", ed_params),
     )
 
     them_cap = capital * CAPITAL_ALLOCATIONS["thematic_momentum"]
+    them_params = {
+        "top_n": 8,
+        "lookback_days": 63,
+        "position_size_pct": 0.135,
+        "trailing_stop_pct": 0.10,
+    }
     portfolios["thematic_momentum"] = PortfolioConfig(
         name="thematic_momentum",
         capital=them_cap,
         signals_fn=make_thematic_momentum_signals_fn(
             bars_by_ticker=bars_by_ticker,
             eligible_tickers=UNIVERSE_REGISTRY["thematic_momentum"],
-            top_n=8,
-            lookback_days=63,
-            position_size_pct=0.135,
             initial_capital=them_cap,
-            trailing_stop_pct=0.10,
             regime_by_date=regime_by_date,
             portfolio_context=contexts.get("thematic_momentum"),
             replacement_policy=ReplacementPolicy.TECHNICAL_ONLY,
+            **them_params,
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=15.0,
@@ -244,17 +288,22 @@ def build_portfolios(
             total_exposure_limit_pct=120.0,
             max_lots_per_ticker=1,
         ),
+        shadow_params=_shadow_params(
+            "thematic_momentum",
+            {**them_params, "replacement_policy": ReplacementPolicy.TECHNICAL_ONLY.name},
+        ),
     )
 
     tr_cap = capital * CAPITAL_ALLOCATIONS["tail_risk_hedge"]
+    tr_params = {"position_size_pct": 0.25}
     portfolios["tail_risk_hedge"] = PortfolioConfig(
         name="tail_risk_hedge",
         capital=tr_cap,
         signals_fn=make_tail_risk_hedge_signals_fn(
             regime_by_date=regime_by_date,
-            position_size_pct=0.25,
             initial_capital=tr_cap,
             portfolio_context=contexts.get("tail_risk_hedge"),
+            **tr_params,
         ),
         risk_engine=RiskEngine(
             position_entry_limit_pct=25.0,
@@ -262,6 +311,7 @@ def build_portfolios(
             total_exposure_limit_pct=100.0,
             max_lots_per_ticker=1,
         ),
+        shadow_params=_shadow_params("tail_risk_hedge", tr_params),
     )
 
     # Level 3: Crash entry freeze — block new buys during crash regime
@@ -273,6 +323,10 @@ def build_portfolios(
             capital=pc.capital,
             signals_fn=make_crash_freeze_signals_fn(pc.signals_fn, regime_by_date),
             risk_engine=pc.risk_engine,
+            # Carried explicitly: this rewrap reconstructs the whole config, so
+            # a field omitted here is lost silently — the sleeve keeps working
+            # and only the model fingerprint quietly stops tracking the model.
+            shadow_params=pc.shadow_params,
         )
 
     return portfolios
