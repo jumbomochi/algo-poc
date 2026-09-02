@@ -147,3 +147,39 @@ def test_shadow_and_pinned_together_are_refused(tmp_path, monkeypatch) -> None:
     ])
 
     assert divergence_monitor.main() == 2
+
+
+def test_the_shadow_path_needs_no_backtest_artifact(tmp_path, monkeypatch) -> None:
+    """A shadow run must not require output/backtest_multi_*.json to exist.
+
+    Regression: the first wiring resolved a backtest path before branching on
+    --shadow, so it errored with "No backtest JSON found" on any machine
+    without a baseline in output/. It passed locally purely because the
+    developer's output/ had artifacts in it, and CI caught it. Pinned here with
+    the resolver stubbed out, so the test does not depend on what happens to be
+    on disk either.
+    """
+    from scripts import divergence_monitor
+
+    monkeypatch.setattr(
+        divergence_monitor, "find_latest_backtest_json", lambda: None
+    )
+    out = tmp_path / "divergence.json"
+
+    code = _run(monkeypatch, db_url=_db(tmp_path, "nobacktest"),
+                shadow=_shadow(tmp_path), output=out)
+
+    assert code == 0, "the shadow path demanded a backtest artifact"
+    assert out.is_file()
+
+
+def test_the_report_records_the_shadow_as_its_source(tmp_path, monkeypatch) -> None:
+    """A report that names no source cannot be audited later. On the shadow
+    path there is no backtest artifact, so ``backtest_source`` must name the
+    shadow rather than being null."""
+    out = tmp_path / "divergence.json"
+    shadow = _shadow(tmp_path)
+
+    _run(monkeypatch, db_url=_db(tmp_path, "source"), shadow=shadow, output=out)
+
+    assert json.loads(out.read_text())["backtest_source"] == str(shadow)

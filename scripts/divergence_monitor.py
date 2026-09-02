@@ -968,7 +968,15 @@ def main() -> int:
         return EXIT_ERROR
 
     # --- Resolve inputs ---
-    if args.pinned:
+    # A shadow run needs no backtest artifact at all: the model is replayed
+    # against live's own bars, so there is nothing in output/ to find. Resolving
+    # one anyway made the monitor demand a baseline it would never read, which
+    # passed on a developer machine with artifacts on disk and failed anywhere
+    # else.
+    backtest_path = None
+    if args.shadow:
+        pass
+    elif args.pinned:
         # No `or find_latest_backtest_json()` here, and that omission is the
         # whole story: the wrapper substitutes the resolver's output straight
         # into --backtest, so an unconfigured pin arrives as an empty string,
@@ -997,7 +1005,11 @@ def main() -> int:
         if not Path(backtest_path).is_file():
             print(f"ERROR: Backtest file not found: {backtest_path}")
             return EXIT_ERROR
-    print(f"  Backtest source: {backtest_path}" + ("  [PINNED]" if args.pinned else ""))
+    if backtest_path is not None:
+        print(
+            f"  Backtest source: {backtest_path}"
+            + ("  [PINNED]" if args.pinned else "")
+        )
 
     # Staleness is judged here, at the point of consumption, rather than by the
     # job that produces the artifact — a producer that never ran cannot report
@@ -1196,7 +1208,10 @@ def main() -> int:
         output_path = args.output or f"output/divergence_{date.today().strftime('%Y%m%d')}.json"
         write_json_report(
             reports, output_path,
-            backtest_path=backtest_path,
+            # Whatever was actually scored against. On the shadow path there is
+            # no backtest artifact, and a report naming no source cannot be
+            # audited after the fact.
+            backtest_path=args.shadow or backtest_path,
             window_days=args.window,
             threshold=args.threshold,
             execution_model=execution_model,
