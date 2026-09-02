@@ -43,7 +43,7 @@ relied on as the drawdown series; ``equity`` can.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 
 from sqlalchemy import func, select
@@ -146,11 +146,17 @@ class Blindness:
 
     blind_sessions: list[date]
     no_data_sessions: list[date]
-    #: Some sleeves reported and some did not. Deliberately NOT blindness: the
-    #: monitor demonstrably ran, so the epoch clock is not blind. One sleeve's
-    #: gap is a data-quality problem the digest surfaces separately. Counting
-    #: it as blindness would pause the whole clock over one sleeve, letting a
-    #: partial outage extend an epoch indefinitely.
+    #: Part of the book was graded and part was not — either because a sleeve
+    #: wrote no row, or because it wrote a NO_DATA while others were graded.
+    #: Deliberately NOT blindness: the monitor demonstrably ran, so the epoch
+    #: clock is not blind, and counting it as blindness would pause the whole
+    #: clock over one sleeve and let a partial outage extend an epoch
+    #: indefinitely.
+    #:
+    #: That decision only holds while the gap is visible somewhere else. It was
+    #: not: this field was read by nothing but tests until the weekly digest
+    #: started surfacing it, and the mixed-verdict shape was not even recorded
+    #: here. A degradation nobody can see is indistinguishable from health.
     partial_sessions: list[date]
     #: The subset of the blind and NO_DATA sessions that
     #: :mod:`shared.absent_sessions` accepts as permanently absent, with a
@@ -162,6 +168,9 @@ class Blindness:
     absent_sessions: list[date]
     longest_consecutive: int
     is_safety_incident: bool
+    #: How many sessions each sleeve went ungraded, over the same range. The
+    #: count says something is wrong; the names say what to go and look at.
+    ungraded_by_sleeve: dict[str, int] = field(default_factory=dict)
 
     @property
     def unexplained_sessions(self) -> list[date]:
@@ -454,20 +463,36 @@ def blindness(
     blind_sessions: list[date] = []
     no_data_sessions: list[date] = []
     partial_sessions: list[date] = []
+    ungraded_by_sleeve: dict[str, int] = {}
     longest = 0
     run = 0
 
     for day in sessions:
         seen = reported.get(day, {})
+        ungraded = [
+            sleeve for sleeve, status in seen.items()
+            if status == DivergenceStatus.NO_DATA.value
+        ]
         if not seen:
             blind_sessions.append(day)
             run += 1
-        elif set(seen) != expected:
+        elif set(seen) != expected or (0 < len(ungraded) < len(seen)):
+            # Two shapes of the same fact: a sleeve wrote nothing, or it wrote
+            # a NO_DATA while others were graded. The second used to fall
+            # through to the else below and land in no bucket at all, so an
+            # epoch could run its whole length with one of six sleeves ever
+            # graded and still report longest_consecutive=0. It is also the
+            # shape the rolling shadow actually produces, because the monitor
+            # scores a sleeve it cannot grade rather than skipping it.
             partial_sessions.append(day)
+            for sleeve in ungraded:
+                ungraded_by_sleeve[sleeve] = ungraded_by_sleeve.get(sleeve, 0) + 1
+            for sleeve in expected - set(seen):
+                ungraded_by_sleeve[sleeve] = ungraded_by_sleeve.get(sleeve, 0) + 1
+            # NOT a pause. One lagging sleeve must not extend an epoch
+            # indefinitely; the digest surfaces this instead.
             run = 0
-        elif all(
-            status == DivergenceStatus.NO_DATA.value for status in seen.values()
-        ):
+        elif len(ungraded) == len(seen):
             no_data_sessions.append(day)
             run += 1
         else:
@@ -479,6 +504,7 @@ def blindness(
         blind_sessions=blind_sessions,
         no_data_sessions=no_data_sessions,
         partial_sessions=partial_sessions,
+        ungraded_by_sleeve=ungraded_by_sleeve,
         absent_sessions=[
             entry.session_date
             for entry in absent_sessions_in(start, end)
