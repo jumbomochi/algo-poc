@@ -183,3 +183,34 @@ def test_the_report_records_the_shadow_as_its_source(tmp_path, monkeypatch) -> N
     _run(monkeypatch, db_url=_db(tmp_path, "source"), shadow=shadow, output=out)
 
     assert json.loads(out.read_text())["backtest_source"] == str(shadow)
+
+
+def test_a_missing_shadow_exits_blind_not_breach(tmp_path, monkeypatch) -> None:
+    """The alert-inversion guard.
+
+    If the 04:15 run dies, no shadow is written — which has happened: the
+    2026-08-13/14 env-FIFO outage killed it two days running. An uncaught
+    FileNotFoundError here makes Python exit 1, and run_divergence.sh maps
+    exit 1 to "🚨 Divergence BREACH". A missing feed would be paged as a
+    strategy breach, sending the operator to investigate drift while the real
+    fault is a dead paper run, and hiding the blindness entirely.
+
+    Absence is the blind signal, so it must exit 3 — the code the wrapper
+    already alerts on with the right words.
+    """
+    from scripts import divergence_monitor
+
+    code = _run(monkeypatch, db_url=_db(tmp_path, "missing"),
+                shadow=tmp_path / "never_written.json",
+                output=tmp_path / "divergence.json")
+
+    assert code == divergence_monitor.EXIT_BASELINE_NOT_COMPARABLE, (
+        f"a missing shadow returned {code}; exit 1 would page as BREACH"
+    )
+
+
+def test_the_missing_shadow_message_names_the_paper_run(tmp_path, monkeypatch) -> None:
+    """The operator has to be sent to the right job."""
+    _run(monkeypatch, db_url=_db(tmp_path, "missingmsg"),
+         shadow=tmp_path / "never_written.json",
+         output=tmp_path / "divergence.json")
