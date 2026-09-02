@@ -7,6 +7,7 @@ the actual send, not on grepping the script.
 from __future__ import annotations
 
 import json
+from datetime import date
 import os
 import re
 import subprocess
@@ -825,37 +826,61 @@ def test_an_unconfigured_divergence_switch_says_so(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# The pinned baseline reaches the monitor (KAN-51)
+# The feed reaches the monitor explicitly (KAN-51, then the shadow migration)
 #
-# D16 requires the Rung-0 baseline to have "its own monitor pins". Before this,
+# D16 requires the Rung-0 baseline to have "its own monitor pins". Before that,
 # production never passed --backtest at all: every 04:45 run took the recency
 # path, so the artifact the gate evidence was measured against was replaced by
 # the Tuesday refresh and nothing recorded that it had changed.
+#
+# The feed is now the rolling shadow rather than the pinned artifact, because a
+# pinned artifact cannot score sessions past its own last bar. The invariant
+# these tests defend is unchanged and is the whole point: the wrapper names the
+# feed EXPLICITLY and never lets the monitor discover one for itself.
 # ---------------------------------------------------------------------------
 
 
-def test_the_wrapper_names_the_pin_flag_at_all():
-    """AC1, in its literal form. Cheap, and it is the one assertion that still
-    holds if someone rewrites how the pin is resolved."""
+def test_the_wrapper_names_the_feed_flag_at_all():
+    """The one assertion that still holds if someone rewrites how the feed path
+    is built. A wrapper that stops naming the flag is the recency fallback
+    wearing a different hat."""
     source = RUN_DIVERGENCE.read_text()
-    assert "--backtest" in source
-    assert "--pinned" in source
+    assert "--shadow" in source
 
 
-def test_the_monitor_is_invoked_against_the_resolved_pin(tmp_path):
-    pinned = tmp_path / "output" / "backtest_multi_20260819_183451.json"
+def test_the_wrapper_no_longer_grades_against_the_pin():
+    """The pin remains the baseline of record for edge evidence
+    (run_sleeve_evaluation.py); it is no longer the daily operational feed, and
+    the monitor refuses --shadow and --pinned together.
+
+    Asserted against the executable lines only. The header still discusses the
+    pin at length, and that history is worth keeping — a future reader needs to
+    know why the feed changed, not just that it did.
+    """
+    executable = [
+        line for line in RUN_DIVERGENCE.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+    assert not [line for line in executable if "--pinned" in line], executable
+
+
+def test_the_monitor_is_invoked_against_the_dated_shadow(tmp_path):
     res, _, log = _drive_wrapper(
-        tmp_path, 0, _report(_portfolio("momentum", "OK")), pin=pinned,
+        tmp_path, 0, _report(_portfolio("momentum", "OK")),
     )
 
     assert res.returncode == 0, res.stderr
     argv = _monitor_argv(tmp_path)
-    assert "--backtest" in argv, argv
-    assert argv[argv.index("--backtest") + 1] == str(pinned), argv
-    assert "--pinned" in argv, argv
-    # The operator has to be able to tell from the log which baseline judged the
-    # session, without re-deriving it from the config that was live at the time.
-    assert str(pinned) in log
+    assert "--shadow" in argv, argv
+    shadow = argv[argv.index("--shadow") + 1]
+    # Dated, absolute, and this run's: a bare or relative name would let a
+    # stale curve from a failed morning grade today's book.
+    assert shadow.endswith(f"shadow_{date.today():%Y%m%d}.json"), shadow
+    assert shadow.startswith("/"), shadow
+    # The operator has to be able to tell from the log which curve judged the
+    # session, without re-deriving it from what was on disk at the time.
+    assert shadow in log
 
 
 def test_the_existing_monitor_arguments_are_still_passed(tmp_path):
@@ -867,19 +892,21 @@ def test_the_existing_monitor_arguments_are_still_passed(tmp_path):
     assert "--output" in argv and "--prometheus-textfile" in argv
 
 
-def test_an_unresolvable_pin_reaches_the_monitor_as_an_empty_backtest(tmp_path):
-    """AC3's wrapper half. The wrapper must NOT decide to skip, and must not drop
-    the flag — dropping it is the recency fallback wearing a different hat. It
-    hands the empty pin over and lets the monitor exit 3 and alert, so there is
-    exactly one authority on whether the run can happen."""
-    res, sends, log = _drive_wrapper(tmp_path, 3, pin_resolver_fails=True)
+def test_a_missing_shadow_still_reaches_the_monitor_as_an_explicit_path(tmp_path):
+    """AC3's wrapper half, carried over to the shadow feed.
+
+    The wrapper must NOT decide to skip, and must not drop the flag. It names
+    the path it expects and lets the monitor exit 3 and alert, so there is
+    exactly one authority on whether the run can happen. The 04:15 run failing
+    is precisely when this matters: that happened two days running in the
+    2026-08-13 env-FIFO outage.
+    """
+    res, sends, log = _drive_wrapper(tmp_path, 3)
 
     argv = _monitor_argv(tmp_path)
-    assert "--backtest" in argv, argv
-    assert argv[argv.index("--backtest") + 1] == "", argv
-    assert "--pinned" in argv, argv
+    assert "--shadow" in argv, argv
+    assert argv[argv.index("--shadow") + 1].endswith(".json"), argv
     # The monitor's own exit 3 still drives the alert and the dead-man beat.
     assert res.returncode == 3
     assert len(sends) == 1, sends
     assert "BLIND" in sends[0]
-    assert "could not resolve" in log
