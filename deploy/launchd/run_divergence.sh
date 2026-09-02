@@ -17,7 +17,10 @@
 #   0 = all portfolios OK or WARNING       -> no action
 #   1 = at least one portfolio BREACH      -> alert
 #   2 = hard error (DB/backtest/args)      -> page
-#   3 = no shadow series to grade against  -> alert; the monitor is BLIND
+#   5 = some sleeves graded, some not      -> alert; a DEGRADATION, not an
+#       outage. Drift detection IS running for the graded half, so this must
+#       never reuse exit 3's "no drift detection is running" wording.
+#   3 = nothing could be graded at all     -> alert; the monitor is BLIND
 #       (the 04:15 paper run did not produce one). The fault is upstream in
 #       the paper run. Historically this also covered a non-comparable pinned
 #       baseline; that path is gone with the pin. Regenerate the baseline
@@ -240,7 +243,7 @@ case "$EXIT_CODE" in
         ;;
     1)
         echo "$(date): ALERT - divergence BREACH (exit 1)" >> "$LOG_FILE"
-        telegram "$(divergence_alert_text 1 "🚨 Divergence BREACH ($(date +%F)) — live paper equity has diverged from the backtest baseline. See $LOG_FILE")"
+        telegram "$(divergence_alert_text 1 "🚨 Divergence BREACH ($(date +%F)) — live paper equity has diverged from what the model would have done. See $LOG_FILE")"
         ;;
     2)
         echo "$(date): PAGE - divergence monitor hard error (exit 2)" >> "$LOG_FILE"
@@ -248,18 +251,25 @@ case "$EXIT_CODE" in
         telegram "$(divergence_alert_text 2 "🚨 Divergence monitor HARD ERROR (exit 2) on $(date +%F). See $LOG_FILE")"
         ;;
     3)
-        echo "$(date): ALERT - divergence monitor BLIND: baseline backtest is not" \
-             "comparable to live (exit 3). No drift detection is running until the" \
-             "baseline is regenerated - see docs/operations/backtest-baseline.md" \
+        echo "$(date): ALERT - divergence monitor BLIND (exit 3): no sleeve could" \
+             "be graded, so no drift detection is running. Usually the 04:15 paper" \
+             "run produced no shadow series - check ~/ibc/logs/paper_*.log" \
              >> "$LOG_FILE"
         # A blind monitor is an outage, not a pass.
-        telegram "$(divergence_alert_text 3 "⚠️ Divergence monitor is BLIND (exit 3): the baseline backtest is not comparable to live, so every report is forced to NO_DATA. No drift detection is running. Regenerate per docs/operations/backtest-baseline.md")"
+        telegram "$(divergence_alert_text 3 "⚠️ Divergence monitor is BLIND (exit 3): no sleeve could be graded, so no drift detection is running. Usually the 04:15 paper run produced no shadow series — check ~/ibc/logs/paper_*.log")"
         ;;
     4)
         echo "$(date): ALERT - divergence baseline is STALE (exit 4): the verdicts" \
              "above are real but were scored against a baseline the weekly refresh" \
              "stopped updating. Check ~/ibc/logs/backtest_refresh_*.log" >> "$LOG_FILE"
         telegram "$(divergence_alert_text 4 "⚠️ Divergence baseline is STALE (exit 4): the weekly backtest refresh has not produced a newer baseline, so drift is being measured against old expectations. See ~/ibc/logs/backtest_refresh_*.log")"
+        ;;
+    5)
+        # Some sleeves graded, some did not. A DEGRADATION, not the outage
+        # exit 3 reports: drift detection IS running for the graded half, so
+        # the message must not repeat exit 3's "nothing is running".
+        echo "$(date): ALERT - divergence PARTIALLY GRADED (exit 5)" >> "$LOG_FILE"
+        telegram "$(divergence_alert_text 5 "⚠️ Divergence PARTIALLY GRADED ($(date +%F)) — part of the book was not compared. See $LOG_FILE")"
         ;;
     *)
         echo "$(date): UNEXPECTED exit code $EXIT_CODE from divergence monitor" >> "$LOG_FILE"
@@ -272,7 +282,7 @@ esac
 # rather than branched on inside the case above so the rule is stated once and
 # a future exit code has to be classified deliberately.
 case "$EXIT_CODE" in
-    0|1|3|4) DEADMAN_EXIT=0 ;;
+    0|1|3|4|5) DEADMAN_EXIT=0 ;;
     *)       DEADMAN_EXIT="$EXIT_CODE" ;;
 esac
 algo_deadman_ping "$DEADMAN_EXIT" ALGO_DEADMAN_DIVERGENCE_URL

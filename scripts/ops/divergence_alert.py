@@ -167,6 +167,35 @@ def _last_error_line(log_tail: str) -> str:
     return _redact(errors[-1]) if errors else ""
 
 
+def _ungraded_lines(report: dict[str, Any] | None) -> list[str]:
+    """Which sleeves were not graded this run, and why.
+
+    A scalar exit code carries one condition; a run can be in several at once.
+    A breach that says nothing about three ungraded sleeves tells the operator
+    "one sleeve drifted" when the truth is "one sleeve drifted and we are only
+    watching half the book".
+
+    AGGREGATE is skipped: it is a derived roll-up (D15), so its absence is a
+    consequence of the sleeves below it, not a fact of its own.
+    """
+    sleeves = [
+        r for r in (report or {}).get("reports", [])
+        if r.get("portfolio") != "AGGREGATE"
+    ]
+    ungraded = [r for r in sleeves if not r.get("baseline_comparable", True)]
+    if not ungraded:
+        return []
+
+    lines = [
+        f"• {len(sleeves) - len(ungraded)} of {len(sleeves)} sleeves graded; "
+        f"{len(ungraded)} not:"
+    ]
+    for r in ungraded:
+        reason = next(iter(r.get("notes") or []), "reason not recorded")
+        lines.append(f"   – {r.get('portfolio', '?')}: {reason}")
+    return lines
+
+
 def render_alert(
     exit_code: int,
     report: dict[str, Any] | None,
@@ -194,9 +223,14 @@ def _render(
         body = "\n".join(lines) if lines else (
             "• (no per-sleeve detail in the report — see the log)"
         )
+        # Feed-neutral: the daily feed is the rolling shadow now, and naming a
+        # "backtest baseline" would send the operator to an artifact this run
+        # never read.
+        ungraded = _ungraded_lines(report)
+        tail = ("\n" + "\n".join(ungraded)) if ungraded else ""
         return (
-            "🚨 Divergence BREACH — live paper equity has diverged from the "
-            f"backtest baseline.\n{body}"
+            "🚨 Divergence BREACH — live paper equity has diverged from what "
+            f"the model would have done.\n{body}{tail}"
         )
 
     if exit_code == 2:
@@ -222,6 +256,17 @@ def _render(
             "⚠️ Divergence monitor is BLIND (exit 3): the baseline backtest is "
             "not comparable to live, so every report is forced to NO_DATA. No "
             f"drift detection is running.\n{body}\n{DOC_HINT}"
+        )
+
+    if exit_code == 5:
+        lines = _ungraded_lines(report)
+        body = "\n".join(lines) if lines else (
+            "• (no per-sleeve detail in the report — see the log)"
+        )
+        return (
+            "⚠️ Divergence is PARTIALLY GRADED (exit 5): part of the book was "
+            "compared and part was not. Drift detection IS running for the "
+            f"graded sleeves.\n{body}"
         )
 
     if exit_code == 4:

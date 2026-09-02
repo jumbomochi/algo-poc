@@ -81,6 +81,12 @@ EXIT_BASELINE_NOT_COMPARABLE = 3
 # three weeks — the weekly refresh missed twice, once without alerting at all.
 EXIT_BASELINE_STALE = 4
 
+#: Some sleeves graded, some did not. A DEGRADATION, distinct from the outage
+#: exit 3 reports. Before this existed, one ungraded sleeve sent the whole run
+#: to exit 3, whose alert says "no drift detection is running" — false, and
+#: alarmingly so, when five of six sleeves were graded fine.
+EXIT_PARTIALLY_GRADED = 5
+
 
 # ---------------------------------------------------------------------------
 # The pinned baseline of record (KAN-51)
@@ -231,8 +237,22 @@ def exit_code_for(
         return EXIT_BREACH
     if execution_model is not None and not execution_model.is_like_for_like:
         return EXIT_BASELINE_NOT_COMPARABLE
-    if any(not r.baseline_comparable for r in reports):
-        return EXIT_BASELINE_NOT_COMPARABLE
+
+    # AGGREGATE is a derived roll-up (D15) and does not get a vote: letting it
+    # decide would report a degradation because the derived row could not be
+    # computed, even when every real sleeve graded.
+    sleeves = [r for r in reports if not is_excluded_portfolio(r.portfolio)
+               and r.portfolio != "AGGREGATE"]
+    ungraded = [r for r in sleeves if not r.baseline_comparable]
+    if ungraded:
+        # Nothing gradeable is an outage; a partial is a degradation. Reporting
+        # the second as the first is how "no drift detection is running" ends up
+        # in an alert about a run where most of the book was watched.
+        return (
+            EXIT_BASELINE_NOT_COMPARABLE if len(ungraded) == len(sleeves)
+            else EXIT_PARTIALLY_GRADED
+        )
+
     if baseline is not None and baseline.is_stale:
         return EXIT_BASELINE_STALE
     return EXIT_OK
