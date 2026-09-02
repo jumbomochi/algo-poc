@@ -58,6 +58,7 @@ from scripts.paper_state import PaperTradingState
 from shared.config import load_config
 from shared.models.evidence import DivergenceDaily
 from backtest.shadow_artifact import load_shadow
+from backtest.sleeve_comparability import SleeveComparability
 from shared.universe import is_excluded_portfolio
 
 
@@ -631,6 +632,53 @@ def baseline_id_for(backtest_path: str) -> str:
     return Path(backtest_path).name
 
 
+def apply_shadow_comparability(
+    report: PortfolioDivergenceReport,
+    comparability: SleeveComparability,
+) -> PortfolioDivergenceReport:
+    """Refuse to grade a sleeve whose shadow cannot fairly judge it.
+
+    The pinned path forces ``NO_DATA`` through ``build_report``'s
+    ``execution_model``. The shadow path has no execution model to gate on --
+    every requirement of one is satisfied by construction -- so the refusal
+    comes from :class:`~backtest.sleeve_comparability.SleeveComparability`.
+
+    The arithmetic survives the refusal, on the same contract
+    ``docs/operations/divergence-monitor.md`` already sets for the pinned path:
+    "the arithmetic is still printed so the gap is visible". Blanking the
+    figures would leave an operator unable to see how far apart the curves were,
+    which is exactly what they need in order to judge how urgent the missing
+    feed is.
+    """
+    if comparability.is_comparable:
+        return report
+
+    report.status = "NO_DATA"
+    report.baseline_comparable = False
+    report.notes.extend(comparability.unmet_requirements())
+    return report
+
+
+def shadow_baseline_id(shadow_path: str) -> str:
+    """The identity of the shadow a verdict was scored against.
+
+    Deliberately NOT :func:`baseline_id_for`. That returns the file's basename,
+    which is correct for a pinned artifact — the same file read from a worktree,
+    a deployed checkout or a backup is the same baseline — and catastrophic for a
+    shadow, whose name is ``shadow_YYYYMMDD.json`` and changes every night. Under
+    a per-night id every session would land in its own baseline,
+    ``breach_streak`` would treat each as unrelated history, and no streak could
+    reach the 10-session trigger. That is precisely the failure the frozen pin
+    already produced, reintroduced by the back door.
+
+    The shadow's identity is its **model fingerprint**: stable night to night,
+    moving only when the model moves. That is also what makes the identity check
+    unnecessary at comparability time — a model change restarts the streak
+    structurally, because the rows stop matching.
+    """
+    return load_shadow(shadow_path).shadow_id
+
+
 # Generous for two INSERTs, and short next to the job's window. The verdict
 # reaches the operator only once this process exits — the launchd wrapper sends
 # the Telegram message from the exit code — so a write blocked on a lock would
@@ -862,6 +910,16 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--shadow", default=None,
+        help=(
+            "Path to the rolling shadow series written by the 04:15 paper run "
+            "(output/shadow_<YYYYMMDD>.json). Grades live against the model "
+            "replayed over the bars live actually saw, whose last session is "
+            "today — unlike a pinned artifact, whose last bar caps the "
+            "comparison window. Mutually exclusive with --pinned."
+        ),
+    )
+    parser.add_argument(
         "--window", type=int, default=DEFAULT_WINDOW_DAYS,
         help=f"Rolling window size in trading days (default {DEFAULT_WINDOW_DAYS}).",
     )
@@ -901,8 +959,24 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.shadow and args.pinned:
+        print(
+            "ERROR: --shadow and --pinned are mutually exclusive. The shadow "
+            "is the model replayed against live's own bars; the pin is a "
+            "frozen artifact. Grading against both at once is not a comparison."
+        )
+        return EXIT_ERROR
+
     # --- Resolve inputs ---
-    if args.pinned:
+    # A shadow run needs no backtest artifact at all: the model is replayed
+    # against live's own bars, so there is nothing in output/ to find. Resolving
+    # one anyway made the monitor demand a baseline it would never read, which
+    # passed on a developer machine with artifacts on disk and failed anywhere
+    # else.
+    backtest_path = None
+    if args.shadow:
+        pass
+    elif args.pinned:
         # No `or find_latest_backtest_json()` here, and that omission is the
         # whole story: the wrapper substitutes the resolver's output straight
         # into --backtest, so an unconfigured pin arrives as an empty string,
@@ -931,7 +1005,11 @@ def main() -> int:
         if not Path(backtest_path).is_file():
             print(f"ERROR: Backtest file not found: {backtest_path}")
             return EXIT_ERROR
-    print(f"  Backtest source: {backtest_path}" + ("  [PINNED]" if args.pinned else ""))
+    if backtest_path is not None:
+        print(
+            f"  Backtest source: {backtest_path}"
+            + ("  [PINNED]" if args.pinned else "")
+        )
 
     # Staleness is judged here, at the point of consumption, rather than by the
     # job that produces the artifact — a producer that never ran cannot report
@@ -939,21 +1017,43 @@ def main() -> int:
     # stayed quiet. 0 disables the check for an ad-hoc run against a
     # deliberately old baseline.
     baseline: BaselineAge | None = None
-    if args.max_baseline_age_days > 0:
+    # A shadow has no artifact age to check: it is rebuilt nightly, so "how old
+    # is the file" is meaningless. Its freshness question is "which session was
+    # it produced for", which SleeveComparability answers per sleeve against
+    # the session actually being graded.
+    if args.shadow is None and args.max_baseline_age_days > 0:
         baseline = baseline_age(backtest_path, args.max_baseline_age_days)
         stale_warning = baseline.warning_line()
         if stale_warning:
             print(f"  ⚠ {stale_warning}")
 
-    bt_per_portfolio, bt_aggregate = load_backtest_equity_series(backtest_path)
-    execution_model = load_backtest_execution_model(backtest_path)
-    if not execution_model.is_like_for_like:
+    if args.shadow:
+        # The shadow needs no execution model. Every requirement of one is met
+        # by construction: the runner decides on today's close and fills the
+        # next session (next-open), CostModel() carries the $1.00 per-order
+        # floor, and no MembershipCalendar is passed, so there is no
+        # point-in-time universe question and no membership-days to price. The
+        # 11.28% exclusion that blinded this monitor is a property of the
+        # 10-year artifact, not of a 30-session window over live's current
+        # universe. Comparability is judged per sleeve instead, below.
+        shadow_artifact = load_shadow(args.shadow)
+        bt_per_portfolio, bt_aggregate = load_shadow_equity_series(args.shadow)
+        execution_model = None
         print(
-            "  ⚠ Baseline is not like-for-like with live: "
-            + "; ".join(execution_model.unmet_requirements())
-            + ". Divergence will be reported as NO_DATA; re-run the baseline "
-            "per docs/operations/backtest-baseline.md."
+            f"  Shadow source: {args.shadow}  "
+            f"[{shadow_artifact.shadow_id}, session {shadow_artifact.session_date}]"
         )
+    else:
+        shadow_artifact = None
+        bt_per_portfolio, bt_aggregate = load_backtest_equity_series(backtest_path)
+        execution_model = load_backtest_execution_model(backtest_path)
+        if not execution_model.is_like_for_like:
+            print(
+                "  ⚠ Baseline is not like-for-like with live: "
+                + "; ".join(execution_model.unmet_requirements())
+                + ". Divergence will be reported as NO_DATA; re-run the baseline "
+                "per docs/operations/backtest-baseline.md."
+            )
 
     # --- Open DB and load paper state ---
     # SQLAlchemy lazy-connects, so the actual connection attempt happens inside
@@ -1030,7 +1130,7 @@ def main() -> int:
             continue
         live = load_live_equity_series(state, name)
         live_series_by_portfolio[name] = live
-        if name not in bt_per_portfolio:
+        if name not in bt_per_portfolio and args.shadow is None:
             print(
                 f"  ⚠ Skipping '{name}': not present in backtest "
                 f"(likely a sleeve that was dropped — see "
@@ -1038,15 +1138,34 @@ def main() -> int:
             )
             continue
         trades = state.get_trades(name)
+        # On the shadow path a missing sleeve is still SCORED, as a recorded
+        # NO_DATA. Skipping it would write no row at all, and the evidence store
+        # draws a hard line between the two: a recorded NO_DATA means the
+        # monitor ran and could not judge, while a missing row on an NYSE
+        # trading day means the monitor did not run. Collapsing them would let a
+        # sleeve drop out of the evidence record unnoticed.
+        model_series = bt_per_portfolio.get(name, {})
         report = build_report(
             portfolio=name,
             live=live,
-            backtest=bt_per_portfolio[name],
+            backtest=model_series,
             trades=trades,
             window_days=args.window,
             threshold=args.threshold,
             execution_model=execution_model,
         )
+        if args.shadow:
+            report = apply_shadow_comparability(
+                report,
+                SleeveComparability(
+                    sleeve=name,
+                    graded_session=max(live) if live else shadow_artifact.session_date,
+                    shadow_session=(
+                        shadow_artifact.session_date if model_series else None
+                    ),
+                    overlapping_sessions=len(set(live) & set(model_series)),
+                ),
+            )
         reports.append(report)
 
     # Everything scored so far is a real sleeve. The aggregate is appended
@@ -1089,7 +1208,10 @@ def main() -> int:
         output_path = args.output or f"output/divergence_{date.today().strftime('%Y%m%d')}.json"
         write_json_report(
             reports, output_path,
-            backtest_path=backtest_path,
+            # Whatever was actually scored against. On the shadow path there is
+            # no backtest artifact, and a report naming no source cannot be
+            # audited after the fact.
+            backtest_path=args.shadow or backtest_path,
             window_days=args.window,
             threshold=args.threshold,
             execution_model=execution_model,
@@ -1114,7 +1236,17 @@ def main() -> int:
             written = persist_divergence_rows(
                 persist_session,
                 sleeve_reports,
-                baseline_id=baseline_id_for(backtest_path),
+                # The shadow's identity is its MODEL fingerprint, never its
+                # filename. baseline_id_for returns a basename, which is right
+                # for a pinned artifact and fatal here: shadow_YYYYMMDD.json
+                # changes nightly, so every session would land under its own
+                # baseline, breach_streak would see each as unrelated history,
+                # and no streak could reach its trigger — the frozen-pin failure
+                # returning by the back door.
+                baseline_id=(
+                    shadow_baseline_id(args.shadow) if args.shadow
+                    else baseline_id_for(backtest_path)
+                ),
                 window_sessions=args.window,
                 threshold=args.threshold,
             )

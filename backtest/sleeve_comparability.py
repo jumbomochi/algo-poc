@@ -25,14 +25,22 @@ What *can* go wrong with a shadow is different, and this is the list:
 
 1. **It is stale.** The 04:15 run failed and yesterday's artifact is still on
    disk, so today's live would be graded against yesterday's model curve.
-2. **It came from a different model.** A sleeve parameter changed, or the
-   checkout moved, between the shadow being produced and the monitor running.
-   The evidence rows would land under the wrong baseline.
-3. **The sleeve is not in it.** No live history to seed from, or the replay
+2. **The sleeve is not in it.** No live history to seed from, or the replay
    produced nothing for it.
-4. **There is not enough overlap to compute a return.** One shared session is
+3. **There is not enough overlap to compute a return.** One shared session is
    not a short window, it is no window: ``window_return`` needs two points, and
    grading one would report 0.0% as though it had been measured.
+
+Model identity is deliberately **not** checked here. It is enforced where it
+already works: the artifact's ``shadow_id`` is written as
+``divergence_daily.baseline_id``, and ``breach_streak`` requires that id and
+treats rows under any other baseline as "history, not evidence for this epoch".
+A model change therefore restarts the streak by construction, with no runtime
+comparison that could rot. The monitor could not perform that comparison
+honestly in any case: it holds no bars, so it cannot rebuild the live roster to
+fingerprint it, and ``gate_epochs`` is empty, so there is no recorded epoch
+baseline to anchor against either. A check with no source of truth is
+decoration, and decoration on a safety gate is worse than an absence.
 
 Every unmet requirement is reported, never just the first. An operator who
 fixes the one reason shown and re-runs, only to meet the next, learns to
@@ -65,10 +73,6 @@ class SleeveComparability:
     #: The session the shadow was produced for, or ``None`` when this sleeve is
     #: absent from the artifact entirely.
     shadow_session: date | None
-    #: Model identity recorded in the artifact.
-    shadow_id: str | None
-    #: Model identity of the roster live is running right now.
-    live_model_id: str
     #: Sessions present on both sides of the comparison.
     overlapping_sessions: int
 
@@ -92,14 +96,6 @@ class SleeveComparability:
                 f"but the session being graded is {self.graded_session}. The "
                 "04:15 run most likely did not produce one today, leaving the "
                 "previous day's artifact on disk"
-            )
-
-        if self.shadow_id != self.live_model_id:
-            reasons.append(
-                f"shadow came from a different model: artifact is "
-                f"{self.shadow_id}, live is running {self.live_model_id}. A "
-                "sleeve parameter or the checkout changed between the shadow "
-                "being produced and this run"
             )
 
         if self.overlapping_sessions < MINIMUM_OVERLAPPING_SESSIONS:
