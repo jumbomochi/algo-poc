@@ -153,10 +153,11 @@ absence.
 | 0 | All portfolios OK or WARNING (or genuinely no overlapping history yet) | None |
 | 1 | At least one portfolio BREACH | Alert (Slack/email) |
 | 2 | Hard error (DB unreachable, backtest missing, invalid args) | Page on-call |
-| 3 | Baseline not comparable, **or** the pin is missing / describes a differently-shaped book — **the monitor is blind**, no drift detection is running | Alert; regenerate or re-pin the baseline ([backtest-baseline.md](backtest-baseline.md)) |
+| 3 | **Nothing could be graded** — the monitor is blind and no drift detection is running. On the shadow feed this usually means the 04:15 paper run produced no shadow series | Alert; check `~/ibc/logs/paper_*.log` — the fault is in the paper run |
+| 5 | **Some sleeves graded, some not** — a degradation, not an outage. Drift detection IS running for the graded half | Alert; the message names which sleeves were skipped and why |
 | 4 | Baseline **stale** — the verdicts are real, but the artifact they were scored against is older than `--max-baseline-age-days` | Alert; the fault is upstream in the weekly refresh, not in divergence |
 
-Precedence is worst-outage-first: **1 > 2 > 3 > 4**. A breach outranks code 3
+Precedence is worst-outage-first: **1 > 2 > 3 > 5 > 4**. A breach outranks code 3
 if both somehow apply — in practice they cannot co-occur, since a
 non-comparable baseline forces every status to `NO_DATA` and there is nothing
 left to breach, which is exactly why code 3 must not be 0. Code 3 outranks
