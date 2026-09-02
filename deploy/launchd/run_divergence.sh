@@ -1,16 +1,26 @@
 #!/bin/bash
 # Daily divergence monitor for algo-poc
 # Runs at 4:45 AM SGT, ~30 min after run_paper.sh (4:15) has written the day's
-# equity_snapshots row. Compares live paper equity to the PINNED backtest
-# baseline (see "THE BASELINE IS PINNED" below) — not to the latest artifact.
+# equity_snapshots row AND the rolling shadow series. Compares live paper equity
+# to that shadow: the model replayed over the bars live actually saw, whose last
+# session is today.
+#
+# It used to compare against a PINNED 10-year backtest artifact. That artifact
+# cannot score sessions past its own last bar, so the comparison window froze —
+# six consecutive runs in August 2026 all reported window_end=2026-08-14 and
+# rewrote the same evidence row, while a coverage figure measured over 2016-2020
+# forced every verdict to NO_DATA. The pin still exists and is still the
+# baseline of record for edge evidence (run_sleeve_evaluation.py); it is simply
+# no longer the daily operational feed.
 #
 # Exit-code contract (from scripts/divergence_monitor.py):
 #   0 = all portfolios OK or WARNING       -> no action
 #   1 = at least one portfolio BREACH      -> alert
 #   2 = hard error (DB/backtest/args)      -> page
-#   3 = baseline backtest not comparable   -> alert; the monitor is BLIND
-#       (same-bar fills, no commission floor, or a survivorship-biased
-#        universe: every report is forced to NO_DATA). Regenerate the baseline
+#   3 = no shadow series to grade against  -> alert; the monitor is BLIND
+#       (the 04:15 paper run did not produce one). The fault is upstream in
+#       the paper run. Historically this also covered a non-comparable pinned
+#       baseline; that path is gone with the pin. Regenerate the baseline
 #        per docs/operations/backtest-baseline.md. Do NOT read this as OK.
 #   4 = baseline artifact is STALE (KAN-56) -> alert; the verdicts are real
 #       but were scored against expectations the weekly refresh stopped
@@ -20,22 +30,36 @@
 # NOTE: deliberately NOT using `set -e` around the python call, because exit
 # codes 1 and 2 are meaningful signals we branch on, not failures to abort on.
 #
-# THE BASELINE IS PINNED (KAN-51)
-# -------------------------------
-# The monitor is invoked with an explicit --backtest --pinned. Before this it
-# was invoked with neither, so every production run took the recency path
-# (find_latest_backtest_json), and the artifact the gate evidence was measured
-# against was silently replaced by the Tuesday refresh. Recency selection is not
-# a pin: it makes the baseline of record a filesystem accident.
+# THE FEED IS NAMED, NEVER DISCOVERED (KAN-51, then the shadow migration)
+# -----------------------------------------------------------------------
+# The monitor is invoked with an explicit --shadow. Two earlier shapes failed,
+# and the invariant that survives both is that this script NAMES the feed:
 #
-# The pin comes from divergence.baseline_pin in config/default.yaml via
-# scripts/ops/baseline_pin.py, so it is a configuration fact rather than a
-# string in this file. If it cannot be resolved the empty value is passed
-# through DELIBERATELY: --pinned makes the monitor exit 3 and this script alerts,
-# which keeps one authority on whether the run can mean anything. Skipping the
-# run here, or quietly dropping --backtest, is the same silent fallback in
-# different clothes — and a job that ran and meant nothing is the 2026-08-13
-# failure pattern this whole cluster of stories exists to remove.
+#   1. Neither flag. Every run took the recency path
+#      (find_latest_backtest_json), so the artifact the gate evidence was
+#      measured against was silently replaced by the Tuesday refresh. Recency
+#      selection is not a pin: it makes the baseline a filesystem accident.
+#   2. --backtest <pin> --pinned. A pinned 10-year artifact cannot score
+#      sessions past its own last bar, so the window froze: six consecutive
+#      runs in August 2026 all reported window_end=2026-08-14 and rewrote the
+#      same evidence row, while a coverage figure measured over 2016-2020
+#      forced every verdict to NO_DATA.
+#
+# The shadow is written by the 04:15 paper run: each sleeve replayed over the
+# bars live actually saw, seeded at live's NAV, so its last session is today.
+# The path is dated and absolute rather than discovered — "newest shadow in
+# output/" would let a stale curve from a failed morning grade today's book.
+#
+# If it is absent the path is passed through DELIBERATELY and the monitor exits
+# 3 and this script alerts, which keeps one authority on whether the run can
+# mean anything. Skipping the run here, or quietly dropping the flag, is the
+# same silent fallback in different clothes — and a job that ran and meant
+# nothing is the 2026-08-13 failure pattern this whole cluster of stories
+# exists to remove.
+#
+# The pin is NOT gone: divergence.baseline_pin remains the baseline of record
+# for edge evidence (scripts/run_sleeve_evaluation.py) and D18's accepted
+# coverage bias still rests on it. It is simply no longer the daily feed.
 #
 # DEAD-MAN SWITCH (KAN-56)
 # ------------------------
@@ -77,7 +101,6 @@ RUN_STARTED=0
 LOG_OFFSET=0
 # The baseline of record. Resolved below, after the cd, so a relative config pin
 # means this checkout's output/ rather than wherever launchd started us.
-BASELINE_PIN=""
 # Secrets come from the macOS login keychain via the shared loader. Sourced by
 # path from the repo (never from the deployed ~/ibc copy) so there is exactly
 # one implementation of the lookup and it cannot drift.
@@ -181,16 +204,19 @@ fi
 
 cd "$ALGO_DIR"
 
-# Resolve the pinned baseline. An empty result is passed to the monitor as-is —
-# see "THE BASELINE IS PINNED" in the header for why this script does not decide.
-BASELINE_PIN=$("$VENV" "$ALGO_DIR/scripts/ops/baseline_pin.py" 2>>"$LOG_FILE")
-if [ -n "$BASELINE_PIN" ]; then
-    echo "$(date): baseline pin: $BASELINE_PIN" >> "$LOG_FILE"
+# The rolling shadow the 04:15 run wrote. Named explicitly rather than
+# discovered: the monitor must never fall back to "whatever shadow is newest in
+# output/", which would let a stale curve from a failed morning grade today's
+# book. A shadow that is absent is the blind signal, and the monitor exits 3
+# for it — it is not this script's job to decide that.
+SHADOW_FILE="${ALGO_DIVERGENCE_SHADOW:-$ALGO_DIR/output/shadow_$(date +%Y%m%d).json}"
+if [ -f "$SHADOW_FILE" ]; then
+    echo "$(date): shadow series: $SHADOW_FILE" >> "$LOG_FILE"
 else
-    echo "$(date): WARNING - could not resolve a divergence baseline pin;" \
-         "the monitor will refuse to score (exit 3) rather than fall back to" \
-         "the newest artifact in output/. Check divergence.baseline_pin in" \
-         "config/default.yaml" >> "$LOG_FILE"
+    echo "$(date): WARNING - no shadow series at $SHADOW_FILE;" \
+         "the 04:15 paper run did not produce one, so the monitor will exit 3" \
+         "(blind). The fault is in the paper run, not in divergence." \
+         >> "$LOG_FILE"
 fi
 
 # Everything the renderer reads back must be attributable to THIS run: a report
@@ -202,8 +228,7 @@ LOG_OFFSET=$(wc -c < "$LOG_FILE" 2>/dev/null | tr -d ' ')
 [ -n "$LOG_OFFSET" ] || LOG_OFFSET=0
 
 "$VENV" scripts/divergence_monitor.py \
-    --backtest "$BASELINE_PIN" \
-    --pinned \
+    --shadow "$SHADOW_FILE" \
     --output "$REPORT_FILE" \
     --prometheus-textfile "$PROM_FILE" \
     >> "$LOG_FILE" 2>&1

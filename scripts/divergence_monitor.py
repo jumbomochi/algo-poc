@@ -1036,8 +1036,26 @@ def main() -> int:
         # 11.28% exclusion that blinded this monitor is a property of the
         # 10-year artifact, not of a 30-session window over live's current
         # universe. Comparability is judged per sleeve instead, below.
-        shadow_artifact = load_shadow(args.shadow)
-        bt_per_portfolio, bt_aggregate = load_shadow_equity_series(args.shadow)
+        # A missing shadow means the 04:15 paper run did not produce one, which
+        # is the blind signal — not a breach. Letting FileNotFoundError escape
+        # would make Python exit 1, and run_divergence.sh maps exit 1 to
+        # "Divergence BREACH": a dead paper run would page as a strategy
+        # breach, send the operator after drift that does not exist, and hide
+        # the blindness. Exit 3 is the code the wrapper already alerts on with
+        # the right words, and it is the same outage class as a non-comparable
+        # baseline: no drift detection is running.
+        try:
+            shadow_artifact = load_shadow(args.shadow)
+            bt_per_portfolio, bt_aggregate = load_shadow_equity_series(args.shadow)
+        except FileNotFoundError:
+            print(
+                f"  ⚠ {BASELINE_PIN_MISSING}: no shadow series at "
+                f"{args.shadow}. The 04:15 paper run did not produce one, so "
+                "there is nothing to grade against and no drift detection is "
+                "running. Check ~/ibc/logs/paper_YYYYMMDD.log — the fault is "
+                "in the paper run, not in divergence."
+            )
+            return EXIT_BASELINE_NOT_COMPARABLE
         execution_model = None
         print(
             f"  Shadow source: {args.shadow}  "
