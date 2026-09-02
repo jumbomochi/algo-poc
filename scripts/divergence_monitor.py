@@ -57,7 +57,7 @@ from backtest.divergence import (
 from scripts.paper_state import PaperTradingState
 from shared.config import load_config
 from shared.models.evidence import DivergenceDaily
-from backtest.shadow_artifact import load_shadow
+from backtest.shadow_artifact import ShadowArtifact, load_shadow
 from backtest.sleeve_comparability import SleeveComparability
 from shared.universe import is_excluded_portfolio
 
@@ -281,7 +281,7 @@ def load_backtest_equity_series(
 
 
 def load_shadow_equity_series(
-    shadow_path: str,
+    artifact: ShadowArtifact,
 ) -> tuple[dict[str, dict[date, float]], dict[date, float]]:
     """Load per-sleeve and aggregate equity from a rolling shadow artifact.
 
@@ -298,13 +298,13 @@ def load_shadow_equity_series(
     sleeve on the days it is missing would step down and read as a loss the book
     never took.
 
-    Raises:
-        FileNotFoundError: No artifact, which means the 04:15 run did not
-            produce one. That is the blind signal and must not read as an empty
-            book.
+    Takes the loaded artifact rather than a path so that one read backs both
+    the graded series and the ``baseline_id`` the verdict is filed under. Three
+    independent reads was a TOCTOU: rewritten between them, the monitor could
+    grade one version and file under another version's id, and ``baseline_id``
+    is exactly what ``breach_streak`` keys on, so the mismatch would split a
+    streak in silence.
     """
-    artifact = load_shadow(shadow_path)
-
     per_sleeve = {
         name: curve
         for name, curve in artifact.series.items()
@@ -657,26 +657,6 @@ def apply_shadow_comparability(
     report.baseline_comparable = False
     report.notes.extend(comparability.unmet_requirements())
     return report
-
-
-def shadow_baseline_id(shadow_path: str) -> str:
-    """The identity of the shadow a verdict was scored against.
-
-    Deliberately NOT :func:`baseline_id_for`. That returns the file's basename,
-    which is correct for a pinned artifact — the same file read from a worktree,
-    a deployed checkout or a backup is the same baseline — and catastrophic for a
-    shadow, whose name is ``shadow_YYYYMMDD.json`` and changes every night. Under
-    a per-night id every session would land in its own baseline,
-    ``breach_streak`` would treat each as unrelated history, and no streak could
-    reach the 10-session trigger. That is precisely the failure the frozen pin
-    already produced, reintroduced by the back door.
-
-    The shadow's identity is its **model fingerprint**: stable night to night,
-    moving only when the model moves. That is also what makes the identity check
-    unnecessary at comparability time — a model change restarts the streak
-    structurally, because the rows stop matching.
-    """
-    return load_shadow(shadow_path).shadow_id
 
 
 # Generous for two INSERTs, and short next to the job's window. The verdict
@@ -1046,7 +1026,7 @@ def main() -> int:
         # baseline: no drift detection is running.
         try:
             shadow_artifact = load_shadow(args.shadow)
-            bt_per_portfolio, bt_aggregate = load_shadow_equity_series(args.shadow)
+            bt_per_portfolio, bt_aggregate = load_shadow_equity_series(shadow_artifact)
         except FileNotFoundError:
             print(
                 f"  ⚠ {BASELINE_PIN_MISSING}: no shadow series at "
@@ -1262,7 +1242,7 @@ def main() -> int:
                 # and no streak could reach its trigger — the frozen-pin failure
                 # returning by the back door.
                 baseline_id=(
-                    shadow_baseline_id(args.shadow) if args.shadow
+                    shadow_artifact.shadow_id if shadow_artifact is not None
                     else baseline_id_for(backtest_path)
                 ),
                 window_sessions=args.window,

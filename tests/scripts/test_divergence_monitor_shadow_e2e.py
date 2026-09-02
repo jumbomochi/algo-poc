@@ -214,3 +214,62 @@ def test_the_missing_shadow_message_names_the_paper_run(tmp_path, monkeypatch) -
     _run(monkeypatch, db_url=_db(tmp_path, "missingmsg"),
          shadow=tmp_path / "never_written.json",
          output=tmp_path / "divergence.json")
+
+
+def _verdict_rows(db_url: str):
+    from sqlalchemy import select
+    from shared.models.evidence import DivergenceDaily
+
+    s = sessionmaker(bind=create_engine(db_url))()
+    try:
+        return s.execute(select(DivergenceDaily)).scalars().all()
+    finally:
+        s.close()
+
+
+def test_verdicts_are_filed_under_the_model_id_not_the_filename(
+    tmp_path, monkeypatch
+) -> None:
+    """breach_streak keys on baseline_id and treats other baselines as
+    unrelated history. shadow_YYYYMMDD.json changes nightly, so filing under
+    the filename would put every session in its own baseline and no streak
+    could ever reach its trigger — the frozen-pin failure by another route.
+    """
+    db_url = _db(tmp_path, "baselineid")
+    shadow = _shadow(tmp_path)
+
+    _run(monkeypatch, db_url=db_url, shadow=shadow,
+         output=tmp_path / "divergence.json")
+
+    rows = _verdict_rows(db_url)
+    assert rows, "no verdicts were stored"
+    assert {r.baseline_id for r in rows} == {"shadow:aaaabbbbccccdddd"}
+    assert not any(shadow.name in r.baseline_id for r in rows)
+
+
+def test_the_graded_series_and_the_baseline_id_come_from_one_read(
+    tmp_path, monkeypatch
+) -> None:
+    """The artifact is read once per run.
+
+    Three independent reads is a TOCTOU: rewritten between them, the monitor
+    could grade one version and file the verdict under another version's id.
+    baseline_id is exactly what the breach streak keys on, so a mismatch there
+    splits a streak silently.
+    """
+    from backtest import shadow_artifact as mod
+
+    reads: list[str] = []
+    real = mod.load_shadow
+
+    def counting(path):
+        reads.append(str(path))
+        return real(path)
+
+    monkeypatch.setattr(mod, "load_shadow", counting)
+    monkeypatch.setattr("scripts.divergence_monitor.load_shadow", counting)
+
+    _run(monkeypatch, db_url=_db(tmp_path, "oneread"),
+         shadow=_shadow(tmp_path), output=tmp_path / "divergence.json")
+
+    assert len(reads) == 1, f"artifact read {len(reads)} times: {reads}"
