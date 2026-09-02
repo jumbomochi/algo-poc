@@ -135,6 +135,24 @@ class BlindReport:
 
 
 @dataclass(frozen=True)
+class PartialReport:
+    """Sessions on which only part of the book was graded.
+
+    Distinct from :class:`BlindReport`, which is "the monitor produced no
+    verdict at all". A partial means it ran and judged some sleeves — so the
+    epoch clock is deliberately not paused — but part of the book went
+    unwatched, and that has to reach a human or the not-pausing decision rests
+    on nothing.
+    """
+
+    partial_sessions: list[date]
+    total_sessions: int
+    #: Sleeve -> how many sessions it went ungraded. The count says something
+    #: is wrong; the names say what to go and look at.
+    ungraded_by_sleeve: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class SleeveLine:
     sleeve: str
     status: str
@@ -172,6 +190,10 @@ class DigestSnapshot:
     dlq: dict[str, int] | None
     alerts: AlertVolume | None
     drills_due: list[str]
+    #: Sessions where only part of the book was graded. Separate from
+    #: ``blind``: partials can occur on a week with no blind session at
+    #: all, and the two have different remedies.
+    partial: PartialReport | None = None
     #: One entry per source that could not be read, already formatted.
     missing: list[str] = field(default_factory=list)
     #: Bare names of the sources that failed. Carried separately from
@@ -217,6 +239,29 @@ def _blind_line(blind: BlindReport | None) -> list[str]:
     return [
         f"🚨 BLIND — the monitor saw nothing on {len(unexplained)} "
         f"of {blind.total_sessions} sessions ({days})"
+    ]
+
+
+def _partial_line(partial: PartialReport | None) -> list[str]:
+    """Sessions where part of the book was graded and part was not.
+
+    Not a 🚨: the monitor ran and most of the book was watched, so this is a
+    degradation rather than the outage ``_blind_line`` reports. It is still
+    reported every week it occurs, because the reason the epoch clock keeps
+    running through a partial is that the gap shows up here instead.
+    """
+    if partial is None or not partial.partial_sessions:
+        return []
+
+    worst_first = sorted(
+        partial.ungraded_by_sleeve.items(), key=lambda kv: (-kv[1], kv[0])
+    )
+    who = ", ".join(f"{sleeve} {count}" for sleeve, count in worst_first)
+    detail = f" ({who})" if who else ""
+    return [
+        f"⚠️ PARTIAL — only part of the book was graded on "
+        f"{len(partial.partial_sessions)} of {partial.total_sessions} "
+        f"sessions{detail}"
     ]
 
 
@@ -335,6 +380,7 @@ def render_digest(snapshot: DigestSnapshot) -> str:
     """
     lines: list[str] = [
         *_blind_line(snapshot.blind),
+        *_partial_line(snapshot.partial),
         *_missing_line(snapshot.missing),
         *_absent_line(snapshot.blind),
         *_epoch_lines(snapshot.epoch, snapshot.failed),
@@ -366,6 +412,10 @@ class Sources:
     dlq: Callable[[], dict[str, int]]
     alerts: Callable[[], AlertVolume | None]
     drills: Callable[[], list[str]]
+    #: Optional so a caller assembling Sources by hand (tests, ad-hoc
+    #: tooling) is not forced to supply one; absent simply means the line
+    #: is not rendered.
+    partial: Callable[[], object] | None = None
 
 
 def collect_snapshot(
@@ -396,12 +446,17 @@ def collect_snapshot(
     dlq = _read("dlq", sources.dlq, None)
     alerts = _read("alerts", sources.alerts, None)
     drills = _read("drills", sources.drills, [])
+    partial = (
+        _read("partial", sources.partial, None)
+        if sources.partial is not None else None
+    )
 
     return DigestSnapshot(
         as_of=as_of,
         window_start=window_start,
         epoch=epoch,
         blind=blind,
+        partial=partial,
         sleeves=sleeves,
         equity=equity,
         dlq=dlq,
@@ -467,6 +522,37 @@ def blind_source(
             blind_sessions=blind_days,
             total_sessions=total,
             absent_sessions=list(report.absent_sessions),
+        )
+
+    return _read
+
+
+def partial_source(
+    session, *, window_start: date, as_of: date, sleeves: list[str],
+    baseline_id: str, calendar=None,
+) -> Callable[[], PartialReport | None]:
+    """Read partially-graded sessions for the digest window.
+
+    Separate from :func:`blind_source` rather than folded into it: a week can
+    have partials and no blind session at all, so a source that returns ``None``
+    when there are no blind days would hide every one of them.
+    """
+    def _read() -> PartialReport | None:
+        report = blindness(
+            session,
+            start=window_start,
+            end=as_of,
+            sleeves=sleeves,
+            baseline_id=baseline_id,
+            calendar=calendar,
+        )
+        if not report.partial_sessions:
+            return None
+        resolved = _resolve_calendar(calendar)
+        return PartialReport(
+            partial_sessions=list(report.partial_sessions),
+            total_sessions=len(resolved.trading_sessions(window_start, as_of)),
+            ungraded_by_sleeve=dict(report.ungraded_by_sleeve),
         )
 
     return _read
@@ -784,9 +870,28 @@ def build_sources(
             ],
         )
 
+    def _partial() -> PartialReport | None:
+        # Needs the same pins the blind reader uses. Without them there is no
+        # per-sleeve expectation to compare against, so a partial cannot be
+        # distinguished from a book that simply has fewer sleeves.
+        sleeves, baseline_id = _blind_pins(
+            session, window_start=window_start, as_of=as_of
+        )
+        if not (sleeves and baseline_id):
+            return None
+        return partial_source(
+            session,
+            window_start=window_start,
+            as_of=as_of,
+            sleeves=sleeves,
+            baseline_id=baseline_id,
+            calendar=resolved,
+        )()
+
     return Sources(
         epoch=epoch_source(session, as_of=as_of, calendar=resolved),
         blind=_blind,
+        partial=_partial,
         sleeves=sleeve_source(
             session, window_start=window_start, as_of=as_of, calendar=resolved
         ),
