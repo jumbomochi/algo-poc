@@ -139,6 +139,9 @@ exit {curl_exit}
     fake_python = stub("fake-python", f"""#!/bin/bash
 case "$1" in
   *baseline_pin.py) {resolver} ;;
+  # Run for real against the stub tree: the prune's exclusions depend on what
+  # it prints, so simulating it would test the simulation.
+  *protected_artifacts.py) exec {sys.executable} "$@" ;;
 esac
 {{ for a in "$@"; do printf '%s\\n' "$a"; done; printf -- '---END---\\n'; }} >> {argv_log}
 sleep {backtest_sleep}
@@ -494,3 +497,100 @@ def test_a_configured_pin_that_does_not_exist_yet_still_prunes(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert not bystander.exists(), log
+
+
+# ---------------------------------------------------------------------------
+# The prune protects formally-accepted evidence, not just the pin (T10)
+#
+# Until this, the prune's only exclusion was divergence.baseline_pin. That
+# incidentally covered the D18 artifact because the pin and the acceptance
+# registry named the same file — an alignment nothing enforced. Two ways to
+# break it, and the second is the likelier now:
+#
+#   1. a re-pin moves the pin to a fresher baseline;
+#   2. someone deletes the pin as dead config, because the divergence monitor
+#      stopped reading it when the feed became the rolling shadow, leaving the
+#      prune as its only consumer.
+#
+# Either way the accepted artifact ages past 90 days and is deleted. It is not
+# reproducible: the holdout was spent, and a re-run today prices a different
+# set of bars, so its sha256 could never match the acceptance again.
+# ---------------------------------------------------------------------------
+
+
+def _stage_accepted_artifact(tmp_path, *, sha="a" * 64):
+    """An old artifact named by the acceptance registry but NOT by the pin."""
+    output = tmp_path / "algo" / "output"
+    output.mkdir(parents=True, exist_ok=True)
+    accepted = output / "backtest_multi_20260819_183451.json"
+    accepted.write_text('{"accepted": true}')
+    os.utime(accepted, _STALE_MTIME)
+
+    research = tmp_path / "algo" / "research"
+    research.mkdir(parents=True, exist_ok=True)
+    (research / "bias_acceptances.json").write_text(json.dumps({
+        "version": 1,
+        "acceptances": [{
+            "decision": "D18", "requirement": "coverage_floor",
+            "source_sha256": sha, "source": "output/" + accepted.name,
+            "excluded_pct": 11.28, "floor_pct": 5.0,
+            "accepted_at": "2026-08-26", "re_evidence": "3 years",
+            "doc": "docs/designs/project-direction.md",
+        }],
+    }))
+    return accepted
+
+
+def test_the_prune_keeps_an_artifact_the_acceptance_registry_names(tmp_path):
+    """The artifact D18 rests on must survive a prune that is not protecting it
+    as the pin."""
+    pinned, bystander = _stage_old_artifacts(tmp_path)
+    accepted = _stage_accepted_artifact(tmp_path)
+
+    result, _, _, log, _ = _drive(tmp_path, pin=pinned)
+
+    assert result.returncode == 0, result.stderr
+    assert accepted.exists(), (
+        "the weekly refresh deleted an artifact the acceptance registry names; "
+        "it is not reproducible and D18 rests on it"
+    )
+    # Proves the prune ran, so survival is the exclusion working.
+    assert not bystander.exists(), log
+
+
+def test_the_accepted_artifact_survives_byte_identical(tmp_path):
+    pinned, _ = _stage_old_artifacts(tmp_path)
+    accepted = _stage_accepted_artifact(tmp_path)
+    before = accepted.read_bytes()
+
+    _drive(tmp_path, pin=pinned)
+
+    assert accepted.read_bytes() == before
+
+
+def test_an_unreadable_registry_skips_the_prune_rather_than_risking_it(tmp_path):
+    """Same posture the unresolvable pin already takes: disk is cheap and the
+    evidence is not reproducible, so when the wrapper cannot tell what is
+    protected it deletes nothing and says so."""
+    pinned, bystander = _stage_old_artifacts(tmp_path)
+    research = tmp_path / "algo" / "research"
+    research.mkdir(parents=True, exist_ok=True)
+    (research / "bias_acceptances.json").write_text("{ not json")
+
+    result, _, _, log, _ = _drive(tmp_path, pin=pinned)
+
+    assert result.returncode == 0, result.stderr
+    assert bystander.exists(), "the prune ran against an unreadable registry"
+    assert "registry" in log.lower(), log
+
+
+def test_a_missing_registry_still_prunes(tmp_path):
+    """Absent is not corrupt. A repo with no accepted biases has nothing extra
+    to protect, and disabling the prune there would grow output/ forever."""
+    pinned, bystander = _stage_old_artifacts(tmp_path)
+
+    result, _, _, log, _ = _drive(tmp_path, pin=pinned)
+
+    assert result.returncode == 0, result.stderr
+    assert not bystander.exists(), log
+    assert pinned.exists()
