@@ -67,6 +67,14 @@ Deferred work with context. Added by /plan-eng-review and /plan-ceo-review 2026-
 - **Context:** Found by /ship on 2026-09-01 while landing the sleeve-scoping fix; verified pre-existing by stashing the branch changes and reproducing on `develop`. Not caused by that work and left untouched (`REPO_MODE=collaborative`).
 - **Depends on / blocked by:** Nothing.
 
+## AVB and EQR need conId overrides (Error 200 on a live gateway)
+- **What:** Probe IB Gateway read-only for the conIds of AVB (AvalonBay) and EQR (Equity Residential), and add them to `CONTRACT_CONID_OVERRIDES` in `shared/universe.py` if the gateway serves bars by conId.
+- **Why:** Both returned `Error 200: No security definition has been found ... Stock(symbol='AVB', exchange='SMART', currency='USD')` on the 2026-08-19 baseline run, so both have **zero** bars across all 2,511 sessions — 5,022 membership-days, 44% of the still-listed exclusion. Both are still S&P members at snapshot end and are large, liquid REITs, so this is a stale gateway contract view, not a delisting. It is the same shape as the existing MMC→MRSH and FI→FISV overrides.
+- **Pros:** Recovers 5,022 membership-days in every future baseline; removes two names that silently vanish from any universe that includes them.
+- **Cons:** Needs a live read-only IB connection to look the conIds up (the D18 memo set the precedent: clientId 77, no orders). Does **not** unblock D18 — coverage moves 11.28% → 10.88%, still above the 5% floor. The override is a workaround for a gateway data problem, and `shared/universe.py:433` already says to re-verify and delete entries if the gateway's contract view is ever refreshed.
+- **Context:** Found by the T11 investigation on 2026-09-03 from `~/ibc/logs/backtest_refresh_20260819.log`. The other 16 still-listed exclusions are a different cause — `Error 162: HMDS query returned no data` on the deepest year-chunks, i.e. IB not serving that history depth for a contract that resolved fine (PEP resolved with `conId=11017`). That is not repairable in code, and live is unaffected because it fetches `years=1`.
+- **Depends on / blocked by:** An authorised read-only IB probe.
+
 ## Trial registry counts sleeves, not parameterizations
 - **What:** `n_trials = 8` counts the eight candidate sleeves that reached a backtest, not the lookbacks, thresholds and top-N values tried inside each one. Make the registry count the real search.
 - **Why:** The deflation under-corrects in a known direction: `SR*` is computed from a search smaller than the one actually run, so every DSR is too generous.
