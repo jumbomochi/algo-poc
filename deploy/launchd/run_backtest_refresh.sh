@@ -192,19 +192,54 @@ if [ "$EXIT_CODE" -eq 0 ]; then
              "skipping the 90-day prune of output/ rather than risk deleting the" \
              "baseline of record. Check divergence.baseline_pin in" \
              "config/default.yaml" >> "$LOG_FILE"
-    elif [ -f "$BASELINE_PIN" ]; then
-        # -samefile, not a path match: the pin, this script and the monitor may
-        # each spell the same artifact differently (absolute, relative, through
-        # a symlinked checkout) and an inode comparison is right under all of them.
-        echo "$(ts): prune keeping pinned baseline $BASELINE_PIN" >> "$LOG_FILE"
-        find "$ALGO_DIR/output" -name "backtest_multi_*.json" -mtime +90 \
-             ! -samefile "$BASELINE_PIN" -delete 2>/dev/null
     else
-        # A re-pin names the artifact before the run that produces it exists.
-        # Nothing in output/ needs protecting yet, and the monitor is what
-        # complains about the gap (exit 3, BASELINE_PIN_MISSING).
-        echo "$(ts): pinned baseline $BASELINE_PIN not present yet; pruning normally" >> "$LOG_FILE"
-        find "$ALGO_DIR/output" -name "backtest_multi_*.json" -mtime +90 -delete 2>/dev/null
+        # Artifacts the acceptance registry names are evidence and must outlive
+        # any pin. The pin used to be the only exclusion, which covered the D18
+        # artifact purely because both happened to name the same file — an
+        # alignment nothing enforced, and one the shadow migration made fragile
+        # by leaving this prune as the pin's only consumer.
+        #
+        # An unreadable registry means we cannot tell what is protected, so we
+        # protect everything: disk is cheap and the evidence is not
+        # reproducible. Absent is different from corrupt and prunes normally.
+        # Declared separately from the assignment: `local`/`VAR=$(...)` makes
+        # $? the assignment's status, not the command's, so a failing resolver
+        # would read as success and hand the prune the evidence.
+        PROTECTED_LIST=""
+        if ! PROTECTED_LIST=$("$VENV" "$ALGO_DIR/scripts/ops/protected_artifacts.py" \
+                              --repo-root "$ALGO_DIR" 2>>"$LOG_FILE"); then
+            echo "$(ts): WARNING - could not read the bias-acceptance registry;" \
+                 "skipping the 90-day prune of output/ rather than risk deleting" \
+                 "an artifact a formally accepted bias rests on. Check" \
+                 "research/bias_acceptances.json" >> "$LOG_FILE"
+        else
+            # -samefile, not a path match: the pin, this script, the registry
+            # and the monitor may each spell the same artifact differently
+            # (absolute, relative, through a symlinked checkout) and an inode
+            # comparison is right under all of them.
+            PRUNE_ARGS=()
+            if [ -f "$BASELINE_PIN" ]; then
+                echo "$(ts): prune keeping pinned baseline $BASELINE_PIN" >> "$LOG_FILE"
+                PRUNE_ARGS+=(! -samefile "$BASELINE_PIN")
+            else
+                # A re-pin names the artifact before the run that produces it
+                # exists. Nothing in output/ needs protecting yet on that
+                # account, and the monitor is what complains about the gap.
+                echo "$(ts): pinned baseline $BASELINE_PIN not present yet" >> "$LOG_FILE"
+            fi
+            while IFS= read -r protected; do
+                [ -n "$protected" ] || continue
+                [ -f "$protected" ] || continue
+                echo "$(ts): prune keeping accepted-bias evidence $protected" >> "$LOG_FILE"
+                PRUNE_ARGS+=(! -samefile "$protected")
+            done <<< "$PROTECTED_LIST"
+            # ${PRUNE_ARGS[@]+...} not ${PRUNE_ARGS[@]}: this script runs
+            # under `set -u`, where an EMPTY array expansion is an unbound
+            # variable and aborts the run. Empty is the normal case for a repo
+            # with no pin and no accepted biases.
+            find "$ALGO_DIR/output" -name "backtest_multi_*.json" -mtime +90 \
+                 ${PRUNE_ARGS[@]+"${PRUNE_ARGS[@]}"} -delete 2>/dev/null
+        fi
     fi
 else
     echo "$(ts): refresh FAILED (exit $EXIT_CODE)" >> "$LOG_FILE"
