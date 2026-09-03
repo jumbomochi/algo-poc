@@ -194,6 +194,7 @@ def build_base_config(
     point_in_time_universe: bool,
     coverage: CoverageReport | None = None,
     whole_shares: bool = False,
+    fetch: "FetchSummary | None" = None,
 ) -> dict:
     """Provenance block saved with the results.
 
@@ -220,7 +221,77 @@ def build_base_config(
     }
     if coverage is not None:
         config["coverage"] = coverage.to_dict()
+    # Same contract as coverage: omitted rather than zeroed when absent, so a
+    # run that never measured cannot be mistaken for one that fetched cleanly.
+    if fetch is not None:
+        config["fetch"] = fetch.to_dict()
     return config
+
+
+@dataclass(frozen=True)
+class FetchSummary:
+    """What a bar fetch actually returned, as opposed to what it attempted.
+
+    Exists because the 2026-08-19 baseline run printed "Successfully fetched
+    data for 826 tickers" while 169 of those 826 had ZERO bars.
+    ``ib.qualifyContracts`` logs IB's Error 200 ("No security definition has
+    been found") without raising, so ``reqHistoricalData`` returns empty and the
+    ticker never reaches the ``failed`` list the summary reports on. A 5.4-hour
+    run claimed complete success while a fifth of the universe returned nothing.
+
+    A ticker with SOME bars is deliberately not counted here. IB's Error 162
+    ("HMDS query returned no data") is a real answer about data availability for
+    a contract that resolved — PEP resolved with ``conId=11017`` and simply has
+    no bars that deep — so treating a short series as a failure would fire on
+    every run and teach an operator to ignore the line.
+    """
+
+    requested: int
+    fetched: int
+    empty: list[str]
+
+    @property
+    def is_complete(self) -> bool:
+        return not self.empty
+
+    def summary_line(self) -> str:
+        """One line for the run log, naming the gap rather than hiding it."""
+        if self.is_complete:
+            return f"Successfully fetched data for {self.fetched} tickers"
+        return (
+            f"Fetched data for {self.fetched} of {self.requested} tickers; "
+            f"{len(self.empty)} returned NO bars (contract unresolved or no "
+            f"history served): {', '.join(self.empty)}"
+        )
+
+    def to_dict(self) -> dict:
+        """For the results artifact. ``output/`` is gitignored and a 5.4-hour
+        run is not repeated to answer "which tickers were missing", so the
+        artifact has to carry it."""
+        return {
+            "requested": self.requested,
+            "fetched": self.fetched,
+            "empty": list(self.empty),
+        }
+
+
+def summarise_fetch(
+    *,
+    requested: list[str],
+    bars_by_ticker: dict[str, list[dict]],
+) -> FetchSummary:
+    """Compare what was asked for against what came back.
+
+    A ticker missing from ``bars_by_ticker`` (its fetch raised) and one present
+    with an empty list (Error 200, logged but not raised) are the same fact for
+    every caller downstream: no bars.
+    """
+    empty = sorted(t for t in requested if not bars_by_ticker.get(t))
+    return FetchSummary(
+        requested=len(requested),
+        fetched=len(requested) - len(empty),
+        empty=empty,
+    )
 
 
 def fetch_bars_from_ib(
@@ -312,7 +383,14 @@ def fetch_bars_from_ib(
 
     if failed:
         print(f"\nFailed tickers ({len(failed)}): {', '.join(failed)}")
-    print(f"Successfully fetched data for {len(bars_by_ticker)} tickers")
+
+    # Reported from what came BACK, not from what was attempted. `failed` only
+    # catches tickers whose fetch raised; qualifyContracts logs IB's Error 200
+    # without raising, so an unresolvable contract yields an empty series and
+    # used to be counted as a success. On 2026-08-19 that made a 5.4-hour run
+    # print "Successfully fetched data for 826 tickers" while 169 of them had
+    # zero bars.
+    print(summarise_fetch(requested=tickers, bars_by_ticker=bars_by_ticker).summary_line())
 
     return bars_by_ticker
 
@@ -2851,6 +2929,10 @@ def main():
         point_in_time_universe=membership is not None,
         coverage=coverage,
         whole_shares=args.whole_shares,
+        # Recomputed from the loaded bars rather than passed down from the
+        # fetch, so it is right whether the bars came from IB or from
+        # --bars-from-json.
+        fetch=summarise_fetch(requested=all_tickers, bars_by_ticker=bars_by_ticker),
     )
     if args.ml_filter:
         base_config["ml_filter"] = {
