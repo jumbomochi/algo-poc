@@ -1211,6 +1211,30 @@ def main() -> int:
             threshold=args.threshold,
             execution_model=execution_model,
         )
+        # AGGREGATE claims the whole book, so it needs the whole book. Without
+        # this it graded independently of its own inputs: a stale shadow left
+        # every sleeve NO_DATA and still printed a green tick on the summary
+        # line, contradicting the exit-3 alert the same run was sending.
+        # (aggregate_reports goes through build_report with execution_model
+        # None, which falls back to a like-for-like DEFAULT_EXECUTION_MODEL.)
+        #
+        # Refusing rather than re-summing the graded subset keeps AGGREGATE
+        # meaning the same thing every day. A subset roll-up would silently
+        # describe a different book on different days, so its figures would
+        # stop being comparable run to run — and it would still be labelled
+        # AGGREGATE.
+        ungraded = sorted(
+            r.portfolio for r in sleeve_reports if not r.baseline_comparable
+        )
+        if ungraded:
+            agg_report.status = "NO_DATA"
+            agg_report.baseline_comparable = False
+            agg_report.notes.append(
+                "not graded: the aggregate is the whole book's verdict and "
+                f"{len(ungraded)} sleeve(s) could not be graded "
+                f"({', '.join(ungraded)}). The figures above are still the "
+                "arithmetic over every sleeve, so the gap stays visible."
+            )
         reports.append(agg_report)
 
     # --- Output ---
