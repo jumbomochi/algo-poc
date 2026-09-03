@@ -101,6 +101,13 @@ transient or overwritten, so they are reports, not evidence.
   aligned session at all — there is no session to date the row by.
 - **`AGGREGATE` is never stored.** It is a derived roll-up (D15); the digest
   recomputes it from the per-sleeve rows.
+- **`AGGREGATE` is only graded when the whole book was graded.** It claims
+  the whole book's verdict, so one ungraded sleeve makes it `NO_DATA` with
+  the sleeves named. Re-summing only the graded sleeves was rejected: the
+  row would silently describe a different book on different days, so its
+  figures would stop being comparable run to run while still being labelled
+  `AGGREGATE`. The arithmetic over every sleeve is still printed, so the gap
+  stays visible.
 - **A write failure never changes the exit code.** The wrapper branches on the
   verdict, and a store outage must not mask a BREACH. The failure is logged and
   raised as a high-priority `stream:alerts` alert instead — which is why
