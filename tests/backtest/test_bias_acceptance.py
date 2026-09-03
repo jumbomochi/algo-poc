@@ -315,6 +315,41 @@ def test_the_registry_note_says_the_commit_is_the_evidence() -> None:
     assert "commit" in registry["note"]
 
 
+def _machine_holds_baselines() -> bool:
+    """Whether this machine is supposed to have the baseline artifacts.
+
+    ``output/`` is gitignored, so on CI it is empty and the sha check below
+    cannot run. On the operator's machine it holds the baselines. The presence
+    of ANY ``backtest_multi_*.json`` is what tells the two apart.
+
+    The distinction matters because the previous guard skipped on
+    ``not KAN52_ARTIFACT.exists()`` alone — so the check evaporated in exactly
+    the situation it exists to catch: the accepted artifact being deleted from
+    a machine that has the others. The weekly prune could have taken it (it is
+    90 days old on 2026-11-17) and nothing would have said a word.
+    """
+    return any(KAN52_ARTIFACT.parent.glob("backtest_multi_*.json"))
+
+
+def test_the_accepted_artifact_is_present_where_baselines_live() -> None:
+    """Absence on a machine that holds baselines is a missing-evidence alarm.
+
+    The artifact is not reproducible: the holdout was spent, and a re-run today
+    prices a different set of bars, so its sha256 could never match the
+    acceptance again. If it is gone, D18 rests on something nobody can verify.
+    """
+    if not _machine_holds_baselines():
+        pytest.skip("output/ is empty — CI, where baselines are gitignored")
+
+    assert KAN52_ARTIFACT.exists(), (
+        f"{KAN52_ARTIFACT.name} is missing from output/, which holds other "
+        "baselines. It is the artifact D18's accepted coverage bias is pinned "
+        "to by sha256 and it cannot be rebuilt. Check whether the weekly "
+        "prune in deploy/launchd/run_backtest_refresh.sh deleted it, and "
+        "restore it from backup."
+    )
+
+
 @pytest.mark.skipif(
     not KAN52_ARTIFACT.exists(),
     reason="output/ is gitignored; the baseline is only present on the operator's machine",

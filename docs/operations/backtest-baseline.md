@@ -230,6 +230,35 @@ it the same two arguments.
 
 ---
 
+## Artifacts the prune must never delete
+
+`deploy/launchd/run_backtest_refresh.sh` deletes `output/backtest_multi_*.json`
+older than 90 days. Two things are excluded:
+
+1. **The pinned baseline** (`divergence.baseline_pin`), so a refresh cannot
+   delete what the pin names.
+2. **Every artifact named by `research/bias_acceptances.json`**, resolved by
+   `scripts/ops/protected_artifacts.py`.
+
+The second exists because the first is not enough. Until 2026-09-03 the pin was
+the only exclusion, and it covered the D18 evidence artifact purely because both
+happened to name the same file — an alignment nothing enforced. Two ways to
+break it: a re-pin moves the pin to a fresher baseline, or someone removes the
+pin as dead config now that the divergence monitor reads the rolling shadow
+instead and this prune is its only remaining consumer.
+
+An accepted artifact is **not reproducible**. The holdout was spent, and a
+re-run today prices a different set of bars, so its sha256 could never match the
+acceptance again — which is the point of pinning the acceptance by sha.
+
+An **unreadable** registry skips the prune entirely and logs why: disk is cheap
+and the evidence is not. A **missing** registry is not an error and prunes
+normally, since a repo with no accepted biases has nothing extra to protect.
+
+`tests/backtest/test_bias_acceptance.py` fails loudly if the accepted artifact
+is absent from an `output/` that holds other baselines. It skips only when
+`output/` is empty, which means CI.
+
 ## The pinned baseline of record
 
 The divergence monitor does **not** score against whichever
