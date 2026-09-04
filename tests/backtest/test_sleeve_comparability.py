@@ -40,8 +40,9 @@ TODAY = SESSIONS[-1]
 def _comparable(**overrides):
     kwargs = dict(
         sleeve="momentum",
+        run_date=TODAY,
+        shadow_produced_on=TODAY,
         graded_session=TODAY,
-        shadow_session=TODAY,
         overlapping_sessions=30,
     )
     kwargs.update(overrides)
@@ -58,18 +59,23 @@ def test_a_matching_fresh_shadow_is_comparable() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_a_shadow_produced_for_an_earlier_session_is_refused() -> None:
+def test_a_shadow_written_on_an_earlier_day_is_refused() -> None:
     """If 04:15 fails, yesterday's artifact is still on disk. Grading today's
-    live against yesterday's model curve would be silent and confident."""
-    verdict = _comparable(shadow_session=SESSIONS[-2])
+    live against yesterday's model curve would be silent and confident.
+
+    Judged on the WRITE date, not the session it covers: at 04:15 SGT the last
+    complete US session is always the previous day, so a session comparison
+    refused every run.
+    """
+    verdict = _comparable(shadow_produced_on=SESSIONS[-2])
 
     assert verdict.is_comparable is False
-    assert any("session" in r for r in verdict.unmet_requirements())
+    assert any("stale" in r for r in verdict.unmet_requirements())
 
 
 def test_the_staleness_reason_names_both_dates() -> None:
     """An operator at 04:45 has to be able to see how stale, not just that."""
-    reasons = " ".join(_comparable(shadow_session=SESSIONS[0]).unmet_requirements())
+    reasons = " ".join(_comparable(shadow_produced_on=SESSIONS[0]).unmet_requirements())
 
     assert str(SESSIONS[0]) in reasons
     assert str(TODAY) in reasons
@@ -82,7 +88,7 @@ def test_the_staleness_reason_names_both_dates() -> None:
 
 def test_a_sleeve_absent_from_the_shadow_is_refused() -> None:
     """No live history to seed from, or the replay produced nothing."""
-    verdict = _comparable(shadow_session=None)
+    verdict = _comparable(shadow_produced_on=None)
 
     assert verdict.is_comparable is False
     assert any("no shadow" in r.lower() for r in verdict.unmet_requirements())
@@ -121,7 +127,7 @@ def test_every_unmet_requirement_is_reported_not_just_the_first() -> None:
     """An operator who fixes the one reason shown and re-runs, only to hit the
     next, learns to distrust the message."""
     verdict = _comparable(
-        shadow_session=SESSIONS[0],
+        shadow_produced_on=SESSIONS[0],
         overlapping_sessions=1,
     )
 

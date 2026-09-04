@@ -48,8 +48,9 @@ def _report(status="OK"):
 def _verdict(**overrides):
     kwargs = dict(
         sleeve="momentum",
+        run_date=SESSIONS[-1],
+        shadow_produced_on=SESSIONS[-1],
         graded_session=SESSIONS[-1],
-        shadow_session=SESSIONS[-1],
         overlapping_sessions=30,
     )
     kwargs.update(overrides)
@@ -65,7 +66,7 @@ def test_a_comparable_sleeve_keeps_its_verdict() -> None:
 
 def test_an_incomparable_sleeve_is_forced_to_no_data() -> None:
     out = apply_shadow_comparability(
-        _report("BREACH"), _verdict(shadow_session=SESSIONS[0])
+        _report("BREACH"), _verdict(shadow_produced_on=SESSIONS[0])
     )
 
     assert out.status == "NO_DATA"
@@ -75,7 +76,7 @@ def test_an_incomparable_sleeve_is_forced_to_no_data() -> None:
 def test_the_reasons_reach_the_notes() -> None:
     """The operator reads notes at 04:45; a bare NO_DATA explains nothing."""
     out = apply_shadow_comparability(
-        _report(), _verdict(shadow_session=SESSIONS[0])
+        _report(), _verdict(shadow_produced_on=SESSIONS[0])
     )
 
     assert any("stale" in n for n in out.notes)
@@ -83,7 +84,7 @@ def test_the_reasons_reach_the_notes() -> None:
 
 def test_pre_existing_notes_are_kept() -> None:
     out = apply_shadow_comparability(
-        _report(), _verdict(shadow_session=SESSIONS[0])
+        _report(), _verdict(shadow_produced_on=SESSIONS[0])
     )
 
     assert "pre-existing note" in out.notes
@@ -93,7 +94,7 @@ def test_the_arithmetic_survives_the_refusal() -> None:
     """Same contract the pinned path already sets: refuse to grade, but still
     show the gap, or nobody can judge how far apart the curves were."""
     out = apply_shadow_comparability(
-        _report(), _verdict(shadow_session=SESSIONS[0])
+        _report(), _verdict(shadow_produced_on=SESSIONS[0])
     )
 
     assert out.live_return == pytest.approx(0.05)
@@ -104,7 +105,7 @@ def test_the_arithmetic_survives_the_refusal() -> None:
 def test_every_reason_is_attached_not_just_the_first() -> None:
     out = apply_shadow_comparability(
         _report(),
-        _verdict(shadow_session=SESSIONS[0], overlapping_sessions=1),
+        _verdict(shadow_produced_on=SESSIONS[0], overlapping_sessions=1),
     )
 
     assert sum(1 for n in out.notes if "stale" in n or "overlap" in n) == 2
