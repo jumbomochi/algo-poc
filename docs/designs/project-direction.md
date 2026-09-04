@@ -143,6 +143,7 @@ Weekly Telegram evidence digest (rides `run_pipeline_report` + the verified bot)
 | D16 | Capital semantics / DD limit / precedence / ladder end | All four pinned (cumulative-funding governs; 12% Gate-3 USD NAV; halt→demote→de-scale; amendment-only rungs + IPS 30% ceiling + tax closure) |
 | D17c | ML decision mis-categorized; WIP gameable | ML = architecture decision on own rubric; WIP = two OPEN threads (edge framework + sentiment); factors/regime queued |
 | D18 | PIT baseline cannot meet the coverage floor from IB data | **DECIDED 2026-08-26: accept the bias, documented and time-bounded** (KAN-59). No vendor purchase. Coverage floor unchanged at 5.00%; artifacts stay `BLOCKED`. Re-evidence after 3 years of forward capture. See [The accepted PIT coverage bias](#the-accepted-pit-coverage-bias-d18) below |
+| D19 | Divergence graded live against a frozen artifact | **DECIDED 2026-09-04: the daily feed is a rolling shadow, comparability is per sleeve.** A pinned 10-year baseline cannot score sessions past its own last bar, so the window froze at 2026-08-14. The pin remains the baseline of record for edge evidence; it is no longer the operational feed. See [Drift comparability is window-scoped and per-sleeve](#drift-comparability-is-window-scoped-and-per-sleeve-d19) below |
 
 ## The accepted PIT coverage bias (D18)
 
@@ -193,11 +194,21 @@ this data, because estimating it would require the very history that is missing.
 affected artifacts continue to report `state: BLOCKED` with `is_like_for_like`
 False. The bias is accepted in this record, **not** by relaxing the gate.
 
-That distinction is the whole point. `is_like_for_like` gates both the divergence
-monitor and `run_sleeve_evaluation.py`, so moving the floor would silently change
-what every future run accepts as evidence — the exact failure the "never silently
-degraded" rule exists to prevent. A reader who opens a `BLOCKED` artifact should
-see that it is blocked and come here to find out why it was spent anyway.
+That distinction is the whole point. `is_like_for_like` gates
+`run_sleeve_evaluation.py`, so moving the floor would silently change what every
+future edge evaluation accepts as evidence — the exact failure the "never
+silently degraded" rule exists to prevent. A reader who opens a `BLOCKED`
+artifact should see that it is blocked and come here to find out why it was
+spent anyway.
+
+**Amended 2026-09-04 (D19).** This paragraph previously said `is_like_for_like`
+gates *both* `run_sleeve_evaluation.py` and the divergence monitor. It no longer
+gates the monitor: the daily feed became a rolling shadow, whose comparability
+is judged per sleeve by `backtest/sleeve_comparability.py`. The conclusion is
+unchanged — the floor stays at 5.0 — but the argument for it now rests on one
+consumer rather than two, and a reader deciding whether to touch the floor is
+entitled to the argument that actually applies. See
+[Drift comparability is window-scoped and per-sleeve (D19)](#drift-comparability-is-window-scoped-and-per-sleeve-d19).
 
 ### How the decision is enforced (KAN-68)
 
@@ -314,6 +325,72 @@ coverage floor, defined at
 ("Baseline coverage floor (D14)"). The **D14 in the table above** is the
 two-person-gate substitute and is unrelated. This decision is recorded as **D18**
 to avoid deepening that collision.
+
+## Drift comparability is window-scoped and per-sleeve (D19)
+
+**Decided 2026-09-04.** The daily divergence feed is a rolling shadow, not the
+pinned backtest artifact, and comparability is judged per sleeve rather than per
+artifact.
+
+### The defect
+
+`scripts/divergence_monitor.py` graded live against the pinned baseline, and
+`backtest.divergence.align_and_window` takes the intersection of live dates with
+the artifact's. A pinned artifact's last bar therefore capped the comparison
+window. Measured across `output/divergence_20260822..20260829.json`, six
+consecutive nightly runs all reported `window_start=2026-07-10
+window_end=2026-08-14` and rewrote the same `(sleeve, session_date,
+baseline_id)` evidence row. **The monitor had not looked at a new session since
+2026-08-14**, and a breach streak could never exceed 1, because only one
+`session_date` ever existed per baseline.
+
+Separately, every verdict was forced to `NO_DATA` because `is_like_for_like`
+requires `coverage_state == OK` and the artifact is `BLOCKED` at 11.28% (D18).
+Un-blinding that gate alone would have produced a confident, permanently stale
+verdict — worse than the honest blindness it replaced.
+
+### What replaces it
+
+Each night the 04:15 paper run replays every sleeve's own signal function over
+the bars it just fetched, seeded at live's NAV `--window` sessions back, and
+writes `output/shadow_<date>.json`. The 04:45 monitor grades against that, so
+`window_end` is the current session.
+
+The shadow needs no execution model: every requirement of one is satisfied by
+construction. The runner decides on a session's close and fills the next
+(next-open), `CostModel()` carries the $1.00 per-order floor, and no membership
+calendar is used — so there is no point-in-time universe question and no
+membership-days to price. **The 11.28% exclusion behind D18 is a property of the
+10-year artifact, not of a 30-session window over live's current universe.**
+
+`backtest/sleeve_comparability.py` gates what can actually go wrong with a
+shadow instead: it is stale, the sleeve is absent from it, or there is too
+little overlap to define a return.
+
+### Two baselines of record, deliberately
+
+| | Feed | Gate |
+|---|---|---|
+| **Daily drift** | rolling shadow, rebuilt nightly | `SleeveComparability`, per sleeve |
+| **Edge evidence** | the pinned artifact | `is_like_for_like`, per artifact |
+
+`divergence.baseline_pin` is **not** dead config. It remains the baseline of
+record for `run_sleeve_evaluation.py`, D18's accepted coverage bias still rests
+on it, and `deploy/launchd/run_backtest_refresh.sh` still excludes it from the
+90-day prune. A reader who finds two baselines should know the split is
+intentional rather than assume one is stale.
+
+The two gates are kept uncoupled on purpose, and the separation is test-pinned:
+`sleeve_comparability.py` must not import `backtest.divergence`, so re-coupling
+drift comparability to D18's coverage acceptance has to be a deliberate,
+reviewable act.
+
+### What this does not change
+
+The coverage floor stays at 5.0 and affected artifacts stay `BLOCKED`. D18's
+accepted bias is untouched, its sha-pinned registry entry still resolves, and
+the D10 verdicts still carry the citation requirement. What changed is only
+which question the *daily* monitor is answering, and against what.
 
 ## Dream State Delta
 
