@@ -30,6 +30,7 @@ from scripts.train_signal_model import (
     walk_forward_evaluate,
     write_model_metadata,
 )
+from services.ml_model.registry import ModelRegistry
 from shared.models.ml_models import ModelVersion
 from shared.models.portfolio import Trade
 
@@ -222,6 +223,14 @@ def run_retraining_pipeline(
         model_path=versioned_path,
         is_active=should_promote,
         created_at=datetime.now(timezone.utc),
+        # Without this, ModelRegistry._verify_integrity refuses to load the row
+        # ("no integrity record ... refusing to load an unverifiable model
+        # file"), so every model this script promoted was unloadable through
+        # the registry that is supposed to serve it. Hashed via the registry's
+        # own helper so the writer and the verifier cannot drift, and hashed
+        # from versioned_path — the same path stored above, because a hash of
+        # any other file would pass the check while describing wrong bytes.
+        content_hash=ModelRegistry.hash_model_file(versioned_path),
     )
     session.add(mv)
     session.flush()
