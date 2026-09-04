@@ -58,6 +58,7 @@ from scripts.run_backtest import (
     get_union_universe,
     make_crash_freeze_signals_fn,
     make_earnings_drift_signals_fn,
+    make_ml_shadow_signals_fn,
     make_momentum_signals_fn,
     make_quality_value_signals_fn,
     make_sector_rotation_signals_fn,
@@ -195,6 +196,43 @@ def produce_shadow_artifact(
     return output_path
 
 
+def load_ml_shadow_model(model_path: str):
+    """Load the signal-quality model and its categorical feature names.
+
+    Returns ``(model, categorical_features)``, or ``None`` when there is no
+    usable model. Absence is the normal state before one has been trained, and
+    a corrupt file is an ops problem — neither may stop the 04:15 run, because
+    the shadow only observes and an observation is worth less than a trading
+    session.
+
+    The categorical names come from the sidecar the trainer writes. They are
+    not recoverable from the model file, which records the LEVELS but not which
+    columns they belong to — and scoring without them raises "train and valid
+    dataset categorical_feature do not match".
+    """
+    try:
+        import json as _json
+
+        import lightgbm as lgb
+
+        model = lgb.Booster(model_file=model_path)
+        meta_path = Path(model_path).with_name(
+            Path(model_path).stem + ".meta.json"
+        )
+        categoricals: list[str] = []
+        if meta_path.is_file():
+            categoricals = _json.loads(meta_path.read_text()).get(
+                "categorical_features", []
+            )
+        return model, categoricals
+    except Exception:
+        logger.warning(
+            "ML shadow model unavailable; the run proceeds without it",
+            model_path=model_path,
+        )
+        return None
+
+
 def _shadow_params(sleeve: str, params: dict) -> dict:
     """Fingerprint inputs for one sleeve: its tuning plus what it may trade.
 
@@ -224,6 +262,7 @@ def build_portfolios(
     fundamentals_lookup,
     earnings_lookup,
     portfolio_contexts: dict[str, PortfolioContext] | None = None,
+    ml_shadow: tuple | None = None,
 ) -> dict[str, PortfolioConfig]:
     """Build the 6 active portfolio configs (same params as backtest main()).
 
@@ -398,14 +437,32 @@ def build_portfolios(
         shadow_params=_shadow_params("tail_risk_hedge", tr_params),
     )
 
-    # Level 3: Crash entry freeze — block new buys during crash regime
+    # Level 3: Crash entry freeze — block new buys during crash regime.
+    #
+    # The ML shadow is applied in the same pass, INSIDE the freeze wrapper, so
+    # it observes what the sleeve actually proposes rather than what survives
+    # the freeze. Applying it afterwards would put it outside and it would
+    # score signals the freeze had already removed; applying it before this
+    # loop would lose it, because the loop rebuilds the whole config.
     for name, pc in list(portfolios.items()):
+        inner = pc.signals_fn
+        if ml_shadow is not None:
+            model, threshold, categoricals, recorder = ml_shadow
+            inner = make_ml_shadow_signals_fn(
+                inner, model, threshold=threshold, strategy_name=name,
+                recorder=recorder, categorical_features=categoricals,
+            )
         if name == "tail_risk_hedge":
+            # Never freeze-wrapped, but it still gets the shadow above.
+            portfolios[name] = PortfolioConfig(
+                name=pc.name, capital=pc.capital, signals_fn=inner,
+                risk_engine=pc.risk_engine, shadow_params=pc.shadow_params,
+            )
             continue
         portfolios[name] = PortfolioConfig(
             name=pc.name,
             capital=pc.capital,
-            signals_fn=make_crash_freeze_signals_fn(pc.signals_fn, regime_by_date),
+            signals_fn=make_crash_freeze_signals_fn(inner, regime_by_date),
             risk_engine=pc.risk_engine,
             # Carried explicitly: this rewrap reconstructs the whole config, so
             # a field omitted here is lost silently — the sleeve keeps working
@@ -1411,6 +1468,19 @@ def _parser(default_db_url: str, default_redis_url: str) -> argparse.ArgumentPar
         help="Record observational factor snapshots for raw buy candidates",
     )
     parser.add_argument(
+        "--ml-shadow-model",
+        default="models/signal_quality_model.txt",
+        help=(
+            "Signal-quality model to score entries against in SHADOW mode: "
+            "every signal is recorded with the verdict the filter would have "
+            "reached, and none are suppressed. Empty string disables it."
+        ),
+    )
+    parser.add_argument(
+        "--ml-shadow-threshold", type=float, default=0.5,
+        help="Score below which the filter WOULD suppress a buy (default 0.5).",
+    )
+    parser.add_argument(
         "--shadow-output-dir",
         default="output",
         help=(
@@ -1712,6 +1782,22 @@ def main() -> int | None:
             account_id=broker_snapshot.account_id,
         )
 
+        # ML shadow: score entries, suppress nothing, record the verdict.
+        # The trained model would suppress ~80% of buys, so it observes against
+        # the live book before anything acts on it.
+        ml_shadow_records: list[dict] = []
+        ml_shadow = None
+        if args.ml_shadow_model:
+            loaded = load_ml_shadow_model(args.ml_shadow_model)
+            if loaded is not None:
+                model, categoricals = loaded
+                ml_shadow = (
+                    model, args.ml_shadow_threshold, categoricals,
+                    ml_shadow_records.append,
+                )
+                print(f"  ML shadow: {args.ml_shadow_model} "
+                      f"(threshold={args.ml_shadow_threshold}, observing only)")
+
         # Build portfolios
         portfolios = build_portfolios(
             capital=preparation.capital.deployable_capital,
@@ -1720,6 +1806,7 @@ def main() -> int | None:
             fundamentals_lookup=fundamentals_lookup,
             earnings_lookup=earnings_lookup,
             portfolio_contexts=portfolio_contexts,
+            ml_shadow=ml_shadow,
         )
 
     # Signal evaluation never projects fills.  Actual IB executions are the
@@ -1791,6 +1878,39 @@ def main() -> int | None:
         # the run finish — the same posture the research shadow observer takes.
         # The loss is visible rather than silent: a missing artifact is how
         # evidence_store.blindness detects that the feed did not arrive.
+        # What the ML filter WOULD have done. Written after the commit, and
+        # non-fatal for the same reason the divergence shadow is: this is
+        # observation, and losing it must never cost a trading session.
+        if ml_shadow_records:
+            try:
+                ml_path = (
+                    Path(args.shadow_output_dir)
+                    / f"ml_shadow_{date.today():%Y%m%d}.json"
+                )
+                would_suppress = sum(
+                    1 for r in ml_shadow_records if r["would_suppress"]
+                )
+                ml_path.write_text(json.dumps({
+                    "model": args.ml_shadow_model,
+                    "threshold": args.ml_shadow_threshold,
+                    "session": max(r["session"] for r in ml_shadow_records).isoformat(),
+                    "scored": len(ml_shadow_records),
+                    "would_suppress": would_suppress,
+                    "records": [
+                        {**r, "session": r["session"].isoformat()}
+                        for r in ml_shadow_records
+                    ],
+                }, indent=2, sort_keys=True))
+                print(
+                    f"  ML shadow: scored {len(ml_shadow_records)} buy signal(s); "
+                    f"the filter would have suppressed {would_suppress} "
+                    f"-> {ml_path}"
+                )
+            except Exception:
+                logger.exception(
+                    "ML shadow record failed; paper trading is unchanged"
+                )
+
         if portfolio_tag is None:
             try:
                 shadow_path = produce_shadow_artifact(

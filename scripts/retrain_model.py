@@ -191,6 +191,12 @@ def run_retraining_pipeline(
         exit_dates=exit_dates,
         embargo_days=embargo_days,
         n_trades=len(trades),
+        categorical_features=(
+            # OBJECT, not "category": _prepare_for_lgb does the
+            # conversion inside train_final_model, so this frame still
+            # holds the pre-conversion dtypes.
+            features.select_dtypes(include=["object"]).columns.tolist()
+        ),
     )
     write_model_metadata(versioned_path, training_window)
 
