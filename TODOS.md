@@ -67,12 +67,12 @@ Deferred work with context. Added by /plan-eng-review and /plan-ceo-review 2026-
 - **Context:** Found by /ship on 2026-09-01 while landing the sleeve-scoping fix; verified pre-existing by stashing the branch changes and reproducing on `develop`. Not caused by that work and left untouched (`REPO_MODE=collaborative`).
 - **Depends on / blocked by:** Nothing.
 
-## Dual signal paths, and a model loader that cannot read what the trainer writes
-- **What:** Pick one authoritative path per responsibility between `scripts/run_paper.py` and the Docker `signal_generation`/`ml_model` services, delete or clearly demote the dormant one, fix the model-loader mismatch, and document the live topology in-repo.
-- **Why:** Two problems, both verified still present on 2026-09-04. (1) `ModelRegistry.load_active` does `joblib.load(record.model_path)` (`services/ml_model/registry.py:112`) while `scripts/retrain_model.py:186-199` writes LightGBM's native format via `model.save_model(...)` to `signal_quality_*.txt` — a `.txt` Booster and `joblib.load` cannot interoperate, so the live model cannot round-trip through its own registry. (2) `run_paper.py` and `services/signal_generation` + `services/ml_model` are two parallel signal systems with duplicated risk/execution logic, and which is authoritative is undocumented.
+## Dual signal paths: which one is authoritative (blocked on D17)
+- **What:** Pick one authoritative path between `scripts/run_paper.py` and the Docker `signal_generation`/`ml_model` services, and delete or clearly demote the dormant one.
+- **Why:** Both docker services are up and healthy while having consumed nothing (`stream:signals` XLEN 0, consumer group `last-delivered-id 0-0`, measured 2026-09-04). `run_paper.py` is the real signal brain. Two systems, one inert, and nothing says which is authoritative.
 - **Pros:** Removes a loader path that cannot work; a new contributor can read one doc and know what actually runs live.
 - **Cons:** Deciding which path is authoritative is an architecture call, not a cleanup — it overlaps the D17 ML decision (dated end of readiness tranche 3), so doing it earlier risks pre-empting that.
-- **Context:** Raised as thread T8 of the 2026-08-06 implementation review (`docs/operations/implementation-review-2026-08-06.md`, Theme 7 + §9) and deliberately excluded from the T-work integration on 2026-08-09 — PR #19 was closed without merging. Absorbed here on 2026-09-04 when the branch `fix/T8-consolidate-implementations` was deleted; it was the last copy. The original scaffold's own diagnosis is worth keeping: this ambiguity is *why* the unwired-safety bugs in T1/T2 hid, because three reviewers could not tell which path was authoritative. Citations re-verified before recording; the registry line moved from `:44,77` to `:112`.
+- **Context:** Thread T8 of the 2026-08-06 implementation review. The model-loader half was CLOSED 2026-09-04 (PR #134) and the live topology documented in `docs/operations/live-topology.md`. What remains is the architecture call only. The original diagnosis still stands: this ambiguity is *why* the unwired-safety bugs in T1/T2 hid.
 - **Depends on / blocked by:** Best done after the D17 ML architecture decision, so the "keep" path is settled first.
 
 ## AVB and EQR need conId overrides (Error 200 on a live gateway)
