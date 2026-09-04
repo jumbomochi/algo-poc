@@ -1,0 +1,12 @@
+{
+  "train_start_date": "2016-08-24",
+  "train_end_date": "2026-08-11",
+  "embargo_days": 5,
+  "out_of_sample_from": "2026-08-17",
+  "n_trades": 2554,
+  "categorical_features": [
+    "portfolio",
+    "bar_regime",
+    "signal_above_ma_50"
+  ]
+}
