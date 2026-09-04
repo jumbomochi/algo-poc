@@ -68,11 +68,25 @@ class SleeveComparability:
     """
 
     sleeve: str
-    #: The session being graded — live's most recent.
+    #: The date this monitor run is happening on. Freshness is judged against
+    #: this, not against a session date.
+    run_date: date
+    #: The wall-clock date the shadow was WRITTEN, or ``None`` when this sleeve
+    #: is absent from the artifact entirely.
+    #:
+    #: The first version of this check compared SESSION dates and was wrong
+    #: every day. ``equity_snapshots.date`` carries the run's SGT wall-clock
+    #: date; the shadow's last bar is the last COMPLETE US session, which at
+    #: 04:15 SGT is always the day before. They are one day apart by
+    #: construction, so every sleeve was refused as stale, permanently — and
+    #: since verdicts are dated by the compared window, the 2026-09-03 run
+    #: wrote its NO_DATA rows over session 09-02 and left 09-03 with no
+    #: evidence at all.
+    shadow_produced_on: date | None
+    #: The session actually being compared: the last one both series share.
+    #: Reported so a reader knows what the verdict covers; it does NOT decide
+    #: freshness.
     graded_session: date
-    #: The session the shadow was produced for, or ``None`` when this sleeve is
-    #: absent from the artifact entirely.
-    shadow_session: date | None
     #: Sessions present on both sides of the comparison.
     overlapping_sessions: int
 
@@ -84,18 +98,18 @@ class SleeveComparability:
         """Every reason this sleeve cannot be graded, in the monitor's words."""
         reasons: list[str] = []
 
-        if self.shadow_session is None:
+        if self.shadow_produced_on is None:
             reasons.append(
                 f"no shadow curve for '{self.sleeve}': either the book has no "
                 "equity history to seed the window from, or the replay produced "
                 "nothing for it"
             )
-        elif self.shadow_session != self.graded_session:
+        elif self.shadow_produced_on != self.run_date:
             reasons.append(
-                f"shadow is stale: produced for session {self.shadow_session}, "
-                f"but the session being graded is {self.graded_session}. The "
-                "04:15 run most likely did not produce one today, leaving the "
-                "previous day's artifact on disk"
+                f"shadow is stale: written on {self.shadow_produced_on}, but "
+                f"this run is {self.run_date}. The 04:15 run most likely did "
+                "not produce one today, leaving the previous day's artifact on "
+                "disk"
             )
 
         if self.overlapping_sessions < MINIMUM_OVERLAPPING_SESSIONS:

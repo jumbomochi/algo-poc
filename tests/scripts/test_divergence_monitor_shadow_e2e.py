@@ -53,7 +53,7 @@ def _db(tmp_path: Path, name: str) -> str:
     return url
 
 
-def _shadow(tmp_path: Path, *, session_date=GRADED, drift=1.0) -> Path:
+def _shadow(tmp_path: Path, *, session_date=GRADED, drift=1.0, produced_on=None) -> Path:
     """A model curve that tracks live, scaled by ``drift``."""
     mom, sec = 23080.0, 15380.0
     series: dict[str, dict[date, float]] = {"momentum": {}, "sector_rotation": {}}
@@ -64,7 +64,8 @@ def _shadow(tmp_path: Path, *, session_date=GRADED, drift=1.0) -> Path:
         sec *= 1.001
     path = tmp_path / "shadow_20260525.json"
     dump_shadow(path, series=series, shadow_id="shadow:aaaabbbbccccdddd",
-                window_sessions=5, session_date=session_date)
+                window_sessions=5, session_date=session_date,
+                produced_on=produced_on or date.today())
     return path
 
 
@@ -115,7 +116,7 @@ def test_a_stale_shadow_is_refused_rather_than_graded(tmp_path, monkeypatch) -> 
     out = tmp_path / "divergence.json"
 
     _run(monkeypatch, db_url=_db(tmp_path, "stale"),
-         shadow=_shadow(tmp_path, session_date=SESSIONS[0]), output=out)
+         shadow=_shadow(tmp_path, produced_on=date(2026, 5, 19)), output=out)
 
     reports = json.loads(out.read_text())["reports"]
     momentum = next(r for r in reports if r["portfolio"] == "momentum")

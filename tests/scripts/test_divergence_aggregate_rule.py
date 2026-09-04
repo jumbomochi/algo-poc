@@ -90,8 +90,11 @@ def test_a_stale_shadow_does_not_leave_a_graded_aggregate(
     """The headline: no green tick while the monitor is blind."""
     db_url, series = _db(tmp_path, "stale")
     shadow = tmp_path / "shadow.json"
+    # Stale = written on an earlier DAY. The session it covers being older
+    # is normal at 04:15 SGT and is not what staleness means.
     dump_shadow(shadow, series=series, shadow_id="shadow:x",
-                window_sessions=5, session_date=SESSIONS[0])
+                window_sessions=5, session_date=GRADED,
+                produced_on=date(2026, 5, 19))
     out = tmp_path / "div.json"
 
     _run(monkeypatch, db_url=db_url, shadow=shadow, output=out)
@@ -107,8 +110,11 @@ def test_the_aggregate_names_why_it_could_not_be_graded(
     """A bare NO_DATA on the summary line explains nothing."""
     db_url, series = _db(tmp_path, "reason")
     shadow = tmp_path / "shadow.json"
+    # Stale = written on an earlier DAY. The session it covers being older
+    # is normal at 04:15 SGT and is not what staleness means.
     dump_shadow(shadow, series=series, shadow_id="shadow:x",
-                window_sessions=5, session_date=SESSIONS[0])
+                window_sessions=5, session_date=GRADED,
+                produced_on=date(2026, 5, 19))
     out = tmp_path / "div.json"
 
     _run(monkeypatch, db_url=db_url, shadow=shadow, output=out)
@@ -124,8 +130,11 @@ def test_the_aggregate_arithmetic_survives_the_refusal(
     gap, or nobody can judge how far apart the curves were."""
     db_url, series = _db(tmp_path, "arith")
     shadow = tmp_path / "shadow.json"
+    # Stale = written on an earlier DAY. The session it covers being older
+    # is normal at 04:15 SGT and is not what staleness means.
     dump_shadow(shadow, series=series, shadow_id="shadow:x",
-                window_sessions=5, session_date=SESSIONS[0])
+                window_sessions=5, session_date=GRADED,
+                produced_on=date(2026, 5, 19))
     out = tmp_path / "div.json"
 
     _run(monkeypatch, db_url=db_url, shadow=shadow, output=out)
@@ -142,7 +151,8 @@ def test_a_fully_graded_book_still_grades_the_aggregate(
     db_url, series = _db(tmp_path, "healthy")
     shadow = tmp_path / "shadow.json"
     dump_shadow(shadow, series=series, shadow_id="shadow:x",
-                window_sessions=5, session_date=GRADED)
+                window_sessions=5, session_date=GRADED,
+                produced_on=date.today())
     out = tmp_path / "div.json"
 
     code = _run(monkeypatch, db_url=db_url, shadow=shadow, output=out)
@@ -164,7 +174,8 @@ def test_one_ungraded_sleeve_ungrades_the_aggregate(
     series["sector_rotation"] = {GRADED: series["sector_rotation"][GRADED]}
     shadow = tmp_path / "shadow.json"
     dump_shadow(shadow, series=series, shadow_id="shadow:x",
-                window_sessions=5, session_date=GRADED)
+                window_sessions=5, session_date=GRADED,
+                produced_on=date.today())
     out = tmp_path / "div.json"
 
     _run(monkeypatch, db_url=db_url, shadow=shadow, output=out)

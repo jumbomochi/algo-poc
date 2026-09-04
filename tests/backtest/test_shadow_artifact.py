@@ -127,6 +127,7 @@ def test_the_artifact_records_the_session_it_was_produced_for(tmp_path) -> None:
         shadow_id="shadow:abc123",
         window_sessions=30,
         session_date=date(2026, 8, 7),
+        produced_on=date(2026, 8, 7),
     )
 
     assert load_shadow(path).session_date == date(2026, 8, 7)
@@ -135,7 +136,7 @@ def test_the_artifact_records_the_session_it_was_produced_for(tmp_path) -> None:
 def test_the_series_round_trips(tmp_path) -> None:
     path = tmp_path / "shadow_20260807.json"
     dump_shadow(path, series=SERIES, shadow_id="shadow:abc123", window_sessions=30,
-                session_date=SESSIONS[-1])
+                session_date=SESSIONS[-1], produced_on=SESSIONS[-1])
 
     loaded = load_shadow(path)
 
@@ -145,7 +146,7 @@ def test_the_series_round_trips(tmp_path) -> None:
 def test_the_artifact_carries_its_identity_and_window(tmp_path) -> None:
     path = tmp_path / "shadow_20260807.json"
     dump_shadow(path, series=SERIES, shadow_id="shadow:abc123", window_sessions=30,
-                session_date=SESSIONS[-1])
+                session_date=SESSIONS[-1], produced_on=SESSIONS[-1])
 
     loaded = load_shadow(path)
 
@@ -157,7 +158,7 @@ def test_dates_are_written_as_iso_strings(tmp_path) -> None:
     """The artifact is read by tools other than this one."""
     path = tmp_path / "shadow_20260807.json"
     dump_shadow(path, series=SERIES, shadow_id="shadow:abc123", window_sessions=30,
-                session_date=SESSIONS[-1])
+                session_date=SESSIONS[-1], produced_on=SESSIONS[-1])
 
     raw = json.loads(path.read_text())
 
@@ -168,7 +169,7 @@ def test_an_artifact_with_no_sleeves_round_trips_as_empty(tmp_path) -> None:
     """Every sleeve ungradeable is a real state, distinct from a missing file."""
     path = tmp_path / "shadow_20260807.json"
     dump_shadow(path, series={}, shadow_id="shadow:abc123", window_sessions=30,
-                session_date=SESSIONS[-1])
+                session_date=SESSIONS[-1], produced_on=SESSIONS[-1])
 
     assert load_shadow(path).series == {}
 

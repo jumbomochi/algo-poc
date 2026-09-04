@@ -30,6 +30,7 @@ def _write(tmp_path, series, shadow_id="shadow:abc123", window=30):
     dump_shadow(
         path, series=series, shadow_id=shadow_id,
         window_sessions=window, session_date=SESSIONS[-1],
+        produced_on=SESSIONS[-1],
     )
     return path
 
