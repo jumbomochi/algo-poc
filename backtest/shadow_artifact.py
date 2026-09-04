@@ -58,6 +58,20 @@ class ShadowArtifact:
     #: a re-run rewrites them, which is the same reason ``baseline_age``
     #: distrusts mtime for the pinned artifact.
     session_date: date
+    #: The wall-clock date the run WROTE this artifact.
+    #:
+    #: Separate from ``session_date`` because they are different facts and
+    #: conflating them broke the freshness check outright. ``session_date`` is
+    #: the last COMPLETE market session the curve covers; at 04:15 SGT that is
+    #: always the previous calendar day, while the live book's
+    #: ``equity_snapshots`` row is stamped with the run's own SGT date. The two
+    #: are therefore always one day apart, so comparing them reported "stale"
+    #: every single day (measured 2026-09-04: live 09-04, shadow 09-03).
+    #:
+    #: Freshness asks "did today's 04:15 run write this", which is exactly this
+    #: field — and it still catches the case the check exists for, a failed
+    #: morning leaving yesterday's artifact on disk.
+    produced_on: date
 
 
 def shadow_id_for(portfolios: Mapping[str, Any]) -> str:
@@ -104,6 +118,7 @@ def dump_shadow(
     shadow_id: str,
     window_sessions: int,
     session_date: date,
+    produced_on: date,
 ) -> None:
     """Write the shadow artifact.
 
@@ -118,6 +133,7 @@ def dump_shadow(
         "shadow_id": shadow_id,
         "window_sessions": window_sessions,
         "session_date": session_date.isoformat(),
+        "produced_on": produced_on.isoformat(),
         "series": {
             sleeve: {session.isoformat(): value for session, value in curve.items()}
             for sleeve, curve in series.items()
@@ -147,4 +163,10 @@ def load_shadow(path: str | Path) -> ShadowArtifact:
         shadow_id=str(raw["shadow_id"]),
         window_sessions=int(raw["window_sessions"]),
         session_date=date.fromisoformat(raw["session_date"]),
+        # Artifacts written before this field existed fall back to the session
+        # date, which makes them look one day stale — correct, since they
+        # predate the fix and should not be graded against.
+        produced_on=date.fromisoformat(
+            raw.get("produced_on") or raw["session_date"]
+        ),
     )

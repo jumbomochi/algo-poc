@@ -192,6 +192,10 @@ def produce_shadow_artifact(
         shadow_id=shadow_id_for(shadow_portfolios),
         window_sessions=window_sessions,
         session_date=max(graded_sessions) if graded_sessions else date.today(),
+        # The wall-clock date of THIS run, not the session it covers. The
+        # monitor's freshness check asks "did today's 04:15 run write this",
+        # and the two dates are always a day apart at 04:15 SGT.
+        produced_on=date.today(),
     )
     return output_path
 

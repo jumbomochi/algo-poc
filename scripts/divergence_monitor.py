@@ -1177,9 +1177,18 @@ def main() -> int:
                 report,
                 SleeveComparability(
                     sleeve=name,
-                    graded_session=max(live) if live else shadow_artifact.session_date,
-                    shadow_session=(
-                        shadow_artifact.session_date if model_series else None
+                    run_date=date.today(),
+                    shadow_produced_on=(
+                        shadow_artifact.produced_on if model_series else None
+                    ),
+                    # The session actually compared: the last one both series
+                    # share. NOT max(live), which carries the run's SGT
+                    # wall-clock date and is always a day ahead of the last
+                    # complete US session the shadow covers.
+                    graded_session=(
+                        max(set(live) & set(model_series))
+                        if (set(live) & set(model_series))
+                        else shadow_artifact.session_date
                     ),
                     overlapping_sessions=len(set(live) & set(model_series)),
                 ),
