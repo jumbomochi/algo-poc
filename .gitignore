@@ -29,3 +29,13 @@ output/
 data/cache/*.json
 .superpowers/
 *.private.md
+
+# Retrained model versions accumulate one file per run; the CANONICAL model is
+# committed deliberately (models/signal_quality_model.txt, 178KB). It is
+# deterministic (seed=42) but only reproducible from a backtest artifact that
+# is itself gitignored at 261MB — and the tests that score against a real
+# Booster are the ones that caught --ml-filter being broken for every trained
+# model. Gitignoring it would make those tests skip in CI and let that defect
+# class return unseen.
+models/signal_quality_v*.txt
+models/signal_quality_v*.meta.json

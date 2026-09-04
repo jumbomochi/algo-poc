@@ -1926,6 +1926,7 @@ def make_ml_filtered_signals_fn(
     model,
     threshold: float = 0.5,
     strategy_name: str = "unknown",
+    categorical_features: list[str] | None = None,
 ) -> Callable[[str, list[dict]], dict | None]:
     """Wrap a signal function with ML quality scoring.
 
@@ -1947,53 +1948,145 @@ def make_ml_filtered_signals_fn(
         if signal.get("action") != "buy":
             return signal
 
-        # Build feature vector for the model
-        row: dict = {"portfolio": strategy_name}
-
-        # Flatten signal features
-        signals = signal.get("signals", {})
-        for key, val in signals.items():
-            if isinstance(val, dict):
-                for subkey, subval in val.items():
-                    if isinstance(subval, (int, float)):
-                        row[f"signal_{key}_{subkey}"] = subval
-            elif isinstance(val, (int, float)):
-                row[f"signal_{key}"] = val
-
-        # Bar-derived features (from recent bars)
-        if len(bars) >= 21:
-            closes = [b["close"] for b in bars[-21:]]
-            volumes = [b["volume"] for b in bars[-21:]]
-
-            row["bar_return_5d"] = (closes[-1] - closes[-6]) / closes[-6]
-            row["bar_return_20d"] = (closes[-1] - closes[0]) / closes[0]
-
-            daily_rets = [
-                (closes[i] - closes[i - 1]) / closes[i - 1]
-                for i in range(1, len(closes))
-            ]
-            row["bar_vol_20d"] = float(np.std(daily_rets))
-
-            avg_vol = np.mean(volumes[:-1])
-            row["bar_volume_ratio"] = float(volumes[-1] / avg_vol) if avg_vol > 0 else 1.0
-
-        # Create DataFrame matching model's expected features
-        feature_names = model.feature_name()
-        feature_row = {name: row.get(name, np.nan) for name in feature_names}
-        df = pd.DataFrame([feature_row])
-
-        # Convert categorical columns
-        for col in df.select_dtypes(include=["object"]).columns:
-            df[col] = df[col].astype("category")
-
-        # Score
-        score = model.predict(df)[0]
+        score = score_signal(
+            signal, bars, model, strategy_name, categorical_features
+        )
 
         if score >= threshold:
             return signal
         return None
 
     return filtered_signals_fn
+
+
+def score_signal(
+    signal: dict,
+    bars: list[dict],
+    model,
+    strategy_name: str,
+    categorical_features: list[str] | None = None,
+) -> float:
+    """P(profitable) for one buy signal, per the signal-quality model.
+
+    Shared by the live filter and the shadow recorder rather than duplicated:
+    a shadow that scored differently from the filter would measure the wrong
+    thing, and the difference would be invisible because both would look
+    plausible.
+    """
+    row: dict = {"portfolio": strategy_name}
+
+    # Flatten signal features
+    signals = signal.get("signals", {})
+    for key, val in signals.items():
+        if isinstance(val, dict):
+            for subkey, subval in val.items():
+                if isinstance(subval, (int, float)):
+                    row[f"signal_{key}_{subkey}"] = subval
+        elif isinstance(val, (int, float)):
+            row[f"signal_{key}"] = val
+
+    # Bar-derived features (from recent bars)
+    if len(bars) >= 21:
+        closes = [b["close"] for b in bars[-21:]]
+        volumes = [b["volume"] for b in bars[-21:]]
+
+        row["bar_return_5d"] = (closes[-1] - closes[-6]) / closes[-6]
+        row["bar_return_20d"] = (closes[-1] - closes[0]) / closes[0]
+
+        daily_rets = [
+            (closes[i] - closes[i - 1]) / closes[i - 1]
+            for i in range(1, len(closes))
+        ]
+        row["bar_vol_20d"] = float(np.std(daily_rets))
+
+        avg_vol = np.mean(volumes[:-1])
+        row["bar_volume_ratio"] = float(volumes[-1] / avg_vol) if avg_vol > 0 else 1.0
+
+    feature_names = model.feature_name()
+    feature_row = {name: row.get(name, np.nan) for name in feature_names}
+    df = pd.DataFrame([feature_row])
+
+    # Categorical columns must match TRAINING's, in both identity and levels.
+    # Two ways this goes wrong with a one-row frame, and both did:
+    #   - `astype("category")` gives exactly the levels present in this row,
+    #     never the six the model saw;
+    #   - a categorical feature missing from `row` becomes a float NaN, so the
+    #     frame has fewer categorical columns than training had.
+    # LightGBM then refuses with "train and valid dataset categorical_feature
+    # do not match", which is why --ml-filter raised for every real Booster.
+    # The stub models in the unit tests accept any frame, so it went unseen.
+    #
+    # The model file records the LEVELS (Booster.pandas_categorical) but not
+    # which columns they belong to, so the trainer records the NAMES in the
+    # metadata sidecar and they are passed in here.
+    levels_by_position = list(getattr(model, "pandas_categorical", None) or [])
+    for i, col in enumerate(categorical_features or []):
+        if col not in df.columns:
+            continue
+        levels = levels_by_position[i] if i < len(levels_by_position) else None
+        # A value outside the training levels becomes NaN — LightGBM's own
+        # representation of an unseen level — so a sleeve added after training
+        # scores instead of crashing.
+        df[col] = pd.Categorical(df[col], categories=levels)
+
+    return float(model.predict(df)[0])
+
+
+def make_ml_shadow_signals_fn(
+    inner_fn: Callable[[str, list[dict]], dict | None],
+    model,
+    threshold: float = 0.5,
+    strategy_name: str = "unknown",
+    recorder: Callable[[dict], None] | None = None,
+    categorical_features: list[str] | None = None,
+) -> Callable[[str, list[dict]], dict | None]:
+    """Score buy signals and record the verdict, WITHOUT acting on it.
+
+    The trained model passes only 17-20% of buy signals (the purged
+    walk-forward folds in ``models/signal_quality_metrics.json``). Switching
+    that on live would cut the book's entries by four fifths in one step, on a
+    model whose own metadata says it is out of sample only from 2026-08-17. So
+    it observes first: every signal passes through unchanged, and what the
+    filter WOULD have done is recorded for joining against real fills.
+
+    Scoring goes through :func:`score_signal`, shared with
+    :func:`make_ml_filtered_signals_fn`. A shadow that scored differently from
+    the live filter would measure the wrong thing, plausibly.
+
+    Neither a scoring failure nor a recording failure may cost a trade: this
+    runs inside the 04:15 job, and an observation is worth less than an entry.
+    """
+    def shadow_signals_fn(ticker: str, bars: list[dict]) -> dict | None:
+        signal = inner_fn(ticker, bars)
+        if signal is None or signal.get("action") != "buy":
+            return signal
+
+        try:
+            score = score_signal(
+                signal, bars, model, strategy_name, categorical_features
+            )
+            if recorder is not None:
+                recorder({
+                    "session": bars[-1]["date"] if bars else None,
+                    "portfolio": strategy_name,
+                    "ticker": ticker,
+                    "score": score,
+                    "threshold": threshold,
+                    "would_suppress": score < threshold,
+                })
+        except Exception:
+            # Deliberately swallowed. This wrapper exists to OBSERVE; a failure
+            # to observe must never remove an entry the sleeve asked for.
+            # Printed rather than logged because this module has no logger and
+            # its output already goes to the 04:15 run log.
+            print(
+                f"  WARNING: ML shadow scoring failed for {strategy_name}/"
+                f"{ticker}; the signal is unaffected"
+            )
+
+        return signal
+
+    return shadow_signals_fn
 
 
 def compute_aggregate_metrics(

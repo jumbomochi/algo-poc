@@ -182,6 +182,7 @@ def build_model_metadata(
     exit_dates: pd.Series,
     embargo_days: int,
     n_trades: int,
+    categorical_features: list[str] | None = None,
 ) -> dict:
     """Provenance for a trained model: what window it has already seen.
 
@@ -200,6 +201,13 @@ def build_model_metadata(
             train_end + timedelta(days=embargo_days + 1)
         ).isoformat(),
         "n_trades": int(n_trades),
+        # Which features LightGBM treated as categorical, in frame order.
+        # Needed at PREDICT time: a one-row frame has only the object columns
+        # that happen to be present, so the categorical count never matches
+        # training's and LightGBM refuses with "train and valid dataset
+        # categorical_feature do not match". The model file records the LEVELS
+        # (Booster.pandas_categorical) but not which columns they belong to.
+        "categorical_features": list(categorical_features or []),
     }
 
 
@@ -395,6 +403,12 @@ def main():
         exit_dates=exit_dates,
         embargo_days=args.embargo_days,
         n_trades=len(all_trades),
+        categorical_features=(
+            # OBJECT, not "category": _prepare_for_lgb does the
+            # conversion inside train_final_model, so this frame still
+            # holds the pre-conversion dtypes.
+            features.select_dtypes(include=["object"]).columns.tolist()
+        ),
     )
     metadata_path = write_model_metadata(model_path, metadata)
 
