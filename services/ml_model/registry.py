@@ -19,6 +19,13 @@ def _hash_file(path: str) -> str:
     return digest.hexdigest()
 
 
+#: LightGBM's native text format, written by ``Booster.save_model``. The
+#: retrainer uses it; the registry's own ``save`` uses joblib. Both are loadable
+#: because BOTH are written by this system — refusing one would make the model
+#: the retrainer promotes unloadable through its own registry.
+NATIVE_MODEL_SUFFIX = ".txt"
+
+
 class ModelIntegrityError(RuntimeError):
     """Raised when a model file's content hash doesn't match the value
     recorded on its ModelVersion DB row, or no recorded value exists.
@@ -37,6 +44,28 @@ class ModelIntegrityError(RuntimeError):
     """
 
 
+def _load_model_file(path: str):
+    """Load a model file by format.
+
+    Two writers exist and only one was readable. ``ModelRegistry.save`` writes
+    ``joblib.dump`` to ``.joblib``; ``scripts/retrain_model.py`` writes
+    ``Booster.save_model`` to ``.txt`` and records a ``ModelVersion`` row
+    pointing at it. ``load_active`` only ever did ``joblib.load``, so the model
+    the retrainer *promotes* could never be loaded back through the registry.
+
+    Dispatching on the suffix rather than sniffing content: the suffix is what
+    each writer controls and is already recorded on the row, and content
+    sniffing would mean partially deserializing an unverified file — which is
+    the thing ``_verify_integrity`` exists to prevent. The hash check runs
+    before this either way.
+    """
+    if path.endswith(NATIVE_MODEL_SUFFIX):
+        import lightgbm as lgb
+
+        return lgb.Booster(model_file=path)
+    return joblib.load(path)
+
+
 class ModelRegistry:
     """Manages ML model versioning, persistence, and activation.
 
@@ -49,6 +78,17 @@ class ModelRegistry:
         self._db = db_session
         self._model_dir = model_dir
         os.makedirs(self._model_dir, exist_ok=True)
+
+    @staticmethod
+    def hash_model_file(path: str) -> str:
+        """Content hash for a model file, for callers that write their own rows.
+
+        ``scripts/retrain_model.py`` persists a ``ModelVersion`` itself rather
+        than going through :meth:`save`, and recorded no hash at all — so
+        ``_verify_integrity`` refused every model it promoted. Exposed here so
+        the two agree by construction instead of by a copied implementation.
+        """
+        return _hash_file(path)
 
     def save(
         self,
@@ -110,7 +150,7 @@ class ModelRegistry:
 
         self._verify_integrity(record.model_path, record.version, record.content_hash)
 
-        model = joblib.load(record.model_path)
+        model = _load_model_file(record.model_path)
         return model, record.version
 
     def _verify_integrity(
