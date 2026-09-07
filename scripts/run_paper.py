@@ -1738,11 +1738,19 @@ def main() -> int | None:
         [DRILL_BASE_SLEEVE] if portfolio_tag else list(CAPITAL_ALLOCATIONS.keys())
     )
     print(f"\nFetching bars for {len(all_tickers)} tickers ({args.years} year)...")
+    # client_id is NOT optional here. The fetcher belongs to run_backtest and
+    # defaults to 10 — the backtest's own id — so omitting it made the daily run
+    # present the weekly refresh's identity on its historical-data connection.
+    # IB refuses a duplicate client id, so a catch-up started inside the Tuesday
+    # 05:00-11:00 refresh window failed at "No data fetched" below, naming the
+    # wrong cause. See run_backtest_refresh.sh, whose timeout design assumes
+    # these two never collide on identity.
     bars_by_ticker = fetch_bars_from_ib(
         tickers=all_tickers,
         years=args.years,
         host=args.ib_host,
         port=args.ib_port,
+        client_id=args.ib_client_id,
     )
 
     if not bars_by_ticker:

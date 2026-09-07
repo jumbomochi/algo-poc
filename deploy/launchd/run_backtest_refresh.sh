@@ -134,6 +134,13 @@ cd "$ALGO_DIR"
 # collision — the backtest uses 10, run_paper 58/59 — but they contend for the
 # same historical-data pacing budget.) On expiry: SIGTERM, then SIGKILL, then
 # exit 124, the conventional timeout code.
+#
+# That parenthetical was an assumption, not a fact, until KAN-69: run_paper's
+# bar fetch omitted client_id and inherited the backtest's 10, so the two DID
+# collide — and only on a catch-up inside this window, the recovery path a
+# missed run depends on. tests/scripts/test_paper_client_id.py now reads the
+# ids out of both scripts and fails if they stop being disjoint, so this
+# comment is enforced rather than believed.
 REFRESH_TIMEOUT="${ALGO_REFRESH_TIMEOUT_SECONDS:-21600}"   # 6h
 TIMEOUT_FLAG="$LOG_DIR/.refresh_timeout.$$"
 rm -f "$TIMEOUT_FLAG"
