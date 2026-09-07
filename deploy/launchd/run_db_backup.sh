@@ -17,7 +17,7 @@
 # calendar slot after a boot) cannot report its own absence, and a backup that
 # silently stopped is discovered at restore time, which is the worst possible
 # moment. So a *successful* dump pings $ALGO_DEADMAN_BACKUP_URL and an external
-# checker pages when the pings stop. Configure its period at ~26h.
+# checker pages when the pings stop. Configure its cron at `15 5 * * *` (daily).
 # See docs/operations/dead-man-switches.md.
 
 set -uo pipefail

@@ -116,8 +116,12 @@ enforces it: a new wrapper with neither reddens the suite.
 | `run_pipeline_report.sh` | — | **is** a dead-man: its whole output is a daily message, so a missed run shows up as a missing report. The jobs it reports on carry their own checks. |
 | `gateway_watchdog.sh` | — | `StartInterval`, so it has no slot to miss; a dead watchdog surfaces as an unreachable Gateway in the paper run and the refresh, both of which alert and both of which ping. The host-wide case belongs to `DEADMAN_WATCHDOG_URL`. |
 
-Suggested periods: ~26 h for the daily checks, ~8 days for the weekly refresh
-(one missed Tuesday pages; a late-finishing run does not).
+Give each check a cron matching its plist rather than a flat period, in
+**Asia/Singapore**: `15 4 * * 2-6` (paper), `45 4 * * 2-6` (divergence),
+`15 5 * * *` (backup), `0 5 * * 2` (refresh), `0 8 * * 1` (digest). The paper
+run and the divergence monitor are Tue–Sat, so a flat ~26 h period pages every
+Sunday and stays red all Monday. A check that has **never been pinged** does not
+alert at all — it needs one successful check-in to arm.
 
 Full setup, cadence guidance and the delivery drill:
 [`docs/operations/dead-man-switches.md`](../../docs/operations/dead-man-switches.md).

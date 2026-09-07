@@ -76,7 +76,7 @@
 # them would saturate the external check for the whole duration of a real drift
 # episode, which is precisely when telling "did not run" from "ran and found
 # something" matters most. Only exit 2 (nothing could be judged) stays silent.
-# Configure the external check with a period of ~26h. See
+# Configure the external check with the cron `45 4 * * 2-6` (SGT, Tue-Sat). See
 # docs/operations/dead-man-switches.md.
 
 set -uo pipefail
