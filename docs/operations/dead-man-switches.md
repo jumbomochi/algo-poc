@@ -73,6 +73,25 @@ the weekday set or the hour in this table stops matching them, so the table
 cannot drift the way the "runs daily including weekends" claim did between
 2026-08-21 and 2026-09-08.
 
+### The baseline has its own staleness check, and it is not a dead-man
+
+`ALGO_DEADMAN_REFRESH_URL` covers "the weekly refresh did not run". It cannot
+cover "the baseline is old", and the difference is not academic — it only pings
+on a **successful** refresh, so it cannot arm itself until the job it watches is
+already healthy, and an unpinged check never alerts (below). Between 2026-08-25
+and 2026-09-08 the baseline aged fourteen days with no page from anything.
+
+So the daily pipeline report measures the artifact on disk directly, every day,
+regardless of why it is old: the newest `output/backtest_multi_*.json` is
+reported with its age, and a **baseline** older than **8 days** is escalated as
+**stale** through `algo_alert_local` plus Telegram. Eight days is one missed
+Tuesday plus a day of slack — the same figure as the dead-man period,
+deliberately. No artifact at all is reported distinctly and alerts just as
+loudly, because absence of evidence must not render as freshness.
+
+Owned by `deploy/launchd/lib/baseline_age.sh`; threshold overridable with
+`ALGO_BASELINE_STALE_DAYS`.
+
 ### A check that has never been pinged does not alert
 
 This is the trap that cost two of the six switches. Importing the URL arms
