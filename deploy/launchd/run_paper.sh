@@ -170,8 +170,8 @@ fi
 # able to change its outcome.
 #
 # KAN-31 note: a publish failure now exits nonzero, so it withholds the ping and
-# the external check pages ~26h later with its documented meaning of "the
-# wrapper never ran". That is knowingly imprecise and knowingly kept: the run
+# the external check pages at its next Tue-Sat deadline with its documented
+# meaning of "the wrapper never ran". That is knowingly imprecise and kept: the run
 # put no orders in front of the broker, which is the class of silence this
 # switch exists to break. The local alert above carries the accurate diagnosis.
 algo_deadman_ping "$EXIT_CODE"

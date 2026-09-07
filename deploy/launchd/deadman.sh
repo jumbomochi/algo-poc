@@ -21,8 +21,9 @@
 # the absence of a message is the message.
 #
 #   ALGO_DEADMAN_PAPER_URL — pinged by run_paper.sh on a successful run.
-#     Configure the external check with a period of ~26h: one missed trading
-#     day pages, and a normal weekend does not (see "weekends" below).
+#     Configure the external check with the cron `15 4 * * 2-6` (SGT), matching
+#     the plist's Tue-Sat slots: one missed trading day pages, and a normal
+#     weekend does not (see "weekends" below).
 #
 # There is a second, wider dead-man switch that is NOT this file's job:
 # config/alert_rules.yml's always-firing Watchdog alert, which Alertmanager
@@ -41,11 +42,24 @@
 #
 # WEEKENDS AND HOLIDAYS
 # ---------------------
-# run_paper.sh runs every day, including weekends, and exits 0 on a
-# non-trading day (it simply commits no signals). So the ping arrives daily
-# and a ~26h external period is correct — deliberately NOT gated on the NYSE
-# calendar here, because a calendar bug would silence the dead-man switch,
-# which is the one failure mode it must not have.
+# This script is deliberately NOT gated on the NYSE calendar: a calendar bug
+# would silence the dead-man switch, which is the one failure mode it must not
+# have. On a non-trading day run_paper.sh still exits 0, having simply
+# committed no signals, and still pings.
+#
+# The SCHEDULE is a separate matter, and getting the two confused is what broke
+# the external check between 2026-08-21 and 2026-09-08. local.algo-paper-trading
+# and local.algo-divergence-monitor are Weekday 2-6 — Tuesday to Saturday SGT,
+# which is US Monday to Friday, because the 04:15 SGT run covers the session
+# that closed at 04:00 SGT that morning. Sunday and Monday are legitimately
+# quiet, so a flat ~26h external period is WRONG for these two: it pages every
+# Sunday and stays red through Monday. Give them a Tue-Sat cron instead
+# (`15 4 * * 2-6` and `45 4 * * 2-6`). The daily backup at 05:15 really is
+# every day and a ~26h period is right for it.
+#
+# docs/operations/dead-man-switches.md carries the full table, and
+# tests/operations/test_dead_man_switches_note.py fails if it stops matching
+# the plists.
 #
 # Usage (sourced, after secrets.sh):
 #   . "$ALGO_DIR/deploy/launchd/deadman.sh"
