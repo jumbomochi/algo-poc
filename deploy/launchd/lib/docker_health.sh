@@ -106,13 +106,62 @@ algo_docker_daemon_ok() {
     "$ALGO_DOCKER_BIN" info >/dev/null 2>&1
 }
 
+# Run a command with a hard bound. Returns 124 on expiry, the conventional
+# timeout(1) code, which the commands used here cannot produce themselves.
+# Done with a killer subshell rather than timeout(1) because production is
+# macOS, which does not ship it, and CI is ubuntu, which does — a chain that
+# silently behaves differently on the two is how the `stat -f %m` bug happened.
+_algo_docker_bounded() {
+    local secs="$1"; shift
+    local tmp; tmp="$(mktemp)" || return 1
+    "$@" >"$tmp" 2>/dev/null &
+    local pid=$!
+    # Both background jobs MUST have stdout redirected away. Command
+    # substitution does not return until every inherited descriptor is closed,
+    # so a killer that keeps the pipe open makes `$(...)` wait out the whole
+    # sleep — turning the bound into the very stall it exists to prevent.
+    ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+    local killer=$!
+    local rc=0
+    wait "$pid" 2>/dev/null || rc=$?
+    kill "$killer" 2>/dev/null
+    wait "$killer" 2>/dev/null
+    cat "$tmp"
+    rm -f "$tmp"
+    [ "$rc" -ge 128 ] && return 124
+    return "$rc"
+}
+
 # Services docker-compose.yml declares, one per line. Best-effort: the compose
 # file interpolates ${POSTGRES_PASSWORD:?} / ${REDIS_PASSWORD:?}, so this fails
 # when the keychain is locked. A failure degrades to "compare nothing", never to
 # a false healthy — the observed-container scan below still runs.
+#
+# --env-file /dev/null is not an optimisation. `docker compose config` reads the
+# project .env to interpolate, and this repo's .env is a named pipe that
+# 1Password serves; when nothing is serving it the read BLOCKS. That is the
+# 2026-08-13 outage exactly, and it was still live here: from 2026-08-27 every
+# scheduled cycle took the "could not read" branch below, and because launchd
+# will not start a second instance while the first is stuck, the 300s watchdog
+# ran every ~10 minutes instead of every 5. The values this interpolates are
+# already exported by secrets.sh (:241), so the file is redundant — dropping it
+# costs nothing and removes the only blocking read in the cycle. With a locked
+# keychain compose now fails fast and loudly instead of hanging, which is the
+# same degrade-to-"compare nothing" outcome, promptly.
 algo_docker_expected_services() {
     [ -n "$ALGO_DOCKER_BIN" ] || return 0
-    (cd "${ALGO_DIR:-.}" 2>/dev/null && "$ALGO_DOCKER_BIN" compose config --services 2>/dev/null) | sed '/^$/d'
+    local out rc=0
+    out="$(cd "${ALGO_DIR:-.}" 2>/dev/null && _algo_docker_bounded \
+            "${ALGO_DOCKER_CONFIG_TIMEOUT:-30}" \
+            "$ALGO_DOCKER_BIN" compose --env-file /dev/null config --services)" || rc=$?
+    if [ "$rc" -eq 124 ]; then
+        # Distinct from the caller's generic "could not read": blocked and
+        # unparseable are different diagnoses, and three weeks were lost to
+        # them looking identical.
+        _algo_docker_log "WARNING - \`docker compose config --services\` did not return within ${ALGO_DOCKER_CONFIG_TIMEOUT:-30}s and was killed; a missing container cannot be detected this cycle"
+        return 0
+    fi
+    printf '%s\n' "$out" | sed '/^$/d'
 }
 
 # Every container in the compose project: "<service>|<state>|<status>".
