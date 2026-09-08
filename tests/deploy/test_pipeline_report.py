@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -342,7 +343,8 @@ RUN_REPORT = DEPLOY_DIR / "run_pipeline_report.sh"
 
 def _drive_wrapper(tmp_path, *, paper_log="paper run finished, exit code: 0\n",
                    seed=None, database_url=None, curl_exit=0,
-                   launchd_installed=(), launchd_loaded=()):
+                   launchd_installed=(), launchd_loaded=(),
+                   baseline_age_days=0):
     """Run run_pipeline_report.sh end-to-end against stubs.
 
     Everything it reaches out to is stubbed on PATH: ``docker`` (compose logs
@@ -362,6 +364,16 @@ def _drive_wrapper(tmp_path, *, paper_log="paper run finished, exit code: 0\n",
         (home / "ibc" / "logs" / f"paper_trading_{today}.log").write_text(
             "  BUY  AAPL 10\n  SELL MSFT 5\n  SKIP NVDA\n" + paper_log
         )
+
+    # A baseline artifact the test controls, rather than the repo's real one.
+    # `baseline_age_days=None` means "no artifact at all".
+    baseline_dir = tmp_path / "output"
+    baseline_dir.mkdir(exist_ok=True)
+    if baseline_age_days is not None:
+        artifact = baseline_dir / "backtest_multi_20260901_050000.json"
+        artifact.write_text("{}")
+        stamp = time.time() - baseline_age_days * 86400
+        os.utime(artifact, (stamp, stamp))
 
     db = tmp_path / "report.db"
     if database_url is None:
@@ -430,6 +442,13 @@ exit 0
         ALGO_OSASCRIPT_BIN=str(bin_dir / "osascript"),
         ALGO_KEYCHAIN_SERVICE="algo-poc-absent-test-service",
         ALGO_LAUNCHCTL_BIN=str(launchctl),
+        # KAN-71's baseline-age check (lib/baseline_age.sh) defaults to
+        # $ALGO_DIR/output, and ALGO_DIR above is the REAL repo — so without
+        # this every test here would read the operator's actual artifacts and
+        # its message count would depend on when the weekly refresh last ran.
+        # Fresh by default, so a test that says nothing about the baseline gets
+        # the quiet path; `baseline_age_days` makes the stale case explicit.
+        ALGO_BASELINE_DIR=str(baseline_dir),
     )
     res = subprocess.run(
         [str(RUN_REPORT)], capture_output=True, text=True,
@@ -750,3 +769,54 @@ def test_a_fully_wired_host_adds_no_extra_message(tmp_path):
     )
 
     assert len(sends) == 1, sends
+
+
+# ---------------------------------------------------------------------------
+# Divergence baseline age (KAN-71)
+# ---------------------------------------------------------------------------
+# The weekly refresh already warns "getting stale" when it fails — but it warns
+# from inside the failing run, so the case where it never started is exactly the
+# case nothing reported. Between 2026-08-25 and 2026-09-08 the baseline aged
+# fourteen days with no page from anything. These assert on the message actually
+# sent, because a section in a log body would reproduce the failure.
+
+
+def _bodies(sends) -> list[str]:
+    return [
+        line[len("text="):]
+        for send in sends
+        for line in send.splitlines()
+        if line.startswith("text=")
+    ]
+
+
+def test_a_fresh_baseline_adds_no_extra_message(tmp_path):
+    """A healthy week stays one line. An alarm that fires every day is one the
+    operator stops reading, which is how the fourteen days happened."""
+    _, sends, log = _drive_wrapper(tmp_path, baseline_age_days=1)
+    assert len(sends) == 1, _bodies(sends)
+    assert "1d old" in log, log
+
+
+def test_a_stale_baseline_escalates_rather_than_only_logging(tmp_path):
+    _, sends, log = _drive_wrapper(tmp_path, baseline_age_days=14)
+    bodies = _bodies(sends)
+    assert any("baseline STALE" in b and "14d old" in b for b in bodies), bodies
+    assert "14d old" in log, log
+
+
+def test_no_baseline_at_all_is_reported_distinctly_and_still_alerts(tmp_path):
+    """Absence of evidence must not render as freshness."""
+    _, sends, _ = _drive_wrapper(tmp_path, baseline_age_days=None)
+    bodies = _bodies(sends)
+    assert any("baseline MISSING" in b for b in bodies), bodies
+    assert not any("baseline STALE" in b for b in bodies), bodies
+
+
+def test_the_stale_baseline_alert_also_reaches_the_local_path(tmp_path):
+    """Telegram needs a working network and a resolvable credential. The local
+    ALERTS.log is what survives when it does not — the 2026-08-13 lesson."""
+    _, _, _ = _drive_wrapper(tmp_path, baseline_age_days=14)
+    alerts = (tmp_path / "home" / "ibc" / "logs" / "ALERTS.log")
+    assert alerts.exists(), "no ALERTS.log written"
+    assert "baseline STALE" in alerts.read_text(), alerts.read_text()

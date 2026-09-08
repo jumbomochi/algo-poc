@@ -65,6 +65,10 @@ ALGO_JOB_LABEL="pipeline report"
 # which is the job that was not loaded.
 # shellcheck source=deploy/launchd/lib/launchd_wiring.sh
 . "$ALGO_DIR/deploy/launchd/lib/launchd_wiring.sh"
+# Age of the divergence baseline (KAN-71), checked here rather than inside the
+# weekly refresh — the refresh cannot report on a run that never started.
+# shellcheck source=deploy/launchd/lib/baseline_age.sh
+. "$ALGO_DIR/deploy/launchd/lib/baseline_age.sh"
 
 ts() { date "+%Y-%m-%d %H:%M:%S %Z"; }
 
@@ -147,6 +151,14 @@ PYEOF
     printf '%s' "$ALGO_LAUNCHD_REPORT"
     [ -n "$ALGO_LAUNCHD_UNLOADED" ] && algo_launchd_bootstrap_hint
 
+    echo; echo "===== divergence baseline age ====="
+    # Independent of the weekly refresh on purpose. run_backtest_refresh.sh only
+    # says "getting stale" when it RUNS and fails; on 2026-08-11 it never ran at
+    # all and the baseline aged in silence. Measured from the artifact on disk,
+    # every day, regardless of why it is old.
+    algo_baseline_age_check
+    printf '%s\n' "$ALGO_BASELINE_DETAIL"
+
     echo; echo "===== equity snapshots (record continuity) ====="
     docker compose exec -T postgres psql -U algo -d algo_poc -t -c \
       "SELECT date, COUNT(*), ROUND(SUM(equity)::numeric,2) FROM equity_snapshots WHERE portfolio NOT LIKE '\_%' GROUP BY date ORDER BY date DESC LIMIT 7;" 2>&1
@@ -192,6 +204,17 @@ fi
 if [ -n "$WIRING" ]; then
     algo_alert_local "$WIRING"
     telegram "$WIRING"
+fi
+
+# A stale baseline is alert-worthy for the same reason the wiring is: the
+# refresh's own "getting stale" line requires the refresh to have run, so the
+# case where it never ran — 2026-08-11, and 2026-08-25 to 2026-09-08 — is
+# precisely the case nothing reported. Escalated through both paths rather than
+# printed into the body above, on the KAN-64 precedent.
+BASELINE_MSG=$(algo_baseline_alert_body)
+if [ -n "$BASELINE_MSG" ]; then
+    algo_alert_local "$BASELINE_MSG"
+    telegram "$BASELINE_MSG"
 fi
 
 telegram "$SUMMARY | $RUN_STATUS | divergence: ${DIV:-no log} | ${RESTING:-IB check failed} | $SNAP"
