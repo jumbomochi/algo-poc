@@ -341,10 +341,36 @@ DEPLOY_DIR = REPO / "deploy" / "launchd"
 RUN_REPORT = DEPLOY_DIR / "run_pipeline_report.sh"
 
 
+def _make_branch_fixture(deploy: Path, state: str) -> None:
+    """A tiny repo standing in for the deploy tree, in a known branch state."""
+    def git(cwd, *args):
+        env = dict(
+            os.environ,
+            GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+            GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t",
+        )
+        subprocess.run(["git", *args], cwd=cwd, check=True, env=env,
+                       capture_output=True, timeout=60)
+
+    origin = deploy.parent / "deployorigin"
+    origin.mkdir(parents=True)
+    git(origin, "init", "-q", "-b", "main")
+    (origin / "f.txt").write_text("one")
+    git(origin, "add", "f.txt")
+    git(origin, "commit", "-q", "-m", "one")
+    deploy.parent.mkdir(parents=True, exist_ok=True)
+    git(deploy.parent, "clone", "-q", str(origin), str(deploy))
+    if state == "unpromoted":
+        git(deploy, "checkout", "-q", "-b", "feature/x")
+        (deploy / "f.txt").write_text("local only")
+        git(deploy, "add", "f.txt")
+        git(deploy, "commit", "-q", "-m", "unpromoted")
+
+
 def _drive_wrapper(tmp_path, *, paper_log="paper run finished, exit code: 0\n",
                    seed=None, database_url=None, curl_exit=0,
                    launchd_installed=(), launchd_loaded=(),
-                   baseline_age_days=0):
+                   baseline_age_days=0, branch_state="promoted"):
     """Run run_pipeline_report.sh end-to-end against stubs.
 
     Everything it reaches out to is stubbed on PATH: ``docker`` (compose logs
@@ -364,6 +390,14 @@ def _drive_wrapper(tmp_path, *, paper_log="paper run finished, exit code: 0\n",
         (home / "ibc" / "logs" / f"paper_trading_{today}.log").write_text(
             "  BUY  AAPL 10\n  SELL MSFT 5\n  SKIP NVDA\n" + paper_log
         )
+
+    # A throwaway repo for KAN-73's branch guard, for the same reason as the
+    # baseline dir below: ALGO_DIR is the REAL repo, so without this every test
+    # here would `ls-remote` to GitHub (75s instead of 15s), and in CI, where
+    # actions/checkout leaves a detached HEAD and often no origin/main ref, the
+    # check would report "unknown" and fire an extra alert.
+    branch_dir = tmp_path / "deploytree"
+    _make_branch_fixture(branch_dir, branch_state)
 
     # A baseline artifact the test controls, rather than the repo's real one.
     # `baseline_age_days=None` means "no artifact at all".
@@ -449,6 +483,7 @@ exit 0
         # Fresh by default, so a test that says nothing about the baseline gets
         # the quiet path; `baseline_age_days` makes the stale case explicit.
         ALGO_BASELINE_DIR=str(baseline_dir),
+        ALGO_BRANCH_DIR=str(branch_dir),
     )
     res = subprocess.run(
         [str(RUN_REPORT)], capture_output=True, text=True,
@@ -820,3 +855,42 @@ def test_the_stale_baseline_alert_also_reaches_the_local_path(tmp_path):
     alerts = (tmp_path / "home" / "ibc" / "logs" / "ALERTS.log")
     assert alerts.exists(), "no ALERTS.log written"
     assert "baseline STALE" in alerts.read_text(), alerts.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Deploy branch guard (KAN-73)
+# ---------------------------------------------------------------------------
+# On 2026-09-08 the deploy tree was found on develop, four commits ahead of
+# main, and later on a main ref 38 commits stale — silently running the live
+# host on rolled-back code. Every other drift guard was correctly silent,
+# because each was true. Nothing asked which commit the tree was on.
+
+
+def test_a_promoted_deploy_adds_no_extra_message(tmp_path):
+    """The healthy case is the common case and must stay quiet."""
+    _, sends, log = _drive_wrapper(tmp_path, branch_state="promoted")
+    assert len(sends) == 1, _bodies(sends)
+    assert "is origin/main" in log, log
+
+
+def test_an_unpromoted_deploy_escalates_rather_than_only_logging(tmp_path):
+    _, sends, log = _drive_wrapper(tmp_path, branch_state="unpromoted")
+    bodies = _bodies(sends)
+    assert any("UNPROMOTED" in b for b in bodies), bodies
+    assert any("feature/x" in b for b in bodies), bodies
+    assert "NOT contained in origin/main" in log, log
+
+
+def test_the_unpromoted_alert_also_reaches_the_local_path(tmp_path):
+    """Telegram needs network and a credential; ALERTS.log is what survives."""
+    _drive_wrapper(tmp_path, branch_state="unpromoted")
+    alerts = tmp_path / "home" / "ibc" / "logs" / "ALERTS.log"
+    assert alerts.exists(), "no ALERTS.log written"
+    assert "UNPROMOTED" in alerts.read_text(), alerts.read_text()
+
+
+def test_the_branch_check_never_changes_the_report_exit_code(tmp_path):
+    """Non-blocking by design: a reporting problem must not become a missed
+    session, because missed sessions are permanent evidence holes."""
+    res, _, _ = _drive_wrapper(tmp_path, branch_state="unpromoted")
+    assert res.returncode == 0, res.stderr
