@@ -69,6 +69,10 @@ ALGO_JOB_LABEL="pipeline report"
 # weekly refresh — the refresh cannot report on a run that never started.
 # shellcheck source=deploy/launchd/lib/baseline_age.sh
 . "$ALGO_DIR/deploy/launchd/lib/baseline_age.sh"
+# Is this tree running promoted code (KAN-73)? On 2026-09-08 it was found on
+# develop, then on a main ref 38 commits stale, and nothing said a word.
+# shellcheck source=deploy/launchd/lib/branch_guard.sh
+. "$ALGO_DIR/deploy/launchd/lib/branch_guard.sh"
 
 ts() { date "+%Y-%m-%d %H:%M:%S %Z"; }
 
@@ -151,6 +155,13 @@ PYEOF
     printf '%s' "$ALGO_LAUNCHD_REPORT"
     [ -n "$ALGO_LAUNCHD_UNLOADED" ] && algo_launchd_bootstrap_hint
 
+    echo; echo "===== deploy branch (is this promoted code?) ====="
+    # Every other drift guard here — schema, wrapper cmp, .env, plists — was
+    # correctly silent through both 2026-09-08 states, because each was true.
+    # The tree was self-consistent; it just was not what had been promoted.
+    algo_branch_check
+    printf '%s\n' "$ALGO_BRANCH_DETAIL"
+
     echo; echo "===== divergence baseline age ====="
     # Independent of the weekly refresh on purpose. run_backtest_refresh.sh only
     # says "getting stale" when it RUNS and fails; on 2026-08-11 it never ran at
@@ -215,6 +226,15 @@ BASELINE_MSG=$(algo_baseline_alert_body)
 if [ -n "$BASELINE_MSG" ]; then
     algo_alert_local "$BASELINE_MSG"
     telegram "$BASELINE_MSG"
+fi
+
+# Running unpromoted code is alert-worthy for the same reason the wiring and the
+# baseline are: the failure mode is silence by construction. Non-blocking by
+# design — see lib/branch_guard.sh on why this must never gate a run.
+BRANCH_MSG=$(algo_branch_alert_body)
+if [ -n "$BRANCH_MSG" ]; then
+    algo_alert_local "$BRANCH_MSG"
+    telegram "$BRANCH_MSG"
 fi
 
 telegram "$SUMMARY | $RUN_STATUS | divergence: ${DIV:-no log} | ${RESTING:-IB check failed} | $SNAP"
