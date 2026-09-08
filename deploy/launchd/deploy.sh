@@ -48,6 +48,7 @@ if [ "$DRY_RUN" = "0" ]; then
 fi
 
 changed=0
+failed=0
 reload_labels=()
 
 sync_one() {
@@ -69,8 +70,42 @@ sync_one() {
         echo "NEW:     $dst"
     fi
     if [ "$DRY_RUN" = "0" ]; then
-        cp "$src" "$dst"
-        [ "$mode" = "exec" ] && chmod +x "$dst"
+        # ATOMIC INSTALL — do not replace with a plain `cp "$src" "$dst"`.
+        #
+        # cp truncates and rewrites the SAME inode, and bash does not read a
+        # script into memory: it reads incrementally and remembers a byte
+        # offset. A shell already executing $dst therefore resumes at its old
+        # offset inside the new content. On 2026-09-08 a backtest refresh that
+        # started at 06:30 took a deploy at 07:54 (+7 lines) and, on its next
+        # read, died with "line 248: ith: command not found" — seven lines
+        # adrift, mid-word. That skipped the whole tail of the wrapper, which is
+        # where refresh_exit's single dead-man decision, the TIMEOUT_FLAG branch
+        # and the output/ prune protection live. run_paper.sh runs for minutes
+        # from 04:15, so the same hazard applies to a live trading run.
+        #
+        # rename(2) is atomic and leaves the old inode readable until the last
+        # descriptor closes, so a running job finishes against the version it
+        # started with and the next invocation gets the new one. The mode is set
+        # on the staged file, before the rename, so $dst never exists with the
+        # wrong permissions.
+        local tmp="$dst.deploy.$$"
+        if ! cp "$src" "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+            echo "    ERROR: could not stage $dst — leaving the existing copy in place" >&2
+            failed=$((failed + 1))
+            return 1
+        fi
+        if [ "$mode" = "exec" ]; then
+            chmod 755 "$tmp"
+        else
+            chmod 644 "$tmp"
+        fi
+        if ! mv -f "$tmp" "$dst" 2>/dev/null; then
+            rm -f "$tmp"
+            echo "    ERROR: could not install $dst — leaving the existing copy in place" >&2
+            failed=$((failed + 1))
+            return 1
+        fi
     fi
     # If this is a plist, remember its label for the reload hint.
     case "$dst" in
@@ -128,6 +163,12 @@ if [ "$DRY_RUN" = "1" ]; then
     exit 0
 fi
 
+if [ "$failed" -gt 0 ]; then
+    echo ""
+    echo "$failed file(s) FAILED to install; the previous copies are untouched." >&2
+    echo "Fix the cause and re-run — nothing was left half-written." >&2
+fi
+
 echo "$changed file(s) synced."
 if [ "${#reload_labels[@]}" -gt 0 ]; then
     echo ""
@@ -139,3 +180,8 @@ if [ "${#reload_labels[@]}" -gt 0 ]; then
         echo "    launchctl list | grep $label"
     done
 fi
+
+# A partial deploy must not report success: some wrappers would be new and some
+# stale, which is the hardest state to reason about during an incident.
+[ "$failed" -gt 0 ] && exit 1
+exit 0
