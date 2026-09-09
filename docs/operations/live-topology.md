@@ -77,6 +77,33 @@ to serve it. Both faults are fixed and pinned by a round-trip test using a real
 LightGBM `Booster`; a stub would round-trip through joblib happily and prove
 nothing about the formats.
 
+## Host prerequisite: the machine must not sleep
+
+```
+sudo pmset -a sleep 0
+```
+
+Every scheduled job here talks to IB Gateway over a socket that does not survive
+a system sleep. On 2026-09-09 the host was found with **`pmset sleep 1`** — idle
+sleep after one minute — and 57 sleep events in a single day. A 04:15 paper run
+recorded 39 × `Error 1100` (connectivity lost) against 38 × `Error 1102`
+(restored), 69 × `Error 322`, and 87 consecutive zero-bar fetches at ~61s each.
+It reached ticker 88 of 140 in fifteen hours with nothing usable, so the 04:47
+divergence monitor exited 3 (BLIND). The same signature explains the weekly
+refresh wedging at 22 of 826 the day before, and the `IB Gateway never came up
+on 7497` aborts on 09-01 and 09-04.
+
+`sleep 0` is the host half. The code half is `deploy/launchd/lib/power.sh`,
+which re-execs each long-running wrapper under `caffeinate -is` so a job is
+protected even if this setting is changed, the machine is replaced, or a backup
+is restored. Both are wanted; neither replaces the other.
+
+Check it with `pmset -g custom`. Note that **`sleep 0` does not stop
+`Dark Wake Thermal Emergency`** sleeps — 37 of that day's 57 were those, and
+they are the machine shutting down from heat during dark wake. Residual sleeps
+of that kind after this change are an airflow or hardware problem, not evidence
+that the setting failed to apply.
+
 ## How to re-check these numbers
 
 ```bash
