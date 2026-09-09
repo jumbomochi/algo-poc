@@ -33,7 +33,7 @@ LOG_DIR="$HOME/ibc/logs"
 LOG_FILE="$LOG_DIR/db_backup_$(date +%Y%m%d).log"
 DUMP_FILE="$BACKUP_DIR/algo_poc_$(date +%Y%m%d_%H%M%S).dump"
 RETENTION_DAYS=30
-ALGO_DIR="/Users/huiliang/GitHub/algo-poc"
+ALGO_DIR="${ALGO_DIR:-/Users/huiliang/GitHub/algo-poc}"
 # Secrets come from the macOS login keychain via the shared loader. Sourced by
 # path from the repo (never from the deployed ~/ibc copy) so there is exactly
 # one implementation of the lookup and it cannot drift.
@@ -64,6 +64,24 @@ fail() {
 }
 
 mkdir -p "$BACKUP_DIR" "$LOG_DIR"
+# Hold a power assertion for the life of this run (KAN-77). The host was found
+# idle-sleeping after one minute on 2026-09-09, which severs the IB connection
+# mid-run and makes every historical data request time out. Taken here, before
+# the run announces itself, so it covers the whole job.
+#
+# The missing-lib branch is not defensive padding: `. missing.sh` fails without
+# aborting under `set -uo pipefail`, so the next line would be a bare
+# "command not found" and the run would continue with no assertion and no
+# record of why. Silence is the failure mode this whole tranche exists to break.
+# shellcheck source=deploy/launchd/lib/power.sh
+. "$ALGO_DIR/deploy/launchd/lib/power.sh" 2>/dev/null
+if command -v algo_hold_power_assertion >/dev/null 2>&1; then
+    algo_hold_power_assertion "$@"
+else
+    echo "$(date): WARNING - $ALGO_DIR/deploy/launchd/lib/power.sh could not be sourced;" \
+         "this run holds no power assertion (KAN-77). Running anyway." >> "$LOG_FILE"
+fi
+
 echo "$(ts): Starting daily paper-DB backup" >> "$LOG_FILE"
 
 # Drift guard: warn loudly if this deployed copy has fallen behind the repo
