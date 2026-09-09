@@ -254,6 +254,18 @@ class FetchSummary:
     def is_complete(self) -> bool:
         return not self.empty
 
+    @property
+    def coverage(self) -> float:
+        """Fraction of requested tickers that came back with any bars.
+
+        1.0 for an empty request: nothing asked for is not the same fact as
+        nothing returned, and a caller gating on this must not divide by zero
+        in the run it exists to protect.
+        """
+        if self.requested == 0:
+            return 1.0
+        return self.fetched / self.requested
+
     def summary_line(self) -> str:
         """One line for the run log, naming the gap rather than hiding it."""
         if self.is_complete:
