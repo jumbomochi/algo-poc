@@ -17,6 +17,7 @@ than a paraphrase of it.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -341,6 +342,40 @@ DEPLOY_DIR = REPO / "deploy" / "launchd"
 RUN_REPORT = DEPLOY_DIR / "run_pipeline_report.sh"
 
 
+def _make_baseline_tree(output_dir: Path, state: str) -> str:
+    """Lay out a pin + newest artifact in a known state.
+
+    Returns the path to use as ALGO_BASELINE_PIN. "unresolved" returns an empty
+    string, which is how an unpinned config presents to the lib.
+    """
+    def artifact(name: str, *, age_days: float, coverage: str) -> Path:
+        f = output_dir / name
+        f.write_text(json.dumps({
+            "config": {"coverage": {"excluded_pct": 17.39, "floor_pct": 5.0,
+                                    "state": coverage}},
+        }, indent=2))
+        stamp = time.time() - age_days * 86400
+        os.utime(f, (stamp, stamp))
+        return f
+
+    if state == "unresolved":
+        # Blanking ALGO_BASELINE_PIN is not enough: baseline_pin.py then falls
+        # through to the real config, which HAS a pin. The unpinned case has to
+        # be driven through a config the resolver cannot read.
+        artifact("backtest_multi_20260901_050000.json", age_days=1, coverage="OK")
+        return ""
+    if state == "missing":
+        return str(output_dir / "backtest_multi_gone.json")
+    if state == "stale":
+        return str(artifact("backtest_multi_old.json", age_days=45, coverage="OK"))
+    if state == "unusable":
+        pin = artifact("backtest_multi_pin.json", age_days=5, coverage="OK")
+        artifact("backtest_multi_new.json", age_days=0, coverage="BLOCKED")
+        return str(pin)
+    # "ok": a recent, usable pin and nothing newer that is unusable
+    return str(artifact("backtest_multi_pin.json", age_days=1, coverage="OK"))
+
+
 def _make_branch_fixture(deploy: Path, state: str) -> None:
     """A tiny repo standing in for the deploy tree, in a known branch state."""
     def git(cwd, *args):
@@ -370,7 +405,7 @@ def _make_branch_fixture(deploy: Path, state: str) -> None:
 def _drive_wrapper(tmp_path, *, paper_log="paper run finished, exit code: 0\n",
                    seed=None, database_url=None, curl_exit=0,
                    launchd_installed=(), launchd_loaded=(),
-                   baseline_age_days=0, branch_state="promoted"):
+                   baseline="ok", branch_state="promoted"):
     """Run run_pipeline_report.sh end-to-end against stubs.
 
     Everything it reaches out to is stubbed on PATH: ``docker`` (compose logs
@@ -399,15 +434,14 @@ def _drive_wrapper(tmp_path, *, paper_log="paper run finished, exit code: 0\n",
     branch_dir = tmp_path / "deploytree"
     _make_branch_fixture(branch_dir, branch_state)
 
-    # A baseline artifact the test controls, rather than the repo's real one.
-    # `baseline_age_days=None` means "no artifact at all".
+    # A baseline tree the test controls, rather than the repo's real one.
+    # Both halves must be injected: ALGO_BASELINE_DIR for the artifacts AND
+    # ALGO_BASELINE_PIN for the pin, because the check resolves the pin through
+    # baseline_pin.py, which would otherwise read the REAL config and judge the
+    # operator's actual 240MB artifacts.
     baseline_dir = tmp_path / "output"
     baseline_dir.mkdir(exist_ok=True)
-    if baseline_age_days is not None:
-        artifact = baseline_dir / "backtest_multi_20260901_050000.json"
-        artifact.write_text("{}")
-        stamp = time.time() - baseline_age_days * 86400
-        os.utime(artifact, (stamp, stamp))
+    baseline_pin = _make_baseline_tree(baseline_dir, baseline)
 
     db = tmp_path / "report.db"
     if database_url is None:
@@ -458,6 +492,10 @@ exit {curl_exit}
     fake_python = stub("fake-python", f"""#!/bin/bash
 case "$1" in
   *pipeline_report_summary.py) exec {sys.executable} "$@" ;;
+  # KAN-71's baseline check resolves the pin through this script. Without the
+  # passthrough the stub's fallback echo below is taken as the pin PATH, which
+  # is how "pinned baseline 2 resting orders is MISSING" happens.
+  *baseline_pin.py) exec {sys.executable} "$@" ;;
 esac
 echo "2 resting orders"
 exit 0
@@ -483,6 +521,9 @@ exit 0
         # Fresh by default, so a test that says nothing about the baseline gets
         # the quiet path; `baseline_age_days` makes the stale case explicit.
         ALGO_BASELINE_DIR=str(baseline_dir),
+        ALGO_BASELINE_PIN=str(baseline_pin),
+        **({"ALGO_BASELINE_CONFIG": str(tmp_path / "no-such-config.yaml")}
+           if baseline == "unresolved" else {}),
         ALGO_BRANCH_DIR=str(branch_dir),
     )
     res = subprocess.run(
@@ -825,36 +866,51 @@ def _bodies(sends) -> list[str]:
     ]
 
 
-def test_a_fresh_baseline_adds_no_extra_message(tmp_path):
+def test_a_healthy_pin_adds_no_extra_message(tmp_path):
     """A healthy week stays one line. An alarm that fires every day is one the
-    operator stops reading, which is how the fourteen days happened."""
-    _, sends, log = _drive_wrapper(tmp_path, baseline_age_days=1)
+    operator stops reading."""
+    _, sends, log = _drive_wrapper(tmp_path, baseline="ok")
     assert len(sends) == 1, _bodies(sends)
-    assert "1d old" in log, log
+    assert "pin is" in log, log
 
 
-def test_a_stale_baseline_escalates_rather_than_only_logging(tmp_path):
-    _, sends, log = _drive_wrapper(tmp_path, baseline_age_days=14)
+def test_a_stale_pin_escalates_rather_than_only_logging(tmp_path):
+    _, sends, log = _drive_wrapper(tmp_path, baseline="stale")
     bodies = _bodies(sends)
-    assert any("baseline STALE" in b and "14d old" in b for b in bodies), bodies
-    assert "14d old" in log, log
+    assert any("PIN STALE" in b and "45d old" in b for b in bodies), bodies
+    assert "45d old" in log, log
 
 
-def test_no_baseline_at_all_is_reported_distinctly_and_still_alerts(tmp_path):
-    """Absence of evidence must not render as freshness."""
-    _, sends, _ = _drive_wrapper(tmp_path, baseline_age_days=None)
+def test_a_refresh_that_produced_an_unusable_baseline_alerts(tmp_path):
+    """The 2026-09-10 state: the pin is fine, but the refresh that just ran
+    produced something that can never replace it. Silent before this change."""
+    _, sends, log = _drive_wrapper(tmp_path, baseline="unusable")
     bodies = _bodies(sends)
-    assert any("baseline MISSING" in b for b in bodies), bodies
-    assert not any("baseline STALE" in b for b in bodies), bodies
+    assert any("UNUSABLE" in b for b in bodies), bodies
+    assert "cannot be pinned" in log, log
 
 
-def test_the_stale_baseline_alert_also_reaches_the_local_path(tmp_path):
+def test_a_missing_pin_is_reported_distinctly_from_a_stale_one(tmp_path):
+    """Absence of evidence must not render as freshness, and "gone" needs a
+    different fix from "old"."""
+    _, sends, _ = _drive_wrapper(tmp_path, baseline="missing")
+    bodies = _bodies(sends)
+    assert any("PIN MISSING" in b for b in bodies), bodies
+    assert not any("PIN STALE" in b for b in bodies), bodies
+
+
+def test_an_unpinned_config_alerts(tmp_path):
+    _, sends, _ = _drive_wrapper(tmp_path, baseline="unresolved")
+    assert any("UNPINNED" in b for b in _bodies(sends)), _bodies(sends)
+
+
+def test_the_baseline_alert_also_reaches_the_local_path(tmp_path):
     """Telegram needs a working network and a resolvable credential. The local
     ALERTS.log is what survives when it does not — the 2026-08-13 lesson."""
-    _, _, _ = _drive_wrapper(tmp_path, baseline_age_days=14)
+    _drive_wrapper(tmp_path, baseline="stale")
     alerts = (tmp_path / "home" / "ibc" / "logs" / "ALERTS.log")
     assert alerts.exists(), "no ALERTS.log written"
-    assert "baseline STALE" in alerts.read_text(), alerts.read_text()
+    assert "PIN STALE" in alerts.read_text(), alerts.read_text()
 
 
 # ---------------------------------------------------------------------------

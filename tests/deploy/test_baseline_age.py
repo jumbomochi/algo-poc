@@ -1,30 +1,45 @@
-"""The divergence baseline must be reported stale by something other than the refresh.
+"""The baseline check must judge the PINNED baseline, not the newest artifact.
 
-``run_backtest_refresh.sh:246`` already says "divergence baseline is getting
-stale" — but it says it *from inside the failing run*, so it cannot fire for the
-case that matters most: a run that never starts. On 2026-08-11 the host booted
-after the 05:00 slot, launchd did not re-fire the missed job, and nothing said a
-word. The dead-man switch is the mechanism designed for that and could not help
-either, because ``ALGO_DEADMAN_REFRESH_URL`` only pings on a *successful*
-refresh — it cannot arm itself until the job it watches is already healthy, and
-an unpinged healthchecks.io check never alerts (KAN-65).
+KAN-71 shipped a daily staleness check that picked the newest
+``output/backtest_multi_*.json`` by mtime. On 2026-09-10 the weekly refresh
+succeeded for the first time in three weeks and the check went quiet:
 
-Net effect, measured on 2026-09-08: the newest artifact was
-``backtest_multi_20260825_102450.json``, fourteen days old, and the daily
-pipeline report did not mention the baseline at all — grepping it for
-stale|baseline|refresh matched one line, ``local.algo-backtest-refresh: loaded``,
-which is KAN-64's launchd wiring section and says nothing about the artifact.
+    status: fresh
+    detail: backtest_multi_20260910_235624.json is 0d old
+    alert : []
 
-These tests drive the shipped ``lib/baseline_age.sh`` in bash rather than a
-paraphrase of it, with the clock injected via ``ALGO_NOW_EPOCH`` so "nine days
-old" is asserted by driving it rather than by waiting.
+Nothing fired. Meanwhile the baseline the divergence monitor actually grades
+against — ``config/default.yaml``'s ``divergence.baseline_pin`` — was still
+``backtest_multi_20260819_183451.json``, 23 days old, and the artifact that
+silenced the alert carried ``config.coverage.state = BLOCKED`` at 17.39%
+excluded, so it could never be pinned.
+
+``scripts/ops/baseline_pin.py`` already states the rule that was broken, in its
+own docstring: *the baseline of record is a configuration fact, not whatever
+``output/backtest_multi_*.json`` happens to sort last*. The seam existed, worked,
+and was not used.
+
+The two facts coincided until a refresh succeeded while producing something
+unpinnable — which is precisely the case most worth reporting.
+
+**What alerts, and why it is split that way.** The pin's age is a *state*: it is
+reported every day and alerts once it passes the monitor's comparison window,
+past which live and backtest stop overlapping meaningfully. An unusable refresh
+is an *event*: it alerts on the day it is produced and is reported as state
+thereafter. Alerting daily on an unusable baseline would fire every morning
+until a data vendor exists for delisted history (KAN-59/KAN-60), which is how an
+alert gets ignored — the failure this whole tranche keeps rediscovering.
+
+A newer, usable artifact sitting unpinned is NOT an alert. Re-pinning is a
+deliberate act (KAN-51) and that is the normal, correct state after any refresh.
 """
 
 from __future__ import annotations
 
+import json
 import os
-import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -34,42 +49,68 @@ LIB = REPO / "deploy/launchd/lib/baseline_age.sh"
 REPORT = REPO / "deploy/launchd/run_pipeline_report.sh"
 OPS_DOC = REPO / "docs/operations/dead-man-switches.md"
 
-NOW = 1_757_000_000  # a fixed epoch; every age below is derived from it
+NOW = 1_757_000_000
 DAY = 86_400
 
 
-def _run(output_dir: Path, *, now: int = NOW, stale_days: int | None = None) -> dict[str, str]:
-    """Source the shipped lib, run the check, and return the variables it set."""
-    stale = f'ALGO_BASELINE_STALE_DAYS={stale_days}\n' if stale_days is not None else ""
+def _artifact(path: Path, *, age_days: float, state: str = "OK",
+              excluded_pct: float = 2.0) -> Path:
+    """A baseline artifact carrying the coverage block the real ones do.
+
+    Written config-first and pretty-printed, because that is the shape the
+    reader has to cope with: the real files are ~240MB, so the coverage state
+    must be recoverable from the first few KB rather than by parsing the whole
+    document in a daily report.
+    """
+    path.write_text(json.dumps({
+        "config": {
+            "tickers": ["AAPL", "MSFT"],
+            "coverage": {
+                "total_membership_days": 1266885,
+                "excluded_membership_days": 220355,
+                "excluded_pct": excluded_pct,
+                "floor_pct": 5.0,
+                "state": state,
+            },
+        },
+        "portfolios": {},
+    }, indent=2))
+    stamp = NOW - int(age_days * DAY)
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def _run(output_dir: Path, *, pin: Path | str | None, now: int = NOW,
+         pin_max_days: int | None = None, config: str | None = None) -> dict[str, str]:
+    """Source the shipped lib and run the check against a controlled tree."""
+    extra = f"ALGO_BASELINE_PIN_MAX_DAYS={pin_max_days}\n" if pin_max_days else ""
     body = (
+        f'ALGO_DIR="{REPO}"\n'
         f'ALGO_BASELINE_DIR="{output_dir}"\n'
         f"ALGO_NOW_EPOCH={now}\n"
-        f"{stale}"
-        f'. "{LIB}"\n'
+        f'ALGO_PYTHON="{sys.executable}"\n'
+        + (f'ALGO_BASELINE_CONFIG="{config}"\n' if config else "")
+        + f"{extra}"
+        + f'. "{LIB}"\n'
         "algo_baseline_age_check\n"
-        'printf "FILE=%s\\n" "$ALGO_BASELINE_FILE"\n'
-        'printf "AGE=%s\\n" "$ALGO_BASELINE_AGE_DAYS"\n'
         'printf "STATUS=%s\\n" "$ALGO_BASELINE_STATUS"\n'
         'printf "DETAIL=%s\\n" "$ALGO_BASELINE_DETAIL"\n'
         'printf "ALERT=%s\\n" "$(algo_baseline_alert_body)"\n'
     )
-    res = subprocess.run(
-        ["bash", "-c", body], capture_output=True, text=True, timeout=60,
-    )
+    env = dict(os.environ)
+    if pin is None:
+        env.pop("ALGO_BASELINE_PIN", None)
+        env["ALGO_BASELINE_PIN"] = ""      # unpinned
+    else:
+        env["ALGO_BASELINE_PIN"] = str(pin)
+    res = subprocess.run(["bash", "-c", body], capture_output=True, text=True,
+                         timeout=90, env=env)
     assert res.returncode == 0, res.stderr
     out: dict[str, str] = {}
     for line in res.stdout.splitlines():
-        key, _, value = line.partition("=")
-        out[key] = value
+        k, _, v = line.partition("=")
+        out[k] = v
     return out
-
-
-def _artifact(output_dir: Path, name: str, *, age_days: float) -> Path:
-    path = output_dir / name
-    path.write_text("{}")
-    stamp = NOW - int(age_days * DAY)
-    os.utime(path, (stamp, stamp))
-    return path
 
 
 @pytest.fixture()
@@ -79,108 +120,142 @@ def output_dir(tmp_path) -> Path:
     return d
 
 
-def test_a_fresh_baseline_is_reported_and_does_not_alert(output_dir):
-    """A healthy week must stay quiet, or the alert trains people to ignore it."""
-    _artifact(output_dir, "backtest_multi_20260901_050000.json", age_days=2)
-    got = _run(output_dir)
-    assert got["STATUS"] == "fresh"
-    assert got["AGE"] == "2"
-    assert got["FILE"] == "backtest_multi_20260901_050000.json"
+def test_the_pin_is_judged_not_the_newest_artifact(output_dir):
+    """The 2026-09-10 defect. A fresh artifact must not silence a stale pin."""
+    pin = _artifact(output_dir / "backtest_multi_20260819_183451.json",
+                    age_days=23, state="BLOCKED", excluded_pct=11.28)
+    _artifact(output_dir / "backtest_multi_20260910_235624.json",
+              age_days=0, state="BLOCKED", excluded_pct=17.39)
+    got = _run(output_dir, pin=pin, pin_max_days=20)
+    assert got["STATUS"] != "ok", got
+    assert "backtest_multi_20260819" in got["DETAIL"], got["DETAIL"]
+    assert got["ALERT"] != "", got
+
+
+def test_the_body_reports_both_the_pin_and_the_newest(output_dir):
+    """Either number alone misleads: "pin 23d" hides that a refresh ran, and
+    "newest 0d" hides that it cannot be used."""
+    pin = _artifact(output_dir / "backtest_multi_20260819_183451.json",
+                    age_days=23, state="BLOCKED", excluded_pct=11.28)
+    _artifact(output_dir / "backtest_multi_20260910_235624.json",
+              age_days=0, state="BLOCKED", excluded_pct=17.39)
+    got = _run(output_dir, pin=pin)
+    assert "backtest_multi_20260819" in got["DETAIL"]
+    assert "backtest_multi_20260910" in got["DETAIL"]
+    assert "23d" in got["DETAIL"], got["DETAIL"]
+
+
+def test_a_refresh_that_produced_an_unusable_baseline_alerts(output_dir):
+    """2026-09-10: the refresh exited 0, pinged its dead-man, and logged
+    "coverage is BLOCKED" into a file nobody opens. Every external signal
+    reported a healthy weekly refresh."""
+    pin = _artifact(output_dir / "backtest_multi_20260819_183451.json",
+                    age_days=23, state="BLOCKED", excluded_pct=11.28)
+    _artifact(output_dir / "backtest_multi_20260910_235624.json",
+              age_days=0, state="BLOCKED", excluded_pct=17.39)
+    got = _run(output_dir, pin=pin, pin_max_days=90)   # pin not yet stale
+    assert got["STATUS"] == "unusable", got
+    assert "BLOCKED" in got["ALERT"], got["ALERT"]
+    assert "17.39" in got["ALERT"] or "17" in got["ALERT"], got["ALERT"]
+
+
+def test_an_old_unusable_artifact_is_reported_but_does_not_alert_daily(output_dir):
+    """The event is "a refresh produced something unpinnable". Repeating it every
+    morning until a data vendor exists is how an alert gets ignored."""
+    pin = _artifact(output_dir / "backtest_multi_20260819_183451.json",
+                    age_days=10, state="BLOCKED", excluded_pct=11.28)
+    _artifact(output_dir / "backtest_multi_20260901_000000.json",
+              age_days=9, state="BLOCKED", excluded_pct=17.39)
+    got = _run(output_dir, pin=pin, pin_max_days=90)
+    assert got["ALERT"] == "", got
+    assert "BLOCKED" in got["DETAIL"], got["DETAIL"]
+
+
+def test_a_usable_refresh_newer_than_the_pin_is_quiet(output_dir):
+    """Re-pinning is deliberate (KAN-51); a newer usable artifact sitting
+    unpinned is the normal state after every refresh."""
+    pin = _artifact(output_dir / "backtest_multi_20260819_183451.json",
+                    age_days=10, state="OK")
+    _artifact(output_dir / "backtest_multi_20260910_235624.json",
+              age_days=0, state="OK")
+    got = _run(output_dir, pin=pin, pin_max_days=90)
+    assert got["STATUS"] == "ok", got
     assert got["ALERT"] == "", got
 
 
-def test_a_stale_baseline_alerts_and_names_its_age(output_dir):
-    """The 2026-09-08 state: fourteen days old and nothing said so."""
-    _artifact(output_dir, "backtest_multi_20260825_102450.json", age_days=14)
-    got = _run(output_dir)
-    assert got["STATUS"] == "stale"
-    assert got["AGE"] == "14"
-    assert "14d" in got["ALERT"], got["ALERT"]
-    assert "backtest_multi_20260825_102450.json" in got["ALERT"]
-
-
-def test_the_threshold_boundary_is_inclusive(output_dir):
-    """Eight days is one missed Tuesday plus a day of slack — at eight it is
-    stale, at seven it is not. Pinned so a later edit cannot quietly widen it."""
-    _artifact(output_dir, "backtest_multi_a.json", age_days=7)
-    assert _run(output_dir)["STATUS"] == "fresh"
-    _artifact(output_dir, "backtest_multi_a.json", age_days=8)
-    assert _run(output_dir)["STATUS"] == "stale"
-
-
-def test_no_baseline_at_all_is_distinct_from_a_stale_one_and_still_alerts(output_dir):
-    """Absence of evidence must not render as freshness."""
-    got = _run(output_dir)
-    assert got["STATUS"] == "absent"
-    assert got["FILE"] == ""
-    assert got["ALERT"] != ""
-    assert "MISSING" in got["ALERT"], got["ALERT"]
-    assert "STALE" not in got["ALERT"], got["ALERT"]
-
-
-def test_the_newest_artifact_wins_regardless_of_filename_order(output_dir):
-    """Chosen by mtime, not by the date in the name: the two disagree whenever a
-    refresh is re-run by hand, and the question is when one was last produced."""
-    _artifact(output_dir, "backtest_multi_20260901_050000.json", age_days=20)
-    _artifact(output_dir, "backtest_multi_20260728_053111.json", age_days=1)
-    got = _run(output_dir)
-    assert got["FILE"] == "backtest_multi_20260728_053111.json", got
-    assert got["STATUS"] == "fresh"
-
-
-def test_a_non_baseline_json_is_not_mistaken_for_one(output_dir):
-    """output/ also holds divergence and shadow artifacts, written daily. Taking
-    one of those as the baseline would make a stale baseline look permanently
-    fresh — the exact false-negative this check exists to prevent."""
-    _artifact(output_dir, "divergence_20260908.json", age_days=0)
-    _artifact(output_dir, "shadow_20260908.json", age_days=0)
-    _artifact(output_dir, "backtest_multi_20260825_102450.json", age_days=14)
-    got = _run(output_dir)
+def test_a_pin_past_the_window_alerts(output_dir):
+    """Past the monitor's comparison window live and backtest stop overlapping
+    meaningfully — which the monitor already hints at with "Only 22 overlapping
+    days available (requested 30)"."""
+    pin = _artifact(output_dir / "backtest_multi_old.json", age_days=45, state="OK")
+    got = _run(output_dir, pin=pin, pin_max_days=30)
     assert got["STATUS"] == "stale", got
-    assert got["FILE"] == "backtest_multi_20260825_102450.json"
+    assert "45d" in got["ALERT"], got["ALERT"]
 
 
-def test_the_mtime_helper_never_trusts_a_gnu_filesystem_dump(tmp_path):
-    """`stat -f %m` on GNU coreutils prints a four-line filesystem dump to
-    stdout while exiting 1. A helper that validates the exit code rather than
-    the shape hands back that dump, and every later comparison silently reads as
-    garbage — which is how a monitor goes quiet. Same guard as the watchdog's."""
-    target = tmp_path / "f"
-    target.write_text("x")
-    res = subprocess.run(
-        ["bash", "-c", f'. "{LIB}"\nalgo_mtime "{target}"'],
-        capture_output=True, text=True, timeout=60,
+def test_a_pin_inside_the_window_does_not_alert(output_dir):
+    pin = _artifact(output_dir / "backtest_multi_old.json", age_days=29, state="OK")
+    got = _run(output_dir, pin=pin, pin_max_days=30)
+    assert got["ALERT"] == "", got
+
+
+def test_a_pinned_file_that_does_not_exist_alerts_distinctly(output_dir):
+    """The monitor will exit 3 (BLIND) on its next run; the report should say so
+    first, and say something different from "the pin is old"."""
+    got = _run(output_dir, pin=output_dir / "backtest_multi_gone.json")
+    assert got["STATUS"] == "missing", got
+    assert got["ALERT"] != ""
+    assert "stale" not in got["ALERT"].lower(), got["ALERT"]
+
+
+def test_a_pin_that_cannot_be_resolved_alerts(output_dir, tmp_path):
+    """Absence of evidence must not render as freshness — the rule this lib was
+    written for and then broke. Covers both an unreadable config and one with no
+    divergence.baseline_pin: resolve_pin returns None for each, deliberately,
+    so that deciding what that MEANS belongs to one place."""
+    _artifact(output_dir / "backtest_multi_20260910_235624.json", age_days=0)
+    got = _run(output_dir, pin="", config=str(tmp_path / "nonexistent.yaml"))
+    assert got["STATUS"] == "unresolved", got
+    assert got["ALERT"] != "", got
+
+
+def test_the_coverage_state_is_read_without_parsing_the_whole_artifact(output_dir):
+    """The real artifacts are ~240MB. A daily report that json.loads one would
+    cost seconds and gigabytes; the coverage block sits in the first few KB."""
+    # Comments are stripped first: an earlier version of this test matched the
+    # lib's own explanation of why it does NOT parse, which is the opposite of
+    # what it is checking.
+    code = "\n".join(
+        l for l in LIB.read_text().splitlines() if not l.lstrip().startswith("#")
     )
-    assert res.stdout.strip().isdigit(), res.stdout
-    assert len(res.stdout.strip().splitlines()) == 1, res.stdout
+    assert "head -c" in code, (
+        "the reader does not bound how much of the artifact it reads"
+    )
+    assert "json.load" not in code and "json.loads" not in code
 
 
-def test_the_daily_report_runs_the_check_and_escalates_through_both_paths():
-    """A log line reproduces the failure. KAN-64 settled this: a failure mode
-    whose nature is silence must not be reported into a file nobody opens."""
+def test_the_daily_report_still_routes_the_alert_through_both_paths():
     text = REPORT.read_text()
-    assert "lib/baseline_age.sh" in text, "run_pipeline_report.sh does not source the lib"
-    assert "algo_baseline_age_check" in text, "the report never runs the check"
-    body = re.search(
-        r"BASELINE_MSG=\$\(algo_baseline_alert_body\).*?\bfi\b",
-        text,
-        re.S,
-    )
+    assert "algo_baseline_age_check" in text
+    import re
+    body = re.search(r"BASELINE_MSG=\$\(algo_baseline_alert_body\).*?\bfi\b", text, re.S)
     assert body, "the report does not route the baseline alert body anywhere"
-    assert "algo_alert_local" in body.group(0), body.group(0)
-    assert "telegram" in body.group(0), body.group(0)
+    assert "algo_alert_local" in body.group(0)
+    assert "telegram" in body.group(0)
 
 
-def test_the_threshold_is_written_down_where_the_operator_reads_it():
-    """The cadence table is the thing an operator configures from; a threshold
-    that lives only in shell is one nobody can sanity-check against it."""
-    # Demands all three in ONE paragraph, not merely somewhere in the file: the
-    # doc already said "baseline" and "8 days" in unrelated table rows, so a
-    # whole-document assertion passed against a runbook that described no
-    # staleness check at all. Paragraph rather than line, because prose wraps.
-    paragraphs = re.split(r"\n\s*\n", OPS_DOC.read_text().lower())
-    hits = [
-        p for p in paragraphs
-        if "baseline" in p and "stale" in p and re.search(r"\b8\b", p)
-    ]
-    assert hits, "the runbook does not state the baseline staleness threshold"
+def test_the_runbook_describes_the_pin_not_the_newest_artifact():
+    """The doc described the newest-artifact behaviour as intended, which is
+    what made the defect look like a feature. It must now state the rule that
+    was broken: the pin is judged, the newest artifact is not.
+
+    Asserted as "one paragraph names both", rather than on the word "stale" —
+    an earlier version of this test demanded that word and would have been
+    satisfied by the very sentence it was meant to replace.
+    """
+    paragraphs = OPS_DOC.read_text().lower().split("\n\n")
+    hits = [p for p in paragraphs if "baseline_pin" in p and "newest" in p]
+    assert hits, (
+        "the runbook does not state that the PIN is judged rather than the "
+        "newest artifact"
+    )
