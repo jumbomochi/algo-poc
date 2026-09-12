@@ -64,6 +64,7 @@ from scripts.run_backtest import (
     make_sector_rotation_signals_fn,
     make_tail_risk_hedge_signals_fn,
     make_thematic_momentum_signals_fn,
+    summarise_fetch,
 )
 from scripts.fetch_fundamentals import (
     load_fundamentals_cache,
@@ -1585,6 +1586,40 @@ def _create_research_shadow(
         return None, None
 
 
+# A run that fetched nothing must not report success. See KAN-80: on 2026-09-10
+# the 04:15 run logged "Fetched data for 0 of 140 tickers; 140 returned NO bars"
+# and then exited 0 and pinged the dead-man, so every external observer recorded
+# a healthy day for a run that produced nothing.
+#
+# Distinct from 1 (generic failure) and 2 (validation) because "fetched nothing"
+# and "could not connect" send an operator to different places — on 2026-09-10
+# the gateway was running and connected, and had simply been up three days
+# without its 2:00 PM restart.
+EXIT_INSUFFICIENT_BAR_COVERAGE = 3
+
+# Below this fraction of the universe, signals are not comparable to the
+# baseline the divergence monitor grades against, so committing them corrupts
+# the evidence rather than merely thinning it. Deliberately not set near 1.0:
+# a ticker returning no bars can be a real answer (see FetchSummary's
+# docstring), and every abort is a self-inflicted evidence gap, so the guard
+# must fire on "clearly broken" rather than "not perfect".
+MIN_BAR_COVERAGE = 0.5
+
+
+def bar_coverage_failure(summary, *, floor: float = MIN_BAR_COVERAGE) -> str | None:
+    """Why this fetch is unusable, or None if the run may proceed."""
+    if summary.coverage >= floor:
+        return None
+    return (
+        f"insufficient bar coverage: fetched data for {summary.fetched} of "
+        f"{summary.requested} tickers ({summary.coverage:.0%}), below the "
+        f"{floor:.0%} floor. Signals from a partial universe are not comparable "
+        f"to the divergence baseline, so nothing was committed. The gateway may "
+        f"be reachable and still not serving history — check how long it has "
+        f"been up and when it last restarted."
+    )
+
+
 def main() -> int | None:
     """Run the CLI. The return value IS the process exit code (see the entry
     point below); ``None`` from an early path means success."""
@@ -1753,9 +1788,16 @@ def main() -> int | None:
         client_id=args.ib_client_id,
     )
 
-    if not bars_by_ticker:
-        print("ERROR: No data fetched. Is IB Gateway running?")
-        sys.exit(1)
+    # Tests the CONTENTS, not the container. run_backtest.py assigns
+    # bars_by_ticker[ticker] = unique_bars unconditionally and only an
+    # *exception* routes a ticker to `failed`, so a 60s timeout stores an empty
+    # list and {140 tickers: []} is comfortably truthy. `if not bars_by_ticker`
+    # was the guard that let the 2026-09-10 run through.
+    fetch = summarise_fetch(requested=all_tickers, bars_by_ticker=bars_by_ticker)
+    coverage_problem = bar_coverage_failure(fetch)
+    if coverage_problem is not None:
+        print(f"ERROR: {coverage_problem}")
+        sys.exit(EXIT_INSUFFICIENT_BAR_COVERAGE)
 
     # Load caches
     fundamentals_cache = load_fundamentals_cache("data/cache/fundamentals.json")
