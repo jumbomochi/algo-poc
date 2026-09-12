@@ -106,31 +106,17 @@ algo_docker_daemon_ok() {
     "$ALGO_DOCKER_BIN" info >/dev/null 2>&1
 }
 
-# Run a command with a hard bound. Returns 124 on expiry, the conventional
-# timeout(1) code, which the commands used here cannot produce themselves.
-# Done with a killer subshell rather than timeout(1) because production is
-# macOS, which does not ship it, and CI is ubuntu, which does — a chain that
-# silently behaves differently on the two is how the `stat -f %m` bug happened.
-_algo_docker_bounded() {
-    local secs="$1"; shift
-    local tmp; tmp="$(mktemp)" || return 1
-    "$@" >"$tmp" 2>/dev/null &
-    local pid=$!
-    # Both background jobs MUST have stdout redirected away. Command
-    # substitution does not return until every inherited descriptor is closed,
-    # so a killer that keeps the pipe open makes `$(...)` wait out the whole
-    # sleep — turning the bound into the very stall it exists to prevent.
-    ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 &
-    local killer=$!
-    local rc=0
-    wait "$pid" 2>/dev/null || rc=$?
-    kill "$killer" 2>/dev/null
-    wait "$killer" 2>/dev/null
-    cat "$tmp"
-    rm -f "$tmp"
-    [ "$rc" -ge 128 ] && return 124
-    return "$rc"
-}
+# Bounded execution lives in one place now (KAN-75): this file and
+# branch_guard.sh each carried a private copy, and neither had a test between
+# them. Sourced by path, like every other lib here.
+# Resolved relative to THIS file, not $ALGO_DIR. A lib knows where its own
+# sibling lives; $ALGO_DIR is the tree under inspection, which is not the same
+# thing and is deliberately pointed at a throwaway repo by the tests. Conflating
+# them made the bounded probe silently undefined, and the fallback path — "could
+# not reach origin" — looks exactly like being offline.
+# shellcheck source=deploy/launchd/lib/bounded.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bounded.sh"
+
 
 # Services docker-compose.yml declares, one per line. Best-effort: the compose
 # file interpolates ${POSTGRES_PASSWORD:?} / ${REDIS_PASSWORD:?}, so this fails
@@ -151,7 +137,7 @@ _algo_docker_bounded() {
 algo_docker_expected_services() {
     [ -n "$ALGO_DOCKER_BIN" ] || return 0
     local out rc=0
-    out="$(cd "${ALGO_DIR:-.}" 2>/dev/null && _algo_docker_bounded \
+    out="$(cd "${ALGO_DIR:-.}" 2>/dev/null && algo_run_bounded \
             "${ALGO_DOCKER_CONFIG_TIMEOUT:-30}" \
             "$ALGO_DOCKER_BIN" compose --env-file /dev/null config --services)" || rc=$?
     if [ "$rc" -eq 124 ]; then

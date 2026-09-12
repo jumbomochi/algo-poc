@@ -75,6 +75,9 @@ ALGO_JOB_LABEL="backtest refresh"
 # Dead-man ping helper (KAN-15), likewise sourced by path and never deployed.
 # shellcheck source=deploy/launchd/deadman.sh
 . "$ALGO_DIR/deploy/launchd/deadman.sh"
+# Bounded execution, shared so the wall-clock rule lives in one place (KAN-75).
+# shellcheck source=deploy/launchd/lib/bounded.sh
+. "$ALGO_DIR/deploy/launchd/lib/bounded.sh"
 
 mkdir -p "$LOG_DIR"
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
@@ -160,41 +163,23 @@ cd "$ALGO_DIR"
 # ids out of both scripts and fails if they stop being disjoint, so this
 # comment is enforced rather than believed.
 REFRESH_TIMEOUT="${ALGO_REFRESH_TIMEOUT_SECONDS:-21600}"   # 6h
-TIMEOUT_FLAG="$LOG_DIR/.refresh_timeout.$$"
-rm -f "$TIMEOUT_FLAG"
 
-"$VENV" scripts/run_backtest.py --years 10 --capital 100000 \
-    --universe-snapshots "$MEMBERSHIP_SNAPSHOT" >> "$LOG_FILE" 2>&1 &
-BACKTEST_PID=$!
-
-# Polls rather than `sleep $REFRESH_TIMEOUT` so it exits on its own once the
-# backtest finishes, instead of leaving a multi-hour sleep behind. stdout and
-# stderr go to /dev/null deliberately: a backgrounded subshell inherits this
-# script's descriptors, and any caller capturing our output would otherwise
-# block until the watchdog died, not until the backtest did.
-(
-    waited=0
-    while [ "$waited" -lt "$REFRESH_TIMEOUT" ]; do
-        kill -0 "$BACKTEST_PID" 2>/dev/null || exit 0
-        sleep 5
-        waited=$((waited + 5))
-    done
-    kill -0 "$BACKTEST_PID" 2>/dev/null || exit 0
-    : > "$TIMEOUT_FLAG"
-    echo "$(ts): ERROR - backtest exceeded ${REFRESH_TIMEOUT}s deadline; terminating" >> "$LOG_FILE"
-    kill -TERM "$BACKTEST_PID" 2>/dev/null
-    sleep 20
-    kill -KILL "$BACKTEST_PID" 2>/dev/null
-) >/dev/null 2>&1 &
-WATCHDOG_PID=$!
-
-wait "$BACKTEST_PID"
+# Bounded through the shared helper (KAN-75). The previous inline watchdog
+# counted its own sleeps — `waited=$((waited + 5))` — which measures AWAKE
+# seconds, so on 2026-09-08 a run started 06:30 with this 6h bound was still
+# going at 19:12, 6h42m past its deadline, because the host suspended four times
+# that afternoon. A deadline is a promise about wall time.
+#
+# Output is streamed, not buffered: an operator greps this log live for
+# "[473/826]" while the job runs.
+algo_run_bounded "$REFRESH_TIMEOUT" \
+    "$VENV" scripts/run_backtest.py --years 10 --capital 100000 \
+    --universe-snapshots "$MEMBERSHIP_SNAPSHOT" >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
-kill "$WATCHDOG_PID" 2>/dev/null
-wait "$WATCHDOG_PID" 2>/dev/null
 
-if [ -f "$TIMEOUT_FLAG" ]; then
-    rm -f "$TIMEOUT_FLAG"
+# 124 is the helper's timeout code, and one run_backtest.py cannot produce
+# itself — so the flag file the old watchdog used to signal this is gone.
+if [ "$EXIT_CODE" = "124" ]; then
     echo "$(ts): refresh TIMED OUT after ${REFRESH_TIMEOUT}s" >> "$LOG_FILE"
     algo_alert_local "backtest refresh timed out after ${REFRESH_TIMEOUT}s"
     telegram "⏱️ Weekly backtest refresh TIMED OUT after ${REFRESH_TIMEOUT}s and was killed — the point-in-time universe is ~830 tickers, so the IB pull is long. Baseline NOT refreshed; the divergence monitor is scoring against the previous one. See ~/ibc/logs/$(basename "$LOG_FILE")."
