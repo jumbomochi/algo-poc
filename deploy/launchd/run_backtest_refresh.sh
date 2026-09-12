@@ -17,6 +17,9 @@
 #   0 = refresh OK
 #   1 = IB Gateway unreachable, nothing run
 #   2 = point-in-time membership snapshot missing, nothing run (KAN-23)
+#  75 = another refresh is already running, nothing run (KAN-76). EX_TEMPFAIL:
+#       not a failure — the other run is doing the work — so it neither alerts
+#       nor pings the dead-man switch.
 # 124 = the backtest exceeded ALGO_REFRESH_TIMEOUT_SECONDS and was killed
 #   * = the backtest's own exit code
 #
@@ -88,9 +91,91 @@ ts() { date '+%Y-%m-%d %H:%M:%S'; }
 # algo_deadman_ping pings only on 0 and returns 0 whatever happens, so this can
 # neither suppress nor alter the exit code it was handed.
 refresh_exit() {
+    algo_refresh_release_lock
     algo_deadman_ping "$1" ALGO_DEADMAN_REFRESH_URL
     echo "$(ts): dead-man switch: $ALGO_DEADMAN_STATUS" >> "$LOG_FILE"
     exit "$1"
+}
+
+# ---------------------------------------------------------------------------
+# One refresh at a time — KAN-76
+# ---------------------------------------------------------------------------
+#
+# Three refreshes ran on 2026-09-08, all appending to one log:
+#
+#   05:11:10  launchd's scheduled run  -> FAILED exit 143 (SIGTERM, dead stack)
+#   06:30:27  a manual run             -> still running at 19:12, 12h42m in
+#   19:11:26  a second manual run      -> FAILED exit 1 at 19:11:43
+#
+# The third lasted seventeen seconds: run_backtest.py connects to IB with the
+# backtest's clientId 10, and IB refuses a second connection presenting a
+# clientId already in use. It did not fail on its own merits — it collided with
+# the 06:30 run, which nobody knew was still alive. The surfaced fault was an
+# asyncio TimeoutError deep in ib_insync, which names the symptom and not the
+# cause; and because the collision withheld its dead-man ping, it looked
+# identical to a refresh that never happened.
+#
+# Manual catch-ups after a failed Tuesday are the normal way this job gets run,
+# so two overlapping invocations is the expected shape, not an edge case.
+#
+# A DIRECTORY, not a file: mkdir is atomic and fails if it exists, which is the
+# whole primitive. A file plus a test would race.
+LOCK_DIR="$LOG_DIR/backtest_refresh.lock"
+LOCK_HELD=0
+
+algo_refresh_release_lock() {
+    # Only the holder releases. A refusing invocation runs the same exit helper
+    # and must not tidy away a lock it never took, or the invocation after it
+    # would walk straight past a live holder.
+    [ "$LOCK_HELD" = "1" ] || return 0
+    rm -rf "$LOCK_DIR"
+    LOCK_HELD=0
+    return 0
+}
+
+# Echoes to the log AND to stdout: a scheduled run has only the log, and a
+# manual catch-up — the case this exists for — is someone at a terminal who
+# should be told there without going looking.
+_refresh_say() {
+    echo "$(ts): $1" >> "$LOG_FILE"
+    echo "$(ts): $1"
+}
+
+# Sets LOCK_HELD=1 and returns 0, or returns 1 with LOCK_HOLDER_* describing who
+# has it.
+algo_refresh_take_lock() {
+    local attempt=0
+    while [ "$attempt" -lt 3 ]; do
+        attempt=$((attempt + 1))
+        if mkdir "$LOCK_DIR" 2>/dev/null; then
+            printf '%s\n' "$$" > "$LOCK_DIR/pid"
+            ts > "$LOCK_DIR/started"
+            LOCK_HELD=1
+            return 0
+        fi
+
+        LOCK_HOLDER_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+        LOCK_HOLDER_STARTED="$(cat "$LOCK_DIR/started" 2>/dev/null)"
+        if [ -z "$LOCK_HOLDER_PID" ]; then
+            # The holder made the directory but has not written its pid yet.
+            # Narrow, but reading it as stale would steal a live lock, which is
+            # the one outcome worse than refusing.
+            sleep 1
+            LOCK_HOLDER_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+            LOCK_HOLDER_STARTED="$(cat "$LOCK_DIR/started" 2>/dev/null)"
+        fi
+
+        if [ -n "$LOCK_HOLDER_PID" ] && kill -0 "$LOCK_HOLDER_PID" 2>/dev/null; then
+            return 1
+        fi
+
+        # The holder is gone. The 05:11 run proves a refresh can die without
+        # cleaning up (SIGTERM, exit 143), and one hard kill must not take the
+        # weekly refresh out of service until a human deletes a directory.
+        _refresh_say "reclaiming stale refresh lock from pid ${LOCK_HOLDER_PID:-unknown} (started ${LOCK_HOLDER_STARTED:-unknown}); that run is no longer alive"
+        rm -rf "$LOCK_DIR"
+    done
+    return 1
 }
 
 # Hold a power assertion for the life of this run (KAN-77). The host was found
@@ -109,6 +194,15 @@ if command -v algo_hold_power_assertion >/dev/null 2>&1; then
 else
     echo "$(date): WARNING - $ALGO_DIR/deploy/launchd/lib/power.sh could not be sourced;" \
          "this run holds no power assertion (KAN-77). Running anyway." >> "$LOG_FILE"
+fi
+
+# Before anything announces itself, so a refused invocation adds one line to the
+# shared daily log instead of a full run's worth of misleading ones.
+if ! algo_refresh_take_lock; then
+    _refresh_say "a refresh started at ${LOCK_HOLDER_STARTED:-an unknown time} is still running (pid ${LOCK_HOLDER_PID:-unknown}); this invocation is doing nothing"
+    # Through refresh_exit like everything else. 75 does not ping, and
+    # algo_refresh_release_lock is a no-op here because LOCK_HELD is 0.
+    refresh_exit 75
 fi
 
 echo "$(ts): Starting weekly backtest refresh" >> "$LOG_FILE"
