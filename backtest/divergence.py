@@ -217,17 +217,34 @@ def align_and_window(
 
 
 def window_return(values: list[float]) -> float | None:
-    """Total return over a series: last/first - 1. ``None`` if degenerate."""
-    if len(values) < 2 or values[0] == 0:
+    """Total return over a series: last/first - 1. ``None`` if degenerate.
+
+    A NON-POSITIVE start is degenerate, not just zero. A negative base yields a
+    number that is arithmetically valid, semantically meaningless, and sign
+    flipped: on 2026-09-12 quality_value went -1,537.94 -> 15,468.14 — a gain —
+    and was reported as ``-1105.8%`` and delivered as a BREACH. The reader's
+    natural conclusion from that figure is the opposite of the truth, and it was
+    written to divergence_daily as gate evidence.
+
+    Returning None routes the sleeve to NO_DATA with a named reason instead,
+    which sends the reader to the equity data rather than to the strategy.
+    """
+    if len(values) < 2 or values[0] <= 0:
         return None
     return values[-1] / values[0] - 1.0
 
 
 def daily_returns(values: list[float]) -> list[float]:
-    """Day-over-day arithmetic returns. Skips zero-denominator transitions."""
+    """Day-over-day arithmetic returns. Skips non-positive denominators.
+
+    Same rule as ``window_return`` and for the same reason: correlation is
+    computed from these, and the 2026-09-12 report carried correlations
+    (+0.081, -0.034) derived across a negative point. A sign-flipped daily
+    return is not a smaller error than a sign-flipped total.
+    """
     out: list[float] = []
     for i in range(len(values) - 1):
-        if values[i] == 0:
+        if values[i] <= 0:
             continue
         out.append(values[i + 1] / values[i] - 1.0)
     return out
@@ -425,6 +442,24 @@ def build_report(
 
     live_ret = window_return(lvals)
     bt_ret = window_return(btvals)
+
+    # A None return here is not "no data" in the ordinary sense — it means the
+    # window starts at an equity that cannot be divided by. Name it, with the
+    # value and the date, so the reader goes to the equity data rather than to
+    # the strategy. The absence of this note on 2026-09-12 is what made
+    # "-1105.8%" read as a finding about quality_value, when quality_value had
+    # in fact gained over the window.
+    if live_ret is None and lvals and lvals[0] <= 0:
+        notes.append(
+            f"Live equity starts at {lvals[0]:.2f} on {dates[0]} — a non-positive "
+            f"balance is not a valid base for a return, so this sleeve cannot be "
+            f"graded. The fault is in the equity data, not the strategy."
+        )
+    if bt_ret is None and btvals and btvals[0] <= 0:
+        notes.append(
+            f"Backtest equity starts at {btvals[0]:.2f} on {dates[0]} — a "
+            f"non-positive balance is not a valid base for a return."
+        )
     abs_div, rel_div = compute_divergence(live_ret, bt_ret)
     corr = correlation(daily_returns(lvals), daily_returns(btvals))
     window_trades = filter_trades_to_window(trades, dates[0], dates[-1])
