@@ -289,6 +289,76 @@ _algo_shell_quote() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
+# ---------------------------------------------------------------------------
+# Shape validation (KAN-84)
+# ---------------------------------------------------------------------------
+# `--check` used to answer "is this retrievable", which is not the question it
+# gets asked. On 2026-09-12 a 192-character JIRA API token was pasted into
+# API_KEYS and --check reported "OK". services/api/auth.py parses that value at
+# import time and raises on a malformed one, so the api service — which carries
+# the kill switch behind require_role("admin") — would have refused to start,
+# crash-looping under `restart: unless-stopped`, first noticed at the next
+# `docker compose up`.
+#
+# A check consulted precisely when someone is worried must not answer a
+# different question confidently. So --check now reports three states: OK,
+# MISSING, and MALFORMED.
+#
+# NO VALIDATOR PRINTS A VALUE, in any branch. --check is run in terminals and
+# pasted into tickets; "got: <secret>" would turn a shape report into a leak.
+# Names of roles and expected formats are not secret; the values are.
+#
+# A name with no validator keeps reporting OK on presence. The point is to add
+# signal, not to make --check fail on anything it does not recognise.
+
+# Echo a reason if $2 is not a usable value for secret $1, nothing if it is.
+_algo_secret_shape_error() {
+    local name="$1" value="$2"
+    case "$name" in
+        API_KEYS)
+            # key:role[,key:role], role in admin|operator|viewer — the format
+            # services/api/auth.py:_load_api_keys accepts.
+            local entry key role seen=0
+            local IFS=','
+            for entry in $value; do
+                entry="${entry#"${entry%%[![:space:]]*}"}"   # ltrim
+                entry="${entry%"${entry##*[![:space:]]}"}"   # rtrim
+                [ -z "$entry" ] && continue
+                seen=$((seen + 1))
+                key="${entry%%:*}"
+                role="${entry#*:}"
+                case "$entry" in
+                    *:*) ;;
+                    *) printf 'expected key:role[,key:role]'; return 0 ;;
+                esac
+                [ -z "$key" ] && { printf 'an entry has an empty key'; return 0; }
+                # Checked BEFORE the role whitelist: a missing comma merges two
+                # entries, leaving a second colon inside the role, and the
+                # whitelist would then report "role must be admin|operator|viewer"
+                # for a value whose real problem is the missing separator.
+                case "$role" in
+                    *:*) printf 'an entry contains two colons (missing comma?)'; return 0 ;;
+                esac
+                case "$role" in
+                    admin|operator|viewer) ;;
+                    *) printf 'role must be admin|operator|viewer'; return 0 ;;
+                esac
+            done
+            [ "$seen" -eq 0 ] && { printf 'no entries'; return 0; }
+            ;;
+        TELEGRAM_CHAT_ID)
+            # Integer, negative for a group chat. A bad id makes every alert
+            # fail to deliver, silently.
+            case "$value" in
+                ''|*[!0-9-]*|*-*-*) printf 'expected an integer chat id'; return 0 ;;
+                -) printf 'expected an integer chat id'; return 0 ;;
+                -*) case "${value#-}" in ''|*[!0-9]*) printf 'expected an integer chat id'; return 0 ;; esac ;;
+            esac
+            ;;
+    esac
+    return 0
+}
+
 _algo_cli_check() {
     local name state rc=0
     state=$(_algo_env_file_state)
@@ -303,14 +373,24 @@ _algo_cli_check() {
         echo "  note: not a regular file — ignored while the keychain has the secrets"
     fi
     echo "secrets:"
+    local value why
     for name in $ALGO_SECRET_NAMES; do
-        if algo_secret "$name" >/dev/null 2>&1; then
-            echo "  OK      $name"
+        if value=$(algo_secret "$name" 2>/dev/null); then
+            why=$(_algo_secret_shape_error "$name" "$value")
+            if [ -n "$why" ]; then
+                # Retrievable but unusable. Non-zero like MISSING: --check is a
+                # gate, and this is not a passing state.
+                echo "  MALFORMED $name — $why"
+                rc=1
+            else
+                echo "  OK      $name"
+            fi
         else
             echo "  MISSING $name — $ALGO_SECRETS_ERROR"
             rc=1
         fi
     done
+    unset value why
     # Optional: reported, never fatal. See $ALGO_OPTIONAL_SECRET_NAMES.
     if [ -n "$ALGO_OPTIONAL_SECRET_NAMES" ]; then
         echo "dead-man switches (optional, but nothing external watches this host without them):"
