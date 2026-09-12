@@ -200,6 +200,80 @@ error instead of hanging — see
 `tests/deploy/test_launchd_secrets_keychain.py`, whose FIFO test blocks and
 times out if that guard is ever removed.
 
+## What is live on `git pull`, and what needs `deploy.sh`
+
+**Production runs from `/Users/huiliang/algo-poc-deploy`, not from
+`~/GitHub/algo-poc`.** That is the whole point of KAN-72: the deploy clone
+exists only to be deployed from, tracks `main`, and nobody develops in it.
+Before this split, every wrapper defaulted to the interactive checkout — which
+names a *working tree*, not a branch — so production ran whatever branch was
+last left checked out there. On 2026-09-08 that was `develop`, four commits
+ahead of `main`, and merging any PR to `develop` reached the live paper host
+immediately. Promotion to `main` changed nothing on the host, so the gate was
+decorative.
+
+### The deployment procedure
+
+Promotion is the only thing that changes what production runs:
+
+```bash
+# 1. Promote develop -> main through a PR, as usual.
+# 2. Then, in the DEPLOY CLONE:
+cd /Users/huiliang/algo-poc-deploy
+git pull --ff-only origin main      # FIRST. deploy.sh reads this tree.
+deploy/launchd/deploy.sh --dry-run  # show what would change
+deploy/launchd/deploy.sh            # copy the wrappers/plists that changed
+```
+
+`git pull` before `deploy.sh`, in that order. Running `deploy.sh` first is what
+produced the "everything in sync" on 2026-09-08 that was true and meaningless:
+it had compared a three-commits-stale checkout against `~/ibc`, found no
+differences, and copied nothing.
+
+### Sourced by path from the tree — live the moment the clone is pulled
+
+`deploy.sh` deliberately does **not** copy these. They are read from
+`$ALGO_DIR` at run time, so a copy under `~/ibc` would never be executed and
+would only ever be a decoy — the stale-copy trap that broke the 2026-08-11 cold
+boot, where an operator edits the `~/ibc` file, sees no effect, and the real
+logic silently stays behind.
+
+| file | what it is |
+|---|---|
+| `secrets.sh` | keychain loader, `algo_alert_local` |
+| `deadman.sh` | the external dead-man ping |
+| `lib/baseline_age.sh` | divergence baseline age, for the daily report |
+| `lib/bounded.sh` | wall-clock bounded execution (KAN-75) |
+| `lib/branch_guard.sh` | is the deploy tree running promoted code (KAN-73) |
+| `lib/docker_health.sh` | docker engine + stack liveness (KAN-66) |
+| `lib/launchd_wiring.sh` | installed-but-not-loaded reconciliation (KAN-64) |
+| `lib/power.sh` | the caffeinate power assertion (KAN-77) |
+| `lib/telegram.sh` | the shared Telegram sender (KAN-43) |
+
+`scripts/` and `config/` are read from the tree the same way, so a pull changes
+what the next run executes without any deploy step.
+
+### Copied to `~/ibc` — a pull alone changes nothing
+
+launchd executes these from `~/ibc`, so they need `deploy.sh` to move. Each one
+also self-checks at startup and logs a loud `WARNING - … differs from repo
+canonical` line if it was launched from a drifted copy.
+
+| file | job |
+|---|---|
+| `gateway_watchdog.sh` | IB Gateway watchdog, every 5 min |
+| `run_backtest_refresh.sh` | weekly backtest refresh, Tue 05:00 |
+| `run_db_backup.sh` | daily paper-DB backup |
+| `run_divergence.sh` | daily divergence monitor, 04:45 |
+| `run_evidence_digest.sh` | evidence digest |
+| `run_paper.sh` | daily paper trading run, 04:15 |
+| `run_pipeline_report.sh` | daily pipeline report, 04:52 |
+
+`deploy.sh` itself is not deployed — it is the deployer.
+
+Plists go to `~/Library/LaunchAgents`, and a copied plist is **not** a loaded
+job: see the KAN-64 section below.
+
 ## Deploying / syncing
 
 `deploy/launchd/deploy.sh` is the one command that pushes these wrappers +

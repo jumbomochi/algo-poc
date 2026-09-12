@@ -35,7 +35,7 @@ export PATH="${ALGO_PATH_PREFIX:+$ALGO_PATH_PREFIX:}/usr/local/bin:/usr/bin:/bin
 # always takes the defaults. Never export any of the three in a login shell: a
 # manual run would then use whatever tree, interpreter or database they point
 # at.
-ALGO_DIR="${ALGO_DIR:-/Users/huiliang/GitHub/algo-poc}"
+ALGO_DIR="${ALGO_DIR:-/Users/huiliang/algo-poc-deploy}"
 VENV="${ALGO_PYTHON:-$ALGO_DIR/.venv/bin/python}"
 LOG_DIR="$HOME/ibc/logs"
 TODAY=$(date +%Y%m%d)

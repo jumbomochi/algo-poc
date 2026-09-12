@@ -33,7 +33,7 @@ LOG_DIR="$HOME/ibc/logs"
 LOG_FILE="$LOG_DIR/db_backup_$(date +%Y%m%d).log"
 DUMP_FILE="$BACKUP_DIR/algo_poc_$(date +%Y%m%d_%H%M%S).dump"
 RETENTION_DAYS=30
-ALGO_DIR="${ALGO_DIR:-/Users/huiliang/GitHub/algo-poc}"
+ALGO_DIR="${ALGO_DIR:-/Users/huiliang/algo-poc-deploy}"
 # Secrets come from the macOS login keychain via the shared loader. Sourced by
 # path from the repo (never from the deployed ~/ibc copy) so there is exactly
 # one implementation of the lookup and it cannot drift.
