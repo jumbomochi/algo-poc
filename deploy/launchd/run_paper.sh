@@ -2,6 +2,15 @@
 # Daily paper trading runner for algo-poc
 # Runs after US market close (4:15 AM SGT / 4:15 PM ET)
 # Signals are computed on finalized daily bars to avoid intraday noise
+#
+# EXIT CODES
+#   0   = the run committed the day's book
+#   1   = the wrapper aborted before starting the run (credentials, IB Gateway,
+#         paper DB, alembic head unreadable, schema behind the code)
+#   124 = the run exceeded ALGO_PAPER_TIMEOUT_SECONDS and was killed (KAN-78)
+#   *   = whatever scripts/run_paper.py returned (see its own contract; 3 is
+#         insufficient bar coverage, KAN-80)
+# Only 0 pings the dead-man switch.
 
 # Overridable only so tests/deploy/test_deadman_ping.py can drive this wrapper
 # end-to-end against a stub tree — launchd starts jobs with an empty
@@ -30,12 +39,27 @@ ALGO_JOB_LABEL="paper run"
 # anything.
 # shellcheck source=deploy/launchd/lib/docker_health.sh
 . "$ALGO_DIR/deploy/launchd/lib/docker_health.sh"
+# Bounded execution, shared so the wall-clock rule lives in one place (KAN-75).
+# shellcheck source=deploy/launchd/lib/bounded.sh
+. "$ALGO_DIR/deploy/launchd/lib/bounded.sh"
 
 # AC#17: create the log directory before the first write. Every other wrapper
 # does this; run_paper.sh did not, so on a fresh host the opening line (and the
 # credential/gateway errors that follow) vanished into a failed redirect — the
 # run died with no log at all to explain why.
 mkdir -p "$LOG_DIR"
+
+# The single exit for this script. Every `exit` below goes through it so that a
+# new early-abort added later cannot accidentally become a healthy beat — the
+# ping decision is made in exactly one place, from the code being returned.
+# Same shape as run_backtest_refresh.sh's refresh_exit. algo_deadman_ping pings
+# only on 0 and returns 0 whatever happens, so this can neither suppress nor
+# alter the exit code it was handed.
+paper_exit() {
+    algo_deadman_ping "$1"
+    echo "$(date): dead-man switch: $ALGO_DEADMAN_STATUS" >> "$LOG_FILE"
+    exit "$1"
+}
 
 # Hold a power assertion for the life of this run (KAN-77). The host was found
 # idle-sleeping after one minute on 2026-09-09, which severs the IB connection
@@ -103,7 +127,7 @@ if ! algo_load_secrets POSTGRES_PASSWORD REDIS_PASSWORD; then
     # rather than in two days.
     algo_alert_local "paper run aborted 04:15 — $ALGO_SECRETS_ERROR"
     telegram "🚨 Paper trading run ABORTED: $ALGO_SECRETS_ERROR"
-    exit 1
+    paper_exit 1
 fi
 export ALGO_DATABASE_URL="postgresql://algo:${POSTGRES_PASSWORD}@localhost:55432/algo_poc"
 export ALGO_REDIS_URL="redis://:${REDIS_PASSWORD}@localhost:56379/0"
@@ -113,7 +137,7 @@ export ALGO_REDIS_URL="redis://:${REDIS_PASSWORD}@localhost:56379/0"
 if ! wait_for_port 127.0.0.1 7497 "IB Gateway" 600; then
     algo_alert_local "paper run aborted — IB Gateway never came up on 7497"
     telegram "🚨 Paper trading run ABORTED: IB Gateway not reachable on 7497 after 10 min."
-    exit 1
+    paper_exit 1
 fi
 
 # Wait up to 5 min for the dockerized paper DB (docker compose stack coming up).
@@ -126,7 +150,7 @@ if ! wait_for_port 127.0.0.1 55432 "paper DB (docker compose up?)" 300; then
     echo "$(date): ERROR - $DOCKER_HINT" >> "$LOG_FILE"
     algo_alert_local "paper run aborted — paper DB never came up on 55432: $DOCKER_HINT"
     telegram "🚨 Paper trading run ABORTED: paper DB not reachable on 55432 after 5 min — $DOCKER_HINT."
-    exit 1
+    paper_exit 1
 fi
 
 # Run paper trading. --publish bridges the signals into the service
@@ -146,13 +170,13 @@ if [ -z "$HEAD_REV" ]; then
     echo "$(date): ERROR - could not determine alembic head revision" >> "$LOG_FILE"
     algo_alert_local "paper run aborted — could not determine alembic head revision"
     telegram "🚨 Paper trading run ABORTED: could not determine alembic head revision."
-    exit 1
+    paper_exit 1
 fi
 if [ "$DB_REV" != "$HEAD_REV" ]; then
     echo "$(date): ERROR - paper DB schema out of date (DB at '${DB_REV:-none}', head '$HEAD_REV'); run '.venv/bin/alembic upgrade head' with ALGO_DATABASE_URL set" >> "$LOG_FILE"
     algo_alert_local "paper run aborted — DB schema at '${DB_REV:-none}', head '$HEAD_REV'"
     telegram "🚨 Paper trading run ABORTED: paper DB schema out of date (DB '${DB_REV:-none}' vs head '$HEAD_REV'). Run: .venv/bin/alembic upgrade head"
-    exit 1
+    paper_exit 1
 fi
 
 # This log is per-day and appended to, so a manual catch-up run shares the file
@@ -160,7 +184,25 @@ fi
 # classifies the fault from the log, and must read only its own output.
 LOG_LINES_BEFORE_RUN=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
 
-"$VENV" scripts/run_paper.py --publish --no-entries-disabled >> "$LOG_FILE" 2>&1
+# Bound the run (KAN-78). The 2026-09-09 run was still going at 19:00 — 14h45m,
+# stalled at ticker 88 of 140 with 87 consecutive zero-bar fetches, holding IB
+# clientId 58 — and nothing would have stopped it before the next 04:15 slot,
+# where two paper runs would have contended for that clientId.
+#
+# WHERE 3h COMES FROM: measured start-to-completion over the last fourteen
+# sessions, healthy runs take 5.8-8.6 minutes and the degraded ones took 144,
+# 502, 527 and 889. The two populations are nowhere near each other. 3h is ~25x
+# the healthy median and still clears the 144-minute run that did eventually
+# complete: a merely slow run should finish and give the book its day, while the
+# 8-to-15-hour pathologies end less than three hours in.
+#
+# Its consumer is the 04:45 divergence monitor, which a run over ~30 minutes has
+# already failed. This bound is not there to protect that; it is there so a run
+# that cannot finish stops before it collides with tomorrow's.
+PAPER_TIMEOUT="${ALGO_PAPER_TIMEOUT_SECONDS:-10800}"   # 3h
+
+algo_run_bounded "$PAPER_TIMEOUT" \
+    "$VENV" scripts/run_paper.py --publish --no-entries-disabled >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
 
 echo "$(date): Paper trading run completed (exit code: $EXIT_CODE)" >> "$LOG_FILE"
@@ -174,14 +216,25 @@ if [ "$EXIT_CODE" != "0" ]; then
     # "No signals committed today" is false in that case, and a false alert
     # sends the operator hunting the wrong fault — so the detail is read out of
     # the log rather than asserted.
-    if tail -n "+$((LOG_LINES_BEFORE_RUN + 1))" "$LOG_FILE" 2>/dev/null \
+    #
+    # KAN-78 adds a third meaning: 124 is the wrapper's own bound firing, not
+    # anything run_paper.py reported. It is classified FIRST because the log
+    # tail it would otherwise be read from belongs to a run that was killed
+    # mid-sentence, and because an operator who reads "No signals committed
+    # today" goes looking for a traceback that does not exist.
+    ICON="🚨"
+    if [ "$EXIT_CODE" = "124" ]; then
+        ICON="⏱️"
+        DETAIL="TIMED OUT after ${PAPER_TIMEOUT:-?}s and was killed; no signals committed today."
+        echo "$(date): paper run TIMED OUT after ${PAPER_TIMEOUT:-?}s and was killed" >> "$LOG_FILE"
+    elif tail -n "+$((LOG_LINES_BEFORE_RUN + 1))" "$LOG_FILE" 2>/dev/null \
         | grep -q "WARNING: publish to pipeline failed"; then
         DETAIL="Book committed, but no orders reached risk/execution; intents replay next run."
     else
         DETAIL="No signals committed today."
     fi
     algo_alert_local "paper run FAILED (exit $EXIT_CODE) — $DETAIL see $LOG_FILE"
-    telegram "🚨 Paper trading run FAILED (exit $EXIT_CODE). $DETAIL See $LOG_FILE"
+    telegram "$ICON Paper trading run FAILED (exit $EXIT_CODE). $DETAIL See $LOG_FILE"
 fi
 
 # KAN-15: tell the OUTSIDE world the run happened. Every alert above this line
@@ -199,10 +252,7 @@ fi
 # meaning of "the wrapper never ran". That is knowingly imprecise and kept: the run
 # put no orders in front of the broker, which is the class of silence this
 # switch exists to break. The local alert above carries the accurate diagnosis.
-algo_deadman_ping "$EXIT_CODE"
-echo "$(date): dead-man switch: $ALGO_DEADMAN_STATUS" >> "$LOG_FILE"
-
 # Clean up logs older than 30 days
 find "$LOG_DIR" -name "paper_trading_*.log" -mtime +30 -delete 2>/dev/null
 
-exit $EXIT_CODE
+paper_exit "$EXIT_CODE"

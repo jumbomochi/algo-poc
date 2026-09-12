@@ -159,8 +159,17 @@ def test_the_exit_code_is_distinct_from_the_existing_ones():
 
 def test_the_wrapper_withholds_the_dead_man_ping_on_any_nonzero_exit():
     """No wrapper change is needed, but that is a property worth pinning: the
-    whole fix rests on a non-zero exit being enough to suppress the ping."""
+    whole fix rests on a non-zero exit being enough to suppress the ping.
+
+    KAN-78 moved the ping into paper_exit(), so the property is now two links:
+    the helper pings with the code it was handed, and the run's own exit code is
+    what gets handed to it. Asserting the old literal would have passed on a
+    wrapper that never called the helper at all.
+    """
     wrapper = (REPO / "deploy/launchd/run_paper.sh").read_text()
-    assert 'algo_deadman_ping "$EXIT_CODE"' in wrapper, (
-        "run_paper.sh no longer keys the dead-man ping on the exit code"
+    assert 'algo_deadman_ping "$1"' in wrapper, (
+        "run_paper.sh's exit helper no longer keys the dead-man ping on its argument"
+    )
+    assert 'paper_exit "$EXIT_CODE"' in wrapper, (
+        "run_paper.sh no longer passes the run's exit code to the exit helper"
     )
