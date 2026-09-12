@@ -15,7 +15,7 @@ things like:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import Iterable, Mapping
 
 from backtest.costs import (
@@ -196,6 +196,65 @@ class PortfolioDivergenceReport:
     # live against it is meaningful at all.
     baseline_fill_model: str = NEXT_OPEN_FILL_MODEL
     baseline_comparable: bool = True
+
+
+# ---------------------------------------------------------------------------
+# Admissible live history (KAN-83)
+# ---------------------------------------------------------------------------
+# Live equity from before a re-baseline is not comparable to anything, and
+# nothing stopped the window reaching across one. equity_snapshots carries four
+# days (2026-07-28..07-31) written between the 07-25 bulk position close and the
+# 2026-08-01 Path A re-baseline: negative sleeve equity, a total a third of
+# reality, byte-identical across all four — a frozen book.
+#
+# The window is 30 days and only ~22 live sessions exist, so it reaches into
+# late July and slides one session per run. On 2026-09-12 it landed on 07-28 and
+# produced a BREACH on five of six sleeves, AGGREGATE +207.4%, delivered to
+# Telegram. Every figure reproduced exactly from the 07-28 starting values.
+#
+# KAN-82's non-positive guard catches two of those sleeves. It cannot catch
+# momentum (3,822 -> 22,891 = +498.9%) or sector_rotation (6,152 -> 12,595 =
+# +104.7%), whose bases are positive and merely wrong. Only a boundary knows
+# those are not comparable.
+
+
+def restrict_live_history(
+    series: dict[date, float], boundary: date | None
+) -> dict[date, float]:
+    """Drop live points before ``boundary``. Inclusive of the boundary date.
+
+    Inclusive because the boundary names the first ADMISSIBLE session, not the
+    last inadmissible one — a re-baseline dated 2026-08-01 means equity from
+    2026-08-01 onward is valid.
+
+    ``None`` leaves the series untouched: an unset boundary must not silently
+    alter grading for anyone who has not configured one.
+    """
+    if boundary is None:
+        return series
+    return {d: v for d, v in series.items() if d >= boundary}
+
+
+def resolve_live_boundary(
+    *,
+    configured: date | None,
+    epoch_started_at: datetime | None,
+) -> tuple[date | None, str]:
+    """Decide the earliest admissible live date, and say where it came from.
+
+    gate_epochs is the mechanism the project intends for this, but it is empty
+    until epoch v2 starts (KAN-33), so the boundary is a configuration fact for
+    now — in the manner of divergence.baseline_pin.
+
+    An open epoch WINS when one exists: it is the authority on what is being
+    graded, and the configured date becomes history. The source is returned
+    alongside so the two cannot disagree silently in a report someone acts on.
+    """
+    if epoch_started_at is not None:
+        return epoch_started_at.date(), f"epoch started_at {epoch_started_at.date()}"
+    if configured is not None:
+        return configured, f"config divergence.live_history_from {configured}"
+    return None, "none set (grading all available live history)"
 
 
 def align_and_window(

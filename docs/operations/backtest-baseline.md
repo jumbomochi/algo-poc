@@ -387,6 +387,74 @@ refresh died".
 
 ---
 
+## Earliest admissible live history
+
+```yaml
+divergence:
+  live_history_from: 2026-08-01
+```
+
+The pin above says *what* live equity is graded against. This says *how far
+back* live equity may be graded at all.
+
+Live equity from before a re-baseline is not comparable to anything.
+`equity_snapshots` carries four days written between the 2026-07-25 bulk
+position close and the **2026-08-01 Path A re-baseline**, when `execution_fills`
+began recording real fills:
+
+```
+2026-07-25 | min sleeve  12,788 | total  96,532   sane
+2026-07-28 | min sleeve  -4,914 | total  31,733   invalid
+2026-07-29 | min sleeve  -4,914 | total  31,733   identical
+2026-07-30 | min sleeve  -4,914 | total  31,733   identical
+2026-07-31 | min sleeve  -4,914 | total  31,733   identical
+2026-08-05 | min sleeve  12,829 | total 101,067   sane
+```
+
+Negative sleeve equity, a total a third of reality, byte-identical across four
+days — a frozen book.
+
+The comparison window is 30 days and only ~22 live sessions exist, so it reaches
+into late July and slides forward one session per run. On **2026-09-12** it
+landed on 07-28 and reported `momentum +498.9%`, `AGGREGATE +207.4%` and a BREACH
+on five of six sleeves, delivered to Telegram. None of it was drift — every
+figure reproduced exactly from the 07-28 starting values.
+
+With the boundary set, the same day grades as:
+
+```
+momentum          +498.9%  ->   -0.2%
+quality_value     NO_DATA  ->   +0.1%
+sector_rotation   +104.7%  ->   -0.4%
+tail_risk_hedge    +42.8%  ->   +0.0%
+thematic_momentum NO_DATA  ->   -0.5%
+```
+
+**Inclusive**: the date names the first *admissible* session, not the last
+inadmissible one.
+
+**Set it at every re-baseline.** Any event that makes prior equity
+incomparable — a re-baseline, a book reset, a capital change — needs this moved
+forward, for the same reason `baseline_pin` needs re-pinning at a rung change.
+
+### Which authority wins
+
+| source | when |
+|---|---|
+| `--live-history-from` | an explicit one-off run; also how the tests declare their span rather than inheriting the operator's |
+| open `gate_epochs` row | once epoch v2 starts (KAN-33) the epoch is the authority and the config value becomes history |
+| `divergence.live_history_from` | today, because `gate_epochs` is empty |
+| none | grades all available history — the state the 2026-09-12 defect lived in |
+
+The monitor prints which one it used, so the two cannot disagree silently:
+
+```
+Live history from: 2026-08-01  [config divergence.live_history_from 2026-08-01]
+```
+
+`--live-history-from all` disables the boundary. That is what produced the false
+BREACH, so it belongs in ad-hoc investigation, not in a scheduled run.
+
 ## Regenerating the headline baseline
 
 Run these yourself; they need IB Gateway and write into `output/`.

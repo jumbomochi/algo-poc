@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
+from datetime import date
+
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -228,6 +230,21 @@ class DivergenceConfig(BaseModel):
     """
 
     baseline_pin: str | None = None
+    #: Earliest live equity date admissible for grading (KAN-83).
+    #:
+    #: Live equity from before a re-baseline is not comparable to anything.
+    #: equity_snapshots carries 2026-07-28..07-31 — negative sleeve equity, a
+    #: total a third of reality, identical across all four days — written
+    #: between the 07-25 bulk position close and the 2026-08-01 Path A
+    #: re-baseline. On 2026-09-12 the sliding window reached them and produced
+    #: a BREACH on five of six sleeves, AGGREGATE +207.4%, none of it drift.
+    #:
+    #: Inclusive: this names the first ADMISSIBLE session. ``None`` grades all
+    #: available history, which is the state the defect lived in.
+    #:
+    #: Superseded by gate_epochs once epoch v2 starts (KAN-33): an open epoch's
+    #: started_at wins, and the monitor reports which authority it used.
+    live_history_from: date | None = None
 
 
 class ResearchConfig(BaseModel):
