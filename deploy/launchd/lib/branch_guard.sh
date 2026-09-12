@@ -57,28 +57,15 @@ ALGO_BRANCH_PROBE_TIMEOUT="${ALGO_BRANCH_PROBE_TIMEOUT:-10}"
 # export it in a login shell.
 ALGO_BRANCH_DIR="${ALGO_BRANCH_DIR:-${ALGO_DIR:-.}}"
 
-# Run a command with a hard bound. Returns 124 on expiry. Both background jobs
-# redirect stdout because command substitution waits for every inherited
-# descriptor — a killer holding the pipe would make the bound itself the stall
-# (the bug this pattern was written around in KAN-70).
-if ! command -v _algo_bounded >/dev/null 2>&1; then
-_algo_bounded() {
-    local secs="$1"; shift
-    local tmp; tmp="$(mktemp)" || return 1
-    "$@" >"$tmp" 2>/dev/null &
-    local pid=$!
-    ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 &
-    local killer=$!
-    local rc=0
-    wait "$pid" 2>/dev/null || rc=$?
-    kill "$killer" 2>/dev/null
-    wait "$killer" 2>/dev/null
-    cat "$tmp"
-    rm -f "$tmp"
-    [ "$rc" -ge 128 ] && return 124
-    return "$rc"
-}
-fi
+# Bounded execution lives in one place now (KAN-75).
+# Resolved relative to THIS file, not $ALGO_DIR. A lib knows where its own
+# sibling lives; $ALGO_DIR is the tree under inspection, which is not the same
+# thing and is deliberately pointed at a throwaway repo by the tests. Conflating
+# them made the bounded probe silently undefined, and the fallback path — "could
+# not reach origin" — looks exactly like being offline.
+# shellcheck source=deploy/launchd/lib/bounded.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bounded.sh"
+
 
 _algo_git() {
     git -C "$ALGO_BRANCH_DIR" "$@" 2>/dev/null
@@ -111,7 +98,7 @@ algo_branch_check() {
     # fetched, which is the state that produced the 38-commit rollback. Deciding
     # from the local ref alone would have called that tree healthy.
     local caveat="" remote_sha head_full target
-    remote_sha="$(_algo_bounded "$ALGO_BRANCH_PROBE_TIMEOUT" \
+    remote_sha="$(algo_run_bounded "$ALGO_BRANCH_PROBE_TIMEOUT" \
                     git -C "$ALGO_BRANCH_DIR" ls-remote origin refs/heads/main \
                     | awk 'NR==1{print $1}')"
     head_full="$(_algo_git rev-parse HEAD)"

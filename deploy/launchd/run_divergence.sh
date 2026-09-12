@@ -175,15 +175,22 @@ fi
 # the docker stack is still coming up.
 wait_for_port() {
     local host="$1" port="$2" label="$3" timeout="${4:-300}"
-    local waited=0
+    # Wall clock, not a count of our own sleeps (KAN-75). `sleep` is suspended
+    # when the machine suspends, so a counted deadline measures AWAKE seconds
+    # while the timeout it defends is a wall-clock one — the same defect that
+    # let a 6h backtest bound overrun by 6h42m on 2026-09-08.
+    local deadline announced=0
+    deadline=$(( $(date +%s) + timeout ))
     until nc -z "$host" "$port" 2>/dev/null; do
-        if [ "$waited" -ge "$timeout" ]; then
+        if [ "$(date +%s)" -ge "$deadline" ]; then
             echo "$(date): ERROR - $label not reachable on $host:$port after ${timeout}s" >> "$LOG_FILE"
             return 1
         fi
-        [ "$waited" = "0" ] && echo "$(date): waiting for $label on $host:$port ..." >> "$LOG_FILE"
+        [ "$announced" = "0" ] && {
+            echo "$(date): waiting for $label on $host:$port ..." >> "$LOG_FILE"
+            announced=1
+        }
         sleep 15
-        waited=$((waited + 15))
     done
     return 0
 }
