@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import math
 from datetime import datetime, timezone
@@ -16,6 +17,107 @@ from shared.broker_state import (
 
 class AccountValidationError(RuntimeError):
     pass
+
+
+class AccountSummaryRefusedError(AccountValidationError):
+    """IB refused the account-summary request — Error 322.
+
+    Distinct from a malformed summary because the remedy is different: nothing
+    is wrong with the data, there are too many subscriptions registered against
+    this gateway session and the oldest ones belong to processes that have
+    already exited. Restarting the gateway clears them.
+    """
+
+
+#: What the snapshot actually reads. NetLiquidation arrives in the account's
+#: base currency; ExchangeRate and TotalCashBalance are per-currency rows that
+#: only appear when $LEDGER:ALL is requested. ib_insync's accountSummaryAsync
+#: asks for all 33 tags; this asks for the two that are read.
+ACCOUNT_SUMMARY_TAGS = "NetLiquidation,$LEDGER:ALL"
+
+#: A request IB never answers must not hang the caller. Generous — the library's
+#: own comment puts a normal round trip at ~250ms.
+ACCOUNT_SUMMARY_TIMEOUT_SECONDS = 30.0
+
+#: IB's refusal code: "Maximum number of account summary requests exceeded;
+#: desubscribe to previous request first".
+_ERROR_ACCOUNT_SUMMARY_REFUSED = 322
+
+
+async def read_account_summary(
+    ib: Any, *, timeout: float = ACCOUNT_SUMMARY_TIMEOUT_SECONDS
+) -> list[Any]:
+    """Take one account summary and release the subscription it opened — KAN-79.
+
+    `reqAccountSummary` opens a SUBSCRIPTION, not a one-shot query, and the
+    gateway holds it for the session — it outlives the process that made it.
+    Nothing in this tree ever cancelled one, so they accumulated across runs
+    until IB refused new ones. On 2026-09-09 that was 69 refusals in a single
+    paper run, each arriving right behind an Error 1102: on every reconnect the
+    gateway replays its stored subscriptions to IBKR, and IBKR rejects each
+    replay whose original registration is still live.
+
+    The snapshot is a point-in-time read. Nothing wants a standing subscription,
+    so this cancels as soon as the rows are in hand — before returning them, so
+    that a caller whose extraction raises cannot leak one either.
+
+    WHY THIS GOES THROUGH ib.client AND NOT IB.accountSummaryAsync
+    --------------------------------------------------------------
+    `IB` exposes no `cancelAccountSummary`, and `accountSummaryAsync` discards
+    the reqId it allocated, so there is no handle to release what it opened.
+    `Client.cancelAccountSummary(reqId)` does exist. Issuing the request at the
+    client level is the only way to hold the reqId the cancel needs.
+
+    (`accountSummaryAsync` also would not have leaked *per call*: it re-requests
+    only when `wrapper.acctSummary` is empty. The leak is one per connection,
+    which is one per run, which over weeks is enough.)
+    """
+    client = ib.client
+    wrapper = ib.wrapper
+    req_id = client.getReqId()
+
+    refusals: list[str] = []
+
+    def _note_refusal(err_req_id, error_code, error_string, _contract=None) -> None:
+        # Only our own reqId. The refusals in the log arrive out of band against
+        # reqIds owned by processes that have already exited.
+        if err_req_id == req_id and error_code == _ERROR_ACCOUNT_SUMMARY_REFUSED:
+            refusals.append(str(error_string))
+
+    ib.errorEvent += _note_refusal
+    refused = False
+    try:
+        future = wrapper.startReq(req_id)
+        client.reqAccountSummary(req_id, "All", ACCOUNT_SUMMARY_TAGS)
+        try:
+            await asyncio.wait_for(future, timeout)
+        except asyncio.TimeoutError as exc:
+            raise AccountValidationError(
+                f"IB did not answer the account summary request within {timeout}s"
+            ) from exc
+
+        if refusals:
+            # ib_insync ends a refused request's future with NO rows, so without
+            # this the caller sees "expected exactly one NetLiquidation value" —
+            # a message that blames the data for a refused subscription.
+            refused = True
+            raise AccountSummaryRefusedError(
+                f"IB refused the account summary (Error "
+                f"{_ERROR_ACCOUNT_SUMMARY_REFUSED}): {refusals[0]}. Account-summary "
+                f"subscriptions are held by the gateway for the whole session and "
+                f"outlive the process that opened them; restarting IB Gateway "
+                f"clears them."
+            )
+
+        return list(wrapper.acctSummary.values())
+    finally:
+        ib.errorEvent -= _note_refusal
+        # A refused request registered nothing, so cancelling it would draw an
+        # Error 300 ("can't find EId") and put a second misleading line in the
+        # log for one event. Every other path cancels, including the timeout:
+        # a request IB never answered may still have registered.
+        if not refused:
+            client.cancelAccountSummary(req_id)
 
 
 async def _resolve(value: Any) -> Any:
@@ -95,7 +197,7 @@ class IBAccountReader:
                 f"live mode requires a U account; connected to {account_id}"
             )
 
-        summary = list(await _resolve(self._ib.accountSummaryAsync()))
+        summary = await read_account_summary(self._ib)
         captured_at = datetime.now(timezone.utc)
         nav_base = _one_float(
             _matching_rows(

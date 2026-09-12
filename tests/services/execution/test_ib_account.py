@@ -6,29 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from services.execution.ib_account import AccountValidationError, IBAccountReader
-
-
-def _summary_rows(account_id="DUN551088"):
-    return [
-        SimpleNamespace(
-            account=account_id,
-            tag="NetLiquidation",
-            value="1001757.23",
-            currency="SGD",
-        ),
-        SimpleNamespace(
-            account="All",
-            tag="ExchangeRate",
-            value="1.2928304",
-            currency="USD",
-        ),
-        SimpleNamespace(
-            account="All",
-            tag="TotalCashBalance",
-            value="-4711.26",
-            currency="USD",
-        ),
-    ]
+from tests.services.execution.fake_ib_gateway import FakeGateway, default_rows
 
 
 def _fake_ib(accounts=("DUN551088",)):
@@ -37,9 +15,17 @@ def _fake_ib(accounts=("DUN551088",)):
     ib.accountSummary.side_effect = AssertionError(
         "sync accountSummary is forbidden inside the async reader"
     )
-    ib.accountSummaryAsync = AsyncMock(
-        return_value=_summary_rows(accounts[0] if accounts else "")
+    ib.accountSummaryAsync.side_effect = AssertionError(
+        "IB.accountSummaryAsync cannot be cancelled — it discards the reqId, and "
+        "IB exposes no cancelAccountSummary. The reader must request through "
+        "ib.client so it can release the subscription (KAN-79)."
     )
+    # A gateway that enforces IB's subscription cap. `ib.gateway.rows` is the
+    # summary the reader will see; tests mutate it in place.
+    ib.gateway = FakeGateway(rows=default_rows(accounts[0] if accounts else ""))
+    ib.client = ib.gateway.client
+    ib.wrapper = ib.gateway.wrapper
+    ib.errorEvent = ib.gateway.errorEvent
     contract = SimpleNamespace(
         conId=265598, symbol="AAPL", localSymbol="AAPL", exchange="SMART", currency="USD"
     )
@@ -79,7 +65,10 @@ async def test_account_reader_returns_contract_keyed_snapshot():
     assert snapshot.captured_at.utcoffset().total_seconds() == 0
     assert snapshot.positions[265598].quantity == 10
     assert snapshot.open_orders["9"].remaining_quantity == 3
-    ib.accountSummaryAsync.assert_awaited_once_with()
+    # KAN-79: the subscription the snapshot opened is released before it
+    # returns, so nothing accumulates on the gateway across runs.
+    assert ib.gateway.requested == ib.gateway.cancelled
+    assert ib.gateway.open_subscriptions == set()
     ib.accountSummary.assert_not_called()
     ib.reqAllOpenOrdersAsync.assert_awaited_once_with()
     ib.reqAllOpenOrders.assert_not_called()
@@ -168,12 +157,23 @@ async def test_account_reader_rejects_paper_account_in_live_mode():
 async def test_account_reader_requires_exactly_one_currency_value(
     tag, row_count, error
 ):
+    """Duplicates arrive under DIFFERENT account labels, never as two identical
+    rows: ib_insync keys `wrapper.acctSummary` by (account, tag, currency), so
+    an exact repeat overwrites rather than accumulating. `_matching_rows`
+    accepts "", the account id, and (for the $LEDGER tags) "All", so two of
+    those labels carrying the same tag and currency is the reachable shape —
+    and the one the guard has to catch.
+    """
     ib = _fake_ib()
-    summary = _summary_rows()
+    summary = default_rows()
     template = next(row for row in summary if row.tag == tag)
     summary = [row for row in summary if row.tag != tag]
-    summary.extend(SimpleNamespace(**vars(template)) for _ in range(row_count))
-    ib.accountSummaryAsync.return_value = summary
+    accepted_accounts = ["", "DUN551088", "All"]
+    summary.extend(
+        SimpleNamespace(**{**vars(template), "account": accepted_accounts[i]})
+        for i in range(row_count)
+    )
+    ib.gateway.rows = summary
 
     with pytest.raises(AccountValidationError, match=error):
         await IBAccountReader(
@@ -189,7 +189,7 @@ async def test_account_reader_selects_trading_currency_cash_among_currencies():
     # IB returns TotalCashBalance per currency (SGD/USD/BASE); the reader must
     # pick the trading-currency (USD) row and tolerate a negative balance.
     ib = _fake_ib()
-    summary = _summary_rows()
+    summary = default_rows()
     summary.extend(
         [
             SimpleNamespace(
@@ -200,7 +200,7 @@ async def test_account_reader_selects_trading_currency_cash_among_currencies():
             ),
         ]
     )
-    ib.accountSummaryAsync.return_value = summary
+    ib.gateway.rows = summary
 
     snapshot = await IBAccountReader(
         ib,
@@ -215,7 +215,7 @@ async def test_account_reader_selects_trading_currency_cash_among_currencies():
 @pytest.mark.asyncio
 async def test_account_reader_rejects_nav_in_wrong_currency():
     ib = _fake_ib()
-    ib.accountSummaryAsync.return_value[0].currency = "USD"
+    ib.gateway.rows[0].currency = "USD"
 
     with pytest.raises(AccountValidationError, match="SGD NetLiquidation"):
         await IBAccountReader(
@@ -241,7 +241,7 @@ async def test_account_reader_rejects_non_finite_or_invalid_values(
 ):
     ib = _fake_ib()
     next(
-        row for row in ib.accountSummaryAsync.return_value if row.tag == tag
+        row for row in ib.gateway.rows if row.tag == tag
     ).value = value
 
     with pytest.raises(AccountValidationError, match=error):
@@ -266,7 +266,7 @@ async def test_account_reader_rejects_non_finite_or_invalid_values(
 async def test_account_reader_rejects_non_positive_nav_or_fx(tag, value):
     ib = _fake_ib()
     next(
-        row for row in ib.accountSummaryAsync.return_value if row.tag == tag
+        row for row in ib.gateway.rows if row.tag == tag
     ).value = value
 
     with pytest.raises(AccountValidationError, match="NAV and FX rate must be positive"):
@@ -283,7 +283,7 @@ async def test_account_reader_rejects_derived_usd_nav_overflow():
     ib = _fake_ib()
     next(
         row
-        for row in ib.accountSummaryAsync.return_value
+        for row in ib.gateway.rows
         if row.tag == "ExchangeRate"
     ).value = "5e-324"
 
