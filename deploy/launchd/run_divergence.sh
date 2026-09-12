@@ -88,7 +88,7 @@ set -uo pipefail
 # manual run would then use whatever tree, interpreter or report path they
 # point at. ALGO_PYTHON swaps the interpreter for the monitor too, not just for
 # the alert renderer.
-ALGO_DIR="${ALGO_DIR:-/Users/huiliang/GitHub/algo-poc}"
+ALGO_DIR="${ALGO_DIR:-/Users/huiliang/algo-poc-deploy}"
 VENV="${ALGO_PYTHON:-$ALGO_DIR/.venv/bin/python}"
 LOG_DIR="$HOME/ibc/logs"
 METRICS_DIR="$HOME/ibc/metrics"

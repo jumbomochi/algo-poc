@@ -16,7 +16,7 @@
 # end-to-end against a stub tree — launchd starts jobs with an empty
 # environment, so production always takes the default. Never export ALGO_DIR
 # in a login shell: a manual run would then use whatever tree that points at.
-ALGO_DIR="${ALGO_DIR:-/Users/huiliang/GitHub/algo-poc}"
+ALGO_DIR="${ALGO_DIR:-/Users/huiliang/algo-poc-deploy}"
 VENV="$ALGO_DIR/.venv/bin/python"
 LOG_DIR="$HOME/ibc/logs"
 LOG_FILE="$LOG_DIR/paper_trading_$(date +%Y%m%d).log"
