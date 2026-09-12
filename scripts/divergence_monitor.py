@@ -52,10 +52,15 @@ from backtest.divergence import (
     aggregate_reports,
     any_breach,
     build_report,
+    resolve_live_boundary,
+    restrict_live_history,
     execution_model_from_backtest_config,
 )
 from scripts.paper_state import PaperTradingState
+from sqlalchemy import select
+
 from shared.config import load_config
+from shared.models import GateEpoch
 from shared.models.evidence import DivergenceDaily
 from backtest.shadow_artifact import ShadowArtifact, load_shadow
 from backtest.sleeve_comparability import SleeveComparability
@@ -883,6 +888,7 @@ def main() -> int:
         _config = load_config("config/default.yaml")
         default_db_url = _config.database.url
         default_redis_url = _config.redis.url
+        _configured_boundary = _config.divergence.live_history_from
     except Exception:
         # Honour ALGO_DATABASE_URL even when the config file can't be loaded, so
         # a missing/unreadable config can't silently fall back to the wrong DB
@@ -891,6 +897,7 @@ def main() -> int:
             "ALGO_DATABASE_URL", "postgresql://algo:algo@localhost:5432/algo_poc"
         )
         default_redis_url = os.environ.get("ALGO_REDIS_URL", "redis://localhost:6379/0")
+        _configured_boundary = None
 
     parser = argparse.ArgumentParser(
         description="Compare live paper-trading equity to backtest expectations."
@@ -898,6 +905,15 @@ def main() -> int:
     parser.add_argument(
         "--backtest", default=None,
         help="Path to backtest results JSON. Default: latest output/backtest_multi_*.json",
+    )
+    parser.add_argument(
+        "--live-history-from", default=None, metavar="YYYY-MM-DD|all",
+        help=(
+            "Earliest live equity date admissible for grading (KAN-83). "
+            "Default: divergence.live_history_from from config, overridden by an "
+            "open gate_epochs row. 'all' grades every available session, which "
+            "is what produced the 2026-09-12 false BREACH."
+        ),
     )
     parser.add_argument(
         "--pinned", action="store_true",
@@ -1128,6 +1144,38 @@ def main() -> int:
             return EXIT_ERROR
         portfolios = [args.portfolio]
 
+    # --- Earliest admissible live history (KAN-83) ---
+    # gate_epochs is the authority when an epoch is open; until epoch v2 starts
+    # (KAN-33) the table is empty and the configured date stands in. Resolved
+    # once, reported with its source, so the two cannot disagree silently in a
+    # report someone acts on.
+    epoch_started_at = None
+    try:
+        epoch_started_at = session.execute(
+            select(GateEpoch.started_at).order_by(
+                GateEpoch.started_at.desc(), GateEpoch.id.desc()
+            ).limit(1)
+        ).scalar_one_or_none()
+    except Exception as exc:  # noqa: BLE001 — an unreadable epoch table must not
+        # stop the monitor; it degrades to the configured date and says so.
+        print(f"  ⚠ could not read gate_epochs ({exc}); using the configured boundary")
+    # An explicit flag outranks both: it is how a one-off run scores a different
+    # span without editing the committed config, and how the tests declare the
+    # span they mean instead of inheriting the operator's.
+    if args.live_history_from is not None:
+        if args.live_history_from.lower() == "all":
+            live_boundary, live_boundary_source = None, "--live-history-from all"
+            epoch_started_at = None
+        else:
+            live_boundary = date.fromisoformat(args.live_history_from)
+            live_boundary_source = f"--live-history-from {live_boundary}"
+            epoch_started_at = None
+    else:
+        live_boundary, live_boundary_source = resolve_live_boundary(
+            configured=_configured_boundary, epoch_started_at=epoch_started_at
+        )
+    print(f"  Live history from: {live_boundary or 'all'}  [{live_boundary_source}]")
+
     # --- Build per-portfolio reports ---
     reports: list[PortfolioDivergenceReport] = []
     live_series_by_portfolio: dict[str, dict[date, float]] = {}
@@ -1147,6 +1195,11 @@ def main() -> int:
             )
             continue
         live = load_live_equity_series(state, name)
+        # Drop live history from before the boundary BEFORE aligning, so the
+        # window is built only from admissible sessions (KAN-83). Applied here
+        # rather than inside build_report because the aggregate is summed from
+        # these same series and must be restricted identically.
+        live = restrict_live_history(live, live_boundary)
         live_series_by_portfolio[name] = live
         if name not in bt_per_portfolio and args.shadow is None:
             print(
