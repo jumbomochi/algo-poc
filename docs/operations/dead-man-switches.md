@@ -73,24 +73,49 @@ the weekday set or the hour in this table stops matching them, so the table
 cannot drift the way the "runs daily including weekends" claim did between
 2026-08-21 and 2026-09-08.
 
-### The baseline has its own staleness check, and it is not a dead-man
+### The baseline has its own check, and it judges the PIN
 
-`ALGO_DEADMAN_REFRESH_URL` covers "the weekly refresh did not run". It cannot
-cover "the baseline is old", and the difference is not academic — it only pings
-on a **successful** refresh, so it cannot arm itself until the job it watches is
-already healthy, and an unpinged check never alerts (below). Between 2026-08-25
-and 2026-09-08 the baseline aged fourteen days with no page from anything.
+`ALGO_DEADMAN_REFRESH_URL` covers "the weekly refresh did not run", and since
+2026-09-10 it is finally armed — it only pings on a *successful* refresh, so it
+could not arm itself until one happened.
 
-So the daily pipeline report measures the artifact on disk directly, every day,
-regardless of why it is old: the newest `output/backtest_multi_*.json` is
-reported with its age, and a **baseline** older than **8 days** is escalated as
-**stale** through `algo_alert_local` plus Telegram. Eight days is one missed
-Tuesday plus a day of slack — the same figure as the dead-man period,
-deliberately. No artifact at all is reported distinctly and alerts just as
-loudly, because absence of evidence must not render as freshness.
+That leaves a different question, which is the one the daily report answers:
+**is the baseline the monitor actually grades against still current and usable?**
+The baseline of record is `divergence.baseline_pin` in `config/default.yaml`,
+resolved through `scripts/ops/baseline_pin.py` — **not** the newest
+`output/backtest_multi_*.json`, whatever happens to sort last.
 
-Owned by `deploy/launchd/lib/baseline_age.sh`; threshold overridable with
-`ALGO_BASELINE_STALE_DAYS`.
+That distinction is not pedantry. The first version of this check measured the
+newest artifact, and on 2026-09-10 it went silent the moment a refresh
+succeeded — while the pin stayed 23 days old and the artifact that silenced it
+was `BLOCKED` at 17.39% excluded and could never be pinned.
+
+The daily report prints both facts on one line, because either alone misleads:
+
+```
+pin is backtest_multi_20260819_183451.json (23d old, coverage BLOCKED at 11.28% excluded);
+newest is backtest_multi_20260910_235624.json (0d, coverage BLOCKED at 17.39% excluded — cannot be pinned)
+```
+
+It escalates through `algo_alert_local` plus Telegram when:
+
+| Condition | Why |
+|---|---|
+| the pin cannot be resolved | the monitor will exit 3 (BLIND) on its next run |
+| the pin's file is missing | same, and a different fix from "it is old" |
+| the pin is older than **30 days** | past the monitor's comparison window, live and backtest stop overlapping meaningfully — which it already hints at with *"Only 22 overlapping days available (requested 30)"* |
+| the newest artifact is **unusable** and fresh (≤1 day) | a refresh that succeeds and produces something unpinnable is otherwise invisible: it exits 0, pings its dead-man, and logs the coverage warning to a file nobody opens |
+
+A newer, **usable** artifact sitting unpinned is deliberately *not* an alert.
+Re-pinning is a deliberate act (KAN-51), so that is the normal state after
+every refresh.
+
+The unusable case alerts only while it is news. Repeating it every morning until
+a vendor exists for delisted history (KAN-59/KAN-60) is how an alert gets
+ignored; after the first day it stays in the report body as state.
+
+Owned by `deploy/launchd/lib/baseline_age.sh`; thresholds overridable with
+`ALGO_BASELINE_PIN_MAX_DAYS` and `ALGO_BASELINE_FRESH_DAYS`.
 
 ### A check that has never been pinged does not alert
 

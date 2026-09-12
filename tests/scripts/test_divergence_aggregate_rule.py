@@ -73,7 +73,11 @@ def _run(monkeypatch, *, db_url, shadow, output) -> int:
     from scripts import divergence_monitor
 
     monkeypatch.setattr(divergence_monitor.sys, "argv", [
-        "divergence_monitor.py", "--shadow", str(shadow),
+        "divergence_monitor.py",
+        # Explicit rather than inheriting the operator's configured KAN-83
+        # boundary: this fixture passes today only because its dates happen to
+        # fall after it.
+        "--live-history-from", "all", "--shadow", str(shadow),
         "--db-url", db_url, "--window", "5", "--output", str(output),
     ])
     return divergence_monitor.main()

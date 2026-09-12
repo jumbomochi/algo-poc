@@ -74,6 +74,9 @@ def _run(monkeypatch, *, db_url, shadow, output, window="5") -> int:
 
     monkeypatch.setattr(divergence_monitor.sys, "argv", [
         "divergence_monitor.py",
+        # Predates the KAN-83 boundary and means "grade everything"; without
+        # this these fixtures inherit the operator's configured date.
+        "--live-history-from", "all",
         "--shadow", str(shadow),
         "--db-url", db_url,
         "--window", window,
@@ -142,6 +145,9 @@ def test_shadow_and_pinned_together_are_refused(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(divergence_monitor.sys, "argv", [
         "divergence_monitor.py",
+        # Predates the KAN-83 boundary and means "grade everything"; without
+        # this these fixtures inherit the operator's configured date.
+        "--live-history-from", "all",
         "--shadow", str(_shadow(tmp_path)),
         "--backtest", "whatever.json", "--pinned",
         "--db-url", _db(tmp_path, "both"),

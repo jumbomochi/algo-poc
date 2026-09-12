@@ -15,7 +15,7 @@ things like:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import Iterable, Mapping
 
 from backtest.costs import (
@@ -198,6 +198,65 @@ class PortfolioDivergenceReport:
     baseline_comparable: bool = True
 
 
+# ---------------------------------------------------------------------------
+# Admissible live history (KAN-83)
+# ---------------------------------------------------------------------------
+# Live equity from before a re-baseline is not comparable to anything, and
+# nothing stopped the window reaching across one. equity_snapshots carries four
+# days (2026-07-28..07-31) written between the 07-25 bulk position close and the
+# 2026-08-01 Path A re-baseline: negative sleeve equity, a total a third of
+# reality, byte-identical across all four — a frozen book.
+#
+# The window is 30 days and only ~22 live sessions exist, so it reaches into
+# late July and slides one session per run. On 2026-09-12 it landed on 07-28 and
+# produced a BREACH on five of six sleeves, AGGREGATE +207.4%, delivered to
+# Telegram. Every figure reproduced exactly from the 07-28 starting values.
+#
+# KAN-82's non-positive guard catches two of those sleeves. It cannot catch
+# momentum (3,822 -> 22,891 = +498.9%) or sector_rotation (6,152 -> 12,595 =
+# +104.7%), whose bases are positive and merely wrong. Only a boundary knows
+# those are not comparable.
+
+
+def restrict_live_history(
+    series: dict[date, float], boundary: date | None
+) -> dict[date, float]:
+    """Drop live points before ``boundary``. Inclusive of the boundary date.
+
+    Inclusive because the boundary names the first ADMISSIBLE session, not the
+    last inadmissible one — a re-baseline dated 2026-08-01 means equity from
+    2026-08-01 onward is valid.
+
+    ``None`` leaves the series untouched: an unset boundary must not silently
+    alter grading for anyone who has not configured one.
+    """
+    if boundary is None:
+        return series
+    return {d: v for d, v in series.items() if d >= boundary}
+
+
+def resolve_live_boundary(
+    *,
+    configured: date | None,
+    epoch_started_at: datetime | None,
+) -> tuple[date | None, str]:
+    """Decide the earliest admissible live date, and say where it came from.
+
+    gate_epochs is the mechanism the project intends for this, but it is empty
+    until epoch v2 starts (KAN-33), so the boundary is a configuration fact for
+    now — in the manner of divergence.baseline_pin.
+
+    An open epoch WINS when one exists: it is the authority on what is being
+    graded, and the configured date becomes history. The source is returned
+    alongside so the two cannot disagree silently in a report someone acts on.
+    """
+    if epoch_started_at is not None:
+        return epoch_started_at.date(), f"epoch started_at {epoch_started_at.date()}"
+    if configured is not None:
+        return configured, f"config divergence.live_history_from {configured}"
+    return None, "none set (grading all available live history)"
+
+
 def align_and_window(
     live: dict[date, float],
     backtest: dict[date, float],
@@ -217,17 +276,34 @@ def align_and_window(
 
 
 def window_return(values: list[float]) -> float | None:
-    """Total return over a series: last/first - 1. ``None`` if degenerate."""
-    if len(values) < 2 or values[0] == 0:
+    """Total return over a series: last/first - 1. ``None`` if degenerate.
+
+    A NON-POSITIVE start is degenerate, not just zero. A negative base yields a
+    number that is arithmetically valid, semantically meaningless, and sign
+    flipped: on 2026-09-12 quality_value went -1,537.94 -> 15,468.14 — a gain —
+    and was reported as ``-1105.8%`` and delivered as a BREACH. The reader's
+    natural conclusion from that figure is the opposite of the truth, and it was
+    written to divergence_daily as gate evidence.
+
+    Returning None routes the sleeve to NO_DATA with a named reason instead,
+    which sends the reader to the equity data rather than to the strategy.
+    """
+    if len(values) < 2 or values[0] <= 0:
         return None
     return values[-1] / values[0] - 1.0
 
 
 def daily_returns(values: list[float]) -> list[float]:
-    """Day-over-day arithmetic returns. Skips zero-denominator transitions."""
+    """Day-over-day arithmetic returns. Skips non-positive denominators.
+
+    Same rule as ``window_return`` and for the same reason: correlation is
+    computed from these, and the 2026-09-12 report carried correlations
+    (+0.081, -0.034) derived across a negative point. A sign-flipped daily
+    return is not a smaller error than a sign-flipped total.
+    """
     out: list[float] = []
     for i in range(len(values) - 1):
-        if values[i] == 0:
+        if values[i] <= 0:
             continue
         out.append(values[i + 1] / values[i] - 1.0)
     return out
@@ -425,6 +501,24 @@ def build_report(
 
     live_ret = window_return(lvals)
     bt_ret = window_return(btvals)
+
+    # A None return here is not "no data" in the ordinary sense — it means the
+    # window starts at an equity that cannot be divided by. Name it, with the
+    # value and the date, so the reader goes to the equity data rather than to
+    # the strategy. The absence of this note on 2026-09-12 is what made
+    # "-1105.8%" read as a finding about quality_value, when quality_value had
+    # in fact gained over the window.
+    if live_ret is None and lvals and lvals[0] <= 0:
+        notes.append(
+            f"Live equity starts at {lvals[0]:.2f} on {dates[0]} — a non-positive "
+            f"balance is not a valid base for a return, so this sleeve cannot be "
+            f"graded. The fault is in the equity data, not the strategy."
+        )
+    if bt_ret is None and btvals and btvals[0] <= 0:
+        notes.append(
+            f"Backtest equity starts at {btvals[0]:.2f} on {dates[0]} — a "
+            f"non-positive balance is not a valid base for a return."
+        )
     abs_div, rel_div = compute_divergence(live_ret, bt_ret)
     corr = correlation(daily_returns(lvals), daily_returns(btvals))
     window_trades = filter_trades_to_window(trades, dates[0], dates[-1])

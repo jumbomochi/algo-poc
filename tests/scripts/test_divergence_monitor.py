@@ -381,6 +381,9 @@ def test_main_exits_three_against_a_blocked_coverage_baseline(
     report_path = tmp_path / "divergence.json"
     monkeypatch.setattr(divergence_monitor.sys, "argv", [
         "divergence_monitor.py",
+        # Predates the KAN-83 boundary and means "grade everything"; without
+        # this these fixtures inherit the operator's configured date.
+        "--live-history-from", "all",
         "--backtest", str(bt_path),
         "--db-url", db_url,
         "--window", "5",
@@ -752,6 +755,9 @@ def test_monitor_skips_drill_portfolio_even_when_it_is_scoreable(
     report_path = tmp_path / "divergence.json"
     monkeypatch.setattr(divergence_monitor.sys, "argv", [
         "divergence_monitor.py",
+        # Predates the KAN-83 boundary and means "grade everything"; without
+        # this these fixtures inherit the operator's configured date.
+        "--live-history-from", "all",
         "--backtest", str(bt_path),
         "--db-url", db_url,
         "--window", "5",
@@ -787,6 +793,9 @@ def _run_monitor(tmp_path: Path, monkeypatch, *, name: str, with_drill: bool) ->
     report_path = tmp_path / f"divergence_{name}.json"
     monkeypatch.setattr(divergence_monitor.sys, "argv", [
         "divergence_monitor.py",
+        # Predates the KAN-83 boundary and means "grade everything"; without
+        # this these fixtures inherit the operator's configured date.
+        "--live-history-from", "all",
         "--backtest", str(_write_backtest_json_with_drill_sleeve(tmp_path)),
         "--db-url", db_url,
         "--window", "5",
@@ -908,6 +917,9 @@ def _run_monitor_main(
 
     monkeypatch.setattr(divergence_monitor.sys, "argv", [
         "divergence_monitor.py",
+        # Predates the KAN-83 boundary and means "grade everything"; without
+        # this these fixtures inherit the operator's configured date.
+        "--live-history-from", "all",
         "--backtest", str(backtest),
         "--db-url", db_url,
         "--window", window,
@@ -1475,6 +1487,9 @@ def test_pinned_with_no_path_at_all_exits_three(tmp_path: Path, monkeypatch, cap
 
     monkeypatch.setattr(divergence_monitor.sys, "argv", [
         "divergence_monitor.py",
+        # Predates the KAN-83 boundary and means "grade everything"; without
+        # this these fixtures inherit the operator's configured date.
+        "--live-history-from", "all",
         "--backtest", "",
         "--pinned",
         "--db-url", db_url,
@@ -1519,6 +1534,9 @@ def test_recency_still_resolves_the_baseline_for_an_unpinned_run(
     report = tmp_path / "divergence.json"
     monkeypatch.setattr(divergence_monitor.sys, "argv", [
         "divergence_monitor.py",
+        # Predates the KAN-83 boundary and means "grade everything"; without
+        # this these fixtures inherit the operator's configured date.
+        "--live-history-from", "all",
         "--db-url", db_url,
         "--window", "5",
         "--max-baseline-age-days", "0",
