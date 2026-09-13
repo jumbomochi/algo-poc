@@ -366,10 +366,18 @@ Two constraints on adopting this:
 
 ## 9. Decision (D8) — Rung 0 runs one sleeve: `momentum`
 
-**Status:** logged 2026-08-17. **Decides:** direction-doc D8 (OPEN since
-2026-08-11). **Closes:** KAN-34 AC 6. **Unblocks:** KAN-33 (epoch v2).
+**Status:** logged 2026-08-17. **HELD 2026-08-28** — the condition in §9.8 was
+not met: `momentum` failed its edge verdict of record and so did the named
+fallback. **Decides:** direction-doc D8 (OPEN since 2026-08-11). **Closes:**
+KAN-34 AC 6. **Does NOT unblock KAN-33 (epoch v2)** — the original text claimed
+it did, and that claim is withdrawn; see §9.8.
 
 ### 9.1 The decision
+
+> **Not in force (2026-08-28).** What follows is the allocation D8 chose, and it
+> remains the allocation of record *if* Rung 0 ever arms. It is held, not
+> amended and not retired, because `momentum` failed its edge verdict of record
+> — see §9.8. Nothing in this section is a live instruction.
 
 Rung 0 (5,000 SGD ≈ USD 3,700) is allocated **100% to `momentum`**. The other
 five sleeves are **suspended at Rung 0, not retired** — they are re-admitted at
@@ -506,6 +514,76 @@ nowhere near enough to say anything about `momentum`'s edge. **A clean Rung 0 is
 evidence the machine works, never evidence the strategy works.**
 
 ### 9.8 Standing condition — `momentum`'s edge verdict of record
+
+> **RESOLVED 2026-08-28 — `momentum` FAILED, the named fallback failed, and
+> Rung 0 does not arm.** This is the third of the three branches pre-committed
+> below on 2026-08-17, before any number existed.
+
+The verdicts of record, from
+[incumbent-edge-evaluation.md](incumbent-edge-evaluation.md) (KAN-55, commit
+`308259c`), against the pinned PIT baseline
+`output/backtest_multi_20260819_183451.json`
+(sha256 `19e130ad8d572ea9eb167df499a3a94b6545f86acb392785a69498b65f480136`),
+admissibility `VALID_WITH_ACCEPTED_BIAS`:
+
+| Sleeve | DSR (threshold 0.95) | FDR | Holdout SR (55 sessions) | Verdict |
+|---|---:|---|---:|---|
+| `momentum` | 0.358 | pass | +0.24 | **FAIL** |
+| `sector_rotation` *(the named fallback)* | 0.401 | pass | −0.26 | **FAIL** |
+| `thematic_momentum` | 0.473 | pass | −0.90 | **FAIL** |
+| `quality_value` | 0.113 | fail | +4.63 | **FAIL** |
+| `earnings_drift` | 0.262 | pass | +0.88 | **FAIL** |
+| `tail_risk_hedge` | 0.000 | fail | −4.78 | **FAIL** |
+
+**The consequences, taken from the pre-commitment and not re-argued now:**
+
+1. **D8 is NOT re-decided to `sector_rotation`.** The fallback exists for the
+   case where `momentum` alone fails. It failed too, at DSR 0.401 — no closer to
+   the threshold than the sleeve it was meant to replace. There is nothing to
+   fall back to.
+2. **§9.1's allocation is held, not amended and not retired.** It remains the
+   allocation of record for a Rung 0 that arms on a sleeve with a passing
+   verdict. No such sleeve exists today.
+3. **Rung 0 does not arm and KAN-33 does not record epoch v2.** The ladder stops
+   here. §9's header originally read "Unblocks: KAN-33"; that is withdrawn.
+4. **Recommended stage for all six is `shadow`** — one step down, never
+   retirement, and nothing moves automatically (D3.3).
+
+**This is not a set of borderline calls.** Every sleeve lands between DSR 0.000
+and 0.473 against a 0.95 threshold; no sleeve is one good quarter away. Four of
+six clear BH-FDR and fail anyway, which is the rehearsal's finding repeated on
+real numbers: across six sleeves with a decade of data, FDR is close to inert
+and DSR carries the decision.
+
+**The accepted D18 bias runs AGAINST these verdicts, not with them.** The
+baseline excludes 11.28% of point-in-time membership-days against a 5.00% floor
+(164 tickers), and index departures skew toward underperformers, so returns are
+flattered by an unmeasured amount. A flattered baseline makes a sleeve *easier*
+to pass. All six failed regardless, so the FAILs are if anything understated.
+See [D18](../designs/project-direction.md).
+
+**Two limits on how far this reaches.** The 55-session holdout is too short to
+carry weight in either direction — `quality_value` posts holdout SR +4.63
+against an in-sample 0.03, which is a short window doing what short windows do,
+not a sleeve that works. And four of six sleeves have no stability surface
+(`run_stability_sweep.py` covers only the sleeves needing nothing but bars).
+Neither limit changes a verdict: the verdicts rest on DSR, and all six fail
+there.
+
+**What would reopen this.** A sleeve — incumbent or new — clearing the framework
+on a *newly registered* holdout. `incumbent_sleeves_2026` is spent, and its
+registry entry restricts it to the six incumbents in any case: the native factor
+catalog was specified 2026-08-02, inside that window, so spending it on a factor
+evaluation would have been contaminated. Any future evaluation registers its own
+split with a later boundary, before the look.
+
+---
+
+#### The pre-commitment, as recorded 2026-08-17
+
+*Kept verbatim. Its value is that it was written before the numbers existed —
+the branch above was chosen under no pressure, which is the whole point of
+recording it in advance.*
 
 Direction D10 requires the edge-validation framework's incumbent evaluation to
 complete **before Rung 0 arms**, and that evaluation has authority over this
