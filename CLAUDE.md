@@ -116,6 +116,64 @@ Environment variables take precedence over `config/default.yaml`:
 | `ALGO_DATABASE_URL` | `database.url` | `postgresql://algo:algo@localhost:5432/algo_poc` |
 | `ALGO_REDIS_URL` | `redis.url` | `redis://localhost:6379/0` |
 
+## Secrets — 1Password is the source of truth, `op` is how you read it
+
+**Never ask the user to paste a secret, and never read one out of a file.**
+The `op` CLI is installed and signed in; anything you need is already
+retrievable:
+
+```bash
+op read 'op://Developer/JIRA_API_Token/password'     # the acli/JIRA token
+op item list --vault Developer                       # titles only, no values
+op read 'op://<vault>/<item>/<field>'
+```
+
+Vaults: `Private`, `Developer`, `Personal`, `Shared`, `Work`. Use
+`op item get <title> --format json` to find a field name rather than guessing —
+`JIRA_API_Token` is a LOGIN whose token is in `password`, not `credential`.
+
+Three layers, and confusing them is the recurring error:
+
+| where | who reads it | how |
+|---|---|---|
+| 1Password | humans, and agents on their behalf | `op read` |
+| macOS login keychain, service `algo-poc` | the launchd jobs | `deploy/launchd/secrets.sh` |
+| `.env` | **nobody** | it is a FIFO — see below |
+
+- **The launchd jobs do NOT read 1Password.** They read the login keychain,
+  because a launchd user agent cannot unlock 1Password and a service-account
+  token would itself have to be stored somewhere (the reasoning is in
+  `deploy/launchd/secrets.sh`'s header, KAN-16). The keychain is a *mirror*;
+  1Password is still where the value lives. Re-mirror with
+  `deploy/launchd/secrets.sh --import`, and check what is present — names and
+  status only, never values — with `deploy/launchd/secrets.sh --check`.
+- **`.env` is a named pipe, not a file.** 1Password Environments serves it, so
+  `cat .env` blocks ~60s and returns nothing, and `[ -f .env ]` is **false**.
+  That combination silently disabled every alert path for two days on
+  2026-08-13/14. `secrets.sh` refuses a non-regular `.env` by name and in under
+  a second; do not add a code path that reads it.
+- **Rotating a secret means both places.** Update the 1Password item, then
+  `secrets.sh --import`, or the jobs keep using the old value until the next
+  04:15 tells you otherwise.
+
+### Piping `op read` into a tool that prompts
+
+The agent harness runs commands with **stdin closed**, so
+`op read ... | acli auth login --token` fails with "failed to read token from
+standard input" — the pipe is not the problem, the closed stdin is. Use a
+short-lived file and remove it immediately:
+
+```bash
+f=$(mktemp); chmod 600 "$f"
+op read 'op://Developer/JIRA_API_Token/password' > "$f"
+acli jira auth login --site "huiliang.atlassian.net" \
+  --email "$EMAIL" --token < "$f"
+rm -f "$f"
+```
+
+Never echo a secret, never pass one in argv (it is visible to `ps`), and never
+write one into a file that is not removed in the same command.
+
 ## Code Conventions
 
 - All modules use `from __future__ import annotations`
@@ -141,6 +199,33 @@ feature branch  ──PR──>  develop  ──PR──>  main
 - **Branch off `develop`, not `main`.** `develop` contains everything `main`
   has plus whatever is awaiting promotion; branching off `main` reintroduces
   conflicts that were already resolved.
+- **Promotions to `main` are SQUASH merges, and that has a cost you pay
+  deliberately.** A squash creates a commit that exists only on `main`, so
+  `main` stops being an ancestor of `develop`. The next promotion PR is then
+  unmergeable even when `git diff origin/main origin/develop` is clean, because
+  the 3-way merge cannot tell that the two sides made the same changes. The fix
+  is a **reconciliation PR** merging `origin/main` into `develop`:
+
+  ```bash
+  git merge-base --is-ancestor origin/main origin/develop   # fails => reconcile
+  git worktree add .worktrees/reconcile -b chore/reconcile-main-<date> origin/develop
+  cd .worktrees/reconcile && git merge origin/main
+  ```
+
+  Resolve conflicts in favour of `develop` — it already contains everything
+  `main` has, so `main`'s side of any conflict is strictly older, not
+  different. Then **verify the merged tree changes nothing**:
+
+  ```bash
+  git diff --cached origin/develop     # MUST be empty
+  ```
+
+  If it is not empty, stop: something on `main` never reached `develop` and
+  resolving toward `develop` would silently drop it.
+
+  Merge that PR with a **merge commit, never a squash** — squashing it would
+  flatten the very ancestry link that stops the next promotion conflicting for
+  the same reason. Needed twice so far (#157, #164).
 - **CI runs on both PRs and branch pushes.** `.github/workflows/tests.yml` and
   `security.yml` build every PR and every push to `main`/`develop`. The
   post-merge build on `develop` is the one that catches two individually-green
@@ -162,6 +247,25 @@ feature branch  ──PR──>  develop  ──PR──>  main
   `tmp_path`, no service containers). Real Postgres, `alembic upgrade head`
   against it, and `docker compose build` are **not** covered — verify those by
   hand before promoting anything that touches migrations or images.
+- **Merging the promotion PR does not deploy it.** The launchd jobs read a
+  working tree on the host, so promotion has a second half. Run it **in the
+  tree the launchd jobs read** — which `deploy/launchd/README.md` names, and
+  which is not necessarily the tree you are developing in — and in this order:
+
+  ```bash
+  git merge --ff-only origin/main     # FIRST
+  deploy/launchd/deploy.sh --dry-run
+  deploy/launchd/deploy.sh
+  ```
+
+  `deploy.sh` run against a stale tree reports "everything in sync" and copies
+  nothing — true and meaningless (2026-09-08). Note that the two halves of the
+  tree behave differently: `secrets.sh`, `deadman.sh`, everything in
+  `deploy/launchd/lib/`, and all of `scripts/` and `config/` are **sourced by
+  path** and go live the moment the tree is pulled, while `run_*.sh` and
+  `gateway_watchdog.sh` are **copies in `~/ibc`** that only move when
+  `deploy.sh` runs. `deploy/launchd/README.md` carries the file list on each
+  side.
 
 ## Destructive Actions — Human Confirmation Required
 
