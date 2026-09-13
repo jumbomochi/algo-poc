@@ -422,9 +422,10 @@ DSR plus the holdout carry the decision.
 
 Stated plainly so the gate review is not surprised by it:
 
-- **The verdicts.** Blocked on a like-for-like baseline, which is an operator
-  run, not a code change. The protocol, the tooling and the decision rules are
-  in place; the numbers are not.
+- ~~**The verdicts.**~~ Produced 2026-08-28; see [Verdicts](#verdicts). All six
+  sleeves FAIL and the `incumbent_sleeves_2026` holdout is spent. This bullet is
+  struck rather than deleted so the gate reviewer can see it closed rather than
+  wonder whether it was ever open.
 - **Four of six stability surfaces.** `thematic_momentum`, `quality_value`,
   `earnings_drift` and `tail_risk_hedge` cannot be swept until
   `run_stability_sweep.py` is wired to the regime series, the fundamentals
