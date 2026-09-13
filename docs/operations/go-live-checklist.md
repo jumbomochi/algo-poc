@@ -32,8 +32,9 @@ equity snapshot, which on this book is **2026-07-10**, i.e. *before* the Path A
 flatten-and-refund. Measured across that reset, gate 1 overstates the elapsed
 days and gate 3 reports the re-baseline as a **68.38% drawdown** — a capital
 event dressed up as a trading loss. With `--paper-start 2026-07-30` the same
-book reports **0.33%**. Both numbers are arithmetically correct; only one is
-about trading.
+book reports a low single-digit figure (**4.19%** as of 2026-09-13; it moves
+with the book, unlike the 68.38%, which is fixed by the size of the refund).
+Both numbers are arithmetically correct; only one is about trading.
 
 It exits `0` only when all eight gates pass, `2` if the database is unreachable
 (checked before any gate runs, so a wrong URL cannot masquerade as an empty
