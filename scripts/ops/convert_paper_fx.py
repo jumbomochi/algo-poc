@@ -19,6 +19,8 @@ import asyncio
 import math
 import sys
 
+from services.execution.ib_account import read_account_summary
+
 
 class FxRefusedError(RuntimeError):
     """Raised when a safety guard blocks the FX conversion."""
@@ -55,7 +57,11 @@ async def convert(
                 f"refusing: account {account_id!r} is not a paper (DU*) account"
             )
 
-        summary = await asyncio.wait_for(ib.accountSummaryAsync(), 20)
+        # KAN-79: read_account_summary releases the subscription it opens.
+        # ib.accountSummaryAsync() would leave one registered on the gateway for
+        # the rest of its session — this script is run by hand, repeatedly,
+        # during a funding session, so it leaks one per invocation.
+        summary = await read_account_summary(ib, timeout=20)
         usd_before = _usd_cash(summary)
         sgd_before = _cash(summary, "SGD")
 
@@ -104,7 +110,7 @@ async def convert(
             print("WARNING: order not fully filled — inspect in the Gateway/TWS.")
             return 1
 
-        summary_after = await asyncio.wait_for(ib.accountSummaryAsync(), 20)
+        summary_after = await read_account_summary(ib, timeout=20)
         print(f"USD cash after: {_usd_cash(summary_after):,.2f}")
         print(f"SGD cash after: {_cash(summary_after, 'SGD'):,.2f}")
         return 0
