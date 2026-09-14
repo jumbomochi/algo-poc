@@ -39,6 +39,23 @@
 # the section and the alert are two renderings of one reading, and two
 # invocations could disagree with each other across the 04:15 run's write.
 
+# Bounded execution lives in one place (KAN-75). Resolved relative to THIS
+# file, not $ALGO_DIR, for the reason branch_guard.sh records: a lib knows
+# where its own sibling lives, and $ALGO_DIR is the tree under inspection.
+# shellcheck source=deploy/launchd/lib/bounded.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bounded.sh"
+
+# Wall-clock bound on the database read. WITHOUT THIS THE SECTION CAN END THE
+# REPORT PERMANENTLY: create_engine has no connect_timeout, so against a
+# half-open localhost:55432 — docker-proxy alive, container wedged, a real
+# state on this host — the read blocks forever. This check runs inside the
+# report's `{ ... } >> "$LOG_FILE"` block, so the whole job hangs, and launchd
+# will not start a second instance of local.algo-pipeline-report while one is
+# running. Every subsequent morning's report would then never run, and the job
+# argues it needs no dead-man precisely because it sends daily. A section added
+# to end silence must not become a permanent silence.
+ALGO_RECONCILIATION_TIMEOUT="${ALGO_RECONCILIATION_TIMEOUT:-60}"
+
 ALGO_RECONCILIATION_SENTINEL="===RECONCILIATION-ALERT==="
 ALGO_RECONCILIATION_DETAIL=""
 ALGO_RECONCILIATION_ALERT=""
@@ -47,24 +64,40 @@ algo_reconciliation_check() {
     ALGO_RECONCILIATION_DETAIL=""
     ALGO_RECONCILIATION_ALERT=""
 
-    local py out
+    local py out rc=0 cause
     py="${ALGO_PYTHON:-${ALGO_DIR:-.}/.venv/bin/python}"
 
     # The script owns every failure it can name — a bad DSN, an unreachable
     # database — and renders those as "unknown" itself, so it exits 0 even
-    # then. This `|| out=""` covers only the case it cannot: the interpreter
-    # or the file being absent. cd first so a relative ALGO_DIR resolves the
-    # same way the rest of the wrapper resolves it.
+    # then. What is left for this layer is the interpreter or file being
+    # absent, and the deadline above firing. cd first so a relative ALGO_DIR
+    # resolves the same way the rest of the wrapper resolves it.
     out="$( (cd "${ALGO_DIR:-.}" 2>/dev/null \
-             && "$py" "${ALGO_DIR:-.}/scripts/ops/reconciliation_status.py" \
-                      --mode "${ALGO_MODE:-paper}" 2>/dev/null) )" || out=""
+             && algo_run_bounded "$ALGO_RECONCILIATION_TIMEOUT" \
+                    "$py" "${ALGO_DIR:-.}/scripts/ops/reconciliation_status.py" \
+                    --mode "${ALGO_MODE:-paper}" 2>/dev/null) )" || rc=$?
 
-    if [ -z "$out" ]; then
+    # A body carrying the sentinel is usable whatever the exit code said.
+    # Discarding good output because the process died after printing it would
+    # replace a precise reading with "could not be run" — the safe direction,
+    # but the wrong cause, and cause is what the operator acts on.
+    case "$out" in
+        *"$ALGO_RECONCILIATION_SENTINEL"*) rc=0 ;;
+    esac
+
+    if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
         # Never a reassuring default. A wrapper that cannot run the check knows
         # less than nothing about the book, and "absence of evidence is not
         # evidence of no halt" is the rule the whole section implements.
-        ALGO_RECONCILIATION_DETAIL="status: unknown — the reconciliation check could not be run (missing interpreter or script); this says nothing about whether entries are blocked"
-        ALGO_RECONCILIATION_ALERT="🚨 reconciliation: CHECK DID NOT RUN — nothing can say whether entries are blocked, and a halted book looks exactly like a quiet market. Remedy: python scripts/reconcile_paper.py --report"
+        if [ "$rc" = "124" ]; then
+            cause="it did not finish within ${ALGO_RECONCILIATION_TIMEOUT}s (the database read is most likely wedged)"
+        elif [ "$rc" -ne 0 ]; then
+            cause="it exited $rc without a usable reading"
+        else
+            cause="missing interpreter or script"
+        fi
+        ALGO_RECONCILIATION_DETAIL="status: unknown — the reconciliation check could not be run ($cause); this says nothing about whether entries are blocked"
+        ALGO_RECONCILIATION_ALERT="🚨 reconciliation: CHECK DID NOT RUN ($cause) — nothing can say whether entries are blocked, and a halted book looks exactly like a quiet market. Remedy: python scripts/reconcile_paper.py --report"
         return 0
     fi
 
@@ -76,9 +109,10 @@ algo_reconciliation_check() {
     ALGO_RECONCILIATION_ALERT="$(printf '%s\n' "$out" \
         | awk -v s="$ALGO_RECONCILIATION_SENTINEL" 'f{print} $0==s{f=1}')"
 
-    # A body with no sentinel means the script printed something unexpected.
-    # Report what it said rather than swallowing it, and treat the missing
-    # sentinel as a reason to page — same rule as an empty body above.
+    # A non-empty body with no sentinel means the script printed something
+    # unexpected — a stub on PATH, a half-written change. Report what it said
+    # rather than swallowing it, and page: an unrecognised reading is still no
+    # reading.
     case "$out" in
         *"$ALGO_RECONCILIATION_SENTINEL"*) : ;;
         *)

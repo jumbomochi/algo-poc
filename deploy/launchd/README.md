@@ -594,6 +594,21 @@ the operator to ignore the page.
 No Prometheus rule was added for `reconciliation_entries_allowed`: nothing is
 deployed to evaluate one, so it would be a fifth detector with no consumer.
 
+The database read is bounded by `algo_run_bounded` (KAN-75) at
+`$ALGO_RECONCILIATION_TIMEOUT` (default 60s). This is not optional:
+`create_engine` has no `connect_timeout`, the check runs inside the report's
+log block, and launchd will not start a second instance of
+`local.algo-pipeline-report` while one is running — so an unbounded read
+against a half-open Postgres would stop *every subsequent* morning's report,
+turning a section added to end silence into a permanent one.
+
+**Deploying it:** `run_pipeline_report.sh` is a copy in `~/ibc`, so the section
+does not exist in production until `deploy/launchd/deploy.sh` is re-run. The
+lib itself (`lib/reconciliation.sh`) and `scripts/ops/reconciliation_status.py`
+are sourced by path and go live the moment the tree is pulled. Until the
+wrapper is resynced the `cmp` drift guard warns into the log, so the mismatch
+fails loudly rather than silently.
+
 - **Logs:** `~/ibc/logs/pipeline_report_YYYYMMDD.log` (pruned after 30 days),
   launchd stdout/stderr to `~/ibc/logs/pipeline-report-launchd.log`.
 - **launchd scripts and PATH:** any job script that calls the `docker` CLI

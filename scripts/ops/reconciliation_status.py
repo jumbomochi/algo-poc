@@ -55,6 +55,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
@@ -74,11 +75,27 @@ from shared.models.order_ledger import ReconciliationReport  # noqa: E402
 #: be read once.
 SENTINEL = "===RECONCILIATION-ALERT==="
 
+#: The clock the trading day is named by. Both the 04:15 paper run and this
+#: 04:52 report are scheduled in SGT, so the SGT date is what "session" means
+#: here. Grouping on the UTC date instead would be wrong in both directions:
+#: the UTC date rolls at 08:00 SGT, so a catch-up reconcile at 09:00 SGT would
+#: land in a *different* session from that morning's 04:15 run — escalating on
+#: one bad day plus the operator's own investigation re-run — while a manual
+#: run at 23:30 SGT would merge into the NEXT morning's session.
+SESSION_TZ = ZoneInfo("Asia/Singapore")
+
 #: How old a reading may be before it stops being evidence about this morning.
-#: The paper run is 04:15 and this report is 04:52, so a healthy reading is ~37
-#: minutes old; 26 hours spans a normal day-to-day gap without spanning the
-#: Sat→Tue weekend hole, which is a *missing session* and should say so.
-STALE_AFTER_HOURS = 26.0
+#: The only legitimate age at 04:52 is ~37 minutes: the paper run writes at
+#: 04:15 the same morning, and the report shares its Tue–Sat schedule, so there
+#: is no weekend gap to accommodate — a Tuesday whose own run wrote nothing
+#: leaves Saturday's reading at 72h and SHOULD say unknown.
+#:
+#: 20 hours therefore tolerates a late or catch-up run within the same day
+#: while still calling a missed session what it is. It is deliberately under
+#: 24: at 26 a run that never wrote left yesterday's reading at ~24.6h and
+#: rendered in the HEALTHY shape — "the last thing we heard was good news and
+#: it is old", which is the KAN-71 defect this module quotes.
+STALE_AFTER_HOURS = 20.0
 
 #: One session is a transient — a position opened after the snapshot, an IB
 #: hiccup, a catch-up run. Two is a halt nobody has noticed. Stated in the
@@ -88,7 +105,9 @@ ESCALATE_AFTER_SESSIONS = 2
 
 #: How many readings back to look. Comfortably past the 17-day case that
 #: prompted this, and bounded so a long-running halt cannot make the query grow
-#: without limit.
+#: without limit. A halt longer than this saturates the reported COUNT — the
+#: headline number stops growing — but never the escalation, which only needs
+#: the count to reach two.
 LOOKBACK_READINGS = 120
 
 #: Discrepancies named individually before the rest are summarised. Telegram
@@ -96,6 +115,14 @@ LOOKBACK_READINGS = 120
 #: fire-and-forget send discards curl's status, so an over-long message is
 #: silently dropped — the exact failure this story exists to end.
 MAX_NAMED_DISCREPANCIES = 3
+
+#: Hard ceiling on the escalation body, applied last and unconditionally.
+#: MAX_NAMED_DISCREPANCIES bounds the *count* of discrepancies named, not their
+#: length — three rows carrying a pathological symbol would still build a body
+#: Telegram drops on the floor. The cap makes "this message is deliverable" a
+#: guarantee rather than a probability, which for the only channel reporting a
+#: trading halt is the difference that matters.
+MAX_BODY_CHARS = 3500
 
 REMEDY = "python scripts/reconcile_paper.py --report"
 
@@ -153,36 +180,42 @@ class ReconciliationFacts:
 
 
 def _session_key(moment: datetime) -> str:
-    """The trading session a reading belongs to.
+    """The trading session a reading belongs to, as an SGT date.
 
-    A catch-up run writes a second report on the same day, and counting rows
-    rather than sessions would escalate on a single day's transient. UTC date
-    is the grouping: the 04:15 SGT run lands at 20:15 UTC the previous day, so
-    consecutive runs still fall on consecutive UTC dates.
+    A catch-up run writes a second report on the same trading day, and counting
+    rows rather than sessions would escalate on a single day's transient. See
+    :data:`SESSION_TZ` for why the SGT date and not the UTC one.
     """
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(timezone.utc).date().isoformat()
+    return moment.astimezone(SESSION_TZ).date().isoformat()
 
 
 def _consecutive_disabled_sessions(rows) -> int:
-    """Sessions, newest first, for which every reading blocked entries.
+    """Sessions, newest first, whose LAST reading blocked entries.
 
-    Stops at the first session that allowed them. An older halt that was
-    repaired must not inflate today's count and re-page for a fixed problem.
+    Each session is judged by its newest reading, because that is the reading
+    that governed trading: ``run_paper.py`` reads the newest row and halts the
+    book on it. Requiring *every* reading in a session to have blocked entries
+    instead produced two bugs — a newest session containing one allowing
+    reading rendered as "blocked for 0 consecutive session(s)", and, worse,
+    silently suppressed the page for a halt of any length behind it.
+
+    Stops at the first session whose last reading allowed entries. An older
+    halt that was repaired must not inflate today's count and re-page for a
+    problem already fixed.
     """
-    by_session: dict[str, bool] = {}
+    newest_by_session: dict[str, bool] = {}
     order: list[str] = []
     for row in rows:  # newest first
         key = _session_key(row.created_at)
-        if key not in by_session:
+        if key not in newest_by_session:
             order.append(key)
-            by_session[key] = True
-        by_session[key] = by_session[key] and not row.entries_allowed
+            newest_by_session[key] = bool(row.entries_allowed)
 
     count = 0
     for key in order:
-        if not by_session[key]:
+        if newest_by_session[key]:
             break
         count += 1
     return count
@@ -207,7 +240,12 @@ def collect_facts(
         session.scalars(
             select(ReconciliationReport)
             .where(ReconciliationReport.mode == mode)
-            .order_by(ReconciliationReport.created_at.desc())
+            .order_by(
+                ReconciliationReport.created_at.desc(),
+                # Same tiebreak gate_data_source.py uses over this table: two
+                # rows can share a timestamp, and "newest" must be total.
+                ReconciliationReport.id.desc(),
+            )
             .limit(LOOKBACK_READINGS)
         )
     )
@@ -290,12 +328,17 @@ def _discrepancy_phrase(facts: ReconciliationFacts) -> str:
     return phrase
 
 
-def _age_phrase(facts: ReconciliationFacts) -> str:
+def _bare_age_phrase(facts: ReconciliationFacts) -> str:
+    """"3.2h ago", with no leading verb, for sentences that supply their own."""
     if facts.age_hours is None:
-        return "age unknown"
+        return "of unknown age"
     if facts.age_hours < 1:
-        return f"read {facts.age_hours * 60:.0f}m ago"
-    return f"read {facts.age_hours:.1f}h ago"
+        return f"{facts.age_hours * 60:.0f}m ago"
+    return f"{facts.age_hours:.1f}h ago"
+
+
+def _age_phrase(facts: ReconciliationFacts) -> str:
+    return f"read {_bare_age_phrase(facts)}"
 
 
 def render_section(facts: ReconciliationFacts) -> str:
@@ -320,7 +363,7 @@ def render_section(facts: ReconciliationFacts) -> str:
     if facts.status == "stale":
         entries = "allowed" if facts.entries_allowed else "DISABLED"
         return (
-            f"status: unknown — newest reading is {_age_phrase(facts)[5:]} "
+            f"status: unknown — newest reading is {_bare_age_phrase(facts)} "
             f"(bound {facts.stale_after_hours:.0f}h), so it says nothing about "
             f"this morning\n"
             f"  last heard: {facts.severity} · entries: {entries} · "
@@ -359,6 +402,16 @@ def alert_body(facts: ReconciliationFacts) -> str:
     ``if``, matching the launchd-wiring, baseline-age and branch-guard sections
     that were added by exactly this class of story.
     """
+    return _capped(_alert_body(facts))
+
+
+def _capped(body: str) -> str:
+    if len(body) <= MAX_BODY_CHARS:
+        return body
+    return body[: MAX_BODY_CHARS - 1] + "…"
+
+
+def _alert_body(facts: ReconciliationFacts) -> str:
     if facts.status == "unreadable":
         return (
             f"🚨 reconciliation: reading UNREADABLE ({facts.error or 'no detail'}) "
@@ -375,7 +428,7 @@ def alert_body(facts: ReconciliationFacts) -> str:
         entries = "allowed" if facts.entries_allowed else "DISABLED"
         return (
             f"🚨 reconciliation: reading is UNKNOWN — newest is "
-            f"{_age_phrase(facts)[5:]}, past the "
+            f"{_bare_age_phrase(facts)}, past the "
             f"{facts.stale_after_hours:.0f}h bound, so it says nothing about "
             f"this morning (last heard: {facts.severity}, entries {entries}). "
             f"Remedy: {REMEDY}"

@@ -19,6 +19,7 @@ inserting rows, not by grepping a shell script.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import create_engine
@@ -147,10 +148,14 @@ def test_two_consecutive_disabled_sessions_escalate(session):
 def test_the_seventeen_day_case_counts_every_consecutive_session(session):
     """The case this story was filed for. The count is the headline, because
     "disabled" alone reads as today's news rather than as a standing halt."""
-    _report(session, at=NOW - timedelta(days=18), allowed=True)
-    for day in range(17, 0, -1):
+    _report(session, at=NOW - timedelta(days=17), allowed=True)
+    for day in range(16, 0, -1):
         _report(session, at=NOW - timedelta(days=day), allowed=False,
                 discrepancies=[LLY])
+    # This morning's own run, 37 minutes ago. Without it the newest reading is
+    # a day old and correctly reads as stale rather than as a live halt.
+    _report(session, at=NOW - timedelta(minutes=37), allowed=False,
+            discrepancies=[LLY])
     facts = _facts(session)
 
     assert facts.disabled_sessions == 17
@@ -362,3 +367,117 @@ def test_main_never_prints_the_password_from_a_bad_dsn():
         ])
     assert code == 0
     assert "sup3r-s3cret" not in out.getvalue() + err.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Sessions are SGT trading days, judged by their newest reading
+# ---------------------------------------------------------------------------
+# Both the 04:15 paper run and the 04:52 report are scheduled in SGT, so the SGT
+# date is what "session" means. The UTC date rolls at 08:00 SGT, which is inside
+# the trading day, and grouping on it was wrong in both directions.
+#
+# NOW is 2026-09-14 20:52 UTC = 2026-09-15 04:52 SGT, so "this session" is the
+# SGT date 2026-09-15.
+
+SGT = ZoneInfo("Asia/Singapore")
+
+
+def _sgt(day: int, hour: int, minute: int = 0) -> datetime:
+    """A moment on 2026-09-<day> in SGT, as the writer would store it."""
+    return datetime(2026, 9, day, hour, minute, tzinfo=SGT).astimezone(timezone.utc)
+
+
+def test_a_catch_up_reconcile_later_the_same_trading_day_is_one_session(session):
+    """The operator's own investigation re-run. The message tells them to run
+    `reconcile_paper.py --report`; doing so must not produce the second page
+    that teaches them to ignore the first. Under UTC-date grouping the 09:00
+    SGT re-run crossed into a new session and escalated."""
+    _report(session, at=_sgt(14, 4, 15), allowed=True)
+    _report(session, at=_sgt(15, 4, 15), allowed=False, discrepancies=[LLY])
+    _report(session, at=_sgt(15, 9, 0), allowed=False, discrepancies=[LLY])
+    facts = collect_facts(session, mode="paper", now=_sgt(15, 10, 0))
+
+    assert facts.disabled_sessions == 1
+    assert alert_body(facts) == ""
+
+
+def test_a_late_evening_run_is_its_own_session_not_the_next_mornings(session):
+    """The converse. A manual run at 23:30 SGT shares a UTC date with the next
+    morning's 04:15 SGT run, and merging them hid a real second session."""
+    _report(session, at=_sgt(14, 23, 30), allowed=False, discrepancies=[LLY])
+    _report(session, at=_sgt(15, 4, 15), allowed=False, discrepancies=[LLY])
+    facts = collect_facts(session, mode="paper", now=_sgt(15, 4, 52))
+
+    assert facts.disabled_sessions == 2
+    assert "ENTRIES DISABLED" in alert_body(facts)
+
+
+def test_a_session_is_judged_by_its_newest_reading_not_by_all_of_them(session):
+    """`run_paper.py` halts on the newest row, so the newest row is what
+    governed trading. Requiring every reading in a session to have blocked
+    entries rendered "blocked for 0 consecutive session(s)" — nonsense on its
+    face — whenever a session contained one allowing reading."""
+    _report(session, at=_sgt(15, 4, 15), allowed=True)
+    _report(session, at=_sgt(15, 5, 0), allowed=False, discrepancies=[LLY])
+    facts = collect_facts(session, mode="paper", now=_sgt(15, 5, 30))
+
+    assert facts.status == "disabled"
+    assert facts.disabled_sessions == 1
+    assert "0 consecutive" not in render_section(facts)
+
+
+def test_a_long_halt_is_not_suppressed_by_one_allowing_reading_today(session):
+    """The dangerous half of the same bug: under the all-must-be-disabled rule
+    the count broke at zero, so a halt of ANY length paged not at all."""
+    for day in range(1, 15):
+        _report(session, at=_sgt(day, 4, 15), allowed=False, discrepancies=[LLY])
+    _report(session, at=_sgt(15, 4, 15), allowed=True)
+    _report(session, at=_sgt(15, 5, 0), allowed=False, discrepancies=[LLY])
+    facts = collect_facts(session, mode="paper", now=_sgt(15, 5, 30))
+
+    assert facts.disabled_sessions == 15
+    assert "ENTRIES DISABLED" in alert_body(facts)
+
+
+def test_a_repaired_session_still_stops_the_count(session):
+    """The rule the newest-reading change must not break."""
+    _report(session, at=_sgt(12, 4, 15), allowed=False, discrepancies=[LLY])
+    _report(session, at=_sgt(13, 4, 15), allowed=False, discrepancies=[LLY])
+    _report(session, at=_sgt(14, 4, 15), allowed=True)
+    _report(session, at=_sgt(15, 4, 15), allowed=False, discrepancies=[LLY])
+    facts = collect_facts(session, mode="paper", now=_sgt(15, 4, 52))
+
+    assert facts.disabled_sessions == 1
+    assert alert_body(facts) == ""
+
+
+def test_a_missed_session_does_not_render_in_the_healthy_shape(session):
+    """The bound is under 24h on purpose. At 26 a run that never wrote left
+    yesterday's reading at ~24.6h and rendered as `status: ok`, which is
+    exactly "the last thing we heard was good news and it is old"."""
+    _report(session, at=_sgt(14, 4, 15), allowed=True)
+    facts = collect_facts(session, mode="paper", now=_sgt(15, 4, 52))
+
+    assert facts.status == "stale"
+    assert "status: ok ·" not in render_section(facts)
+    assert alert_body(facts) != ""
+
+
+def test_todays_own_reading_is_fresh(session):
+    """The normal morning: the 04:15 run wrote 37 minutes ago."""
+    _report(session, at=_sgt(15, 4, 15), allowed=True)
+    facts = collect_facts(session, mode="paper", now=_sgt(15, 4, 52))
+    assert facts.status == "ok"
+
+
+def test_an_overlong_body_is_capped_so_the_send_is_not_dropped(session):
+    """The count cap bounds how many discrepancies are named, not how long each
+    one is. Telegram rejects over 4096 chars and the send discards curl's
+    status, so the ceiling has to be unconditional."""
+    huge = dict(LLY, symbol="X" * 5000)
+    _report(session, at=_sgt(14, 4, 15), allowed=False, discrepancies=[huge])
+    _report(session, at=_sgt(15, 4, 15), allowed=False, discrepancies=[huge])
+    body = alert_body(collect_facts(session, mode="paper", now=_sgt(15, 4, 52)))
+
+    assert len(body) <= 3500
+    assert body.endswith("…")

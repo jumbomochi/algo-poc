@@ -460,7 +460,7 @@ def _drive_wrapper(tmp_path, *, paper_log="paper run finished, exit code: 0\n",
                    seed=None, database_url=None, curl_exit=0,
                    launchd_installed=(), launchd_loaded=(),
                    baseline="ok", branch_state="promoted",
-                   reconciliation="ok"):
+                   reconciliation="ok", python_override=None, env_extra=None):
     """Run run_pipeline_report.sh end-to-end against stubs.
 
     Everything it reaches out to is stubbed on PATH: ``docker`` (compose logs
@@ -585,7 +585,10 @@ exit 0
         **({"ALGO_BASELINE_CONFIG": str(tmp_path / "no-such-config.yaml")}
            if baseline == "unresolved" else {}),
         ALGO_BRANCH_DIR=str(branch_dir),
+        **(env_extra or {}),
     )
+    if python_override is not None:
+        env["ALGO_PYTHON"] = str(python_override)
     res = subprocess.run(
         [str(RUN_REPORT)], capture_output=True, text=True,
         timeout=300, env=env, cwd=str(REPO),
@@ -1105,3 +1108,80 @@ def test_the_reconciliation_check_never_changes_the_report_exit_code(tmp_path):
     for state in ("ok", "transient", "disabled", "stale", "none"):
         res, _, _ = _drive_wrapper(tmp_path / state, reconciliation=state)
         assert res.returncode == 0, (state, res.stderr)
+
+
+def _drive_with_python(tmp_path, body: str):
+    """Drive the wrapper with a fake python whose reconciliation branch is
+    replaced by `body`. Everything else — the summariser, baseline_pin — still
+    dispatches to the real interpreter, so only this section is perturbed."""
+    bin_dir = tmp_path / "override"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    script = bin_dir / "python-override"
+    script.write_text(f"""#!/bin/bash
+case "$1" in
+  *reconciliation_status.py) {body} ;;
+  *pipeline_report_summary.py) exec {sys.executable} "$@" ;;
+  *baseline_pin.py) exec {sys.executable} "$@" ;;
+esac
+echo "2 resting orders"
+exit 0
+""")
+    script.chmod(0o755)
+    return script
+
+
+def test_a_check_that_cannot_run_reports_unknown_and_pages(tmp_path):
+    """The lib's own fallback, which no amount of Python-side care covers: the
+    interpreter or the script is absent. A wrapper that cannot run the check
+    knows less than nothing about the book."""
+    res, sends, log = _drive_wrapper(
+        tmp_path, python_override=_drive_with_python(tmp_path, "exit 127")
+    )
+    assert res.returncode == 0, res.stderr
+    assert any("CHECK DID NOT RUN" in b for b in _bodies(sends)), _bodies(sends)
+    assert "status: unknown" in log, log
+
+
+def test_unrecognised_check_output_pages_rather_than_being_trusted(tmp_path):
+    """A stub on PATH, or a half-written change. An unrecognised reading is
+    still no reading, and must not render as a healthy book."""
+    res, sends, log = _drive_wrapper(
+        tmp_path,
+        python_override=_drive_with_python(tmp_path, 'echo "entries: allowed"; exit 0'),
+    )
+    assert res.returncode == 0, res.stderr
+    assert any("UNRECOGNISED" in b for b in _bodies(sends)), _bodies(sends)
+
+
+def test_a_wedged_database_read_is_bounded_and_does_not_hang_the_report(tmp_path):
+    """The one that can end the report permanently. create_engine has no
+    connect_timeout, so a half-open postgres blocks forever; this check runs
+    inside the log block, and launchd will not start a second instance while
+    one is running — so every subsequent morning's report would never run."""
+    res, sends, log = _drive_wrapper(
+        tmp_path,
+        python_override=_drive_with_python(tmp_path, "sleep 600"),
+        env_extra={"ALGO_RECONCILIATION_TIMEOUT": "2"},
+    )
+    assert res.returncode == 0, res.stderr
+    bodies = _bodies(sends)
+    assert any("CHECK DID NOT RUN" in b and "within 2s" in b for b in bodies), bodies
+    assert "status: unknown" in log, log
+
+
+def test_output_printed_before_a_nonzero_exit_is_still_used(tmp_path):
+    """A body carrying the sentinel is usable whatever the exit code said.
+    Discarding it would replace a precise reading with "could not be run" —
+    the safe direction, but the wrong cause, and cause is what gets acted on."""
+    body = (
+        'printf "status: major · entries: DISABLED · discrepancies: 1\\n'
+        '===RECONCILIATION-ALERT===\\n'
+        '🚨 reconciliation: ENTRIES DISABLED for 9 consecutive sessions\\n"; exit 3'
+    )
+    res, sends, log = _drive_wrapper(
+        tmp_path, python_override=_drive_with_python(tmp_path, body)
+    )
+    assert res.returncode == 0, res.stderr
+    bodies = _bodies(sends)
+    assert any("9 consecutive sessions" in b for b in bodies), bodies
+    assert not any("CHECK DID NOT RUN" in b for b in bodies), bodies
