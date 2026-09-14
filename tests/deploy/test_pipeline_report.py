@@ -37,7 +37,12 @@ from scripts.ops.pipeline_report_summary import (
 )
 from shared.models import Base
 from shared.models.market_data import OHLCVDaily
-from shared.models.order_ledger import ExecutionFill, OrderIntent, OrderStatus
+from shared.models.order_ledger import (
+    ExecutionFill,
+    OrderIntent,
+    OrderStatus,
+    ReconciliationReport,
+)
 from shared.models.system_halt import SystemHaltState
 
 REPO = Path(__file__).resolve().parents[2]
@@ -402,10 +407,60 @@ def _make_branch_fixture(deploy: Path, state: str) -> None:
         git(deploy, "commit", "-q", "-m", "unpromoted")
 
 
+def _seed_reconciliation(session, state: str) -> None:
+    """Seed ``reconciliation_reports`` for KAN-86's section.
+
+    Defaulted to a healthy, fresh reading for the same reason ``baseline``
+    defaults to "ok": ALGO_DATABASE_URL is a real database this harness builds,
+    and a book with no reading at all renders as *unknown* and escalates — so
+    without this every test in this module would get a second message.
+    """
+    if state == "none":
+        return
+    now = datetime.now(timezone.utc)
+    # "disabled" is a two-session halt (escalates); "transient" is one session
+    # (renders, does not escalate); "stale" is a reading too old to be evidence.
+    plan: list[tuple[timedelta, bool]]
+    if state == "ok":
+        plan = [(timedelta(minutes=37), True)]
+    elif state == "transient":
+        plan = [(timedelta(days=1), True), (timedelta(minutes=37), False)]
+    elif state == "disabled":
+        plan = [
+            (timedelta(days=2), True),
+            (timedelta(days=1), False),
+            (timedelta(minutes=37), False),
+        ]
+    elif state == "stale":
+        plan = [(timedelta(days=4), True)]
+    else:  # pragma: no cover - a typo in a test argument must not pass silently
+        raise ValueError(f"unknown reconciliation state {state!r}")
+
+    for ago, allowed in plan:
+        session.add(ReconciliationReport(
+            account_id="DUN551088", mode="paper",
+            status="ok" if allowed else "major", entries_allowed=allowed,
+            result={
+                "account_id": "DUN551088",
+                "severity": "ok" if allowed else "major",
+                "entries_allowed": allowed,
+                "matched": [],
+                "discrepancies": [] if allowed else [{
+                    "type": "missing_in_ib", "con_id": 9160, "symbol": "LLY",
+                    "ib_quantity": None, "db_quantity": 12.0,
+                    "portfolio": "quality_value", "auto_correct": False,
+                }],
+            },
+            created_at=now - ago,
+        ))
+    session.commit()
+
+
 def _drive_wrapper(tmp_path, *, paper_log="paper run finished, exit code: 0\n",
                    seed=None, database_url=None, curl_exit=0,
                    launchd_installed=(), launchd_loaded=(),
-                   baseline="ok", branch_state="promoted"):
+                   baseline="ok", branch_state="promoted",
+                   reconciliation="ok"):
     """Run run_pipeline_report.sh end-to-end against stubs.
 
     Everything it reaches out to is stubbed on PATH: ``docker`` (compose logs
@@ -450,6 +505,7 @@ def _drive_wrapper(tmp_path, *, paper_log="paper run finished, exit code: 0\n",
         with Session(engine) as s:
             if seed is not None:
                 seed(s)
+            _seed_reconciliation(s, reconciliation)
         database_url = f"sqlite:///{db}"
 
     def stub(name, body):
@@ -496,6 +552,10 @@ case "$1" in
   # passthrough the stub's fallback echo below is taken as the pin PATH, which
   # is how "pinned baseline 2 resting orders is MISSING" happens.
   *baseline_pin.py) exec {sys.executable} "$@" ;;
+  # KAN-86's reconciliation section reads the same database the summariser
+  # does; without the passthrough the stub's echo below is parsed as the
+  # section body and the check reports "output unrecognised".
+  *reconciliation_status.py) exec {sys.executable} "$@" ;;
 esac
 echo "2 resting orders"
 exit 0
@@ -607,10 +667,17 @@ def test_an_unreadable_database_degrades_to_a_marker_not_a_false_all_clear(tmp_p
         tmp_path, database_url="postgresql://nobody@127.0.0.1:1/nothing",
     )
     assert res.returncode == 0
-    msg = _message(sends)
+    bodies = _bodies(sends)
+    # KAN-86 added a second message here: the same outage also makes the
+    # reconciliation reading unreadable, and that is a distinct unknown — the
+    # summary's marker says nothing about whether entries are blocked. Both
+    # must be sent, and neither may claim health.
+    digest = [b for b in bodies if "paper run" in b]
+    assert digest, bodies
+    msg = digest[0]
     assert "halt: clear" not in msg
     assert "unknown" in msg.lower()
-    assert "paper run" in msg
+    assert any("UNREADABLE" in b for b in bodies), bodies
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -950,3 +1017,91 @@ def test_the_branch_check_never_changes_the_report_exit_code(tmp_path):
     session, because missed sessions are permanent evidence holes."""
     res, _, _ = _drive_wrapper(tmp_path, branch_state="unpromoted")
     assert res.returncode == 0, res.stderr
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation section (KAN-86)
+# ---------------------------------------------------------------------------
+# From 2026-08-28 the book was fail-closed for 17 days on one missing_in_ib
+# discrepancy, blocking every buy in all six sleeves, and the only trace was one
+# line in a log. These assert on what reaches a human, because the whole defect
+# is that a correct detector had no consumer — and because the failure is
+# indistinguishable from a quiet market, which no exit code or dead-man switch
+# can separate.
+
+
+def test_a_healthy_book_renders_the_section_and_adds_no_message(tmp_path):
+    """State, not event: rendered every morning so a quiet section is evidence.
+    An alarm that fires on a healthy day is one the operator stops reading."""
+    _, sends, log = _drive_wrapper(tmp_path, reconciliation="ok")
+    assert len(sends) == 1, _bodies(sends)
+    assert "reconciliation (are entries allowed?)" in log, log
+    assert "entries: allowed" in log, log
+
+
+def test_a_halted_book_escalates_rather_than_only_logging(tmp_path):
+    """AC2. Two consecutive disabled sessions is a halt nobody has noticed."""
+    _, sends, log = _drive_wrapper(tmp_path, reconciliation="disabled")
+    bodies = _bodies(sends)
+    assert any("ENTRIES DISABLED" in b for b in bodies), bodies
+    assert any("2 consecutive sessions" in b for b in bodies), bodies
+    assert "entries: DISABLED" in log, log
+
+
+def test_the_halt_alert_also_reaches_the_local_path(tmp_path):
+    """AC2, the second path. Telegram needs a working network and a resolvable
+    credential; ALERTS.log is what survives when it does not — 2026-08-13."""
+    _drive_wrapper(tmp_path, reconciliation="disabled")
+    alerts = tmp_path / "home" / "ibc" / "logs" / "ALERTS.log"
+    assert alerts.exists(), "no ALERTS.log written"
+    assert "ENTRIES DISABLED" in alerts.read_text(), alerts.read_text()
+
+
+def test_the_escalation_names_the_discrepancy_and_the_remedy(tmp_path):
+    """AC4. "Entries disabled" without "and here is the thing to run" produces
+    a second silent week while someone works out what to do."""
+    _, sends, _ = _drive_wrapper(tmp_path, reconciliation="disabled")
+    halt = [b for b in _bodies(sends) if "ENTRIES DISABLED" in b]
+    assert halt, _bodies(sends)
+    body = halt[0]
+    for expected in ("missing_in_ib", "LLY", "9160", "quality_value",
+                     "scripts/reconcile_paper.py --report"):
+        assert expected in body, (expected, body)
+
+
+def test_one_disabled_session_renders_but_does_not_escalate(tmp_path):
+    """AC3. One session is a transient; paging on it trains the operator to
+    ignore the page."""
+    _, sends, log = _drive_wrapper(tmp_path, reconciliation="transient")
+    assert len(sends) == 1, _bodies(sends)
+    assert "entries: DISABLED" in log, log
+    assert "1 consecutive session(s)" in log, log
+
+
+def test_a_stale_reading_is_unknown_and_escalates_never_healthy(tmp_path):
+    """AC6, the KAN-71 rule. The dangerous shape is that the last thing we
+    heard was good news and it is old."""
+    _, sends, log = _drive_wrapper(tmp_path, reconciliation="stale")
+    bodies = _bodies(sends)
+    assert any("UNKNOWN" in b for b in bodies), bodies
+    assert "status: unknown" in log, log
+    # The old reading is still shown, but under "last heard" — what must not
+    # appear is the healthy section's own shape, which would assert freshness.
+    assert "status: ok ·" not in log, log
+
+
+def test_no_reading_at_all_escalates_rather_than_rendering_as_ok(tmp_path):
+    """Absence of evidence is not evidence that entries are allowed."""
+    _, sends, log = _drive_wrapper(tmp_path, reconciliation="none")
+    assert any("NO reconciliation reading" in b for b in _bodies(sends)), \
+        _bodies(sends)
+    assert "status: unknown" in log, log
+
+
+def test_the_reconciliation_check_never_changes_the_report_exit_code(tmp_path):
+    """AC5. Refusing to trade because the report could not be sent converts a
+    reporting problem into a missed session, and missed sessions are permanent
+    holes in the gate evidence (2026-08-13, 08-18, 09-01)."""
+    for state in ("ok", "transient", "disabled", "stale", "none"):
+        res, _, _ = _drive_wrapper(tmp_path / state, reconciliation=state)
+        assert res.returncode == 0, (state, res.stderr)

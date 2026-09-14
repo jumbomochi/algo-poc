@@ -532,7 +532,7 @@ Runs `run_pipeline_report.sh` at **04:52 SGT, Tue–Sat** — after the 04:15
 paper run and 04:45 divergence monitor. One log per day with the whole
 pipeline's state: paper-run tail, risk-gate BUY/SELL/SKIP counts, divergence
 result, execution-service activity (last 2h), resting IB orders (clientId 54),
-and the last 7 days of equity snapshots.
+the four standing-fact sections below, and the last 7 days of equity snapshots.
 
 Sends a one-line **Telegram summary every run** — deliberately a positive
 heartbeat, not failure-only: the 2026-07-07 incident showed a single missed
@@ -558,6 +558,41 @@ segment becomes `⚠️ halt/fills/rejections UNKNOWN (DB read failed)` and the
 message is still sent — a reassuring `halt: clear` the job cannot substantiate
 would be worse than admitting it does not know. The BUY/SELL/SKIP greps remain
 in the log body for diagnosis.
+
+### Standing facts, rendered daily and escalated when bad
+
+Four sections report a *state* rather than an event, on every run whether the
+news is good or bad. A section that appears only when something is wrong
+teaches the reader that its absence means "fine", which is precisely the
+assumption each of these was added to break:
+
+| Section | Lib | Escalates when |
+|---|---|---|
+| launchd wiring (KAN-64) | `lib/launchd_wiring.sh` | a plist is installed but not loaded, or loaded with no plist in the repo |
+| deploy branch (KAN-73) | `lib/branch_guard.sh` | the tree is not contained in `origin/main` |
+| divergence baseline age (KAN-71) | `lib/baseline_age.sh` | the pin is stale, missing or unpinned, or a fresh refresh is unusable |
+| reconciliation (KAN-86) | `lib/reconciliation.sh` | entries have been blocked for ≥2 consecutive sessions, or the reading is stale/missing/unreadable |
+
+Each escalates through **both** `algo_alert_local` and `telegram`, because
+Telegram needs a working network and a resolvable credential and `ALERTS.log`
+is what survives when it does not (the 2026-08-13 lesson). None of them gates
+the run: a reporting problem must never become a missed session, and missed
+sessions are permanent holes in the gate evidence.
+
+**Reconciliation** is the one with the highest cost of silence. A single
+`missing_in_ib` discrepancy makes `run_paper.py` set `entries_disabled` for the
+*whole book* — every buy, in all six sleeves — and from 2026-08-28 it did so for
+17 days with no alert anywhere: the run happened, so the dead-man switch pinged;
+it exited 0, so the external check stayed green; and a book that places no buys
+is indistinguishable from a book whose signals said hold. The section renders
+severity, `entries_allowed`, the discrepancy count and the reading's age;
+the escalation names the con_id, symbol and portfolio, and the remedy
+(`python scripts/reconcile_paper.py --report`, then `--apply-plan`). One
+disabled session does not escalate — it is a transient, and paging on it trains
+the operator to ignore the page.
+
+No Prometheus rule was added for `reconciliation_entries_allowed`: nothing is
+deployed to evaluate one, so it would be a fifth detector with no consumer.
 
 - **Logs:** `~/ibc/logs/pipeline_report_YYYYMMDD.log` (pruned after 30 days),
   launchd stdout/stderr to `~/ibc/logs/pipeline-report-launchd.log`.
