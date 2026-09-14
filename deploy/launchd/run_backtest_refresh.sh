@@ -56,7 +56,7 @@ set -uo pipefail
 # production always takes the defaults. Never export any of the three in a
 # login shell: a manual run would then backtest whatever tree, interpreter or
 # membership file they point at, and the success path prunes $ALGO_DIR/output.
-ALGO_DIR="${ALGO_DIR:-/Users/huiliang/GitHub/algo-poc}"
+ALGO_DIR="${ALGO_DIR:-/Users/huiliang/algo-poc-deploy}"
 VENV="${ALGO_PYTHON:-$ALGO_DIR/.venv/bin/python}"
 # Point-in-time index membership. Without it the backtest ranks only the names
 # that survived to today, which is the survivorship bias the rebaseline exists
