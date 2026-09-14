@@ -36,7 +36,15 @@ class HoldoutAlreadyEvaluated(RuntimeError):
 
 @dataclass(frozen=True)
 class HoldoutRegistration:
-    """The pre-registration record: what was written down, and when."""
+    """The pre-registration record: what was written down, and when.
+
+    ``min_sessions`` is the shortest window this split may be spent on. It is
+    part of the *registration* rather than a caller's argument on purpose: a
+    window too small to be significant is evidence of nothing, and deciding
+    after the look how short is too short is the same goalpost-moving the
+    single-use rule exists to prevent. Zero means no minimum was registered --
+    which is a statement about the record, not a licence.
+    """
 
     split_id: str
     holdout_start: str
@@ -44,6 +52,7 @@ class HoldoutRegistration:
     embargo: int
     registered_at: str
     note: str = ""
+    min_sessions: int = 0
 
     @property
     def gap(self) -> int:
@@ -119,6 +128,7 @@ class HoldoutProtocol:
                 embargo=int(row["embargo"]),
                 registered_at=str(row["registered_at"]),
                 note=str(row.get("note", "")),
+                min_sessions=int(row.get("min_sessions", 0)),
             )
             for row in payload.get("splits", [])
         }
@@ -150,6 +160,7 @@ class HoldoutProtocol:
         embargo: int,
         note: str = "",
         registered_at: str | None = None,
+        min_sessions: int = 0,
     ) -> HoldoutRegistration:
         """Write down a split before anyone looks at it."""
         if self.is_burned(split_id):
@@ -159,6 +170,8 @@ class HoldoutProtocol:
             )
         if horizon < 1 or embargo < 1:
             raise ValueError("horizon and embargo must both be at least 1 date")
+        if min_sessions < 0:
+            raise ValueError("min_sessions cannot be negative")
         registration = HoldoutRegistration(
             split_id=split_id,
             holdout_start=_as_iso(holdout_start),
@@ -166,6 +179,7 @@ class HoldoutProtocol:
             embargo=embargo,
             registered_at=registered_at or _now(),
             note=note,
+            min_sessions=min_sessions,
         )
         self._registrations[split_id] = registration
         self._save()
@@ -276,6 +290,13 @@ class HoldoutProtocol:
                     "embargo": r.embargo,
                     "registered_at": r.registered_at,
                     "note": r.note,
+                    # Emitted only when one was registered, so a split that
+                    # predates this field round-trips byte-identically. This
+                    # file is the tamper-evident record of a spent holdout;
+                    # rewriting an already-burned entry to add a default would
+                    # be exactly the kind of after-the-fact edit it exists to
+                    # make visible.
+                    **({"min_sessions": r.min_sessions} if r.min_sessions else {}),
                 }
                 for r in self._registrations.values()
             ],

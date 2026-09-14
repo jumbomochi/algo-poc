@@ -552,6 +552,7 @@ def _spend_holdout(
     protocol: HoldoutProtocol,
     registration: HoldoutRegistration,
     label: str,
+    min_sessions: int | None = None,
 ) -> tuple[HoldoutSplit, dict]:
     """Resolve and spend the pre-registered split against the sleeve dates.
 
@@ -559,15 +560,40 @@ def _spend_holdout(
     an artifact where they do not), so the split is resolved once and spent
     once -- six burns for one look would be theatre.
 
-    Nothing that can raise may run after this call: the burn is recorded to
-    disk immediately and cannot be undone, so a later failure would destroy
-    the split and produce no result at all.
+    Nothing that can raise may run after the ``evaluate`` call: the burn is
+    recorded to disk immediately and cannot be undone, so a later failure would
+    destroy the split and produce no result at all. That is also why the length
+    gate below resolves the split *first*, without burning it -- a window too
+    short to carry a claim must cost nothing, or the protocol punishes the one
+    person who checked.
     """
     split_id = registration.split_id
     dates = [
         date.fromisoformat(d)
         for d in next(iter(mapping["sleeves"].values()))["dates"]
     ]
+
+    # ``resolve`` is pure -- it maps the registered boundary onto this date
+    # index and records nothing. ``evaluate`` resolves again internally; the
+    # duplication buys the refusal below its free trial.
+    required = (
+        registration.min_sessions if min_sessions is None else int(min_sessions)
+    )
+    if required > 0:
+        preview = protocol.resolve(split_id, dates)
+        available = preview.holdout[1] - preview.holdout[0]
+        if available < required:
+            raise ValueError(
+                f"holdout {split_id!r} resolves to {available} sessions against "
+                f"this date index, below the {required} its registration "
+                f"requires. The split is NOT spent. A window this short cannot "
+                f"carry the claim, and lowering the bar after seeing the window "
+                f"is the goalpost-moving a pre-registration exists to prevent. "
+                f"Wait for the window to grow, or evaluate against a baseline "
+                f"whose date index reaches further past "
+                f"{registration.holdout_start}."
+            )
+
     split = protocol.evaluate(split_id, dates, label=label)
     start, end = split.holdout
     return split, {
@@ -584,6 +610,11 @@ def _spend_holdout(
         "n_sessions": end - start,
         "first_session": dates[start].isoformat(),
         "last_session": dates[end - 1].isoformat(),
+        # The bar this run had to clear, recorded beside the window it
+        # cleared it with. Zero means the registration set none -- which is a
+        # fact about the split's provenance, and belongs in the artifact
+        # rather than only in the registry.
+        "min_sessions": required,
         "note": registration.note,
     }
 
@@ -595,6 +626,7 @@ def evaluate_mapping(
     holdout_registry_path: Path | str | None = None,
     holdout_split_id: str = "incumbent_sleeves_2026",
     holdout_label: str = "KAN-40 incumbent sleeve evaluation",
+    min_holdout_sessions: int | None = None,
     stability_dir: Path | str | None = None,
     fdr_q: float = 0.10,
     dsr_threshold: float = 0.95,
@@ -655,7 +687,7 @@ def evaluate_mapping(
 
     # --- the burn ----------------------------------------------------------
     split, holdout_summary = _spend_holdout(
-        mapping, protocol, registration, holdout_label
+        mapping, protocol, registration, holdout_label, min_holdout_sessions
     )
     start, end = split.holdout
     train_end = split.train[1]
@@ -776,11 +808,21 @@ def _print_summary(evaluation: dict) -> None:
         f"{holdout['split_id']} from {holdout['holdout_start']} "
         f"= {holdout['n_sessions']} sessions"
     )
-    if holdout["n_sessions"] < 60:
+    required = holdout.get("min_sessions", 0)
+    if required:
+        # A registered minimum is enforced before the burn, so reaching here
+        # means it was met. Say so: the reader otherwise cannot tell a window
+        # that cleared a pre-registered bar from one that never faced one.
         print(
-            f"  NOTE: {holdout['n_sessions']} sessions is a short holdout. "
-            "Report the length beside the result; a window too small to be "
-            "significant is evidence of nothing."
+            f"  the registration required at least {required} sessions; "
+            f"{holdout['n_sessions']} available"
+        )
+    elif holdout["n_sessions"] < 60:
+        print(
+            f"  NOTE: {holdout['n_sessions']} sessions is a short holdout, and "
+            "its registration set no minimum. Report the length beside the "
+            "result; a window too small to be significant is evidence of "
+            "nothing."
         )
     header = (
         f"{'sleeve':<20}{'sharpe':>8}{'maxDD':>9}{'PSR':>7}{'DSR':>7}"
@@ -866,6 +908,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--holdout-split-id", default="incumbent_sleeves_2026")
     parser.add_argument(
+        "--min-holdout-sessions", type=int, default=None,
+        help="Override the minimum holdout length the registration requires. "
+             "The split is NOT spent when the bar is not met. Raising it is a "
+             "stricter run; LOWERING it after seeing the window is the "
+             "goalpost-moving a pre-registration exists to prevent, so a "
+             "lowered value is recorded in the artifact beside the result.",
+    )
+    parser.add_argument(
         "--n-trials", type=int, default=None,
         help="Override the declared search size upward. Defaults to the "
              "sleeve-selection count in research/trial_registry.json (8); a "
@@ -945,6 +995,7 @@ def main(argv: list[str] | None = None) -> int:
         n_trials=n_trials,
         holdout_registry_path=args.holdout_registry,
         holdout_split_id=args.holdout_split_id,
+        min_holdout_sessions=args.min_holdout_sessions,
         stability_dir=args.stability_dir,
         fdr_q=args.fdr_q,
         dsr_threshold=args.dsr_threshold,
