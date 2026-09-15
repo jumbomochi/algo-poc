@@ -21,6 +21,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import pytest
+from pathlib import Path
 
 from backtest.bias_acceptance import (
     ADMISSIBLE,
@@ -44,6 +45,7 @@ from scripts.run_sleeve_evaluation import (
     to_research_equity_returns,
     to_research_max_drawdown,
 )
+from research.evaluation.holdout import HoldoutProtocol
 from shared.universe import ACTIVE_SLEEVES
 
 
@@ -1094,3 +1096,104 @@ def test_the_gate_invalid_banner_still_prints_now_that_the_state_is_a_string(
     assert code == 0
     out = capsys.readouterr().out
     assert "GATE-INVALID" in out
+
+
+# --------------------------------------------------------------------------
+# The registered minimum window, enforced BEFORE the burn
+# --------------------------------------------------------------------------
+# `incumbent_sleeves_2026` was spent at 44 sessions against a driver that only
+# printed "this is a short holdout" afterwards — advice that arrives once the
+# split is already gone. The bar now comes from the registration and is checked
+# against a resolve() that records nothing, so a refusal costs nothing.
+
+
+def _registry(tmp_path, *, min_sessions=None, start="2026-04-01"):
+    path = tmp_path / "min_registry.json"
+    split = {
+        "split_id": "incumbent_sleeves_2026",
+        "holdout_start": start,
+        "horizon": 21,
+        "embargo": 21,
+        "registered_at": "2026-01-01T00:00:00+00:00",
+        "note": "test split",
+    }
+    if min_sessions is not None:
+        split["min_sessions"] = min_sessions
+    path.write_text(json.dumps(
+        {"version": 1, "splits": [split], "evaluations": []}
+    ))
+    return path
+
+
+def _evaluate(artifact_path, registry, **kwargs):
+    mapping = build_mapping(
+        json.loads(Path(artifact_path).read_text()), str(artifact_path)
+    )
+    return evaluate_mapping(
+        mapping,
+        n_trials=8,
+        holdout_registry_path=registry,
+        holdout_split_id="incumbent_sleeves_2026",
+        **kwargs,
+    )
+
+
+def test_a_window_below_the_registered_minimum_is_refused(artifact_path, tmp_path):
+    registry = _registry(tmp_path, min_sessions=10_000)
+    with pytest.raises(ValueError, match="below the 10000"):
+        _evaluate(artifact_path, registry)
+
+
+def test_a_refused_window_does_NOT_spend_the_split(artifact_path, tmp_path):
+    """The point of the gate. A refusal that still burned the split would
+    punish the one person who checked, and there is no second attempt."""
+    registry = _registry(tmp_path, min_sessions=10_000)
+    with pytest.raises(ValueError):
+        _evaluate(artifact_path, registry)
+
+    protocol = HoldoutProtocol.load(registry)
+    assert not protocol.is_burned("incumbent_sleeves_2026")
+    assert json.loads(registry.read_text())["evaluations"] == []
+
+    # And it is still spendable afterwards, against a bar it can meet.
+    result = _evaluate(artifact_path, registry, min_holdout_sessions=1)
+    assert result["holdout"]["n_sessions"] > 0
+
+
+def test_a_met_minimum_is_recorded_beside_the_window_it_was_met_with(
+    artifact_path, tmp_path
+):
+    """The reader otherwise cannot tell a window that cleared a pre-registered
+    bar from one that never faced one."""
+    registry = _registry(tmp_path, min_sessions=5)
+    result = _evaluate(artifact_path, registry)
+    assert result["holdout"]["min_sessions"] == 5
+    assert result["holdout"]["n_sessions"] >= 5
+
+
+def test_a_split_with_no_registered_minimum_still_runs(artifact_path, tmp_path):
+    """`incumbent_sleeves_2026` carries none, and adding a retroactive default
+    would rewrite what was pre-registered for a split already spent."""
+    registry = _registry(tmp_path)
+    result = _evaluate(artifact_path, registry)
+    assert result["holdout"]["min_sessions"] == 0
+
+
+def test_the_override_can_raise_the_bar_on_a_split_that_registered_none(
+    artifact_path, tmp_path
+):
+    registry = _registry(tmp_path)
+    with pytest.raises(ValueError, match="below the 10000"):
+        _evaluate(artifact_path, registry, min_holdout_sessions=10_000)
+
+
+def test_a_boundary_past_the_last_bar_refuses_without_spending(
+    artifact_path, tmp_path
+):
+    """The shape the 2026-09-14 decision actually hit: `forward_2026h2` starts
+    2026-08-29 and the pinned baseline ends 2026-08-18. resolve() must raise
+    rather than hand back an empty window that scores as a result."""
+    registry = _registry(tmp_path, min_sessions=60, start="2099-01-01")
+    with pytest.raises(ValueError, match="no dates on or after"):
+        _evaluate(artifact_path, registry)
+    assert not HoldoutProtocol.load(registry).is_burned("incumbent_sleeves_2026")
