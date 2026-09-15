@@ -147,12 +147,78 @@ of the search that produced it. Both limits belong in any citation of it:
   clean one.
 - **Short, and growing.** Against a baseline ending 2026-08-03 it is 44
   sessions. Report the length beside the result; a window too small to be
-  significant is evidence of nothing. The driver prints the warning itself
-  below 60 sessions.
+  significant is evidence of nothing. The driver printed a warning below 60
+  sessions — *after* the burn, which is advice arriving once the split is
+  already gone. See the successor split below: that bar is now part of the
+  registration and is enforced before anything is spent.
 
 The split is single-use and the burn is recorded in
 `research/holdout_registry.json`. **Commit the burn** — a holdout whose use is
 not in git is a holdout on the honour system.
+
+### The successor split, and what it is not for
+
+**Decided 2026-09-14.** `incumbent_sleeves_2026` is spent. Two questions
+followed, and both were settled before any new window was looked at.
+
+**1. The benchmark-relative re-judge spends no holdout.** The
+[2026-08-28 CEO plan](#) corrects the framework's null from "beat cash"
+(`sr_star = 0`) to Jensen's alpha on the residuals of a regression against each
+sleeve's own universe. That correction is worth shipping — it is a
+prerequisite for gate S and gate P, and for the sentiment thread's 2026-11
+evaluation — but it is **not** re-litigating the six incumbents. They already
+FAIL, and the plan's own beta correction *strengthens* that verdict rather than
+softening it: once exposure is removed, no sleeve shows significant alpha
+(largest t = 1.25 against a ~2.0 bar). A split spent re-confirming a negative
+is a split gone. The re-judge is therefore reported **full-sample and
+descriptively**, and the D10 verdicts of record stand as they are.
+
+**2. `forward_2026h2` is registered, and cannot be spent yet.** Boundary
+**2026-08-29**, horizon 21, embargo 21 (gap 42), `min_sessions` **60**,
+registered 2026-09-14. It was registered *now* because registration is free and
+today is the last day the window is unlooked-at — a boundary written down after
+someone has seen the bars it covers is not a pre-registration.
+
+It is **single-use and scoped**: valid for any candidate whose search predates
+2026-08-29, which covers the sentiment thread (merged 2026-08-04) and the
+native factor catalog (specified 2026-08-02). Spending it on one **forecloses
+the other**; register a second split rather than arguing after the fact that
+one covers both. It is **not** valid for the six incumbent sleeves.
+
+Two limits, both binding, both recorded in the registration itself:
+
+- **Out-of-search-sample, not out-of-sight-sample.** The paper book trades this
+  window daily and is watched daily. No live-overlapping window can ever be
+  out-of-sight; out-of-search is the honest ceiling, and this split reaches it.
+- **No admissible baseline reaches past the boundary yet.** The pinned,
+  bias-accepted artifact `backtest_multi_20260819_183451.json` ends
+  **2026-08-18**, so `resolve()` *raises* against it rather than handing back
+  an empty window. The only artifact that reaches further,
+  `backtest_multi_20260910_235624.json`, carries coverage **17.39% excluded**
+  against a 5.00% floor — worse than the 11.28% [D18](#the-limitation-this-verdict-rests-on-d18)
+  accepted — and `research/bias_acceptances.json` pins an acceptance to one
+  sha256 and never widens. Spending this split needs either a clean baseline or
+  a new, deliberate bias acceptance larger than D18's.
+
+This corrects baseline item 5 of the 2026-08-28 plan, which said only "register
+a new holdout split, boundary after 2026-08-28". As written that is not
+executable: against the only admissible artifact there are no dates on or after
+such a boundary at all.
+
+#### The minimum window is now part of the registration
+
+`min_sessions` is enforced by `scripts/run_sleeve_evaluation.py` **before the
+burn**, against a `resolve()` that records nothing — so a window too short to
+carry a claim costs nothing to discover. It lives in the registration rather
+than in a caller's argument because deciding after the look how short is too
+short is the same goalpost-moving the single-use rule exists to prevent.
+`--min-holdout-sessions` can raise the bar for a stricter run; a lowered value
+is recorded in the artifact beside the result. A split registered before this
+field existed reads as `0`, and is **not** rewritten to carry a retroactive
+default — this file is the tamper-evident record of a spent holdout, and
+editing an already-burned entry is precisely what it exists to make visible.
+
+60 sessions from 2026-08-29 lands around **late November 2026**.
 
 ### The named load-bearing parameter, per sleeve
 
@@ -412,7 +478,9 @@ DSR plus the holdout carry the decision.
   small. The residual error is at least in the known direction.
 - **Eight counts sleeves, not parameterizations.** Every lookback and threshold
   tried inside a sleeve is an untracked trial. The true search is larger than 8.
-- **The holdout is out-of-search-sample only**, and 44 sessions long today.
+- **The holdout is out-of-search-sample only**, and was 44 sessions long when
+  it was spent — below the 60 the driver itself calls significant. Its
+  successor registers that bar and enforces it before the burn.
 - **Four of six parameters are unmeasured for stability**, as above.
 - **This evaluation judges the backtest, not the live book.** It says whether
   the strategy had an edge over 2016–2026. Whether the live implementation
@@ -422,9 +490,10 @@ DSR plus the holdout carry the decision.
 
 Stated plainly so the gate review is not surprised by it:
 
-- **The verdicts.** Blocked on a like-for-like baseline, which is an operator
-  run, not a code change. The protocol, the tooling and the decision rules are
-  in place; the numbers are not.
+- ~~**The verdicts.**~~ Produced 2026-08-28; see [Verdicts](#verdicts). All six
+  sleeves FAIL and the `incumbent_sleeves_2026` holdout is spent. This bullet is
+  struck rather than deleted so the gate reviewer can see it closed rather than
+  wonder whether it was ever open.
 - **Four of six stability surfaces.** `thematic_momentum`, `quality_value`,
   `earnings_drift` and `tail_risk_hedge` cannot be swept until
   `run_stability_sweep.py` is wired to the regime series, the fundamentals

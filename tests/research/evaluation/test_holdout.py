@@ -156,3 +156,84 @@ def test_committed_registry_pre_registers_the_incumbent_sleeve_holdout():
     assert registration.holdout_start
     assert registration.registered_at
     assert registration.horizon >= 1 and registration.embargo >= 1
+
+
+# ---------------------------------------------------------------------------
+# A registered minimum window (2026-09-14 holdout decision)
+# ---------------------------------------------------------------------------
+# `incumbent_sleeves_2026` was spent at 44 sessions against a driver that only
+# *printed* "this is a short holdout" afterwards. A bar that is advice arrives
+# too late to matter: by the time it prints, the split is gone. So the bar now
+# lives in the registration — written down before the look, where it cannot be
+# lowered after seeing how short the window turned out to be.
+
+
+def test_a_registered_minimum_round_trips_through_the_file(tmp_path):
+    path = tmp_path / "holdout_registry.json"
+    path.write_text(json.dumps({"version": 1, "splits": [], "evaluations": []}))
+    HoldoutProtocol.load(path).register(
+        split_id="s", holdout_start="2026-08-29", horizon=21, embargo=21,
+        min_sessions=60, registered_at="2026-09-14T00:00:00+00:00",
+    )
+    assert HoldoutProtocol.load(path).registration("s").min_sessions == 60
+
+
+def test_a_split_with_no_registered_minimum_reads_as_zero(tmp_path):
+    """Absent is a fact about that split's provenance, not a default of 60
+    applied retroactively — which would rewrite what was pre-registered."""
+    assert _registered(tmp_path).registration("s").min_sessions == 0
+
+
+def test_a_split_without_a_minimum_is_not_rewritten_to_carry_one(tmp_path):
+    """This file is the tamper-evident record of a spent holdout. Recording a
+    burn must not silently edit an older registration's fields."""
+    path = tmp_path / "holdout_registry.json"
+    path.write_text(json.dumps({
+        "version": 1,
+        "splits": [{
+            "split_id": "s", "holdout_start": "2024-10-27", "horizon": 21,
+            "embargo": 21, "registered_at": "2026-08-16T00:00:00+00:00",
+            "note": "fixture",
+        }],
+        "evaluations": [],
+    }, indent=2) + "\n")
+    HoldoutProtocol.load(path).evaluate("s", _dates(), label="burn")
+
+    written = json.loads(path.read_text())["splits"][0]
+    assert "min_sessions" not in written, written
+
+
+def test_a_negative_minimum_is_refused(tmp_path):
+    path = tmp_path / "holdout_registry.json"
+    path.write_text(json.dumps({"version": 1, "splits": [], "evaluations": []}))
+    with pytest.raises(ValueError, match="min_sessions"):
+        HoldoutProtocol.load(path).register(
+            split_id="s", holdout_start="2026-08-29", horizon=21, embargo=21,
+            min_sessions=-1,
+        )
+
+
+def test_committed_registry_pre_registers_the_forward_split():
+    """Registered 2026-09-14, boundary after the 2026-08-28 burn. The evidence
+    that it preceded the look is this file's git commit date, not the field."""
+    registration = HoldoutProtocol.load().registration("forward_2026h2")
+    assert registration.holdout_start == "2026-08-29"
+    assert registration.gap == 42
+    assert registration.min_sessions == 60
+
+
+def test_the_forward_split_is_unspent():
+    """It cannot be spent until the window reaches 60 sessions — around late
+    November 2026. A burn recorded before then is a bug or a mistake."""
+    assert not HoldoutProtocol.load().is_burned("forward_2026h2")
+
+
+def test_the_incumbent_split_stays_spent():
+    """Single-use is the whole protocol. Nothing added later may un-burn it."""
+    protocol = HoldoutProtocol.load()
+    assert protocol.is_burned("incumbent_sleeves_2026")
+    with pytest.raises(HoldoutAlreadyEvaluated):
+        protocol.register(
+            split_id="incumbent_sleeves_2026", holdout_start="2026-08-29",
+            horizon=21, embargo=21,
+        )
