@@ -73,6 +73,11 @@ ALGO_JOB_LABEL="pipeline report"
 # develop, then on a main ref 38 commits stale, and nothing said a word.
 # shellcheck source=deploy/launchd/lib/branch_guard.sh
 . "$ALGO_DIR/deploy/launchd/lib/branch_guard.sh"
+# Is the book fail-closed (KAN-86)? From 2026-08-28 it was, for 17 days, on one
+# discrepancy — and every channel built to break that silence was quiet and
+# correct to be quiet, because the run DID happen and DID exit 0.
+# shellcheck source=deploy/launchd/lib/reconciliation.sh
+. "$ALGO_DIR/deploy/launchd/lib/reconciliation.sh"
 
 ts() { date "+%Y-%m-%d %H:%M:%S %Z"; }
 
@@ -170,6 +175,14 @@ PYEOF
     algo_baseline_age_check
     printf '%s\n' "$ALGO_BASELINE_DETAIL"
 
+    echo; echo "===== reconciliation (are entries allowed?) ====="
+    # The fourth standing fact, beside launchd wiring, deploy branch and
+    # baseline age — and the one whose absence cost the most. Rendered whether
+    # the book is healthy or not: a section that appears only on a bad day
+    # teaches the reader that its absence means "fine".
+    algo_reconciliation_check
+    printf '%s\n' "$ALGO_RECONCILIATION_DETAIL"
+
     echo; echo "===== equity snapshots (record continuity) ====="
     docker compose exec -T postgres psql -U algo -d algo_poc -t -c \
       "SELECT date, COUNT(*), ROUND(SUM(equity)::numeric,2) FROM equity_snapshots WHERE portfolio NOT LIKE '\_%' GROUP BY date ORDER BY date DESC LIMIT 7;" 2>&1
@@ -235,6 +248,18 @@ BRANCH_MSG=$(algo_branch_alert_body)
 if [ -n "$BRANCH_MSG" ]; then
     algo_alert_local "$BRANCH_MSG"
     telegram "$BRANCH_MSG"
+fi
+
+# A fail-closed book is alert-worthy for the same reason the three above are,
+# and more so: it blocks every buy in every sleeve, and the result is
+# INDISTINGUISHABLE from a quiet market. Nothing in the equity curve, the exit
+# code or the dead-man switch separates "17 days halted" from "17 days of hold
+# signals". Non-blocking by design — see lib/reconciliation.sh; a reporting
+# problem must never become a missed session.
+RECONCILIATION_MSG=$(algo_reconciliation_alert_body)
+if [ -n "$RECONCILIATION_MSG" ]; then
+    algo_alert_local "$RECONCILIATION_MSG"
+    telegram "$RECONCILIATION_MSG"
 fi
 
 telegram "$SUMMARY | $RUN_STATUS | divergence: ${DIV:-no log} | ${RESTING:-IB check failed} | $SNAP"
