@@ -14,6 +14,19 @@
       "re_evidence": "3 years of continuous forward-captured daily bars for the whole index, then re-run the baseline over that window",
       "doc": "docs/designs/project-direction.md",
       "note": "The PIT baseline cannot meet the 5.00% coverage floor from IB data: 142,856 of 1,265,893 membership-days are unpriceable across 164 tickers. 10.38% is genuine index departures and 0.91% is resolution failures, so recovering every one of the latter still leaves 10.38% -- the gap is not repairable in code, and IB serves no bars for departed names by symbol or conId. Shortening the window does not rescue it either: only 1y clears the floor, and a 1-year backtest cannot carry DSR/holdout evidence already marginal at DSR 0.868 against 0.95. The floor is NOT moved and this artifact still reports BLOCKED with is_like_for_like false; the bias is accepted in the record, not at the gate."
+    },
+    {
+      "decision": "D20",
+      "requirement": "coverage_floor",
+      "source_sha256": "6124e275722e588eb98ff3efaa63250fd7aeb5ed98b6ef09f7550ad3d5a67a34",
+      "source": "output/backtest_multi_20260915_102125.json",
+      "excluded_pct": 11.21,
+      "floor_pct": 5.0,
+      "accepted_at": "2026-09-16",
+      "direction": "survivorship-biased upward by an unmeasured amount -- the same structural gap D18 accepted, re-measured on a fresher artifact at 11.21% rather than 11.28%",
+      "re_evidence": "3 years of continuous forward-captured daily bars for the whole index, then re-run the baseline over that window -- unchanged from D18, and still dated from the 2026-08-18 capture start (2029-08-18)",
+      "doc": "docs/designs/project-direction.md",
+      "note": "D18 accepted this bias for ONE artifact by sha256 and an acceptance never widens, so a fresher baseline needs its own deliberate entry rather than inheriting D18's. Nothing about the bias changed: 141,811 of 1,265,371 membership-days unpriceable (11.21%), floor unmoved at 5.00, artifact still BLOCKED, is_like_for_like still False. This entry exists so the EDGE-EVIDENCE baseline of record can move to an artifact whose date index reaches past 2026-08-18 -- which the D18 artifact never can, and which forward_2026h2 (boundary 2026-08-29) requires before it can ever be spent. Per D19 the pin is no longer the operational divergence feed, so this re-pin does not touch nightly drift detection. The 2026-09-10 refresh measured 17.39% and is deliberately NOT accepted: it is an outlier against the ~11.2% structural level, not a trend."
     }
   ]
 }

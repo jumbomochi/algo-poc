@@ -144,6 +144,7 @@ Weekly Telegram evidence digest (rides `run_pipeline_report` + the verified bot)
 | D17c | ML decision mis-categorized; WIP gameable | ML = architecture decision on own rubric; WIP = two OPEN threads (edge framework + sentiment); factors/regime queued |
 | D18 | PIT baseline cannot meet the coverage floor from IB data | **DECIDED 2026-08-26: accept the bias, documented and time-bounded** (KAN-59). No vendor purchase. Coverage floor unchanged at 5.00%; artifacts stay `BLOCKED`. Re-evidence after 3 years of forward capture. See [The accepted PIT coverage bias](#the-accepted-pit-coverage-bias-d18) below |
 | D19 | Divergence graded live against a frozen artifact | **DECIDED 2026-09-04: the daily feed is a rolling shadow, comparability is per sleeve.** A pinned 10-year baseline cannot score sessions past its own last bar, so the window froze at 2026-08-14. The pin remains the baseline of record for edge evidence; it is no longer the operational feed. See [Drift comparability is window-scoped and per-sleeve](#drift-comparability-is-window-scoped-and-per-sleeve-d19) below |
+| D20 | The edge-evidence baseline of record cannot move to a fresher artifact | **DECIDED 2026-09-16: re-accept the same measured bias on the 2026-09-15 refresh.** D18 pinned its acceptance to one sha256 and an acceptance never widens, so a fresher baseline needs its own deliberate entry. Exclusion 11.21% vs D18's 11.28% — the same structural gap, re-measured. Floor still 5.00%, artifact still `BLOCKED`, re-evidence date unchanged. See [Re-accepting the coverage bias on a fresher baseline](#re-accepting-the-coverage-bias-on-a-fresher-baseline-d20) below |
 
 ## The accepted PIT coverage bias (D18)
 
@@ -325,6 +326,82 @@ coverage floor, defined at
 ("Baseline coverage floor (D14)"). The **D14 in the table above** is the
 two-person-gate substitute and is unrelated. This decision is recorded as **D18**
 to avoid deepening that collision.
+
+## Re-accepting the coverage bias on a fresher baseline (D20)
+
+**Decided 2026-09-16.** The pinned baseline of record moves from
+`backtest_multi_20260819_183451.json` to `backtest_multi_20260915_102125.json`,
+and the coverage bias is re-accepted on the new artifact under its own entry.
+
+### Why a new decision rather than an edit
+
+D18 accepted the bias for **one artifact, pinned by sha256**, and
+`research/bias_acceptances.json` says in its own header that *an acceptance never
+widens: a re-run produces a new sha256 and needs a new, deliberate entry*. The
+code enforces it — `resolve_admissibility` refuses any acceptance whose
+`source_sha256` is not the artifact's — and so does the test suite, which asserts
+there is **exactly one** D18 entry so it can never be ambiguous which figures
+were accepted.
+
+Editing D18 to point at the new file was therefore not an option, and would have
+been wrong on the merits anyway: the D10 verdicts of record (2026-08-28, all six
+sleeves FAIL) were produced on the D18 artifact citing that acceptance. Moving it
+would orphan the evidence those verdicts rest on.
+
+### The number being accepted
+
+Measured on `output/backtest_multi_20260915_102125.json` (refresh run 2026-09-15),
+sha256 `6124e275…a67a34`:
+
+```
+total membership-days    : 1,265,371
+excluded membership-days :   141,811
+excluded_pct             :     11.21%
+floor_pct                :      5.00%
+state                    : BLOCKED
+date range               : 2016-09-19 .. 2026-09-14  (2,510 sessions)
+```
+
+This is the same structural gap D18 documented, re-measured four weeks later:
+**11.21% against 11.28%**. Nothing about the cause changed — IB still serves no
+bars for departed names — and the marginal improvement is the rolling ten-year
+window dropping older, sparser membership-days, not a recovery.
+
+**The 2026-09-10 refresh measured 17.39% and is deliberately NOT accepted.** It
+is an outlier against the ~11.2% structural level rather than a trend, and
+accepting an artifact whose exclusion is half again the documented figure would
+have made the accepted number meaningless.
+
+### What this changes, and what it does not
+
+**Changes:** the edge-evidence baseline of record now has a date index reaching
+**2026-09-14** instead of 2026-08-18. That matters for exactly one reason: the
+`forward_2026h2` holdout is registered with a boundary of **2026-08-29** and
+`min_sessions` 60, and the D18 artifact ends before that boundary — it can never
+resolve the split at all, let alone satisfy it. The new pin resolves to 10 of the
+required 60 sessions today and grows with each session; the split becomes
+spendable around late November 2026.
+
+**Does not change:** the floor stays at **5.00**, the artifact stays `BLOCKED`
+with `is_like_for_like` False, and D18's re-evidence trigger is untouched — three
+years of continuous forward capture from the 2026-08-18 start, so **2029-08-18**.
+Re-accepting the bias on a fresher artifact does not restart that clock, because
+it is the same bias.
+
+**Not an operational change.** Per [D19](#drift-comparability-is-window-scoped-and-per-sleeve-d19)
+the nightly divergence feed is a rolling shadow, not the pinned artifact, so the
+pin's age and identity no longer affect drift detection. This re-pin is about the
+evidence baseline only. It also ends the daily *pin is stale* alert, which had
+been reporting a 27-day-old pin against a 30-day bound — but that alert was
+measuring "this has not been re-pinned", not "the monitor is blind".
+
+### What it does not rescue
+
+A `VALID_WITH_ACCEPTED_BIAS` baseline is still not a `VALID` one. Any verdict
+spent against this artifact inherits the same upward survivorship bias D18
+describes, and the bias still runs **against** a passing verdict rather than for
+it. The holdout being spendable in November is not the same as its result being
+clean evidence.
 
 ## Drift comparability is window-scoped and per-sleeve (D19)
 

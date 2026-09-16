@@ -278,7 +278,7 @@ pins"; this is the mechanism half of that.
 ```yaml
 # config/default.yaml
 divergence:
-  baseline_pin: output/backtest_multi_20260819_183451.json
+  baseline_pin: output/backtest_multi_20260915_102125.json
 ```
 
 - **Resolution.** `scripts/ops/baseline_pin.py` turns that value into an
@@ -344,6 +344,24 @@ Re-pin deliberately; it is a change to what the evidence means.
 
 1. Produce the new baseline (*Regenerating the headline baseline* above) and
    check `config.coverage.state` is `OK`.
+
+   **If it is `BLOCKED`, that is the normal case here, not a blocker** — and it
+   needs one extra step. Under [D18](../designs/project-direction.md) the PIT
+   baseline cannot meet the 5% floor from IB data, so every artifact reports
+   `BLOCKED`. An acceptance in `research/bias_acceptances.json` is what makes
+   one citable, and **it is pinned to a single sha256 and never widens**: a
+   re-run produces a new checksum and needs its own deliberate entry, under a
+   new decision number. Editing the existing entry to point at the new file is
+   not the shortcut it looks like — the verdicts already spent against the old
+   artifact cite that acceptance, and moving it orphans them. D20 (2026-09-16)
+   is the worked example: same bias, fresher artifact, separate entry, D18 left
+   untouched.
+
+   Check the measured figure before accepting it. The 2026-09-10 refresh came
+   back at 17.39% against a documented 11.28% and was rejected as an outlier;
+   the 2026-09-15 one measured 11.21% and was accepted. An acceptance whose
+   number has drifted far from the documented one makes the documented number
+   meaningless.
 2. Confirm its `portfolios` keys match the live book's sleeves — otherwise the
    first pinned run exits 3 with `BASELINE_SHAPE_MISMATCH`.
 3. Set `divergence.baseline_pin` to the new path and land it through a PR.
@@ -526,6 +544,14 @@ membership-day cost of each one.
 `output/backtest_multi_20260819_183451.json`, 826 tickers requested,
 **`coverage.state: BLOCKED`** — 142,856 of 1,265,893 membership-days excluded
 (**11.28%** against the 5.0% floor) across **164 names**.
+
+**Re-measured 2026-09-15 (D20), on the refresh now pinned:**
+`output/backtest_multi_20260915_102125.json` — **`coverage.state: BLOCKED`**,
+141,811 of 1,265,371 membership-days excluded (**11.21%**). The same structural
+gap four weeks on; the marginal improvement is the rolling ten-year window
+dropping older, sparser membership-days, not a recovery. The 2026-09-10 refresh
+in between measured **17.39%** and was rejected as an outlier rather than
+accepted.
 
 The dominant failure mode is not a stale symbol and not a missing
 `primaryExchange`. IB keeps a contract record for a delisted name but attaches
