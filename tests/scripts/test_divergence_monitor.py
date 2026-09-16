@@ -833,6 +833,19 @@ def test_drill_equity_is_absent_from_the_aggregate_report(
 # ---------------------------------------------------------------------------
 
 
+#: Backtest daily growth that makes momentum diverge far enough to BREACH on
+#: the ABSOLUTE axis. Live grows at 1.002/day (+1.41% over the window), so this
+#: falling baseline (-5.5%) opens a ~6.9 pp gap — past the 5 pp absolute breach.
+#:
+#: It was 1.0005 (+0.35%), which only breached via the relative axis: a 1.06 pp
+#: gap over a near-flat baseline read as +302%. MIN_RELATIVE_BASE now suppresses
+#: the ratio below a 2.5% baseline, so that fixture stopped breaching — correctly.
+#: These three tests are about the evidence store, not about classification, and
+#: they need a breach that is real rather than one manufactured by dividing by
+#: noise.
+BREACHING_DAILY = 0.992
+
+
 def _comparable_backtest(
     tmp_path: Path,
     label: str = "20260525_000000",
@@ -1026,7 +1039,7 @@ def test_a_rerun_on_the_same_baseline_updates_rather_than_duplicates(
     against a writer that silently did nothing on the second run.
     """
     db_url = _evidence_db(tmp_path, "idempotent")
-    backtest = _comparable_backtest(tmp_path, momentum_daily=1.0005)
+    backtest = _comparable_backtest(tmp_path, momentum_daily=BREACHING_DAILY)
     report_path = tmp_path / "divergence.json"
 
     _run_monitor_main(
@@ -1041,7 +1054,7 @@ def test_a_rerun_on_the_same_baseline_updates_rather_than_duplicates(
         EquitySnapshot.portfolio == "momentum"
     ).order_by(EquitySnapshot.date).all()
     for i, snapshot in enumerate(snapshots):
-        snapshot.equity = 23080.0 * (1.0005 ** i)
+        snapshot.equity = 23080.0 * (BREACHING_DAILY ** i)
     session.commit()
     session.close()
 
@@ -1070,7 +1083,7 @@ def test_an_ad_hoc_rerun_cannot_overwrite_a_differently_pinned_verdict(
     firing breach streak that the capital ladder gates on, with no trace.
     """
     db_url = _evidence_db(tmp_path, "pinned")
-    backtest = _comparable_backtest(tmp_path, momentum_daily=1.0005)
+    backtest = _comparable_backtest(tmp_path, momentum_daily=BREACHING_DAILY)
     report_path = tmp_path / "divergence.json"
 
     canonical = _run_monitor_main(
@@ -1224,7 +1237,7 @@ def test_a_breach_still_exits_one_when_the_store_write_fails(
 
     code = _run_monitor_main(
         monkeypatch,
-        backtest=_comparable_backtest(tmp_path, momentum_daily=1.0005),
+        backtest=_comparable_backtest(tmp_path, momentum_daily=BREACHING_DAILY),
         db_url=db_url,
         output=tmp_path / "divergence.json",
     )

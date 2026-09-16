@@ -295,3 +295,127 @@ def test_the_decision_and_the_registry_point_at_each_other() -> None:
         "D18 must name the registry that now enforces it, or the decision reads "
         "as prose-only and the next person re-derives the code path"
     )
+
+
+# ---------------------------------------------------------------------------
+# D20 — re-accepting the same bias on a fresher baseline (2026-09-16)
+# ---------------------------------------------------------------------------
+# D18 pinned its acceptance to one sha256, and an acceptance never widens. A
+# fresher baseline therefore needs its own deliberate entry rather than
+# inheriting D18's — and that entry needs the same guards, or it is prose that
+# drifts away from the number the code actually gates on.
+
+D20_EXCLUDED_PCT = "11.21"
+D20_SHA256 = "6124e275722e588eb98ff3efaa63250fd7aeb5ed98b6ef09f7550ad3d5a67a34"
+D20_ARTIFACT = "backtest_multi_20260915_102125.json"
+
+
+def _raw_entries() -> list[dict]:
+    """The registry as committed.
+
+    ``source`` is a human-facing path the ``BiasAcceptance`` dataclass does not
+    model -- only ``source_sha256`` gates -- so assertions about which FILE was
+    accepted have to read the JSON, as test_bias_acceptance.py does.
+    """
+    import json
+    return json.loads(ACCEPTANCE_REGISTRY_PATH.read_text())["acceptances"]
+
+
+def _raw(decision: str) -> dict:
+    rows = [e for e in _raw_entries() if e["decision"] == decision]
+    assert len(rows) == 1, (decision, len(rows))
+    return rows[0]
+
+
+def _d20():
+    entries = [a for a in load_acceptances(ACCEPTANCE_REGISTRY_PATH)
+               if a.decision == "D20"]
+    assert len(entries) == 1, (
+        "expected exactly one D20 acceptance; a second would make it ambiguous "
+        "which figures were accepted, for the same reason D18 allows only one"
+    )
+    return entries[0]
+
+
+def test_d20_accepts_the_coverage_floor_and_nothing_else() -> None:
+    entry = _d20()
+    assert entry.requirement == REQUIREMENT_COVERAGE_FLOOR, (
+        "D20 re-accepts D18's bias and nothing else. An acceptance for a "
+        "different requirement would excuse a defect nobody decided about."
+    )
+
+
+def test_d20_figures_match_the_decision_prose() -> None:
+    """The registry gates; the doc is what a human reads. If they disagree the
+    doc is the lie, because the registry is what admits the run."""
+    entry = _d20()
+    assert f"{entry.excluded_pct:.2f}" == D20_EXCLUDED_PCT
+    assert entry.floor_pct == FLOOR_PCT, (
+        "D20 rests on the floor being unmoved, exactly as D18 does"
+    )
+    prose = _prose(DIRECTION)
+    assert f"{D20_EXCLUDED_PCT}%" in prose, (
+        "the D20 section must carry the number it accepts"
+    )
+
+
+def test_d20_is_pinned_to_its_own_artifact() -> None:
+    """The whole reason D20 exists: an acceptance names ONE artifact."""
+    entry = _d20()
+    assert entry.source_sha256 == D20_SHA256
+    assert D20_ARTIFACT in _raw("D20")["source"]
+
+
+def test_d20_does_not_disturb_d18() -> None:
+    """The D10 verdicts of record were produced on the D18 artifact citing the
+    D18 acceptance. Re-pointing or removing it would orphan that evidence."""
+    d18 = [a for a in load_acceptances(ACCEPTANCE_REGISTRY_PATH)
+           if a.decision == "D18"]
+    assert len(d18) == 1
+    assert d18[0].source_sha256 != _d20().source_sha256, (
+        "D18 and D20 must name different artifacts, or one of them is pointless"
+    )
+    assert "backtest_multi_20260819_183451.json" in _raw("D18")["source"]
+
+
+def test_d20_does_not_restart_the_re_evidence_clock() -> None:
+    """Re-accepting the same bias on a fresher artifact is not new evidence.
+    A clock that resets whenever the baseline is rebuilt bounds nothing."""
+    entry = _d20()
+    assert RE_EVIDENCE_YEARS in entry.re_evidence, (
+        "D20 must carry D18's re-evidence trigger, or the accepted bias has no "
+        "recorded end"
+    )
+    assert "2029-08-18" in entry.re_evidence, (
+        "the re-evidence date is dated from the 2026-08-18 capture start and "
+        "does not move when the baseline is re-pinned"
+    )
+
+
+def test_d20_points_at_the_decision_document() -> None:
+    entry = _d20()
+    assert "project-direction" in entry.doc
+    assert "D20" in _prose(DIRECTION)
+
+
+def test_the_pin_names_the_artifact_d20_accepts() -> None:
+    """A pin the accepted bias does not cover makes every run that reads it
+    INADMISSIBLE — the failure would surface as a refusal far from here."""
+    config = (ROOT / "config/default.yaml").read_text()
+    pinned = [ln.split(":", 1)[1].strip() for ln in config.splitlines()
+              if ln.strip().startswith("baseline_pin:")]
+    assert len(pinned) == 1, pinned
+    assert pinned[0].endswith(D20_ARTIFACT), (
+        f"divergence.baseline_pin is {pinned[0]} but the newest acceptance "
+        f"covers {D20_ARTIFACT}"
+    )
+
+
+def test_the_rejected_outlier_refresh_is_not_accepted() -> None:
+    """The 2026-09-10 refresh measured 17.39%. Accepting an artifact whose
+    exclusion is half again the documented figure would make the accepted
+    number meaningless."""
+    sources = [e["source"] for e in _raw_entries()]
+    assert not any("20260910" in s for s in sources), (
+        "the 2026-09-10 outlier refresh must never carry an acceptance"
+    )

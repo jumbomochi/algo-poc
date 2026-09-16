@@ -11,7 +11,9 @@ from datetime import date
 import pytest
 
 from backtest.divergence import (
+    DEFAULT_ABSOLUTE_WARN_PP,
     DEFAULT_THRESHOLD,
+    MIN_RELATIVE_BASE,
     NEXT_OPEN_FILL_MODEL,
     SAME_BAR_FILL_MODEL,
     ExecutionModel,
@@ -751,3 +753,76 @@ class TestCoverageFloorIsPartOfComparability:
         assert report.baseline_comparable is False
         assert report.status == "NO_DATA"
         assert any("coverage" in note.lower() for note in report.notes)
+
+
+# ---------------------------------------------------------------------------
+# The relative ratio needs a baseline worth dividing by (2026-09-16)
+# ---------------------------------------------------------------------------
+# The guard was `abs(bt_ret) < 1e-9` — exact zero only — so any baseline that
+# merely rounded near zero still produced a ratio. On 2026-09-16, with every
+# sleeve inside a single percentage point of its shadow, the monitor breached
+# on all four:
+#
+#   sector_rotation  Δ -0.82 pp  ->   -42.2%  (baseline +1.9%)
+#   tail_risk_hedge  Δ +0.18 pp  ->   +93.8%  (baseline -0.2%)
+#   AGGREGATE        Δ -0.15 pp  ->  -425.2%  (baseline +0.0%)
+#
+# Fifteen basis points reported as -425% is arithmetic, not tracking error.
+
+
+def test_a_baseline_below_the_floor_yields_no_relative() -> None:
+    """0.2% over the window is arithmetically non-zero and still a useless
+    denominator — the exact case 1e-9 let through."""
+    absolute, relative = compute_divergence(-0.002, -0.004)
+    assert absolute == pytest.approx(0.002)
+    assert relative is None
+
+
+def test_a_baseline_above_the_floor_still_yields_a_relative() -> None:
+    """The floor must not disable the relative axis on a real move."""
+    absolute, relative = compute_divergence(0.15, 0.10)
+    assert absolute == pytest.approx(0.05)
+    assert relative == pytest.approx(0.5)
+
+
+def test_the_floor_is_the_absolute_warn_threshold() -> None:
+    """Tied to an existing constant rather than invented: a ratio against a
+    baseline smaller than the gap we already call negligible is meaningless."""
+    assert MIN_RELATIVE_BASE == DEFAULT_ABSOLUTE_WARN_PP
+
+
+def test_the_2026_09_16_breaches_become_ok() -> None:
+    """Every one of the four, with its real figures. All were sub-1 pp."""
+    for live, backtest in (
+        (-0.012, -0.024),   # momentum         Δ +1.17 pp, was +49.2%
+        (0.011, 0.019),     # sector_rotation  Δ -0.82 pp, was -42.2%
+        (-0.0001, -0.002),  # tail_risk_hedge  Δ +0.18 pp, was +93.8%
+        (-0.001, 0.0005),   # AGGREGATE        Δ -0.15 pp, was -425.2%
+    ):
+        absolute, relative = compute_divergence(live, backtest)
+        assert relative is None, (live, backtest)
+        assert classify_status(relative, absolute) == "OK", (live, backtest)
+
+
+def test_a_real_divergence_on_a_flat_baseline_still_breaches() -> None:
+    """The floor must not become a blind spot. With no relative axis the
+    absolute one governs, and it is unchanged: 5 pp is still a breach however
+    little the baseline moved."""
+    absolute, relative = compute_divergence(0.07, 0.001)
+    assert relative is None
+    assert classify_status(relative, absolute) == "BREACH"
+
+
+def test_a_moderate_divergence_on_a_flat_baseline_still_warns() -> None:
+    absolute, relative = compute_divergence(0.03, 0.001)
+    assert relative is None
+    assert classify_status(relative, absolute) == "WARNING"
+
+
+def test_the_write_off_scale_divergence_would_still_have_breached() -> None:
+    """Sanity: the -35.96 pp gap this monitor was reporting before the ledger
+    was repaired breaches on the absolute axis alone, so the floor could never
+    have hidden it."""
+    absolute, relative = compute_divergence(-0.340, 0.019)
+    assert relative is None
+    assert classify_status(relative, absolute) == "BREACH"
