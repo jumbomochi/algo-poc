@@ -164,7 +164,7 @@ divergence:
   #
   # Re-pin at a rung change. See docs/operations/backtest-baseline.md,
   # "The pinned baseline of record".
-  baseline_pin: output/backtest_multi_20260819_183451.json
+  baseline_pin: output/backtest_multi_20260915_102125.json
 
   # Earliest live equity date admissible for grading (KAN-83). Live equity from
   # before a re-baseline is not comparable to anything: equity_snapshots carries
