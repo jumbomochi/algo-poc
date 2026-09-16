@@ -33,6 +33,24 @@ DEFAULT_THRESHOLD = 0.20  # relative divergence — warn above this
 DEFAULT_ABSOLUTE_WARN_PP = 0.025  # 2.5 pp absolute return divergence
 DEFAULT_ABSOLUTE_BREACH_PP = 0.05  # 5 pp absolute breach
 
+# Smallest baseline return the RELATIVE ratio may be taken against. Tied to the
+# absolute warn threshold on purpose: a ratio measured against a baseline move
+# smaller than the gap we already call negligible cannot be informative, it is
+# just division by noise.
+#
+# Without this floor the monitor paged on 2026-09-16 with every sleeve inside a
+# single percentage point of its shadow:
+#
+#   sector_rotation  Δ -0.82 pp  ->   -42.2% relative  (baseline +1.9%)
+#   tail_risk_hedge  Δ +0.18 pp  ->   +93.8% relative  (baseline -0.2%)
+#   AGGREGATE        Δ -0.15 pp  ->  -425.2% relative  (baseline +0.0%)
+#
+# Fifteen basis points reported as -425% is arithmetic, not tracking error, and
+# an alarm that fires on it every morning is one that stops being read. Below
+# the floor the absolute axis governs alone; it is unchanged and still breaches
+# at 5 pp whatever the baseline did.
+MIN_RELATIVE_BASE = DEFAULT_ABSOLUTE_WARN_PP
+
 # The backtest assumes these per-trade frictions. The monitor flags when live
 # fills consistently exceed them.
 ASSUMED_SLIPPAGE_BPS = DEFAULT_SLIPPAGE_BPS
@@ -333,13 +351,19 @@ def compute_divergence(
     """Return ``(absolute_pp, relative)``.
 
     - absolute_pp = live_ret - bt_ret (decimal, so 0.01 = 1 pp)
-    - relative = absolute_pp / |bt_ret|, or ``None`` if bt_ret is ~0 (the
-      ratio is meaningless when the baseline is flat)
+    - relative = absolute_pp / |bt_ret|, or ``None`` when the baseline moved
+      less than :data:`MIN_RELATIVE_BASE` over the window
+
+    The guard used to be ``abs(bt_ret) < 1e-9`` — exact-zero only — which is
+    far too narrow. A baseline that moved 0.2% over 19 sessions is arithmetically
+    non-zero and still a useless denominator: it turned an 18 bp gap into +93.8%.
+    Returning ``None`` hands the decision to the absolute axis, which is the
+    only one that means anything at that scale.
     """
     if live_ret is None or bt_ret is None:
         return None, None
     absolute = live_ret - bt_ret
-    if abs(bt_ret) < 1e-9:
+    if abs(bt_ret) < MIN_RELATIVE_BASE:
         return absolute, None
     return absolute, absolute / abs(bt_ret)
 
@@ -354,9 +378,14 @@ def classify_status(
     """Return ``OK`` / ``WARNING`` / ``BREACH`` / ``NO_DATA``.
 
     Two-axis test: divergence is concerning if EITHER the relative or absolute
-    figure exceeds its threshold. Using both prevents false alarms when the
-    backtest return happens to be tiny (relative blows up) AND when both
-    returns are large but a fixed pp gap is meaningful.
+    figure exceeds its threshold — the relative axis catches proportional drift
+    on a baseline that actually moved, the absolute axis catches a meaningful
+    pp gap whatever the baseline did.
+
+    Note that OR does NOT protect against a tiny baseline; it makes the relative
+    axis able to fire alone on one. That protection lives upstream in
+    ``compute_divergence``, which returns ``relative=None`` below
+    :data:`MIN_RELATIVE_BASE` so there is no ratio here to fire on.
     """
     if relative is None and absolute_pp is None:
         return "NO_DATA"
