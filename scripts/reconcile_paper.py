@@ -21,6 +21,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from scripts.run_paper import dump_paper_state
+from shared.artifact_dir import durable_artifact_dir
 from services.execution.ib_account import IBAccountReader
 from services.execution.reconciliation import (
     PositionReconciler,
@@ -71,6 +72,12 @@ def persist_reconciliation_report(
     session.add(report)
     session.flush()
     return report
+
+
+#: Relative on purpose: the repair plan belongs beside the book it describes.
+#: `durable_artifact_dir` relocates it out of a linked worktree so a
+#: `git worktree remove` cannot delete it (2026-09-16).
+DEFAULT_OUTPUT_DIR = Path("output/reconciliation")
 
 
 def write_repair_plan(
@@ -394,7 +401,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--ib-port", type=int, default=7497)
     parser.add_argument("--ib-client-id", type=int, default=57)
     parser.add_argument(
-        "--output-dir", type=Path, default=Path("output/reconciliation")
+        "--output-dir", type=Path, default=None
     )
     return parser
 
@@ -422,7 +429,13 @@ def main() -> int:
             )
         )
         result, plan = reconcile_snapshot(session, snapshot)
-        plan_path = write_repair_plan(plan, output_dir=args.output_dir)
+        plan_path = write_repair_plan(
+            plan,
+            output_dir=durable_artifact_dir(
+                args.output_dir or DEFAULT_OUTPUT_DIR,
+                explicit=args.output_dir is not None,
+            ),
+        )
         session.commit()
         print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         print(f"Repair plan: {plan_path}")
