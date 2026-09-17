@@ -80,10 +80,42 @@ def _artifact(path: Path, *, age_days: float, state: str = "OK",
     return path
 
 
+def _acceptance_root(root: Path, *sources: str) -> Path:
+    """A repo root whose acceptance registry names ``sources``.
+
+    Shaped like the real ``research/bias_acceptances.json`` but written per
+    test: coupling to the committed registry would make these tests fail the
+    next time a baseline is re-pinned.
+    """
+    registry = root / "research" / "bias_acceptances.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(json.dumps({
+        "version": 1,
+        "acceptances": [
+            {
+                "decision": "D20",
+                "requirement": "coverage_floor",
+                "source_sha256": "6124e275722e588eb98ff3efaa63250fd7aeb5ed98b6ef09f7550ad3d5a67a34",
+                "source": f"output/{name}",
+                "excluded_pct": 11.21,
+                "floor_pct": 5.0,
+                "accepted_at": "2026-09-16",
+                "re_evidence": "3 years of forward-captured daily bars",
+                "doc": "docs/designs/project-direction.md",
+            }
+            for name in sources
+        ],
+    }, indent=2))
+    return root
+
+
 def _run(output_dir: Path, *, pin: Path | str | None, now: int = NOW,
-         pin_max_days: int | None = None, config: str | None = None) -> dict[str, str]:
+         pin_max_days: int | None = None, config: str | None = None,
+         acceptance_root: Path | None = None) -> dict[str, str]:
     """Source the shipped lib and run the check against a controlled tree."""
     extra = f"ALGO_BASELINE_PIN_MAX_DAYS={pin_max_days}\n" if pin_max_days else ""
+    if acceptance_root is not None:
+        extra += f'ALGO_BASELINE_ACCEPTANCE_ROOT="{acceptance_root}"\n'
     body = (
         f'ALGO_DIR="{REPO}"\n'
         f'ALGO_BASELINE_DIR="{output_dir}"\n'
@@ -259,3 +291,96 @@ def test_the_runbook_describes_the_pin_not_the_newest_artifact():
         "the runbook does not state that the PIN is judged rather than the "
         "newest artifact"
     )
+
+
+# ---------------------------------------------------------------------------
+# The check knew nothing about research/bias_acceptances.json, so it called an
+# artifact unpinnable on the strength of its coverage state alone. D20 had
+# formally accepted exactly that artifact the day before, and it WAS the pin —
+# so the 05:04 Telegram said the file could not be pinned while naming it as
+# the pin in the same sentence:
+#
+#   pin is backtest_multi_20260915_102125.json (1d old, BLOCKED at 11.21%);
+#   newest is backtest_multi_20260915_102125.json (1d, BLOCKED at 11.21%
+#   -- cannot be pinned)
+#
+# BLOCKED coverage is what an accepted bias LOOKS like: the floor was
+# deliberately not moved, so an accepted artifact still reports BLOCKED and
+# is_like_for_like False. Coverage state alone can therefore never answer
+# "can this be pinned"; the registry is what answers it.
+
+
+def test_an_accepted_bias_is_not_reported_as_unpinnable(output_dir, tmp_path):
+    """The D20 case: BLOCKED, fresh, and formally accepted."""
+    pin = _artifact(output_dir / "backtest_multi_20260819_183451.json",
+                    age_days=10, state="BLOCKED", excluded_pct=11.28)
+    _artifact(output_dir / "backtest_multi_20260915_102125.json",
+              age_days=0, state="BLOCKED", excluded_pct=11.21)
+    root = _acceptance_root(tmp_path / "root", "backtest_multi_20260915_102125.json")
+
+    got = _run(output_dir, pin=pin, pin_max_days=90, acceptance_root=root)
+
+    assert got["ALERT"] == "", got
+    assert got["STATUS"] == "ok", got
+    assert "cannot be pinned" not in got["DETAIL"], got["DETAIL"]
+
+
+def test_an_accepted_bias_is_named_as_accepted_in_the_body(output_dir, tmp_path):
+    """Still reported — the coverage figure is the point of the daily line —
+    but as a decision rather than a defect."""
+    pin = _artifact(output_dir / "backtest_multi_20260819_183451.json",
+                    age_days=10, state="BLOCKED", excluded_pct=11.28)
+    _artifact(output_dir / "backtest_multi_20260915_102125.json",
+              age_days=0, state="BLOCKED", excluded_pct=11.21)
+    root = _acceptance_root(tmp_path / "root", "backtest_multi_20260915_102125.json")
+
+    got = _run(output_dir, pin=pin, pin_max_days=90, acceptance_root=root)
+
+    assert "11.21" in got["DETAIL"], got["DETAIL"]
+    assert "accepted" in got["DETAIL"].lower(), got["DETAIL"]
+
+
+def test_the_pinned_artifact_is_never_called_unpinnable(output_dir, tmp_path):
+    """The literal 05:04 message: newest IS the pin. Whatever the registry
+    says, an artifact that is already the baseline of record can be one."""
+    pin = _artifact(output_dir / "backtest_multi_20260915_102125.json",
+                    age_days=0, state="BLOCKED", excluded_pct=11.21)
+    root = _acceptance_root(tmp_path / "root")   # registry names nothing
+
+    got = _run(output_dir, pin=pin, pin_max_days=90, acceptance_root=root)
+
+    assert got["ALERT"] == "", got
+    assert "cannot be pinned" not in got["DETAIL"], got["DETAIL"]
+
+
+def test_an_unaccepted_unusable_refresh_still_alerts(output_dir, tmp_path):
+    """The guard. The 2026-09-10 artifact at 17.39% is deliberately NOT
+    accepted, and teaching the check about acceptances must not mute it."""
+    pin = _artifact(output_dir / "backtest_multi_20260819_183451.json",
+                    age_days=10, state="BLOCKED", excluded_pct=11.28)
+    _artifact(output_dir / "backtest_multi_20260910_235624.json",
+              age_days=0, state="BLOCKED", excluded_pct=17.39)
+    root = _acceptance_root(tmp_path / "root", "backtest_multi_20260915_102125.json")
+
+    got = _run(output_dir, pin=pin, pin_max_days=90, acceptance_root=root)
+
+    assert got["STATUS"] == "unusable", got
+    assert got["ALERT"] != "", got
+    assert "cannot be pinned" in got["DETAIL"], got["DETAIL"]
+
+
+def test_an_unreadable_registry_does_not_mute_the_alert(output_dir, tmp_path):
+    """Fail toward reporting. A registry that cannot be read must not be taken
+    as "nothing is accepted"... but it must not silence the event either."""
+    pin = _artifact(output_dir / "backtest_multi_20260819_183451.json",
+                    age_days=10, state="BLOCKED", excluded_pct=11.28)
+    _artifact(output_dir / "backtest_multi_20260910_235624.json",
+              age_days=0, state="BLOCKED", excluded_pct=17.39)
+    root = tmp_path / "broken"
+    (root / "research").mkdir(parents=True)
+    (root / "research" / "bias_acceptances.json").write_text("{not json")
+
+    got = _run(output_dir, pin=pin, pin_max_days=90, acceptance_root=root)
+
+    assert got["STATUS"] == "unusable", got
+    assert got["ALERT"] != "", got

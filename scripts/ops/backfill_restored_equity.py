@@ -70,6 +70,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from shared.artifact_dir import durable_artifact_dir  # noqa: E402
 from shared.config import load_config  # noqa: E402
 from shared.models.equity_snapshot import EquitySnapshot  # noqa: E402
 from shared.models.portfolio_config import PortfolioConfig  # noqa: E402
@@ -284,7 +285,13 @@ def main(argv: list[str] | None = None) -> int:
              "must reconcile to portfolio_config.cash or the run is refused",
     )
     parser.add_argument("--database-url", default=None)
-    parser.add_argument("--artifact-dir", default=str(DEFAULT_ARTIFACT_DIR))
+    parser.add_argument(
+        "--artifact-dir", default=None,
+        help="where the audit record goes; defaults beside the repair plans. "
+             "A default resolved inside a LINKED git worktree is relocated to "
+             "the main worktree, because `git worktree remove` would otherwise "
+             "delete the record of a gate-evidence rewrite (2026-09-16).",
+    )
     parser.add_argument(
         "--apply", action="store_true",
         help="Rewrite the rows (default: dry-run diff only).",
@@ -317,8 +324,12 @@ def main(argv: list[str] | None = None) -> int:
         if not sys.stdin.isatty():
             raise BackfillRefusedError("--apply requires an interactive TTY")
         answer = input(f"\nType {CONFIRMATION} to rewrite these rows: ")
+        artifact_dir = durable_artifact_dir(
+            args.artifact_dir or DEFAULT_ARTIFACT_DIR,
+            explicit=args.artifact_dir is not None,
+        )
         path = apply_backfill(
-            session, plan, confirm=answer.strip(), artifact_dir=args.artifact_dir
+            session, plan, confirm=answer.strip(), artifact_dir=artifact_dir
         )
         print(f"Rewritten. Audit artifact: {path}")
         return 0
