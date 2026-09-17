@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from services.execution.execution_sweep import (
     RECOVERY_SOURCE_SWEEP,
     SweptExecution,
+    executions_from_ib_fills,
     plan_sweep,
 )
 from shared.models import Base, ExecutionFill, OrderIntent, OrderStatus
@@ -252,3 +253,278 @@ def test_a_corrected_intent_is_still_publishable_on_a_later_sweep(session) -> No
 
     assert second.corrected == ()  # nothing left to correct
     assert len(second.recovered) == 1  # still publishable
+
+
+# ---------------------------------------------------------------------------
+# C1/C2 — the message must be one the projector can actually accept
+#
+# ``FillProjector._validate`` rejects a fill whose ``commission_trading`` is
+# None, and writes the immutable ``execution_fills`` audit row *before* it
+# validates. So an unprojectable message is not merely "not applied": it
+# makes ``execution_fill_exists`` True forever, which the next sweep reads as
+# ``already_recorded``. The first sweep after a missed fill would consume the
+# only chance to recover it. Hence: never emit a message the projector is
+# guaranteed to reject.
+# ---------------------------------------------------------------------------
+
+
+def test_a_usd_commission_is_translated_one_to_one(session) -> None:
+    """C1: the live callback always sets commission_trading; so must this."""
+    ledger = OrderLedger(session)
+    _submitted_intent(session, ledger, "rec-unh", ib_order_id="148")
+
+    outcome = plan_sweep([_execution(commission=1.25)], ledger)
+
+    [fill] = outcome.recovered
+    assert fill.commission_trading == pytest.approx(1.25)
+    assert fill.commission_fx_base_per_trading is None
+
+
+def test_a_zero_usd_commission_is_still_translated(session) -> None:
+    """The projector's None check fires even at 0.0 — a falsy commission is
+    not an absent one."""
+    ledger = OrderLedger(session)
+    _submitted_intent(session, ledger, "rec-unh", ib_order_id="148")
+
+    outcome = plan_sweep([_execution(commission=0.0)], ledger)
+
+    [fill] = outcome.recovered
+    assert fill.commission_trading == 0.0
+
+
+def test_an_sgd_commission_is_converted_with_the_carried_fx_rate(session) -> None:
+    """Mirrors ``_on_commission_report``: amount / (base per USD)."""
+    ledger = OrderLedger(session)
+    _submitted_intent(session, ledger, "rec-unh", ib_order_id="148")
+
+    outcome = plan_sweep(
+        [
+            _execution(
+                commission=2.60,
+                commission_currency="SGD",
+                commission_fx_base_per_trading=1.30,
+            )
+        ],
+        ledger,
+    )
+
+    [fill] = outcome.recovered
+    assert fill.commission_trading == pytest.approx(2.0)
+    assert fill.commission_fx_base_per_trading == pytest.approx(1.30)
+
+
+def test_an_untranslatable_commission_is_deferred_not_published(session) -> None:
+    """C1/C2: an SGD commission with no FX rate cannot be projected. Emitting
+    it would burn the execution permanently, so it waits for the next run."""
+    ledger = OrderLedger(session)
+    _submitted_intent(session, ledger, "rec-unh", ib_order_id="148")
+
+    outcome = plan_sweep(
+        [
+            _execution(
+                commission=2.60,
+                commission_currency="SGD",
+                commission_fx_base_per_trading=None,
+            )
+        ],
+        ledger,
+    )
+
+    assert outcome.recovered == ()
+    assert outcome.deferred == ("exec-1",)
+
+
+def test_an_unsupported_commission_currency_is_deferred(session) -> None:
+    """``_validate`` allows only USD and SGD; anything else is a guaranteed
+    rejection, so it must never be emitted."""
+    ledger = OrderLedger(session)
+    _submitted_intent(session, ledger, "rec-unh", ib_order_id="148")
+
+    outcome = plan_sweep([_execution(commission_currency="EUR")], ledger)
+
+    assert outcome.recovered == ()
+    assert outcome.deferred == ("exec-1",)
+
+
+def test_a_missing_commission_currency_is_deferred(session) -> None:
+    """C2: ``reqExecutionsAsync`` resolves on ``execDetailsEnd``, which TWS
+    sends before the commission reports are guaranteed to have landed."""
+    ledger = OrderLedger(session)
+    _submitted_intent(session, ledger, "rec-unh", ib_order_id="148")
+
+    outcome = plan_sweep([_execution(commission_currency=None)], ledger)
+
+    assert outcome.recovered == ()
+    assert outcome.deferred == ("exec-1",)
+
+
+def test_a_deferred_execution_does_not_disturb_the_intent(session) -> None:
+    """A deferral must leave the ledger exactly as it found it — in
+    particular it must not un-expire an intent it is not going to recover."""
+    ledger = OrderLedger(session)
+    intent = _submitted_intent(session, ledger, "rec-unh", ib_order_id="148")
+    ledger.transition(
+        intent.recommendation_id,
+        OrderStatus.EXPIRED,
+        reason=ABSENT_AT_IB_REASON,
+    )
+
+    outcome = plan_sweep(
+        [_execution(commission_currency="SGD")], ledger
+    )
+
+    assert outcome.deferred == ("exec-1",)
+    assert outcome.corrected == ()
+    assert (
+        session.get(type(intent), intent.id).status == OrderStatus.EXPIRED.value
+    )
+
+
+def test_an_untracked_execution_is_reported_untracked_not_deferred(
+    session,
+) -> None:
+    """Classification order: an order the book never had is an AC3 untracked
+    even when its commission is also unreadable."""
+    ledger = OrderLedger(session)
+
+    outcome = plan_sweep(
+        [_execution(ib_order_id="999", commission_currency=None)], ledger
+    )
+
+    assert outcome.untracked == ("999",)
+    assert outcome.deferred == ()
+
+
+# ---------------------------------------------------------------------------
+# I4 — whole-share rounding must terminalize the intent
+# ---------------------------------------------------------------------------
+
+
+def test_a_whole_share_rounded_fill_reports_the_order_done(session) -> None:
+    """``fractional_orders: false`` truncates 10.4 to 10 at placement while
+    ``requested_quantity`` keeps the fraction. Without this the intent sits
+    PARTIALLY_FILLED forever: a permanent reservation leak on a BUY, and a
+    permanently muted stop-loss on a SELL."""
+    ledger = OrderLedger(session)
+    _submitted_intent(
+        session, ledger, "rec-unh", ib_order_id="148", quantity=10.4
+    )
+
+    outcome = plan_sweep(
+        [_execution(quantity=10.0, cumulative_quantity=10.0)], ledger
+    )
+
+    [fill] = outcome.recovered
+    assert fill.order_done is True
+
+
+def test_a_materially_partial_fill_does_not_report_the_order_done(
+    session,
+) -> None:
+    """The mirror of the projector's ``rounding_complete`` guard: only a
+    sub-one-share shortfall is rounding. 4 of 10 is a real partial."""
+    ledger = OrderLedger(session)
+    _submitted_intent(
+        session, ledger, "rec-unh", ib_order_id="148", quantity=10.0
+    )
+
+    outcome = plan_sweep(
+        [_execution(quantity=4.0, cumulative_quantity=4.0)], ledger
+    )
+
+    [fill] = outcome.recovered
+    assert fill.order_done is False
+
+
+def test_a_fully_filled_order_still_reports_the_order_done(session) -> None:
+    ledger = OrderLedger(session)
+    _submitted_intent(
+        session, ledger, "rec-unh", ib_order_id="148", quantity=6.0
+    )
+
+    outcome = plan_sweep([_execution(cumulative_quantity=6.0)], ledger)
+
+    [fill] = outcome.recovered
+    assert fill.order_done is True
+
+
+# ---------------------------------------------------------------------------
+# C2 — the adapter must not hand plan_sweep a currency TWS never sent
+# ---------------------------------------------------------------------------
+
+
+def test_a_blank_report_currency_falls_back_to_the_contract_currency() -> None:
+    """``CommissionReport.currency`` defaults to ``''``. The contract's own
+    currency is the sweep's best available answer and is right for every US
+    equity this book trades."""
+    fill = SimpleNamespace(
+        execution=SimpleNamespace(
+            execId="e1",
+            acctNumber="DUN551088",
+            orderId=148,
+            side="SLD",
+            shares=6.0,
+            cumQty=6.0,
+            price=341.22,
+            time=datetime(2026, 9, 14, 13, 31, tzinfo=UTC),
+        ),
+        contract=SimpleNamespace(
+            conId=756733, symbol="UNH", exchange="SMART", currency="USD"
+        ),
+        commissionReport=SimpleNamespace(commission=0.0, currency=""),
+    )
+
+    [swept] = executions_from_ib_fills([fill])
+
+    assert swept.commission_currency == "USD"
+
+
+def test_the_fx_rate_read_at_the_edge_is_carried_onto_the_execution() -> None:
+    """The ``ExchangeRate`` account value can only be read where IB is — the
+    pure module has to be handed it."""
+    fill = SimpleNamespace(
+        execution=SimpleNamespace(
+            execId="e1",
+            acctNumber="DUN551088",
+            orderId=148,
+            side="SLD",
+            shares=6.0,
+            cumQty=6.0,
+            price=341.22,
+            time=datetime(2026, 9, 14, 13, 31, tzinfo=UTC),
+        ),
+        contract=SimpleNamespace(
+            conId=756733, symbol="UNH", exchange="SGX", currency="SGD"
+        ),
+        commissionReport=SimpleNamespace(commission=2.6, currency="SGD"),
+    )
+
+    [swept] = executions_from_ib_fills([fill], fx_base_per_trading=1.30)
+
+    assert swept.commission_currency == "SGD"
+    assert swept.commission_fx_base_per_trading == pytest.approx(1.30)
+
+
+def test_a_usd_execution_carries_no_fx_rate() -> None:
+    """A USD commission needs no translation; recording a rate against it
+    would put a number in the audit row that was never used."""
+    fill = SimpleNamespace(
+        execution=SimpleNamespace(
+            execId="e1",
+            acctNumber="DUN551088",
+            orderId=148,
+            side="SLD",
+            shares=6.0,
+            cumQty=6.0,
+            price=341.22,
+            time=datetime(2026, 9, 14, 13, 31, tzinfo=UTC),
+        ),
+        contract=SimpleNamespace(
+            conId=756733, symbol="UNH", exchange="SMART", currency="USD"
+        ),
+        commissionReport=SimpleNamespace(commission=1.0, currency="USD"),
+    )
+
+    [swept] = executions_from_ib_fills([fill], fx_base_per_trading=1.30)
+
+    assert swept.commission_fx_base_per_trading is None
