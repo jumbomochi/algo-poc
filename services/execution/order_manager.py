@@ -364,21 +364,46 @@ class OrderManager:
     ) -> list[OrderAction]:
         """Check all open orders and decide on reprice or cancel actions.
 
-        Rules:
+        Rules, applied only while the market is open (see below):
         1. If market close is within 15 minutes -> cancel
         2. If max reprice attempts reached -> cancel
         3. If unfilled for longer than reprice_interval_minutes -> reprice
         4. Otherwise -> no action
 
+        Every rule here is an INTRA-SESSION one: each asks some form of "this
+        order has had its chance to fill and did not". Outside regular trading
+        hours no order can fill, so none of them may run — the sweep sits out
+        the close entirely and resumes at the next open, leaving a resting
+        limit its full reprice budget in *session* time.
+
+        Enforcing that is not a refinement; without it no BUY could ever fill.
+        The daily run places its entries at ~16:22 ET, after the bell, and
+        ``get_next_market_close`` returns *today's* close even once it has
+        passed — so ``time_to_close`` went negative and rule 1 cancelled every
+        entry within minutes of it being placed. Sells are market orders and
+        exempt from the sweep, so they rested and filled at the next open; the
+        book could close positions but never open them (2026-09-17: 17 order
+        intents placed, 17 cancelled, 0 fills).
+
+        A lower bound on rule 1 alone would not be enough. At 04:15 ET, when
+        the daily run starts, ``time_to_close`` is positive (~11h45m) and rule
+        3 ages the order instead, retiring it through rule 2's attempt cap
+        hours before the open it was waiting for.
+
         Args:
             current_prices: Map of ticker -> current market price.
-            market_calendar: MarketCalendar instance for close time checks.
+            market_calendar: MarketCalendar instance for close/session checks.
 
         Returns:
             List of OrderAction describing what to do with each order.
         """
         now = datetime.now(timezone.utc)
         actions: list[OrderAction] = []
+
+        if not market_calendar.is_market_open(now):
+            return actions
+
+        next_close = market_calendar.get_next_market_close(now)
 
         for order_id, info in self.open_orders.items():
             # Market orders (e.g. exits/liquidations) fill at once and have no
@@ -393,7 +418,6 @@ class OrderManager:
             if info.get("order_type") in _SWEEP_EXEMPT_ORDER_TYPES:
                 continue
             ticker = info["ticker"]
-            next_close = market_calendar.get_next_market_close(now)
 
             # Rule 1: Cancel if market close is within 15 minutes
             time_to_close = next_close - now
