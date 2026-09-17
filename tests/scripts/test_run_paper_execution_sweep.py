@@ -19,6 +19,9 @@ pattern in ``test_run_paper_publish_failure.py``.
 
 from __future__ import annotations
 
+import asyncio
+import sys
+import types
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -95,6 +98,70 @@ def _execution(**overrides) -> SweptExecution:
     )
     base.update(overrides)
     return SweptExecution(**base)
+
+
+def _record_existing_fill(
+    session: Session, *, execution_id: str, ib_order_id: str = "148"
+) -> None:
+    """An execution_fills row the projector already applied."""
+    from shared.models import ExecutionFill
+
+    session.add(
+        ExecutionFill(
+            account_id="DUN551088",
+            execution_id=execution_id,
+            ib_order_id=ib_order_id,
+            recommendation_id="rec-unh",
+            portfolio="momentum",
+            con_id=756733,
+            symbol="UNH",
+            exchange="SMART",
+            currency="USD",
+            side="SELL",
+            quantity=6.0,
+            price=341.22,
+            commission=1.0,
+            executed_at=datetime(2026, 9, 14, 13, 31, tzinfo=UTC),
+            projection_applied=True,
+        )
+    )
+    session.commit()
+
+
+class _StallingIB:
+    """Completes the handshake, then never answers the request."""
+
+    def __init__(self):
+        self._connected = False
+
+    async def connectAsync(self, host, port, clientId=None, **kwargs):
+        self._connected = True
+
+    async def reqExecutionsAsync(self, _filter):
+        await asyncio.sleep(30)
+
+    def accountValues(self):
+        return []
+
+    def isConnected(self):
+        return self._connected
+
+    def disconnect(self):
+        self._connected = False
+
+
+def _stub_ib_insync(monkeypatch, ib_class) -> None:
+    """Swap the module ``read_broker_executions`` imports from.
+
+    A stub rather than monkeypatching the real ``ib_insync.IB``: importing
+    ``ib_insync`` inside a test drags in ``eventkit``, which takes hold of an
+    event loop at import time and upsets whatever loop the rest of the suite
+    is on.
+    """
+    module = types.ModuleType("ib_insync")
+    module.IB = ib_class
+    module.ExecutionFilter = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "ib_insync", module)
 
 
 class FakeRedis:
@@ -247,7 +314,7 @@ def test_a_decision_error_does_not_change_the_run_either(
     """
 
     async def _fake_read(**kwargs):
-        return [_execution()]
+        return run_paper.BrokerExecutions(1, [_execution()])
 
     def _boom(*args, **kwargs):
         raise RuntimeError("ledger blew up")
@@ -277,7 +344,7 @@ def test_the_decision_error_message_redacts_a_dsn(monkeypatch, session, capsys) 
     warning in this function, not just the publish-side ones."""
 
     async def _fake_read(**kwargs):
-        return [_execution()]
+        return run_paper.BrokerExecutions(1, [_execution()])
 
     def _boom(*args, **kwargs):
         raise RuntimeError(
@@ -335,7 +402,7 @@ def test_a_recovered_fill_is_published_to_stream_fills(monkeypatch, session) -> 
     _submitted_intent(session)
 
     async def _fake_read(**kwargs):
-        return [_execution()]
+        return run_paper.BrokerExecutions(1, [_execution()])
 
     fake = FakeRedis()
     monkeypatch.setattr(run_paper, "read_broker_executions", _fake_read)
@@ -364,15 +431,18 @@ def test_the_sweep_opens_exactly_one_redis_connection_for_many_fills(
     _submitted_intent(session, recommendation_id="rec-msft", ib_order_id="149")
 
     async def _fake_read(**kwargs):
-        return [
-            _execution(execution_id="exec-1", ib_order_id="148"),
-            _execution(
-                execution_id="exec-2",
-                ib_order_id="149",
-                con_id=272093,
-                ticker="MSFT",
-            ),
-        ]
+        return run_paper.BrokerExecutions(
+            2,
+            [
+                _execution(execution_id="exec-1", ib_order_id="148"),
+                _execution(
+                    execution_id="exec-2",
+                    ib_order_id="149",
+                    con_id=272093,
+                    ticker="MSFT",
+                ),
+            ],
+        )
 
     fake = FakeRedis()
     calls: list[str] = []
@@ -398,10 +468,16 @@ def test_the_sweep_opens_exactly_one_redis_connection_for_many_fills(
 
 
 def test_no_redis_connection_when_nothing_was_recovered(monkeypatch, session) -> None:
-    """An untracked-only sweep has nothing to publish; don't open Redis for it."""
+    """A sweep with nothing to say opens no connection at all.
+
+    (An *untracked* sweep does open one now — it has an alert to raise. This
+    case is the quiet one: an execution the projector already recorded.)
+    """
+    _submitted_intent(session)
+    _record_existing_fill(session, execution_id="exec-1")
 
     async def _fake_read(**kwargs):
-        return [_execution(ib_order_id="unknown-order")]
+        return run_paper.BrokerExecutions(1, [_execution()])
 
     calls: list[str] = []
 
@@ -430,7 +506,7 @@ def test_the_sweep_redis_connection_is_bounded(monkeypatch, session) -> None:
     _submitted_intent(session)
 
     async def _fake_read(**kwargs):
-        return [_execution()]
+        return run_paper.BrokerExecutions(1, [_execution()])
 
     seen: list[dict] = []
 
@@ -449,8 +525,11 @@ def test_the_sweep_redis_connection_is_bounded(monkeypatch, session) -> None:
         redis_url="redis://localhost:6379/0",
     )
 
-    assert seen[0]["socket_connect_timeout"] > 0
-    assert seen[0]["socket_timeout"] > 0
+    assert (
+        seen[0]["socket_connect_timeout"]
+        == run_paper.PUBLISH_CONNECT_TIMEOUT_SECONDS
+    )
+    assert seen[0]["socket_timeout"] == run_paper.PUBLISH_SOCKET_TIMEOUT_SECONDS
 
 
 def test_a_publish_failure_for_one_fill_does_not_stop_the_others(
@@ -460,15 +539,18 @@ def test_a_publish_failure_for_one_fill_does_not_stop_the_others(
     _submitted_intent(session, recommendation_id="rec-msft", ib_order_id="149")
 
     async def _fake_read(**kwargs):
-        return [
-            _execution(execution_id="exec-fails", ib_order_id="148"),
-            _execution(
-                execution_id="exec-succeeds",
-                ib_order_id="149",
-                con_id=272093,
-                ticker="MSFT",
-            ),
-        ]
+        return run_paper.BrokerExecutions(
+            2,
+            [
+                _execution(execution_id="exec-fails", ib_order_id="148"),
+                _execution(
+                    execution_id="exec-succeeds",
+                    ib_order_id="149",
+                    con_id=272093,
+                    ticker="MSFT",
+                ),
+            ],
+        )
 
     class FlakyRedis(FakeRedis):
         def xadd(self, stream, payload):
@@ -502,7 +584,7 @@ def test_a_broken_redis_connection_does_not_raise(monkeypatch, session, capsys) 
     _submitted_intent(session)
 
     async def _fake_read(**kwargs):
-        return [_execution()]
+        return run_paper.BrokerExecutions(1, [_execution()])
 
     def _boom_connect(url, **kwargs):
         raise ConnectionError("Error connecting to redis")
@@ -521,3 +603,358 @@ def test_a_broken_redis_connection_does_not_raise(monkeypatch, session, capsys) 
     assert len(outcome.recovered) == 1  # decided, just not delivered
     out = capsys.readouterr().out
     assert "WARNING" in out
+
+
+# ---------------------------------------------------------------------------
+# C3 — "IB returned nothing" and "nothing needed recovery" are opposites
+#
+# ``reqExecutions`` is clientId-scoped. If this connection's client id is not
+# the Gateway's Master API client ID, the sweep sees `[]` every night while
+# the execution service places orders under a different one. That is the
+# silent failure this branch exists to prevent, so the raw count IB returned
+# is reported separately from the four outcome counts. Whether the client id
+# is in fact the master one is a live-Gateway question, escalated; all the
+# code can do is make the two cases distinguishable.
+# ---------------------------------------------------------------------------
+
+
+def test_the_raw_ib_count_is_reported_when_nothing_needed_recovery(
+    monkeypatch, session, capsys
+) -> None:
+    _submitted_intent(session)
+    _record_existing_fill(session, execution_id="exec-1")
+
+    async def _fake_read(**kwargs):
+        return run_paper.BrokerExecutions(1, [_execution()])
+
+    monkeypatch.setattr(run_paper, "read_broker_executions", _fake_read)
+
+    run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    out = capsys.readouterr().out
+    assert "IB returned 1" in out
+    assert "0 recovered" in out
+    assert "1 already recorded" in out
+
+
+def test_an_empty_ib_response_is_reported_as_zero_returned(
+    monkeypatch, session, capsys
+) -> None:
+    """The clientId-scoping failure mode: indistinguishable from a healthy
+    night until the raw count is printed."""
+
+    async def _fake_read(**kwargs):
+        return run_paper.BrokerExecutions(0, [])
+
+    monkeypatch.setattr(run_paper, "read_broker_executions", _fake_read)
+
+    run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    assert "IB returned 0" in capsys.readouterr().out
+
+
+def test_unreadable_rows_are_visible_as_a_gap_in_the_counts(
+    monkeypatch, session, capsys
+) -> None:
+    """IB returned rows the adapter could not classify — also not a healthy
+    night, and also invisible without the raw count."""
+
+    async def _fake_read(**kwargs):
+        return run_paper.BrokerExecutions(3, [])
+
+    monkeypatch.setattr(run_paper, "read_broker_executions", _fake_read)
+
+    run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    out = capsys.readouterr().out
+    assert "IB returned 3" in out
+    assert "0 readable" in out
+
+
+def test_deferred_executions_are_reported(monkeypatch, session, capsys) -> None:
+    """A deferral is a recoverable non-event, but it must still be counted:
+    a deferral that recurs every night is a stuck fill."""
+    _submitted_intent(session)
+
+    async def _fake_read(**kwargs):
+        return run_paper.BrokerExecutions(
+            1, [_execution(commission_currency="SGD")]
+        )
+
+    monkeypatch.setattr(run_paper, "read_broker_executions", _fake_read)
+
+    outcome = run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    assert outcome.deferred == ("exec-1",)
+    assert "1 deferred" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# I6 — the execution request itself must be bounded
+# ---------------------------------------------------------------------------
+
+
+def test_a_stalled_execution_request_times_out(monkeypatch) -> None:
+    """``connectAsync`` was bounded; ``reqExecutionsAsync`` was not. A
+    Gateway that completes the handshake and then stalls would hold the run
+    open until ALGO_PAPER_TIMEOUT_SECONDS (3h) killed it — the AC5 violation
+    the bound exists to prevent. Precedent: ``ib_account.py``'s
+    ``asyncio.wait_for(future, ACCOUNT_SUMMARY_TIMEOUT_SECONDS)``.
+    """
+    _stub_ib_insync(monkeypatch, _StallingIB)
+    monkeypatch.setattr(run_paper, "REQ_EXECUTIONS_TIMEOUT_SECONDS", 0.05)
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(
+            run_paper.read_broker_executions(
+                host="127.0.0.1", port=7497, client_id=58
+            )
+        )
+
+
+def test_a_stalled_execution_request_does_not_gate_the_run(
+    monkeypatch, session, capsys
+) -> None:
+    """And the timeout is caught by the AC5 boundary like any other failure."""
+    _stub_ib_insync(monkeypatch, _StallingIB)
+    monkeypatch.setattr(run_paper, "REQ_EXECUTIONS_TIMEOUT_SECONDS", 0.05)
+
+    assert (
+        run_paper.sweep_executions_best_effort(
+            host="127.0.0.1",
+            port=7497,
+            client_id=58,
+            session=session,
+            redis_url="redis://localhost:6379/0",
+        )
+        is None
+    )
+    assert "could not read executions from IB" in capsys.readouterr().out
+
+
+def test_the_named_timeout_constant_is_a_sane_bound() -> None:
+    assert 0 < run_paper.REQ_EXECUTIONS_TIMEOUT_SECONDS <= 120
+
+
+# ---------------------------------------------------------------------------
+# I7 — a sweep failure must be able to reach the operator
+#
+# run_paper.sh only sends Telegram on a non-zero exit, and the sweep never
+# changes the exit code (correctly, per AC5). Without an alert, every one of
+# these stops at a log file nobody reads.
+# ---------------------------------------------------------------------------
+
+
+def test_a_decision_failure_alerts_the_operator(monkeypatch, session) -> None:
+    async def _fake_read(**kwargs):
+        return run_paper.BrokerExecutions(1, [_execution()])
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("ledger blew up")
+
+    fake = FakeRedis()
+    monkeypatch.setattr(run_paper, "read_broker_executions", _fake_read)
+    monkeypatch.setattr(run_paper, "plan_sweep", _boom)
+    monkeypatch.setattr(run_paper, "_redis_from_url", lambda url, **kw: fake)
+
+    run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    [(stream, payload)] = fake.published
+    assert stream == "stream:alerts"
+    assert payload["event_type"] == "execution_sweep_failed"
+    assert payload["priority"] == "high"
+    assert "ledger blew up" in payload["message"]
+
+
+def test_the_decision_failure_alert_redacts_a_dsn(monkeypatch, session) -> None:
+    async def _fake_read(**kwargs):
+        return run_paper.BrokerExecutions(1, [_execution()])
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("postgresql://algo:p@ssw0rd@db:5432/algo_poc is down")
+
+    fake = FakeRedis()
+    monkeypatch.setattr(run_paper, "read_broker_executions", _fake_read)
+    monkeypatch.setattr(run_paper, "plan_sweep", _boom)
+    monkeypatch.setattr(run_paper, "_redis_from_url", lambda url, **kw: fake)
+
+    run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    [(_, payload)] = fake.published
+    assert "p@ssw0rd" not in payload["message"]
+    assert "***@" in payload["message"]
+
+
+def test_untracked_executions_alert_the_operator(monkeypatch, session) -> None:
+    """IB executed something the book has no intent for. That is the book
+    and the broker disagreeing about what was traded — printing it and
+    exiting 0 is how it stays unnoticed."""
+
+    async def _fake_read(**kwargs):
+        return run_paper.BrokerExecutions(
+            1, [_execution(ib_order_id="9999")]
+        )
+
+    fake = FakeRedis()
+    monkeypatch.setattr(run_paper, "read_broker_executions", _fake_read)
+    monkeypatch.setattr(run_paper, "_redis_from_url", lambda url, **kw: fake)
+
+    run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    alerts = [p for stream, p in fake.published if stream == "stream:alerts"]
+    assert len(alerts) == 1
+    assert alerts[0]["event_type"] == "execution_sweep_untracked"
+    assert "9999" in alerts[0]["message"]
+
+
+def test_no_untracked_alert_on_a_clean_sweep(monkeypatch, session) -> None:
+    """An alert that fires every night is an alert nobody reads."""
+    _submitted_intent(session)
+
+    async def _fake_read(**kwargs):
+        return run_paper.BrokerExecutions(1, [_execution()])
+
+    fake = FakeRedis()
+    monkeypatch.setattr(run_paper, "read_broker_executions", _fake_read)
+    monkeypatch.setattr(run_paper, "_redis_from_url", lambda url, **kw: fake)
+
+    run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    assert [stream for stream, _ in fake.published] == ["stream:fills"]
+
+
+def test_a_failed_alert_does_not_gate_the_run(monkeypatch, session, capsys) -> None:
+    """AC5 again: the alert is best-effort. Its usual cause of failure is
+    Redis being unreachable, which takes the alert path down with it."""
+
+    async def _fake_read(**kwargs):
+        return run_paper.BrokerExecutions(
+            1, [_execution(ib_order_id="9999")]
+        )
+
+    def _boom_connect(url, **kwargs):
+        raise ConnectionError("Error connecting to redis")
+
+    monkeypatch.setattr(run_paper, "read_broker_executions", _fake_read)
+    monkeypatch.setattr(run_paper, "_redis_from_url", _boom_connect)
+
+    outcome = run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    assert outcome.untracked == ("9999",)
+    assert "WARNING" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# C1 (edge half) — the FX rate only IB can answer for
+# ---------------------------------------------------------------------------
+
+
+def test_the_exchange_rate_is_read_the_way_the_live_callback_reads_it() -> None:
+    """Mirrors ``ib_executor._on_commission_report``: the single USD
+    ``ExchangeRate`` account value, finite and positive."""
+    ib = SimpleNamespace(
+        accountValues=lambda: [
+            SimpleNamespace(tag="NetLiquidation", currency="SGD", value="5000"),
+            SimpleNamespace(tag="ExchangeRate", currency="USD", value="1.2865"),
+        ]
+    )
+
+    assert run_paper._exchange_rate_usd(ib) == pytest.approx(1.2865)
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [],
+        [SimpleNamespace(tag="ExchangeRate", currency="USD", value="0")],
+        [SimpleNamespace(tag="ExchangeRate", currency="USD", value="nope")],
+        [
+            SimpleNamespace(tag="ExchangeRate", currency="USD", value="1.2"),
+            SimpleNamespace(tag="ExchangeRate", currency="USD", value="1.3"),
+        ],
+    ],
+)
+def test_an_unusable_exchange_rate_reads_as_absent(rows) -> None:
+    """Absent, not guessed: plan_sweep defers rather than booking a wrong
+    commission."""
+    assert run_paper._exchange_rate_usd(SimpleNamespace(accountValues=lambda: rows)) is None
+
+
+def test_an_exchange_rate_read_that_raises_does_not_fail_the_sweep() -> None:
+    def _boom():
+        raise RuntimeError("no account subscription")
+
+    assert run_paper._exchange_rate_usd(SimpleNamespace(accountValues=_boom)) is None
+
+
+# ---------------------------------------------------------------------------
+# I8 — the comment at the call site must state the guarantee that holds
+# ---------------------------------------------------------------------------
+
+
+def test_the_call_site_does_not_claim_this_run_is_corrected() -> None:
+    """``FillProjector`` runs in the portfolio_accounting container and
+    ``xadd`` returns immediately, so ``prepare_daily_run`` — which runs
+    microseconds later, against a ``broker_snapshot`` read *before* the
+    sweep — cannot see the recovered fill. The benefit lands one run later,
+    and the comment must not promise otherwise."""
+    source = (REPO_ROOT / "scripts/run_paper.py").read_text()
+    sweep_at = source.index("sweep_executions_best_effort(\n        host=args.ib_host")
+    comment = source[sweep_at - 1200 : sweep_at]
+
+    assert "BEFORE reconciliation reads the book" not in comment
+    assert "next run" in comment

@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import re
 import sys
@@ -32,7 +33,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping, NamedTuple
 
 # When invoked as ``python scripts/run_paper.py``, Python otherwise resolves
 # editable-package imports from the primary checkout instead of this worktree.
@@ -1249,24 +1250,28 @@ def _redis_from_url(url: str, **kwargs: Any) -> Any:
     return redis_sync.Redis.from_url(url, **kwargs)
 
 
-def emit_publish_failure_alert(
-    redis_url: str, error: BaseException, *, account_id: str | None = None
+def emit_alert_best_effort(
+    redis_url: str,
+    *,
+    event_type: str,
+    priority: str,
+    message: str,
+    context: dict[str, Any],
+    label: str,
 ) -> bool:
-    """Page the operator that the day's orders never reached the pipeline.
+    """Write one ``AlertMessage`` to ``stream:alerts``. Never raises.
 
-    Best-effort by construction: the usual cause of a failed publish is Redis
+    Best-effort by construction: the usual cause of a failed alert is Redis
     being unreachable, which takes this path down with it. A failure here is
-    logged and swallowed — never raised — because the guaranteed signal is the
-    nonzero exit code, which the launchd wrapper turns into a Telegram message
-    without touching the network.
+    logged and swallowed — never raised — because nothing in this script may
+    be gated on the alert landing.
+
+    ``message`` is redacted here rather than at each call site, so a caller
+    cannot forget: the strings these alerts carry are exception texts, and a
+    psycopg2/redis failure routinely quotes the full DSN.
     """
     from shared.schemas.messages import AlertMessage
 
-    message = _redact(
-        f"run_paper.py: publish to stream:recommendations failed ({error}). "
-        "The day's book is committed, but no orders reached risk or execution. "
-        "The intents remain replayable on the next run."
-    )
     try:
         conn = _redis_from_url(
             redis_url,
@@ -1276,10 +1281,10 @@ def emit_publish_failure_alert(
         try:
             alert = AlertMessage(
                 timestamp=datetime.now(timezone.utc),
-                event_type="publish_failed",
-                priority="high",
-                message=message,
-                context={"script": "run_paper.py", "account_id": account_id},
+                event_type=event_type,
+                priority=priority,
+                message=_redact(message),
+                context=context,
             )
             conn.xadd(ALERTS_STREAM, alert.to_stream_dict())
         finally:
@@ -1287,10 +1292,33 @@ def emit_publish_failure_alert(
         return True
     except Exception as alert_error:
         print(
-            "WARNING: could not raise the publish-failure alert "
+            f"WARNING: could not raise the {label} alert "
             f"({_redact(str(alert_error))})"
         )
         return False
+
+
+def emit_publish_failure_alert(
+    redis_url: str, error: BaseException, *, account_id: str | None = None
+) -> bool:
+    """Page the operator that the day's orders never reached the pipeline.
+
+    Best-effort: see :func:`emit_alert_best_effort`. The guaranteed signal
+    for this particular failure is the nonzero exit code, which the launchd
+    wrapper turns into a Telegram message without touching the network.
+    """
+    return emit_alert_best_effort(
+        redis_url,
+        event_type="publish_failed",
+        priority="high",
+        message=(
+            f"run_paper.py: publish to stream:recommendations failed ({error}). "
+            "The day's book is committed, but no orders reached risk or "
+            "execution. The intents remain replayable on the next run."
+        ),
+        context={"script": "run_paper.py", "account_id": account_id},
+        label="publish-failure",
+    )
 
 
 def publish_bridge(
@@ -1372,10 +1400,61 @@ async def read_broker_snapshot(
 
 FILLS_STREAM = "stream:fills"
 
+# ``connectAsync`` was already bounded; the request that follows it was not.
+# A Gateway that completes the handshake and then stalls would hold the run
+# open until ALGO_PAPER_TIMEOUT_SECONDS (3h) killed it — a direct AC5
+# violation, since the sweep must never gate the run. Precedent and rough
+# magnitude: ``ib_account.ACCOUNT_SUMMARY_TIMEOUT_SECONDS``.
+REQ_EXECUTIONS_TIMEOUT_SECONDS = 30
+
+
+class BrokerExecutions(NamedTuple):
+    """What IB answered with, and what of it the adapter could read.
+
+    ``fetched`` is the raw row count, kept separate from the outcome counts
+    on purpose. ``reqExecutions`` is clientId-scoped, so a sweep connected
+    under a client id that is not the Gateway's Master API client ID returns
+    an empty list every night — which, reported as "0 recovered", is
+    indistinguishable from a healthy night on which nothing needed
+    recovering. Those are opposite facts and the digest must be able to tell
+    them apart. (Whether client id 58 *is* the master one is a live-Gateway
+    question and is escalated, not decided here.)
+    """
+
+    fetched: int
+    executions: list[SweptExecution]
+
+
+def _exchange_rate_usd(ib: Any) -> float | None:
+    """IB's ``ExchangeRate`` account value for USD, or None.
+
+    Mirrors ``ib_executor._on_commission_report`` exactly — exactly one USD
+    row, parseable, finite and positive — because the two must agree about
+    what an un-translatable commission looks like. None means "absent", not
+    "one": ``plan_sweep`` defers such an execution rather than booking a
+    wrong commission, and a wrong commission here is unrecoverable.
+
+    Never raises: the account subscription is incidental to the sweep, and a
+    USD commission (every US equity this book trades) needs no rate at all.
+    """
+    try:
+        rows = [
+            row
+            for row in (ib.accountValues() or ())
+            if getattr(row, "tag", None) == "ExchangeRate"
+            and getattr(row, "currency", None) == "USD"
+        ]
+        if len(rows) != 1:
+            return None
+        candidate = float(rows[0].value)
+    except Exception:
+        return None
+    return candidate if math.isfinite(candidate) and candidate > 0 else None
+
 
 async def read_broker_executions(
     *, host: str, port: int, client_id: int
-) -> list[SweptExecution]:
+) -> BrokerExecutions:
     """Ask IB what it executed this trading day.
 
     ``reqExecutions`` serves the CURRENT trading day only. The fill lands at
@@ -1396,8 +1475,15 @@ async def read_broker_executions(
         await ib.connectAsync(
             host, port, clientId=client_id, readonly=True, timeout=15
         )
-        return executions_from_ib_fills(
-            await ib.reqExecutionsAsync(ExecutionFilter())
+        fills = await asyncio.wait_for(
+            ib.reqExecutionsAsync(ExecutionFilter()),
+            REQ_EXECUTIONS_TIMEOUT_SECONDS,
+        )
+        return BrokerExecutions(
+            fetched=len(fills),
+            executions=executions_from_ib_fills(
+                fills, fx_base_per_trading=_exchange_rate_usd(ib)
+            ),
         )
     finally:
         if ib.isConnected():
@@ -1442,7 +1528,7 @@ def sweep_executions_best_effort(
     the two are labelled differently.
     """
     try:
-        executions = asyncio.run(
+        fetched, executions = asyncio.run(
             read_broker_executions(host=host, port=port, client_id=client_id)
         )
     except Exception as exc:
@@ -1464,6 +1550,23 @@ def sweep_executions_best_effort(
             f"logic failed ({_redact(str(exc))}). This is not IB flakiness; "
             "it needs investigating. Reconciliation continues; a missed "
             "fill stays missed until the next run."
+        )
+        # The print alone cannot reach anyone: run_paper.sh only sends
+        # Telegram on a non-zero exit, and AC5 forbids this changing the
+        # exit code. Without the alert a recurring decision-layer bug lives
+        # in a log file indefinitely.
+        emit_alert_best_effort(
+            redis_url,
+            event_type="execution_sweep_failed",
+            priority="high",
+            message=(
+                "run_paper.py: the execution sweep's own decision logic "
+                f"failed ({exc}). No missed fill was recovered this run, so "
+                "a phantom position may still be blocking entries. The run "
+                "itself continued."
+            ),
+            context={"script": "run_paper.py", "stage": "decide"},
+            label="execution-sweep-failure",
         )
         return None
 
@@ -1505,11 +1608,39 @@ def sweep_executions_best_effort(
                         f"connection failed ({close_error})"
                     )
 
+    if outcome.untracked:
+        # IB executed something this book has no intent for. Nothing was
+        # projected for it (AC3), which means the book and the broker now
+        # disagree about what was traded — not a condition to leave in a log.
+        emit_alert_best_effort(
+            redis_url,
+            event_type="execution_sweep_untracked",
+            priority="high",
+            message=(
+                "run_paper.py: the execution sweep found "
+                f"{len(outcome.untracked)} IB execution(s) with no order "
+                "intent in the book (broker order ids: "
+                f"{', '.join(outcome.untracked)}). Nothing was projected for "
+                "them; the book and IB disagree about what was traded."
+            ),
+            context={
+                "script": "run_paper.py",
+                "ib_order_ids": list(outcome.untracked),
+            },
+            label="execution-sweep-untracked",
+        )
+
+    # `IB returned N (M readable)` leads, and is deliberately not folded into
+    # the outcome counts: zero returned means the sweep saw nothing at all
+    # (a clientId-scoping or connectivity fault), while zero recovered with a
+    # non-zero return means a healthy night. They read identically without it.
     print(
-        f"Execution sweep: {len(outcome.recovered)} recovered, "
+        f"Execution sweep: IB returned {fetched} execution(s) "
+        f"({len(executions)} readable); {len(outcome.recovered)} recovered, "
         f"{outcome.already_recorded} already recorded, "
         f"{len(outcome.untracked)} untracked, "
-        f"{len(outcome.corrected)} corrected"
+        f"{len(outcome.corrected)} corrected, "
+        f"{len(outcome.deferred)} deferred"
     )
     return outcome
 
@@ -1893,12 +2024,24 @@ def main() -> int | None:
         )
     )
 
-    # Recover fills the live callback never saw, BEFORE reconciliation reads
-    # the book. A sell that filled at the open is otherwise invisible here,
-    # and reconciliation can only see that a position moved, never what
-    # executed — which is how PANW, LLY and UNH became phantoms. Best-effort:
-    # AC5 requires this never change the run's exit code or block
-    # reconciliation, so nothing from it is checked or propagated here.
+    # Recover fills the live callback never saw. A sell that filled at the
+    # open is otherwise invisible to the book, and reconciliation can only
+    # see that a position moved, never what executed — which is how PANW,
+    # LLY and UNH became phantoms.
+    #
+    # What this corrects is the next run, not this one. The sweep publishes
+    # to stream:fills; FillProjector consumes it in the separate
+    # portfolio_accounting container, and xadd returns as soon as the entry
+    # is written. prepare_daily_run runs microseconds later, against a
+    # broker_snapshot read *before* this call, so this run's reconciliation
+    # may well still see the phantom. Re-reading and re-reconciling to close
+    # that gap would cost a second broker round trip and a second
+    # reconciliation path for one run's worth of latency; one run later is
+    # the right trade.
+    #
+    # Best-effort: AC5 requires this never change the run's exit code or
+    # block reconciliation, so nothing from it is checked or propagated here.
+    # Failures the operator must see are alerted from inside it instead.
     sweep_executions_best_effort(
         host=args.ib_host,
         port=args.ib_port,
