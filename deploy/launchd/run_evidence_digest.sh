@@ -21,7 +21,7 @@
 
 set -uo pipefail
 
-ALGO_DIR="${ALGO_DIR:-/Users/huiliang/GitHub/algo-poc}"
+ALGO_DIR="${ALGO_DIR:-/Users/huiliang/algo-poc-deploy}"
 VENV="$ALGO_DIR/.venv/bin/python"
 LOG_DIR="$HOME/ibc/logs"
 LOG_FILE="$LOG_DIR/evidence_digest_$(date +%Y%m%d).log"
