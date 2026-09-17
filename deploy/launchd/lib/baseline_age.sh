@@ -35,6 +35,33 @@
 # A newer, USABLE artifact sitting unpinned is not an alert at all. Re-pinning
 # is a deliberate act (KAN-51) and that is the normal state after any refresh.
 #
+# WHAT "USABLE" MEANS, AND WHY COVERAGE STATE CANNOT ANSWER IT ALONE
+# ------------------------------------------------------------------
+# The first version read "coverage != OK" as "cannot be pinned". That is wrong
+# in the one direction that matters: BLOCKED is exactly what a formally
+# accepted bias LOOKS like. D18/D20 accepted the PIT coverage shortfall in
+# writing and deliberately did NOT move the floor, so an accepted artifact
+# still reports BLOCKED with is_like_for_like False -- indistinguishable, by
+# coverage state, from one nobody decided about.
+#
+# So on 2026-09-17 the 05:04 report said the baseline could not be pinned while
+# naming it as the pin in the same sentence:
+#
+#   pin is backtest_multi_20260915_102125.json (1d old, BLOCKED at 11.21%);
+#   newest is backtest_multi_20260915_102125.json (1d, BLOCKED at 11.21%
+#   -- cannot be pinned)
+#
+# research/bias_acceptances.json is what answers "can this be pinned", and
+# scripts/ops/protected_artifacts.py already reads it to answer a more
+# consequential question (which artifacts the weekly prune must never delete).
+# That seam is reused here rather than parsing the registry again in shell --
+# the same reasoning that made the pin resolve through baseline_pin.py.
+#
+# Failure is toward REPORTING: an unreadable or missing registry yields no
+# accepted names, so nothing is excused and the event still alerts. Muting an
+# alert on the strength of a file that could not be read is the 2026-08-13
+# failure in a new costume.
+#
 # Sourced by run_pipeline_report.sh. Sets, and never exits non-zero:
 #   ALGO_BASELINE_STATUS   ok | stale | unusable | missing | unresolved
 #   ALGO_BASELINE_DETAIL   one line carrying BOTH the pin and the newest
@@ -49,6 +76,10 @@ ALGO_BASELINE_PIN_MAX_DAYS="${ALGO_BASELINE_PIN_MAX_DAYS:-30}"
 # How new an artifact must be for "this refresh produced something unusable" to
 # still be news rather than a standing condition.
 ALGO_BASELINE_FRESH_DAYS="${ALGO_BASELINE_FRESH_DAYS:-1}"
+# Repo root whose research/bias_acceptances.json names the formally accepted
+# artifacts. Separate from ALGO_DIR only so a test can supply a registry
+# without editing the committed one.
+ALGO_BASELINE_ACCEPTANCE_ROOT="${ALGO_BASELINE_ACCEPTANCE_ROOT:-${ALGO_DIR:-.}}"
 
 ALGO_BASELINE_STATUS=""
 ALGO_BASELINE_DETAIL=""
@@ -108,6 +139,25 @@ algo_baseline_pin_path() {
               ${cfg_arg[@]+"${cfg_arg[@]}"} 2>/dev/null)
 }
 
+# Basenames of every artifact the acceptance registry names, one per line.
+#
+# Matched by basename rather than full path: the registry records a repo-
+# relative source and this check may be pointed at another output directory,
+# while backtest_multi_<timestamp>.json is unique by construction. The registry
+# binds an acceptance to a sha256 and this does not re-verify that -- hashing a
+# 240MB file every morning to decide the wording of a status line is not a
+# trade worth making, and scripts/run_sleeve_evaluation.py already enforces the
+# sha where it actually gates evidence.
+#
+# Prints nothing if the registry is missing, unreadable, or python is absent.
+# Nothing is then excused and the event alerts, which is the safe direction.
+algo_baseline_accepted_names() {
+    local py="${ALGO_PYTHON:-${ALGO_DIR:-.}/.venv/bin/python}"
+    "$py" "${ALGO_DIR:-.}/scripts/ops/protected_artifacts.py" \
+          --repo-root "$ALGO_BASELINE_ACCEPTANCE_ROOT" 2>/dev/null \
+        | while IFS= read -r p; do [ -n "$p" ] && basename "$p"; done
+}
+
 # Newest backtest_multi_* by mtime. Still computed — it answers "a refresh
 # produced something", which belongs in the body — but it no longer decides
 # anything on its own.
@@ -127,6 +177,7 @@ algo_baseline_age_check() {
     ALGO_BASELINE_DETAIL=""
 
     local pin newest newest_part="" ncov nstate npct nage
+    local newest_unpinnable=0 accepted_names=""
     pin="$(algo_baseline_pin_path)"
 
     # Describe the newest artifact first: it is reported in every branch,
@@ -137,7 +188,19 @@ algo_baseline_age_check() {
         ncov="$(_algo_baseline_coverage "$newest")"
         nstate="${ncov%% *}"; npct="${ncov##* }"
         if [ -n "$nstate" ] && [ "$nstate" != "OK" ]; then
-            newest_part="; newest is $(basename "$newest") (${nage}d, coverage ${nstate} at ${npct}% excluded — cannot be pinned)"
+            # Three ways a non-OK artifact is still pinnable. Unreadable
+            # coverage is deliberately not one of them (it stays "unknown",
+            # as before): absence must not read as a pass.
+            accepted_names="$(algo_baseline_accepted_names)"
+            if [ "$newest" = "$pin" ]; then
+                newest_part="; newest is $(basename "$newest") (${nage}d, coverage ${nstate} at ${npct}% excluded — and IS the pinned baseline)"
+            elif printf '%s\n' "$accepted_names" \
+                 | grep -qxF "$(basename "$newest")"; then
+                newest_part="; newest is $(basename "$newest") (${nage}d, coverage ${nstate} at ${npct}% excluded — bias formally accepted, so it can be pinned)"
+            else
+                newest_unpinnable=1
+                newest_part="; newest is $(basename "$newest") (${nage}d, coverage ${nstate} at ${npct}% excluded — cannot be pinned)"
+            fi
         else
             newest_part="; newest is $(basename "$newest") (${nage}d, coverage ${nstate:-unknown})"
         fi
@@ -174,7 +237,7 @@ algo_baseline_age_check() {
 
     # The event: a refresh produced something that cannot become the baseline.
     # Only while it is still news — see the header on state versus event.
-    if [ -n "$newest" ] && [ -n "$nstate" ] && [ "$nstate" != "OK" ] \
+    if [ -n "$newest" ] && [ "$newest_unpinnable" -eq 1 ] \
        && [ "${nage:-999}" -le "$ALGO_BASELINE_FRESH_DAYS" ]; then
         ALGO_BASELINE_STATUS="unusable"
         ALGO_BASELINE_DETAIL="${pin_part}${newest_part}"
