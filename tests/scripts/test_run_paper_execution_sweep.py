@@ -871,6 +871,43 @@ def test_no_untracked_alert_on_a_clean_sweep(monkeypatch, session) -> None:
     assert [stream for stream, _ in fake.published] == ["stream:fills"]
 
 
+def test_untracked_alert_does_not_misname_a_terminal_intent(
+    monkeypatch, session
+) -> None:
+    """``untracked`` has two producers: no intent at all for the broker
+    order id, and an intent that exists but is already terminal (CANCELLED,
+    FILLED, or genuinely EXPIRED) for a reason the sweep must not overturn.
+    The alert text must not claim "no order intent in the book" for the
+    second case — an operator reading that would go looking for an order
+    the system never placed, when the truth is the opposite: IB executed
+    against an order the book had already closed."""
+    _submitted_intent(session, ib_order_id="148")
+    intent = session.query(OrderIntent).filter_by(ib_order_id="148").one()
+    intent.status = OrderStatus.CANCELLED.value
+    session.commit()
+
+    async def _fake_read(**kwargs):
+        return run_paper.BrokerExecutions(1, [_execution(ib_order_id="148")])
+
+    fake = FakeRedis()
+    monkeypatch.setattr(run_paper, "read_broker_executions", _fake_read)
+    monkeypatch.setattr(run_paper, "_redis_from_url", lambda url, **kw: fake)
+
+    run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    alerts = [p for stream, p in fake.published if stream == "stream:alerts"]
+    assert len(alerts) == 1
+    message = alerts[0]["message"]
+    assert "148" in message
+    assert "no order intent in the book" not in message
+
+
 def test_a_failed_alert_does_not_gate_the_run(monkeypatch, session, capsys) -> None:
     """AC5 again: the alert is best-effort. Its usual cause of failure is
     Redis being unreachable, which takes the alert path down with it."""

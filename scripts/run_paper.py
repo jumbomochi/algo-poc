@@ -1609,19 +1609,26 @@ def sweep_executions_best_effort(
                     )
 
     if outcome.untracked:
-        # IB executed something this book has no intent for. Nothing was
-        # projected for it (AC3), which means the book and the broker now
-        # disagree about what was traded — not a condition to leave in a log.
+        # IB executed something this book will not book. Two causes share
+        # this outcome: no order_intents row matches the broker order id at
+        # all, or one does but it is already terminal (CANCELLED, FILLED, or
+        # genuinely EXPIRED) for a reason this sweep must not overturn.
+        # Nothing was projected either way (AC3), which means the book and
+        # the broker now disagree about what was traded — not a condition to
+        # leave in a log.
         emit_alert_best_effort(
             redis_url,
             event_type="execution_sweep_untracked",
             priority="high",
             message=(
                 "run_paper.py: the execution sweep found "
-                f"{len(outcome.untracked)} IB execution(s) with no order "
-                "intent in the book (broker order ids: "
-                f"{', '.join(outcome.untracked)}). Nothing was projected for "
-                "them; the book and IB disagree about what was traded."
+                f"{len(outcome.untracked)} IB execution(s) this book will "
+                "not record (broker order ids: "
+                f"{', '.join(outcome.untracked)}) — for each, either no "
+                "order intent matches the broker order id, or the matching "
+                "intent is already terminal and this sweep will not reopen "
+                "it. Nothing was projected for them; the book and IB "
+                "disagree about what was traded."
             ),
             context={
                 "script": "run_paper.py",
