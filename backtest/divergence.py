@@ -382,22 +382,48 @@ def classify_status(
     on a baseline that actually moved, the absolute axis catches a meaningful
     pp gap whatever the baseline did.
 
-    Note that OR does NOT protect against a tiny baseline; it makes the relative
-    axis able to fire alone on one. That protection lives upstream in
-    ``compute_divergence``, which returns ``relative=None`` below
-    :data:`MIN_RELATIVE_BASE` so there is no ratio here to fire on.
+    The relative axis may only ESCALATE a gap that is already worth acting on;
+    it may not manufacture one. Its test is therefore conjoined with
+    ``absolute_pp`` clearing ``absolute_warn_pp`` — the same bar the absolute
+    axis uses to stop calling a gap negligible.
+
+    That leaves the relative axis with exactly one job: turning a WARNING into
+    a BREACH. There is deliberately no relative WARNING branch, because it
+    could never decide anything — a gap material enough to qualify a ratio has
+    already cleared ``absolute_warn_pp``, so the absolute axis has warned.
+
+    Without that, :data:`MIN_RELATIVE_BASE` left a discontinuity at its own
+    edge. The floor decides whether the ratio EXISTS, so a baseline either side
+    of it needed wildly different gaps to breach:
+
+        baseline 2.49%  ->  relative is None, so a breach needs 5.0 pp
+        baseline 2.51%  ->  the ratio is taken, so a breach needs 1.0 pp
+
+    The monitor paged on exactly that on 2026-09-17: ``momentum`` was -2.8%
+    over the window, a hair above the floor, so a 1.53 pp gap read as +54.7%
+    and breached — while the same gap on a 2.49% baseline was silent.
+
+    A residual step remains at the floor (above it the relative axis can still
+    turn a 2.5 pp gap into a BREACH that below it would only WARN), but both
+    sides now require a gap the absolute axis already considers real, so it is
+    a difference of severity rather than of silence.
     """
     if relative is None and absolute_pp is None:
         return "NO_DATA"
 
-    rel_breach = relative is not None and abs(relative) > 2 * threshold
+    # A ratio qualifies a real gap; it cannot stand in for one. Also false when
+    # ``absolute_pp`` is None: with no gap to qualify there is nothing for the
+    # ratio to escalate. ``compute_divergence`` never returns that pairing.
+    gap_is_material = absolute_pp is not None and abs(absolute_pp) > absolute_warn_pp
+
+    rel_breach = (
+        gap_is_material and relative is not None and abs(relative) > 2 * threshold
+    )
     abs_breach = absolute_pp is not None and abs(absolute_pp) > absolute_breach_pp
     if rel_breach or abs_breach:
         return "BREACH"
 
-    rel_warn = relative is not None and abs(relative) > threshold
-    abs_warn = absolute_pp is not None and abs(absolute_pp) > absolute_warn_pp
-    if rel_warn or abs_warn:
+    if gap_is_material:
         return "WARNING"
 
     return "OK"

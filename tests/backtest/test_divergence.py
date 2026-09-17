@@ -155,10 +155,13 @@ def test_classify_status_ok_when_within_thresholds() -> None:
     assert classify_status(relative=0.10, absolute_pp=0.01) == "OK"
 
 
-def test_classify_status_warning_on_relative_exceeded() -> None:
-    # Relative 25% > 20% warn threshold, absolute small -> WARNING.
-    # absolute = 0.025 is at the warn boundary; use 0.024 to stay below.
-    assert classify_status(relative=0.25, absolute_pp=0.024) == "WARNING"
+def test_classify_status_ignores_a_relative_excess_on_a_negligible_gap() -> None:
+    # Was: "relative 25% > 20%, absolute small -> WARNING", deliberately probed
+    # at 0.024 to stay just under the absolute warn boundary. That is the shape
+    # that paged on 2026-09-17 and the relative axis no longer fires alone on
+    # it: 2.4 pp is a gap the absolute axis calls negligible, and a ratio
+    # cannot promote a negligible gap into a reportable one.
+    assert classify_status(relative=0.25, absolute_pp=0.024) == "OK"
 
 
 def test_classify_status_warning_on_absolute_exceeded() -> None:
@@ -167,8 +170,11 @@ def test_classify_status_warning_on_absolute_exceeded() -> None:
 
 
 def test_classify_status_breach_on_relative_exceeded() -> None:
-    # Relative 50% > 40% (2x threshold) -> BREACH.
-    assert classify_status(relative=0.50, absolute_pp=0.02) == "BREACH"
+    # Relative 50% > 40% (2x threshold) -> BREACH. The gap must also be one the
+    # absolute axis already considers real; 3 pp is (> 2.5 pp warn) without
+    # being a breach on its own (< 5 pp), so the relative axis is what decides.
+    assert classify_status(relative=0.50, absolute_pp=0.03) == "BREACH"
+    assert classify_status(relative=0.05, absolute_pp=0.03) == "WARNING"
 
 
 def test_classify_status_breach_on_absolute_exceeded() -> None:
@@ -826,3 +832,62 @@ def test_the_write_off_scale_divergence_would_still_have_breached() -> None:
     absolute, relative = compute_divergence(-0.340, 0.019)
     assert relative is None
     assert classify_status(relative, absolute) == "BREACH"
+
+
+# ---------------------------------------------------------------------------
+# MIN_RELATIVE_BASE removed the absurd ratios but left a discontinuity at its
+# own edge, and the monitor paged on it the very next morning (2026-09-17):
+# `momentum` was -2.8% over the window, a hair ABOVE the 2.5% floor, so the
+# ratio was taken and a 1.53 pp gap read as +54.7% -> BREACH.
+#
+#   baseline 2.49%  ->  relative is None, so a breach needs 5.0 pp
+#   baseline 2.51%  ->  ratio is taken, so a breach needs 1.0 pp
+#
+# A hair of baseline movement moved the breach threshold five-fold. The floor
+# decides whether the ratio EXISTS; it cannot also decide whether a gap is big
+# enough to act on. So the relative axis no longer fires alone: it may escalate
+# a gap that already clears the negligible bar, and may not manufacture one.
+
+
+def test_the_momentum_breach_of_2026_09_17_becomes_ok() -> None:
+    """The real figures: -2.8% baseline, live -1.27%, a 1.53 pp gap."""
+    absolute, relative = compute_divergence(-0.0127, -0.028)
+    assert absolute == pytest.approx(0.0153)
+    assert relative == pytest.approx(0.546, abs=0.01)
+    assert classify_status(relative, absolute) == "OK"
+
+
+def test_the_floor_edge_is_not_a_cliff() -> None:
+    """The same 1.5 pp gap either side of the floor must classify the same.
+    Before, one was OK and the other BREACH."""
+    below = compute_divergence(-0.0099, -0.0249)
+    above = compute_divergence(-0.0101, -0.0251)
+    assert classify_status(*reversed(below)) == classify_status(*reversed(above))
+    assert classify_status(*reversed(above)) == "OK"
+
+
+def test_the_relative_axis_still_escalates_a_real_gap() -> None:
+    """Suppression must not disarm the axis. A 3.5 pp gap on an 8% baseline is
+    43% off track: the absolute axis alone would only warn, the relative one
+    correctly makes it a breach."""
+    absolute, relative = compute_divergence(0.045, 0.080)
+    assert relative == pytest.approx(-0.4375)
+    assert classify_status(None, absolute) == "WARNING"
+    assert classify_status(relative, absolute) == "BREACH"
+
+
+def test_the_relative_axis_still_warns_on_a_real_gap() -> None:
+    absolute, relative = compute_divergence(0.070, 0.100)
+    assert classify_status(relative, absolute) == "WARNING"
+
+
+def test_a_negligible_gap_cannot_breach_however_large_the_ratio() -> None:
+    """The general property behind the fix, stated once."""
+    for live, backtest in (
+        (0.001, 0.030),   # 2.9 pp on a 3% baseline -> -96.7%
+        (-0.010, 0.005),  # 1.5 pp on a 0.5% baseline
+        (0.040, 0.026),   # 1.4 pp just above the floor
+    ):
+        absolute, relative = compute_divergence(live, backtest)
+        if abs(absolute) <= DEFAULT_ABSOLUTE_WARN_PP:
+            assert classify_status(relative, absolute) == "OK", (live, backtest)
