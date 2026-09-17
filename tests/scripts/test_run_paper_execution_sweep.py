@@ -208,13 +208,42 @@ def test_ib_unreachable_prints_a_diagnostic_warning(monkeypatch, session, capsys
     out = capsys.readouterr().out
     assert "WARNING" in out
     assert "gateway down" in out
+    assert "could not read executions from IB" in out
 
 
-def test_a_decision_error_does_not_change_the_run_either(monkeypatch, session) -> None:
+def test_the_ib_unreachable_message_redacts_a_dsn(monkeypatch, session, capsys) -> None:
+    """FINDING 1: every warning in this function must redact secrets, and
+    this fetch-stage one is no exception."""
+
+    def _boom(**kwargs):
+        raise ConnectionError(
+            "could not connect to postgresql://algo:p@ssw0rd@db:5432/algo_poc"
+        )
+
+    monkeypatch.setattr(run_paper, "read_broker_executions", _boom)
+
+    run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    out = capsys.readouterr().out
+    assert "p@ssw0rd" not in out
+    assert "***@" in out
+
+
+def test_a_decision_error_does_not_change_the_run_either(
+    monkeypatch, session, capsys
+) -> None:
     """AC5 says 'or the sweep raises for any reason' — not just IB.
 
     A failure inside ``plan_sweep`` (or the commit that follows it) must be
-    just as harmless as IB being unreachable.
+    just as harmless as IB being unreachable, but FINDING 2 requires the
+    message to say so distinctly: a recurring decision-layer bug must not
+    look identical to intermittent IB flakiness in the logs.
     """
 
     async def _fake_read(**kwargs):
@@ -235,6 +264,42 @@ def test_a_decision_error_does_not_change_the_run_either(monkeypatch, session) -
     )
 
     assert outcome is None
+    out = capsys.readouterr().out
+    assert "ledger blew up" in out
+    assert "the sweep's own decision logic failed" in out
+    # Distinguishable from the fetch-stage message — not the same string.
+    assert "could not read executions from IB" not in out
+
+
+def test_the_decision_error_message_redacts_a_dsn(monkeypatch, session, capsys) -> None:
+    """FINDING 1: a SQLAlchemy/psycopg2 failure from session.commit() can
+    carry the raw database DSN; it must be redacted like every sibling
+    warning in this function, not just the publish-side ones."""
+
+    async def _fake_read(**kwargs):
+        return [_execution()]
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError(
+            "could not connect to server: "
+            "postgresql://algo:p@ssw0rd@db:5432/algo_poc"
+        )
+
+    monkeypatch.setattr(run_paper, "read_broker_executions", _fake_read)
+    monkeypatch.setattr(run_paper, "plan_sweep", _boom)
+
+    outcome = run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    assert outcome is None
+    out = capsys.readouterr().out
+    assert "p@ssw0rd" not in out
+    assert "***@" in out
 
 
 def test_the_sweep_runs_before_reconciliation_and_reuses_the_broker_client_id() -> None:

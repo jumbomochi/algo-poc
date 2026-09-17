@@ -1433,18 +1433,37 @@ def sweep_executions_best_effort(
     decided :class:`SweepOutcome`, even if publishing some or all of its
     recovered fills subsequently failed (that failure is reported but does
     not downgrade the return value, since the decision itself succeeded).
+
+    The fetch and the decide/commit are caught separately, not because
+    either is allowed to propagate (both are equally fatal to this
+    function's promise), but because collapsing them into one message hides
+    a real distinction from whoever reads the log: an IB outage recurring
+    every night looks identical to a genuine bug in ``plan_sweep`` unless
+    the two are labelled differently.
     """
     try:
         executions = asyncio.run(
             read_broker_executions(host=host, port=port, client_id=client_id)
         )
+    except Exception as exc:
+        session.rollback()
+        print(
+            f"WARNING: execution sweep skipped — could not read executions "
+            f"from IB ({_redact(str(exc))}). Reconciliation continues; a "
+            "missed fill stays missed until the next run."
+        )
+        return None
+
+    try:
         outcome = plan_sweep(executions, OrderLedger(session))
         session.commit()
     except Exception as exc:
         session.rollback()
         print(
-            f"WARNING: execution sweep skipped ({exc}). Reconciliation "
-            "continues; a missed fill stays missed until the next run."
+            f"WARNING: execution sweep skipped — the sweep's own decision "
+            f"logic failed ({_redact(str(exc))}). This is not IB flakiness; "
+            "it needs investigating. Reconciliation continues; a missed "
+            "fill stays missed until the next run."
         )
         return None
 
