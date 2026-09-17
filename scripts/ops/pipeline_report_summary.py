@@ -47,6 +47,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from services.execution.execution_sweep import RECOVERY_SOURCE_SWEEP  # noqa: E402
 from shared.halt_state import HaltStateRepository  # noqa: E402
 from shared.models.market_data import OHLCVDaily  # noqa: E402
 from shared.models.order_ledger import (  # noqa: E402
@@ -91,6 +92,13 @@ class RunFacts:
     # when capture is disabled.
     capture_written: int = 0
     capture_expected: int = 0
+    # KAN-87. Recovered by the daily IB execution sweep — a subset of `fills`,
+    # counted over the same window and the same way (unscoped by mode; see the
+    # comment on `fills` in collect_facts) so the two numbers are always
+    # comparable. Reported whether zero or not: a sweep that silently recovers
+    # fills every day is hiding a worsening upstream problem, and the only way
+    # to notice the rate rising is to see the rate when it is normal.
+    fills_recovered: int = 0
 
 
 def collect_facts(
@@ -116,6 +124,17 @@ def collect_facts(
         select(func.count())
         .select_from(ExecutionFill)
         .where(ExecutionFill.executed_at >= since)
+    ) or 0
+
+    # Counted the same way and over the same window as `fills`, so the two
+    # are always comparable: "fills:3 (1 recovered)" reads as a subset.
+    fills_recovered = session.scalar(
+        select(func.count())
+        .select_from(ExecutionFill)
+        .where(
+            ExecutionFill.executed_at >= since,
+            ExecutionFill.recovery_source == RECOVERY_SOURCE_SWEEP,
+        )
     ) or 0
 
     rejected = dict(
@@ -151,6 +170,7 @@ def collect_facts(
         submission_failed=int(rejected.get(OrderStatus.SUBMISSION_FAILED, 0)),
         capture_written=int(captured),
         capture_expected=int(capture_expected),
+        fills_recovered=int(fills_recovered),
     )
 
 
@@ -169,7 +189,7 @@ def render_summary(facts: RunFacts) -> str:
         halt = "halt: clear"
 
     line = (
-        f"{halt} · fills:{facts.fills}"
+        f"{halt} · fills:{facts.fills} ({facts.fills_recovered} recovered)"
         f" · rejected: risk {facts.risk_rejected}"
         f" / broker {facts.submission_failed}"
     )

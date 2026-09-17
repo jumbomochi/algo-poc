@@ -70,12 +70,13 @@ def _halt(session, *, mode="paper", active=True, reason="daily drawdown -6.2%",
     session.commit()
 
 
-def _fill(session, *, at=DURING, symbol="AAPL"):
+def _fill(session, *, at=DURING, symbol="AAPL", recovery_source=None):
     n = session.query(ExecutionFill).count()
     session.add(ExecutionFill(
         account_id="DUN551088", execution_id=f"exec-{n}", ib_order_id=str(n),
         con_id=1 + n, symbol=symbol, exchange="SMART", currency="USD",
         side="BUY", quantity=10.0, price=100.0, executed_at=at,
+        recovery_source=recovery_source,
     ))
     session.commit()
 
@@ -168,6 +169,27 @@ def test_non_rejected_intents_are_not_counted_as_rejections(session):
     summary = render_summary(_facts(session))
     assert "risk 0" in summary
     assert "broker 0" in summary
+
+
+def test_recovered_fills_are_counted_and_rendered(session):
+    _fill(session, recovery_source=None)
+    _fill(session, symbol="MSFT", recovery_source="ib_execution_sweep")
+
+    facts = _facts(session)
+
+    assert facts.fills == 2
+    assert facts.fills_recovered == 1
+    assert "1 recovered" in render_summary(facts)
+
+
+def test_zero_recovered_is_still_reported(session):
+    """Whether zero or not — a silent sweep hides a worsening problem."""
+    _fill(session, recovery_source=None)
+
+    facts = _facts(session)
+
+    assert facts.fills_recovered == 0
+    assert "0 recovered" in render_summary(facts)
 
 
 def test_activity_before_the_window_is_excluded(session):
