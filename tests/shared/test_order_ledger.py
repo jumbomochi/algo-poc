@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from shared.models import Base, OrderIntent, OrderStatus
 from shared.order_ledger import (
+    ABSENT_AT_IB_REASON,
     ConflictingOrderIntent,
     InvalidOrderTransition,
     OrderLedger,
@@ -522,3 +523,43 @@ def test_open_stop_quantity_sums_several_stops_on_one_position(session):
     ledger.record_submission("stop-2", "ib-2")
 
     assert ledger.open_stop_quantity("DU12345", "momentum", 265598) == pytest.approx(21.0)
+
+
+class TestRestoreAbsentTerminalization:
+    """EXPIRED is terminal; exactly one evidence-gated way back out."""
+
+    def test_an_absent_terminalized_intent_is_restored_to_submitted(
+        self, session
+    ) -> None:
+        ledger = OrderLedger(session)
+        _submit(ledger, make_proposal("rec-absent"))
+        ledger.transition(
+            "rec-absent",
+            OrderStatus.EXPIRED,
+            reason=ABSENT_AT_IB_REASON,
+        )
+
+        restored = ledger.restore_absent_terminalization("rec-absent")
+
+        assert restored.status == OrderStatus.SUBMITTED.value
+        assert restored.terminal_at is None
+
+    def test_a_genuinely_expired_intent_is_refused(self, session) -> None:
+        """A day order that really expired must stay expired."""
+        ledger = OrderLedger(session)
+        _submit(ledger, make_proposal("rec-real"))
+        ledger.transition(
+            "rec-real",
+            OrderStatus.EXPIRED,
+            reason="IB reported the order Expired",
+        )
+
+        with pytest.raises(InvalidOrderTransition):
+            ledger.restore_absent_terminalization("rec-real")
+
+    def test_a_non_expired_intent_is_refused(self, session) -> None:
+        ledger = OrderLedger(session)
+        _submit(ledger, make_proposal("rec-open"))
+
+        with pytest.raises(InvalidOrderTransition):
+            ledger.restore_absent_terminalization("rec-open")

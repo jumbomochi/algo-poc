@@ -66,6 +66,15 @@ TERMINAL_STATUSES = {
     OrderStatus.CANCELLED,
     OrderStatus.EXPIRED,
 }
+
+#: The exact reason ``IBExecutor.restore_order_by_ref`` writes when an order
+#: is absent from both open trades and completed-order history after a
+#: session boundary (``services/execution/ib_executor.py:818``). It is the
+#: only evidence that an EXPIRED intent was terminalized on absence rather
+#: than on IB actually reporting the order expired — and so the only thing
+#: that makes the terminalization reversible. Keep the two in sync.
+ABSENT_AT_IB_REASON = "order absent from IB after session boundary"
+
 # Everything a terminal status is not — including PROPOSED, which
 # PENDING_ORDER_STATUSES deliberately omits. An exit must not be emitted while
 # *any* of these is outstanding for the position, and a PROPOSED sell is still
@@ -275,6 +284,40 @@ class OrderLedger:
             intent.submitted_at = now
         if new_status in TERMINAL_STATUSES:
             intent.terminal_at = now
+        self.session.flush()
+        return intent
+
+    def restore_absent_terminalization(
+        self, recommendation_id: str
+    ) -> OrderIntent:
+        """Undo a terminalization that absence caused and evidence refutes.
+
+        ``EXPIRED`` has no entry in :data:`ALLOWED_TRANSITIONS` and that is
+        correct: a terminal order stays terminal. But one EXPIRED is a
+        guess — the one written when an order was missing from IB after a
+        session boundary — and when the broker's own execution record turns
+        up, the guess is simply wrong. This restores the intent to
+        ``SUBMITTED``, the state it held before the guess, so the ordinary
+        fill path can terminalize it properly.
+
+        Refuses anything else. A genuinely expired order carries a
+        different reason and must stay expired.
+        """
+        intent = self._locked(recommendation_id, required=True)
+        if intent.status != OrderStatus.EXPIRED.value:
+            raise InvalidOrderTransition(
+                f"cannot restore {recommendation_id} from "
+                f"{intent.status}: only EXPIRED is restorable"
+            )
+        if intent.reason != ABSENT_AT_IB_REASON:
+            raise InvalidOrderTransition(
+                f"refusing to restore {recommendation_id}: it expired with "
+                f"reason {intent.reason!r}, not on absence from IB"
+            )
+        intent.status = OrderStatus.SUBMITTED.value
+        intent.reason = None
+        intent.terminal_at = None
+        intent.updated_at = _utcnow()
         self.session.flush()
         return intent
 
