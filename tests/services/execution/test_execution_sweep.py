@@ -220,3 +220,35 @@ def test_a_genuinely_expired_intent_is_left_alone(session) -> None:
     assert outcome.corrected == ()
     assert outcome.recovered == ()
     assert outcome.untracked == ("148",)
+
+
+def test_a_corrected_intent_is_still_publishable_on_a_later_sweep(session) -> None:
+    """A publish that failed after the correction committed must retry.
+
+    ``plan_sweep`` never writes ``execution_fills`` itself — the projector
+    does, on consuming ``stream:fills``. So if Task 4's publish step fails
+    after this call returns, the AC4 correction (EXPIRED -> SUBMITTED) is
+    still committed but no fill is recorded. The next run's sweep must not
+    treat that as "nothing left to do": ``execution_fill_exists`` is still
+    False, so it re-decides the same execution, finds the intent already
+    SUBMITTED (nothing left to correct -- ``restore_absent_terminalization``
+    raises ``InvalidOrderTransition``), and republishes on the normal
+    ``_FILLABLE_STATUSES`` branch.
+    """
+    ledger = OrderLedger(session)
+    intent = _submitted_intent(session, ledger, "rec-unh", ib_order_id="148")
+    ledger.transition(
+        intent.recommendation_id,
+        OrderStatus.EXPIRED,
+        reason=ABSENT_AT_IB_REASON,
+    )
+
+    first = plan_sweep([_execution()], ledger)  # corrects, publish "fails"
+
+    assert first.corrected == (intent.recommendation_id,)
+    assert len(first.recovered) == 1
+
+    second = plan_sweep([_execution()], ledger)  # the next run
+
+    assert second.corrected == ()  # nothing left to correct
+    assert len(second.recovered) == 1  # still publishable

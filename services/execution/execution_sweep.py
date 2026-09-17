@@ -158,3 +158,45 @@ def _to_fill_message(
         ),
         recovery_source=RECOVERY_SOURCE_SWEEP,
     )
+
+
+#: IB reports the side of an execution as BOT/SLD, not buy/sell.
+_IB_SIDE = {"BOT": "buy", "SLD": "sell"}
+
+
+def executions_from_ib_fills(fills: Sequence[object]) -> list[SweptExecution]:
+    """Normalize ``ib_insync`` Fill objects, skipping anything unusable.
+
+    Mirrors the payload the live callback builds (``ib_executor.py:536-559``)
+    so a recovered fill is indistinguishable from the one that should have
+    arrived. Duck-typed and import-free by design: the caller (Task 4, in
+    ``scripts/run_paper.py``) is the only place that touches ``ib_insync``.
+    """
+    swept: list[SweptExecution] = []
+    for fill in fills:
+        execution = fill.execution
+        side = _IB_SIDE.get(str(execution.side).upper())
+        if side is None:
+            continue
+        report = getattr(fill, "commissionReport", None)
+        swept.append(
+            SweptExecution(
+                execution_id=str(execution.execId),
+                account_id=str(execution.acctNumber),
+                ib_order_id=str(execution.orderId),
+                con_id=int(fill.contract.conId),
+                ticker=str(fill.contract.symbol),
+                exchange=fill.contract.exchange or "SMART",
+                currency=fill.contract.currency or "USD",
+                side=side,
+                quantity=float(execution.shares),
+                cumulative_quantity=float(execution.cumQty),
+                price=float(execution.price),
+                commission=float(getattr(report, "commission", 0.0) or 0.0),
+                commission_currency=(
+                    str(getattr(report, "currency", "") or "") or None
+                ),
+                executed_at=execution.time,
+            )
+        )
+    return swept

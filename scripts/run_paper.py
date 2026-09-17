@@ -91,6 +91,12 @@ from shared.models import CapitalSnapshot, OrderIntent, OrderStatus
 from shared.observability import DEFAULT_TRADING_METRICS
 from services.execution.ib_account import IBAccountReader
 from services.execution.reconciliation import ReconciliationResult
+from services.execution.execution_sweep import (
+    SweepOutcome,
+    SweptExecution,
+    executions_from_ib_fills,
+    plan_sweep,
+)
 from shared.logging import get_logger
 from shared.universe import DRILL_PORTFOLIO, is_excluded_portfolio
 
@@ -1364,6 +1370,131 @@ async def read_broker_snapshot(
             ib.disconnect()
 
 
+FILLS_STREAM = "stream:fills"
+
+
+async def read_broker_executions(
+    *, host: str, port: int, client_id: int
+) -> list[SweptExecution]:
+    """Ask IB what it executed this trading day.
+
+    ``reqExecutions`` serves the CURRENT trading day only. The fill lands at
+    the next open (13:30 UTC) and this runs at 20:15 UTC the same day, still
+    inside that window — which is why it recovers the misses at all. By the
+    fifth day the record is gone (confirmed 2026-09-16, when UNH's price had
+    to come off an IB statement by hand).
+
+    Connects with the **same** ``client_id`` as :func:`read_broker_snapshot`,
+    sequentially, after that connection has already disconnected — IB refuses
+    a duplicate client id, and a past incident (2026-08-30) came from
+    inventing a second one.
+    """
+    from ib_insync import IB, ExecutionFilter
+
+    ib = IB()
+    try:
+        await ib.connectAsync(
+            host, port, clientId=client_id, readonly=True, timeout=15
+        )
+        return executions_from_ib_fills(
+            await ib.reqExecutionsAsync(ExecutionFilter())
+        )
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+
+
+def publish_fill_message(fill: Any, *, redis_client: Any) -> None:
+    """Write one recovered fill to ``stream:fills``.
+
+    Deliberately the same stream and the same message type the live callback
+    publishes, so ``FillProjector`` applies it through the existing path —
+    position close, realised P&L, cash, intent advanced. No new accounting
+    code; this is the path that repaired UNH correctly by hand.
+
+    Takes an already-open connection, the way ``publish_unpublished_intents``
+    does — the caller opens one connection for the whole sweep and reuses it
+    for every recovered fill, rather than paying a fresh timeout budget per
+    fill.
+    """
+    redis_client.xadd(FILLS_STREAM, fill.to_stream_dict())
+
+
+def sweep_executions_best_effort(
+    *, host: str, port: int, client_id: int, session: Session, redis_url: str
+) -> SweepOutcome | None:
+    """Recover missed fills, or report why not. Never raises.
+
+    AC5: a sweep failure must not change the run's exit code or block
+    reconciliation, which is why this is called before ``prepare_daily_run``
+    but is not allowed to propagate anything it encounters. Returns ``None``
+    when the fetch-and-decide stage failed for any reason — IB unreachable,
+    or ``plan_sweep``/the commit raising — otherwise always returns the
+    decided :class:`SweepOutcome`, even if publishing some or all of its
+    recovered fills subsequently failed (that failure is reported but does
+    not downgrade the return value, since the decision itself succeeded).
+    """
+    try:
+        executions = asyncio.run(
+            read_broker_executions(host=host, port=port, client_id=client_id)
+        )
+        outcome = plan_sweep(executions, OrderLedger(session))
+        session.commit()
+    except Exception as exc:
+        session.rollback()
+        print(
+            f"WARNING: execution sweep skipped ({exc}). Reconciliation "
+            "continues; a missed fill stays missed until the next run."
+        )
+        return None
+
+    if outcome.recovered:
+        conn = None
+        try:
+            conn = _redis_from_url(
+                redis_url,
+                socket_connect_timeout=PUBLISH_CONNECT_TIMEOUT_SECONDS,
+                socket_timeout=PUBLISH_SOCKET_TIMEOUT_SECONDS,
+            )
+            for fill in outcome.recovered:
+                try:
+                    publish_fill_message(fill, redis_client=conn)
+                except Exception as exc:
+                    print(
+                        f"WARNING: execution sweep could not publish fill "
+                        f"{fill.execution_id} ({_redact(str(exc))}); it "
+                        "remains recoverable on the next sweep"
+                    )
+        except Exception as exc:
+            print(
+                f"WARNING: execution sweep could not open Redis to publish "
+                f"recovered fills ({_redact(str(exc))}); "
+                f"{len(outcome.recovered)} fill(s) remain recoverable on the "
+                "next sweep"
+            )
+        finally:
+            # Outside the guard on purpose, same shape as publish_bridge: by
+            # the time the connection is closed every fill that could be
+            # published already has been, so a hiccup here must not be
+            # treated as a fresh failure.
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception as close_error:
+                    print(
+                        "WARNING: closing the execution sweep Redis "
+                        f"connection failed ({close_error})"
+                    )
+
+    print(
+        f"Execution sweep: {len(outcome.recovered)} recovered, "
+        f"{outcome.already_recorded} already recorded, "
+        f"{len(outcome.untracked)} untracked, "
+        f"{len(outcome.corrected)} corrected"
+    )
+    return outcome
+
+
 def resolve_contract_details_from_ib(
     tickers: list[str], *, host: str, port: int, client_id: int
 ) -> dict[str, Any]:
@@ -1742,6 +1873,21 @@ def main() -> int | None:
             trading_currency=_config.currency.trading_currency,
         )
     )
+
+    # Recover fills the live callback never saw, BEFORE reconciliation reads
+    # the book. A sell that filled at the open is otherwise invisible here,
+    # and reconciliation can only see that a position moved, never what
+    # executed — which is how PANW, LLY and UNH became phantoms. Best-effort:
+    # AC5 requires this never change the run's exit code or block
+    # reconciliation, so nothing from it is checked or propagated here.
+    sweep_executions_best_effort(
+        host=args.ib_host,
+        port=args.ib_port,
+        client_id=args.ib_client_id,
+        session=session,
+        redis_url=args.redis_url,
+    )
+
     try:
         preparation = prepare_daily_run(
             broker_snapshot=broker_snapshot,
