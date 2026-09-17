@@ -210,6 +210,7 @@ class FillProjector:
             ),
             "cumulative_quantity": fill.cumulative_quantity,
             "executed_at": fill.timestamp,
+            "recovery_source": fill.recovery_source,
         }
 
     def _existing_fill(self, values: dict[str, Any]) -> ExecutionFill | None:
