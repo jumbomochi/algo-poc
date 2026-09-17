@@ -192,6 +192,35 @@ def test_zero_recovered_is_still_reported(session):
     assert "0 recovered" in render_summary(facts)
 
 
+def test_a_recovered_fill_from_before_the_window_is_still_counted(session):
+    """KAN-87 / I5. ``SINCE`` is local (SGT) midnight = 16:00 UTC the previous
+    day. The fill this sweep exists to recover is a resting day order filling
+    at the US open — 13:30 UTC, i.e. 21:30 SGT the *previous* calendar day. On
+    the ``executed_at >= since`` bound the recovered count therefore read zero
+    on precisely the nights the sweep did its job, so the recovered figure is
+    bounded a day wider and labelled as such.
+    """
+    _fill(session, at=SINCE - timedelta(hours=3),
+          recovery_source="ib_execution_sweep")
+
+    facts = _facts(session)
+
+    assert facts.fills_recovered == 1
+    # The pre-existing `fills` bound is deliberately untouched: that
+    # under-count is not new and is out of scope here.
+    assert facts.fills == 0
+    assert "1 recovered" in render_summary(facts)
+    assert "2-day window" in render_summary(facts)
+
+
+def test_a_recovered_fill_older_than_the_wider_window_is_excluded(session):
+    """Wider, not unbounded — yesterday's recovery is not today's news."""
+    _fill(session, at=SINCE - timedelta(days=2),
+          recovery_source="ib_execution_sweep")
+
+    assert _facts(session).fills_recovered == 0
+
+
 def test_activity_before_the_window_is_excluded(session):
     """Yesterday's fills must not be reported as this morning's run."""
     _fill(session, at=BEFORE)
