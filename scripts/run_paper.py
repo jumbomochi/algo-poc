@@ -30,7 +30,7 @@ import re
 import sys
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Mapping, NamedTuple
@@ -1407,6 +1407,17 @@ FILLS_STREAM = "stream:fills"
 # magnitude: ``ib_account.ACCOUNT_SUMMARY_TIMEOUT_SECONDS``.
 REQ_EXECUTIONS_TIMEOUT_SECONDS = 30
 
+# How far back the blindness self-check will accept ledger evidence that IB
+# should have had an execution to report. IB serves ``reqExecutions`` for the
+# current trading day, but the intent that produced today's fill was written
+# the evening the order was *placed* — which is the previous session, or the
+# previous Friday when the order rested over a weekend (a holiday Monday makes
+# that four days). Five covers that with a day to spare, and is where IB's own
+# execution record runs out anyway (see ``read_broker_executions``). Longer
+# would re-admit permanently stuck intents, and a check that fires every night
+# on the same stale row is a check nobody reads.
+SWEEP_BLINDNESS_EVIDENCE_WINDOW_DAYS = 5
+
 
 class BrokerExecutions(NamedTuple):
     """What IB answered with, and what of it the adapter could read.
@@ -1504,6 +1515,81 @@ def publish_fill_message(fill: Any, *, redis_client: Any) -> None:
     fill.
     """
     redis_client.xadd(FILLS_STREAM, fill.to_stream_dict())
+
+
+def alert_sweep_blindness_best_effort(
+    session: Session, *, redis_url: str, client_id: int
+) -> bool:
+    """Page the operator when a zero-execution sweep is not a quiet night.
+
+    ``reqExecutions`` is **clientId-scoped**: a client is served its own
+    executions and nothing else, unless it holds the Gateway's *Master API
+    client ID*. The orders are placed by the execution service under
+    ``ib.client_id``, not by this script, so with that setting unset the
+    sweep is served ``[]`` every night — and an empty answer is exactly what
+    a healthy night with nothing to recover looks like. The setting is host
+    state: no commit carries it, and a Gateway reinstall, a settings reset or
+    a new machine drops it silently. Documented in
+    ``deploy/launchd/README.md``.
+
+    So the code has to notice, and the only thing it can compare against
+    without a second IB call is the book. See
+    :meth:`OrderLedger.broker_activity_evidence_count` for what counts as the
+    book expecting IB to have had something to say. Zero evidence and zero
+    executions agree with each other — that is the quiet night this must stay
+    silent on.
+
+    Best-effort in both halves, the same as every other alert here (AC5):
+    neither the extra query nor the alert may change what the run does.
+    """
+    since = datetime.now(timezone.utc) - timedelta(
+        days=SWEEP_BLINDNESS_EVIDENCE_WINDOW_DAYS
+    )
+    try:
+        evidence = OrderLedger(session).broker_activity_evidence_count(
+            since=since
+        )
+    except Exception as exc:
+        session.rollback()
+        print(
+            "WARNING: execution sweep could not check whether its empty "
+            f"result was expected ({_redact(str(exc))}); the IB-returned-0 "
+            "line above is the only signal for this run"
+        )
+        return False
+
+    if evidence == 0:
+        return False
+
+    return emit_alert_best_effort(
+        redis_url,
+        event_type="execution_sweep_blind",
+        priority="high",
+        message=(
+            f"run_paper.py: the execution sweep asked IB for today's "
+            f"executions as client id {client_id} and IB returned none at "
+            f"all, while the book holds {evidence} order intent(s) from the "
+            f"last {SWEEP_BLINDNESS_EVIDENCE_WINDOW_DAYS} days that were "
+            "working at the broker, or were terminalized because IB could "
+            "not find them. reqExecutions is scoped to the calling client: "
+            "it returns nothing for orders placed by another client unless "
+            "the caller holds the Gateway's Master API client ID — and these "
+            "orders are placed by the execution service under its own id "
+            "(`ib.client_id` in config/default.yaml). Check IB Gateway > "
+            f"Configure > API > Settings > Master API client ID; it must be "
+            f"{client_id}. While it is not, every sweep recovers nothing and "
+            "a missed fill stays a phantom position that blocks entries. If "
+            "it is already set, the ledger evidence is stale instead and "
+            "reconciliation is what needs looking at."
+        ),
+        context={
+            "script": "run_paper.py",
+            "sweep_client_id": client_id,
+            "ledger_evidence_intents": evidence,
+            "evidence_window_days": SWEEP_BLINDNESS_EVIDENCE_WINDOW_DAYS,
+        },
+        label="execution-sweep-blind",
+    )
 
 
 def sweep_executions_best_effort(
@@ -1649,6 +1735,16 @@ def sweep_executions_best_effort(
         f"{len(outcome.corrected)} corrected, "
         f"{len(outcome.deferred)} deferred"
     )
+
+    # Printed first on purpose: the count is the evidence, the alert is the
+    # reading of it. A non-zero `fetched` — including one whose rows the
+    # adapter could not read — proves the client id is being served, so the
+    # blindness this guards against is not what happened.
+    if fetched == 0:
+        alert_sweep_blindness_best_effort(
+            session, redis_url=redis_url, client_id=client_id
+        )
+
     return outcome
 
 

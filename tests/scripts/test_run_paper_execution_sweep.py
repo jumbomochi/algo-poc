@@ -53,6 +53,9 @@ def _submitted_intent(
     account_id: str = "DUN551088",
     portfolio: str = "momentum",
     quantity: float = 6.0,
+    updated_at: datetime | None = None,
+    status: str = OrderStatus.SUBMITTED.value,
+    reason: str | None = None,
 ) -> OrderIntent:
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
     intent = OrderIntent(
@@ -68,10 +71,11 @@ def _submitted_intent(
         requested_quantity=quantity,
         limit_price=340.0,
         order_type="LMT",
-        status=OrderStatus.SUBMITTED.value,
+        status=status,
+        reason=reason,
         ib_order_id=ib_order_id,
         created_at=now,
-        updated_at=now,
+        updated_at=updated_at or now,
         submitted_at=now,
     )
     session.add(intent)
@@ -995,3 +999,262 @@ def test_the_call_site_does_not_claim_this_run_is_corrected() -> None:
 
     assert "BEFORE reconciliation reads the book" not in comment
     assert "next run" in comment
+
+
+# ---------------------------------------------------------------------------
+# The blindness self-check — `reqExecutions` is clientId-scoped
+# ---------------------------------------------------------------------------
+#
+# A client sees only its OWN executions unless it holds the Gateway's Master
+# API client ID. The sweep connects as 58; the orders are placed by the
+# execution service under `ib.client_id`. With the Master API client ID unset
+# the sweep returns [] every night — byte-identical to a healthy night on
+# which nothing needed recovering. That setting is host state no commit
+# carries and a Gateway reinstall silently drops, so the code has to notice.
+
+
+def _blind_alerts(fake: FakeRedis) -> list[dict]:
+    return [
+        payload
+        for stream, payload in fake.published
+        if stream == "stream:alerts"
+        and payload["event_type"] == "execution_sweep_blind"
+    ]
+
+
+async def _returned_nothing(**kwargs):
+    return run_paper.BrokerExecutions(0, [])
+
+
+def test_zero_executions_with_a_working_order_alerts_the_operator(
+    monkeypatch, session
+) -> None:
+    """The book thinks IB is holding an order it placed; IB says it executed
+    nothing at all, for anybody. That is the signature of a sweep that cannot
+    see past its own client id."""
+    _submitted_intent(session, updated_at=datetime.now(UTC))
+
+    fake = FakeRedis()
+    monkeypatch.setattr(run_paper, "read_broker_executions", _returned_nothing)
+    monkeypatch.setattr(run_paper, "_redis_from_url", lambda url, **kw: fake)
+
+    run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    alerts = _blind_alerts(fake)
+    assert len(alerts) == 1
+    assert alerts[0]["priority"] == "high"
+
+
+def test_the_blind_alert_names_the_master_api_client_id(
+    monkeypatch, session
+) -> None:
+    """"0 executions" restates the symptom. The operator needs the cause and
+    the setting to go and look at, or the alert is the silence again."""
+    _submitted_intent(session, updated_at=datetime.now(UTC))
+
+    fake = FakeRedis()
+    monkeypatch.setattr(run_paper, "read_broker_executions", _returned_nothing)
+    monkeypatch.setattr(run_paper, "_redis_from_url", lambda url, **kw: fake)
+
+    run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    message = _blind_alerts(fake)[0]["message"]
+    assert "Master API client ID" in message
+    assert "Configure > API > Settings" in message
+    assert "58" in message
+    assert "reqExecutions" in message
+
+
+def test_an_absent_at_ib_terminalization_is_enough_to_alert(
+    monkeypatch, session
+) -> None:
+    """The phantom this whole feature exists to clear. If it is in the book
+    and IB reports nothing at all, the sweep is the suspect."""
+    from shared.order_ledger import ABSENT_AT_IB_REASON
+
+    _submitted_intent(
+        session,
+        updated_at=datetime.now(UTC),
+        status=OrderStatus.EXPIRED.value,
+        reason=ABSENT_AT_IB_REASON,
+    )
+
+    fake = FakeRedis()
+    monkeypatch.setattr(run_paper, "read_broker_executions", _returned_nothing)
+    monkeypatch.setattr(run_paper, "_redis_from_url", lambda url, **kw: fake)
+
+    run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    assert len(_blind_alerts(fake)) == 1
+
+
+def test_a_quiet_night_does_not_alert(monkeypatch, session) -> None:
+    """No resting orders, nothing the book expected IB to report. This is the
+    normal case and an alert here would train the operator to ignore it."""
+    fake = FakeRedis()
+    monkeypatch.setattr(run_paper, "read_broker_executions", _returned_nothing)
+    monkeypatch.setattr(run_paper, "_redis_from_url", lambda url, **kw: fake)
+
+    run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    assert fake.published == []
+
+
+def test_stale_ledger_evidence_does_not_alert(monkeypatch, session) -> None:
+    """``reqExecutions`` serves the current trading day. A month-old stuck
+    intent cannot be what today's request should have returned, and counting
+    it would make this fire every night for the rest of the book's life."""
+    from datetime import timedelta
+
+    _submitted_intent(
+        session, updated_at=datetime.now(UTC) - timedelta(days=30)
+    )
+
+    fake = FakeRedis()
+    monkeypatch.setattr(run_paper, "read_broker_executions", _returned_nothing)
+    monkeypatch.setattr(run_paper, "_redis_from_url", lambda url, **kw: fake)
+
+    run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    assert fake.published == []
+
+
+def test_a_recovering_sweep_never_claims_blindness(monkeypatch, session) -> None:
+    """IB answered. Whatever the ledger holds, the client id is not the
+    problem."""
+    _submitted_intent(session, updated_at=datetime.now(UTC))
+
+    async def _fake_read(**kwargs):
+        return run_paper.BrokerExecutions(1, [_execution()])
+
+    fake = FakeRedis()
+    monkeypatch.setattr(run_paper, "read_broker_executions", _fake_read)
+    monkeypatch.setattr(run_paper, "_redis_from_url", lambda url, **kw: fake)
+
+    run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    assert _blind_alerts(fake) == []
+
+
+def test_unreadable_rows_are_not_blindness(monkeypatch, session) -> None:
+    """IB returned rows the adapter could not classify. That is an adapter
+    gap, already visible in the `(M readable)` count — not a client-id
+    problem, and naming the wrong cause sends the operator to the wrong
+    screen."""
+    _submitted_intent(session, updated_at=datetime.now(UTC))
+
+    async def _fake_read(**kwargs):
+        return run_paper.BrokerExecutions(3, [])
+
+    fake = FakeRedis()
+    monkeypatch.setattr(run_paper, "read_broker_executions", _fake_read)
+    monkeypatch.setattr(run_paper, "_redis_from_url", lambda url, **kw: fake)
+
+    run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    assert _blind_alerts(fake) == []
+
+
+def test_a_failed_blind_alert_does_not_gate_the_run(
+    monkeypatch, session, capsys
+) -> None:
+    """AC5. Redis being unreachable is both the usual cause of a failed alert
+    and something this run must survive."""
+    _submitted_intent(session, updated_at=datetime.now(UTC))
+
+    def _boom_connect(url, **kwargs):
+        raise ConnectionError("Error connecting to redis")
+
+    monkeypatch.setattr(run_paper, "read_broker_executions", _returned_nothing)
+    monkeypatch.setattr(run_paper, "_redis_from_url", _boom_connect)
+
+    outcome = run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    assert outcome is not None
+    assert outcome.recovered == ()
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_a_failed_evidence_query_does_not_gate_the_run(
+    monkeypatch, session, capsys
+) -> None:
+    """The self-check reads the book a second time, after the sweep's own
+    commit. A failure there is a diagnostic failing, not the run failing."""
+    _submitted_intent(session, updated_at=datetime.now(UTC))
+
+    def _boom(self, **kwargs):
+        raise RuntimeError("no such column: order_intents.updated_at")
+
+    fake = FakeRedis()
+    monkeypatch.setattr(run_paper, "read_broker_executions", _returned_nothing)
+    monkeypatch.setattr(run_paper, "_redis_from_url", lambda url, **kw: fake)
+    monkeypatch.setattr(
+        run_paper.OrderLedger, "broker_activity_evidence_count", _boom
+    )
+
+    outcome = run_paper.sweep_executions_best_effort(
+        host="127.0.0.1",
+        port=7497,
+        client_id=58,
+        session=session,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    assert outcome is not None
+    assert _blind_alerts(fake) == []
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_the_blind_check_uses_a_window_reqexecutions_can_still_cover() -> None:
+    """A window shorter than a long weekend would miss the Friday order that
+    fills on Monday; one much longer re-admits the stale evidence the guard
+    is built to exclude."""
+    assert 3 <= run_paper.SWEEP_BLINDNESS_EVIDENCE_WINDOW_DAYS <= 7

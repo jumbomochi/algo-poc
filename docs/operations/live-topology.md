@@ -104,6 +104,15 @@ they are the machine shutting down from heat during dark wake. Residual sleeps
 of that kind after this change are an airflow or hardware problem, not evidence
 that the setting failed to apply.
 
+## Host prerequisite: the Gateway's Master API client ID
+
+`Configure > API > Settings > Master API client ID` must be **58**, or the
+daily run's execution sweep silently recovers nothing — `reqExecutions` only
+serves the calling client's own executions, and the orders are placed by the
+execution service under `ib.client_id`. Full reasoning, and the
+`execution_sweep_blind` alert that fires if the setting is lost, are in
+[deploy/launchd/README.md](../../deploy/launchd/README.md#ib-gateway-api-settings-master-api-client-id-kan-87).
+
 ## How to re-check these numbers
 
 ```bash

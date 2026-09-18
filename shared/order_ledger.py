@@ -321,6 +321,48 @@ class OrderLedger:
         self.session.flush()
         return intent
 
+    def broker_activity_evidence_count(self, *, since: datetime) -> int:
+        """How many intents say the broker had something to report (KAN-87).
+
+        Read by the execution sweep's blindness self-check, which has one
+        question to answer from the book alone, without a second IB call:
+        *if IB returned no executions at all, is that a quiet night or a
+        blind sweep?* ``reqExecutions`` is clientId-scoped, so a sweep whose
+        client id does not hold the Gateway's Master API client ID returns
+        ``[]`` every night — byte-identical to a healthy one.
+
+        Two things count, both meaning "the book believed the broker was
+        acting on its behalf":
+
+        * a **non-terminal intent bound to an ``ib_order_id``** — the order
+          was placed and the book has never seen it end;
+        * an intent **terminalized with** :data:`ABSENT_AT_IB_REASON` — the
+          exact phantom signature this sweep exists to clear, written when
+          the order could be found neither open nor completed at IB.
+
+        ``since`` bounds both on ``updated_at``, and is not optional. IB
+        serves executions for the current trading day, so an intent the book
+        has not touched in weeks cannot be what today's request should have
+        returned; counting it would make the self-check fire every night
+        forever on a single stuck row, which is how a guard gets ignored.
+        """
+        if not isinstance(since, datetime):
+            raise ValueError("since must be a datetime")
+        stmt = select(func.count(OrderIntent.id)).where(
+            OrderIntent.updated_at >= since,
+            or_(
+                and_(
+                    OrderIntent.ib_order_id.is_not(None),
+                    OrderIntent.status.in_(NONTERMINAL_STATUSES),
+                ),
+                and_(
+                    OrderIntent.status == OrderStatus.EXPIRED.value,
+                    OrderIntent.reason == ABSENT_AT_IB_REASON,
+                ),
+            ),
+        )
+        return int(self.session.scalar(stmt) or 0)
+
     def record_submission(
         self,
         recommendation_id: str,

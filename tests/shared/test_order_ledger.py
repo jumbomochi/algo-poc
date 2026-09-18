@@ -563,3 +563,111 @@ class TestRestoreAbsentTerminalization:
 
         with pytest.raises(InvalidOrderTransition):
             ledger.restore_absent_terminalization("rec-open")
+
+
+# ---------------------------------------------------------------------------
+# KAN-87: the ledger-only evidence that IB should have had an execution to
+# report. Read by the execution sweep's blindness self-check, which fires when
+# IB returns zero executions while this count is non-zero.
+# ---------------------------------------------------------------------------
+
+
+class TestBrokerActivityEvidence:
+    """What counts as "the book thought the broker was doing something"."""
+
+    @staticmethod
+    def _window_start():
+        from datetime import timedelta
+
+        return datetime.now(timezone.utc) - timedelta(days=5)
+
+    @staticmethod
+    def _age(session, recommendation_id: str, *, days: float) -> None:
+        from datetime import timedelta
+
+        intent = session.scalar(
+            select(OrderIntent).where(
+                OrderIntent.recommendation_id == recommendation_id
+            )
+        )
+        intent.updated_at = datetime.now(timezone.utc) - timedelta(days=days)
+        session.flush()
+
+    def test_a_working_order_bound_to_a_broker_id_is_evidence(self, session):
+        """The book believes IB has this order — so IB had something to say."""
+        ledger = OrderLedger(session)
+        _submit(ledger, make_proposal("rec-1"))
+
+        assert ledger.broker_activity_evidence_count(
+            since=self._window_start()
+        ) == 1
+
+    def test_an_intent_with_no_broker_id_is_not_evidence(self, session):
+        """Nothing was ever placed, so IB cannot have executed it."""
+        ledger = OrderLedger(session)
+        ledger.create_intent(make_proposal("rec-1"))
+        ledger.transition("rec-1", OrderStatus.APPROVED)
+
+        assert ledger.broker_activity_evidence_count(
+            since=self._window_start()
+        ) == 0
+
+    def test_an_ordinarily_terminal_intent_is_not_evidence(self, session):
+        """A filled order is already booked; nothing is owed to this sweep."""
+        ledger = OrderLedger(session)
+        _submit(ledger, make_proposal("rec-1"))
+        ledger.transition("rec-1", OrderStatus.FILLED)
+
+        assert ledger.broker_activity_evidence_count(
+            since=self._window_start()
+        ) == 0
+
+    def test_an_absent_at_ib_terminalization_is_evidence(self, session):
+        """The exact phantom signature: the book gave up on an order because
+        IB could not find it. If IB now reports nothing at all either, the
+        sweep that exists to clear this is the thing to suspect."""
+        ledger = OrderLedger(session)
+        _submit(ledger, make_proposal("rec-1"))
+        ledger.transition(
+            "rec-1", OrderStatus.EXPIRED, reason=ABSENT_AT_IB_REASON
+        )
+
+        assert ledger.broker_activity_evidence_count(
+            since=self._window_start()
+        ) == 1
+
+    def test_a_genuine_expiry_is_not_evidence(self, session):
+        """IB said the order expired, so IB has no execution for it."""
+        ledger = OrderLedger(session)
+        _submit(ledger, make_proposal("rec-1"))
+        ledger.transition(
+            "rec-1",
+            OrderStatus.EXPIRED,
+            reason="IB reported the order Expired",
+        )
+
+        assert ledger.broker_activity_evidence_count(
+            since=self._window_start()
+        ) == 0
+
+    def test_evidence_older_than_the_window_does_not_count(self, session):
+        """``reqExecutions`` serves the current trading day. An intent the
+        book has not touched in weeks is a reconciliation problem, not proof
+        that today's request should have returned rows — and counting it
+        would make the self-check fire every night forever."""
+        ledger = OrderLedger(session)
+        _submit(ledger, make_proposal("rec-1"))
+        self._age(session, "rec-1", days=30)
+
+        assert ledger.broker_activity_evidence_count(
+            since=self._window_start()
+        ) == 0
+
+    def test_several_pieces_of_evidence_are_counted(self, session):
+        ledger = OrderLedger(session)
+        _submit(ledger, make_proposal("rec-1"))
+        _submit(ledger, make_proposal("rec-2"))
+
+        assert ledger.broker_activity_evidence_count(
+            since=self._window_start()
+        ) == 2
