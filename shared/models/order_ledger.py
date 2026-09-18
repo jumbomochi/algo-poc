@@ -135,6 +135,20 @@ class ExecutionFill(Base):
     projection_applied: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
+    #: How this fill reached the book. ``None`` is the live ``execDetails``
+    #: callback — every row written before KAN-87 and every row written by
+    #: the normal path. ``"ib_execution_sweep"`` means the callback was
+    #: missed and the daily sweep re-read the execution from IB.
+    #:
+    #: Deliberately NOT in ``_IMMUTABLE_FILL_FIELDS``: a live callback can
+    #: legitimately re-report an execution the sweep already recorded (the
+    #: execution service reconnects and replays), and that arrives with
+    #: ``recovery_source=None`` against a stored ``"ib_execution_sweep"``.
+    #: Treating that as an identity conflict would dead-letter a fill whose
+    #: economics match perfectly.
+    recovery_source: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
 
 
 class CapitalSnapshot(Base):

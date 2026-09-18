@@ -32,6 +32,36 @@ def optional_float(value: Any) -> float | None:
     return numeric if math.isfinite(numeric) else None
 
 
+def commission_in_usd(
+    amount: float,
+    currency: str,
+    *,
+    fx_base_per_trading: float | None,
+) -> float | None:
+    """A broker-reported commission expressed in the trading currency (USD).
+
+    One rule, one home. ``FillProjector._validate`` rejects any fill whose
+    ``commission_trading`` is None *and* re-derives the conversion to check
+    it, so a second, subtly different rule anywhere would not merely disagree
+    — it would produce messages the projector refuses while still writing
+    their immutable audit row. Both producers of a ``FillMessage`` import
+    this: the live ``execDetails`` callback in
+    ``services.execution.ib_executor`` and the daily sweep in
+    ``services.execution.execution_sweep``.
+
+    ``fx_base_per_trading`` is IB's ``ExchangeRate`` account value for USD —
+    base-currency units per USD — so the conversion divides. None means the
+    commission cannot be translated, which callers must treat as "do not
+    emit this fill yet", never as zero.
+    """
+    if currency == "USD":
+        return amount
+    if currency == "SGD" and fx_base_per_trading is not None:
+        if math.isfinite(fx_base_per_trading) and fx_base_per_trading > 0:
+            return amount / fx_base_per_trading
+    return None
+
+
 @dataclass(frozen=True)
 class BrokerPosition:
     account_id: str

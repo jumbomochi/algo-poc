@@ -478,6 +478,44 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.algo-gateway-watch
 launchctl list | grep local.algo-gateway-watchdog
 ```
 
+## IB Gateway API settings: Master API client ID (KAN-87)
+
+**`Configure > API > Settings > Master API client ID` must be `58`** — the
+same id the 04:15 paper run connects with (`run_paper.py --ib-client-id`,
+default 58). Like `AutoRestartTime` above this is host state in the Gateway's
+own settings, not a repo file, so it is recorded here: nothing in a commit
+carries it, and a Gateway reinstall, a settings reset or a new machine drops
+it without a word.
+
+Why it is required: the daily run ends with an **execution sweep** that calls
+`reqExecutions` to recover fills the live `execDetails` callback never
+received (the order is placed ~21 min after the close, fills at the next open,
+and the process that placed it is long gone — KAN-85). `reqExecutions` is
+**clientId-scoped**: a client is served its own executions and nothing else,
+*unless* it holds the Master API client ID. The orders are not placed by the
+sweep — the execution service places them under `ib.client_id`
+(`config/default.yaml:123`, currently `1`). So without this setting the sweep
+connecting as 58 is served an empty list every night. An `ExecutionFilter`
+does not help: a filter narrows what a client can already see, it cannot grant
+visibility.
+
+**IBC cannot set this.** `~/ibc/config.ini` has no key for it (unlike
+`AutoRestartTime`); it is stored in the Gateway's own settings, so it has to
+be set in the UI once per install and re-checked after one.
+
+**If it is ever lost**, the failure is silent by construction — an empty
+result is exactly what a healthy night with nothing to recover looks like. The
+guard against that is a self-check in the sweep: when IB returns **zero**
+executions while the order ledger still holds intents that were working at the
+broker (or were terminalized because IB could not find them) inside the last 5
+days, `run_paper.py` raises a **high**-priority `execution_sweep_blind` alert
+on `stream:alerts` naming this setting. It is best-effort and never changes
+the run's exit code, so the alert is the whole signal — and the daily
+`IB returned N (M readable)` line in the paper-run log is how to confirm it by
+hand. Two known false positives, both harmless: yesterday's limit order simply
+never filled and expired at IB, and a stale intent inside the window. Either
+way the check to run is the same one.
+
 ## Weekly backtest refresh
 
 Runs `run_backtest_refresh.sh` every **Tuesday 05:00 SGT** — full 10yr
