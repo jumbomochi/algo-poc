@@ -160,3 +160,254 @@ async def test_connect_attaches_handler_and_clears_stale_marker(
     assert not marker.exists()
     # ...and future 1100s are observed.
     assert ex._on_ib_error in ex._ib.errorEvent
+
+
+# --- IB-1101: 1101 (data lost) vs 1102 (data maintained) -------------------
+#
+# A 1100/1101 pair leaves the API socket up, so `connect()` never re-runs and
+# `_reregister_open_trades()` never fires. On 2026-09-18 that left the executor
+# blind to 15 fills: it repriced 119 times against a stale view and then
+# cancelled orders IB had already executed. 1101 must re-request open orders;
+# 1102 (subscriptions maintained) must not.
+
+
+class _RestoreTrade:
+    """Minimal ib_insync Trade stand-in with re-bindable callback events."""
+
+    def __init__(self, order_id: int) -> None:
+        self.order = types.SimpleNamespace(orderId=order_id)
+        self.orderStatus = types.SimpleNamespace(status="Submitted", filled=0)
+        self.statusEvent = _FakeEvent()
+        self.commissionReportEvent = _FakeEvent()
+
+
+class _RestoreIB:
+    """Fake IB whose `reqOpenOrdersAsync` is observable."""
+
+    def __init__(self, open_trades=None, raises: Exception | None = None) -> None:
+        self._open_trades = list(open_trades or [])
+        self._raises = raises
+        self.req_open_orders_calls = 0
+
+    async def reqOpenOrdersAsync(self):
+        self.req_open_orders_calls += 1
+        if self._raises is not None:
+            raise self._raises
+        return list(self._open_trades)
+
+    def openTrades(self):
+        return list(self._open_trades)
+
+    def isConnected(self):
+        return True
+
+
+async def _drain(ex: IBExecutor) -> None:
+    """Await every fire-and-forget task the executor spawned."""
+    import asyncio
+
+    for _ in range(5):
+        pending = list(ex._pending_tasks)
+        if not pending:
+            return
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+def _restored_executor(tmp_path: Path, ib) -> IBExecutor:
+    ex = _executor(tmp_path)
+    ex._ib = ib
+    return ex
+
+
+@pytest.mark.asyncio
+async def test_1102_clears_marker_and_does_not_resubscribe(tmp_path: Path) -> None:
+    """1102 means connectivity restored with data MAINTAINED — the open-order
+    and market-data subscriptions survived, so re-requesting is pure noise."""
+    marker = tmp_path / MARKER_NAME
+    marker.write_text("1754006400")
+    ib = _RestoreIB()
+    ex = _restored_executor(tmp_path, ib)
+
+    ex._on_ib_error(reqId=-1, errorCode=1102, errorString="restored", contract=None)
+    await _drain(ex)
+
+    assert not marker.exists()
+    assert ib.req_open_orders_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_1101_clears_marker_and_re_requests_open_orders(
+    tmp_path: Path,
+) -> None:
+    """1101 means data LOST: IB invalidated the open-order subscription and
+    will push nothing further for previously-tracked orders. The client must
+    re-request them and re-bind the per-Trade callbacks."""
+    marker = tmp_path / MARKER_NAME
+    marker.write_text("1754006400")
+
+    fresh = _RestoreTrade(9)
+    ib = _RestoreIB(open_trades=[fresh])
+    ex = _restored_executor(tmp_path, ib)
+    ex.set_fill_handler(_noop_async)
+    ex.set_order_status_handler(_noop_async)
+    stale = _RestoreTrade(9)
+    ex._register_trade("9", stale, "AAPL", "buy")
+
+    ex._on_ib_error(reqId=-1, errorCode=1101, errorString="data lost", contract=None)
+    await _drain(ex)
+
+    assert not marker.exists()
+    assert ib.req_open_orders_calls == 1
+    # _reregister_open_trades ran against the re-requested trades.
+    assert ex._trades["9"] is fresh
+    assert len(fresh.statusEvent) == 1
+    assert len(fresh.commissionReportEvent) == 1
+
+
+@pytest.mark.asyncio
+async def test_1101_does_not_double_bind_callbacks_on_a_surviving_trade(
+    tmp_path: Path,
+) -> None:
+    """ib_insync keys its Trade cache on (clientId, orderId), so a re-request
+    over a live socket hands back the SAME Trade object. eventkit invokes a
+    listener once per registration, so binding again would double every fill."""
+    survivor = _RestoreTrade(9)
+    ib = _RestoreIB(open_trades=[survivor])
+    ex = _restored_executor(tmp_path, ib)
+    ex.set_fill_handler(_noop_async)
+    ex.set_order_status_handler(_noop_async)
+    ex._register_trade("9", survivor, "AAPL", "buy")
+    assert len(survivor.statusEvent) == 1
+
+    ex._on_ib_error(reqId=-1, errorCode=1101, errorString="data lost", contract=None)
+    await _drain(ex)
+
+    assert len(survivor.statusEvent) == 1
+    assert len(survivor.commissionReportEvent) == 1
+
+
+@pytest.mark.asyncio
+async def test_1101_re_request_failure_never_escapes_the_error_handler(
+    tmp_path: Path,
+) -> None:
+    """`marker I/O must never disturb order routing` applies here too: a failed
+    re-subscription is logged, never raised into ib_insync's dispatch."""
+    ib = _RestoreIB(raises=RuntimeError("socket gone"))
+    ex = _restored_executor(tmp_path, ib)
+    ex._logger = _RecordingLogger()
+
+    # Must not raise, either synchronously...
+    ex._on_ib_error(reqId=-1, errorCode=1101, errorString="data lost", contract=None)
+    # ...or out of the spawned task.
+    await _drain(ex)
+
+    assert any(
+        call[0] in ("error", "exception") for call in ex._logger.calls
+    ), ex._logger.calls
+
+
+@pytest.mark.asyncio
+async def test_1101_absent_orders_are_surfaced_not_terminalized(
+    tmp_path: Path,
+) -> None:
+    """An order missing from IB's re-requested open orders may have FILLED
+    during the blackout. Resolving it by guesswork is what turned 15 filled
+    positions into phantoms — it gets logged for reconciliation, nothing more."""
+    ib = _RestoreIB(open_trades=[])  # order 9 is not open at IB any more
+    ex = _restored_executor(tmp_path, ib)
+    ex.set_fill_handler(_noop_async)
+    ex.set_order_status_handler(_noop_async)
+    ex._logger = _RecordingLogger()
+    stale = _RestoreTrade(9)
+    ex._register_trade("9", stale, "AAPL", "buy")
+
+    ex._on_ib_error(reqId=-1, errorCode=1101, errorString="data lost", contract=None)
+    await _drain(ex)
+
+    warned = [c for c in ex._logger.calls if c[0] == "warning"]
+    assert any(c[2].get("order_ids") == ["9"] for c in warned), ex._logger.calls
+    # Still tracked — nothing was terminalized or forgotten.
+    assert "9" in ex._trades
+    assert ex._trade_meta["9"] == ("AAPL", "buy")
+
+
+@pytest.mark.asyncio
+async def test_restore_codes_log_distinctly_with_the_code_in_the_payload(
+    tmp_path: Path,
+) -> None:
+    """Today the restore path logs nothing, which is why the 2026-09-18 logs
+    could not answer 'was that a 1101 or a 1102?'. Both must be recoverable."""
+    ib = _RestoreIB()
+    ex = _restored_executor(tmp_path, ib)
+    ex._logger = _RecordingLogger()
+
+    ex._on_ib_error(reqId=-1, errorCode=1102, errorString="ok", contract=None)
+    await _drain(ex)
+    infos = [c for c in ex._logger.calls if c[0] == "info"]
+    assert any(c[2].get("error_code") == 1102 for c in infos), ex._logger.calls
+
+    ex._logger.calls.clear()
+    ex._on_ib_error(reqId=-1, errorCode=1101, errorString="lost", contract=None)
+    await _drain(ex)
+    warnings = [c for c in ex._logger.calls if c[0] == "warning"]
+    assert any(c[2].get("error_code") == 1101 for c in warnings), ex._logger.calls
+    # A 1101 is not merely informational — it may mean lost fills.
+    assert not any(c[2].get("error_code") == 1101 for c in ex._logger.calls if c[0] == "info")
+
+
+@pytest.mark.asyncio
+async def test_1101_pages_the_operator(tmp_path: Path) -> None:
+    """Going blind to fills is money on this system, and the daily broker
+    reconciliation proved insufficient on 2026-08-28. The executor hands the
+    condition to the runner's alert publisher."""
+    ib = _RestoreIB(open_trades=[])
+    ex = _restored_executor(tmp_path, ib)
+    seen: list[dict] = []
+
+    async def _alert(payload):
+        seen.append(payload)
+
+    ex.set_connectivity_alert_handler(_alert)
+    ex._on_ib_error(reqId=-1, errorCode=1101, errorString="data lost", contract=None)
+    await _drain(ex)
+
+    assert len(seen) == 1, seen
+    assert seen[0]["error_code"] == 1101
+
+
+@pytest.mark.asyncio
+async def test_1102_does_not_page(tmp_path: Path) -> None:
+    ib = _RestoreIB()
+    ex = _restored_executor(tmp_path, ib)
+    seen: list[dict] = []
+
+    async def _alert(payload):
+        seen.append(payload)
+
+    ex.set_connectivity_alert_handler(_alert)
+    ex._on_ib_error(reqId=-1, errorCode=1102, errorString="ok", contract=None)
+    await _drain(ex)
+
+    assert seen == []
+
+
+async def _noop_async(_payload) -> None:
+    return None
+
+
+class _RecordingLogger:
+    """Records (level, message, kwargs) so tests can assert on the payload."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def _record(self, level):
+        def _log(message="", **kwargs):
+            self.calls.append((level, message, kwargs))
+
+        return _log
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return self._record(name)
