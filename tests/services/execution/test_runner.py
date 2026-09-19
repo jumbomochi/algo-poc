@@ -3122,3 +3122,28 @@ class TestOversellGuard:
 
         mock_order_manager.submit_exit.assert_awaited_once()
         assert "not guarded against overselling" in capsys.readouterr().out
+
+
+class TestIBConnectivityAlert:
+    """IB Error 1101 (connectivity restored, DATA LOST) has to reach a human.
+
+    The executor writes a watchdog marker but has no alert publisher; the
+    runner owns ``_publish_alert``. Without this, the 2026-09-18 blackout that
+    cost 15 unrecorded fills produced no operator-visible signal at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_1101_publishes_a_high_priority_alert(self, runner):
+        await runner.handle_ib_connectivity_alert({
+            "error_code": 1101,
+            "host": "gw",
+            "port": 7497,
+            "tracked_order_ids": ["189", "190"],
+        })
+
+        runner._redis.publish.assert_awaited_once()
+        stream, payload = runner._redis.publish.await_args.args
+        assert stream == "stream:alerts"
+        assert payload["event_type"] == "ib_connectivity_data_lost"
+        assert payload["priority"] == "high"
+        assert "1101" in str(payload)

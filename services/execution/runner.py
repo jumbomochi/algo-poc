@@ -1390,6 +1390,35 @@ class ExecutionServiceRunner:
         )
         await self._redis.publish(ALERTS_STREAM, alert.to_stream_dict())
 
+    async def handle_ib_connectivity_alert(
+        self, info: dict[str, Any]
+    ) -> None:
+        """Page on IB Error 1101 — connectivity restored, subscriptions lost.
+
+        The executor re-requests its open orders, but any fill that completed
+        while it was blind cannot be replayed from a callback, so a human has
+        to check the book against the broker. On 2026-09-18 this condition was
+        entirely silent and 15 filled positions never reached the ledger.
+        """
+        order_ids = info.get("tracked_order_ids") or []
+        await self._publish_alert(
+            event_type="ib_connectivity_data_lost",
+            priority="high",
+            message=(
+                f"IB Error {info.get('error_code')}: connectivity restored but "
+                f"data LOST on {info.get('host')}:{info.get('port')}. Open "
+                f"orders were re-requested; fills on the "
+                f"{len(order_ids)} order(s) tracked this session may have "
+                f"completed unobserved — reconcile against the broker."
+            ),
+            context={
+                "error_code": str(info.get("error_code")),
+                "host": str(info.get("host")),
+                "port": str(info.get("port")),
+                "tracked_order_ids": ",".join(str(o) for o in order_ids),
+            },
+        )
+
     async def handle_ib_order_status(
         self, status_info: dict[str, Any]
     ) -> None:
@@ -2054,6 +2083,9 @@ if __name__ == "__main__":
             }
             executor.set_fill_handler(runner.handle_ib_fill)
             executor.set_order_status_handler(runner.handle_ib_order_status)
+            executor.set_connectivity_alert_handler(
+                runner.handle_ib_connectivity_alert
+            )
             await runner.run()
         finally:
             session.close()
