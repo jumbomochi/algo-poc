@@ -15,7 +15,12 @@ logger = get_logger("ib_executor")
 
 # IB API system codes for server-connectivity state (delivered via errorEvent).
 IB_CONNECTIVITY_LOST = 1100  # connectivity between IB and the Gateway lost
-IB_CONNECTIVITY_RESTORED = (1101, 1102)  # restored (data lost / data maintained)
+# Restored — and the two codes are NOT interchangeable. 1102 keeps the open-order
+# and market-data subscriptions alive; 1101 invalidates them, so IB pushes
+# nothing further for orders tracked before the outage and the client must
+# re-request them. Collapsing the two cost 15 unrecorded fills on 2026-09-18.
+IB_CONNECTIVITY_RESTORED_DATA_LOST = 1101
+IB_CONNECTIVITY_RESTORED_DATA_MAINTAINED = 1102
 
 # File the host Gateway watchdog reads to learn about a 1100 — the API port
 # stays open during a connectivity loss, so the watchdog's port check is blind
@@ -25,6 +30,10 @@ CONNECTIVITY_MARKER_NAME = "gateway_connectivity_lost"
 # Payload passed to the fill handler on every real IB fill (partial or full).
 FillHandler = Callable[[dict[str, Any]], Awaitable[None]]
 OrderStatusHandler = Callable[[dict[str, Any]], Awaitable[None]]
+# Optional operator page for a connectivity condition the executor cannot
+# resolve on its own (Error 1101). The executor has no alert publisher of its
+# own; ExecutionServiceRunner wires this to its ``_publish_alert``.
+ConnectivityAlertHandler = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 def _commission_in_usd(
@@ -194,6 +203,7 @@ class IBExecutor:
         self._pending_tasks: set[Any] = set()
         self._fill_handler: FillHandler | None = None
         self._order_status_handler: OrderStatusHandler | None = None
+        self._connectivity_alert_handler: ConnectivityAlertHandler | None = None
         self._expect_paper: bool | None = None
         self._logger = get_logger("ib_executor")
         # Where to drop the connectivity-lost marker for the host watchdog.
@@ -248,11 +258,103 @@ class IBExecutor:
         (and port) stay up — invisible to the watchdog's port check. Drop a
         marker the host watchdog reads; clear it when connectivity is restored
         (1101/1102). Best-effort: marker I/O must never disturb order routing.
+
+        1101 and 1102 both mean "restored" and both clear the marker, but only
+        1102 means the subscriptions survived. A 1101 says IB threw them away,
+        and because the socket never dropped, ``connect()`` — and with it
+        :meth:`_reregister_open_trades` — never re-runs. Left alone the
+        executor goes silently blind to every later fill on its tracked orders,
+        which is what happened on 2026-09-18. So a 1101 re-requests open orders
+        off the event loop; nothing here may raise into ib_insync's dispatch.
         """
         if errorCode == IB_CONNECTIVITY_LOST:
             self._mark_connectivity_lost()
-        elif errorCode in IB_CONNECTIVITY_RESTORED:
+        elif errorCode == IB_CONNECTIVITY_RESTORED_DATA_MAINTAINED:
             self._clear_connectivity_marker()
+            self._logger.info(
+                "IB connectivity restored, data maintained (Error 1102) — "
+                "subscriptions survived, nothing to re-request",
+                error_code=errorCode,
+            )
+        elif errorCode == IB_CONNECTIVITY_RESTORED_DATA_LOST:
+            self._clear_connectivity_marker()
+            self._logger.warning(
+                "IB connectivity restored but DATA LOST (Error 1101) — "
+                "re-requesting open orders; fills that completed during the "
+                "outage may be missing and need broker reconciliation",
+                error_code=errorCode,
+            )
+            self._schedule_resubscribe_after_data_loss(errorCode)
+
+    def _schedule_resubscribe_after_data_loss(self, error_code: int) -> None:
+        """Hand the async recovery to the event loop, swallowing every failure.
+
+        ``_on_ib_error`` is a synchronous ib_insync callback, so the work is
+        fire-and-forget via :meth:`_spawn`. Outside a running loop (unit tests,
+        a callback delivered off-loop) there is nothing to schedule — say so
+        rather than raising into order routing.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self._logger.error(
+                "No running event loop — could not re-subscribe after IB "
+                "Error 1101; verify fills via broker reconciliation",
+                error_code=error_code,
+            )
+            return
+        try:
+            self._spawn(self._resubscribe_after_data_loss(error_code))
+        except Exception:  # pragma: no cover - defensive
+            self._logger.exception(
+                "Could not schedule re-subscription after IB Error 1101"
+            )
+
+    async def _resubscribe_after_data_loss(self, error_code: int) -> None:
+        """Rebuild the open-order subscription IB dropped across a 1101.
+
+        ``reqOpenOrders`` is client-scoped and is what makes IB resume pushing
+        status and execution updates for this session's orders; the trades it
+        returns are IB's authoritative view of what is still working, which
+        ``openTrades()`` is not — that reads ib_insync's local cache, where an
+        order that filled unobserved is still sitting at ``Submitted``.
+
+        Orders absent from that answer are logged by
+        :meth:`_reregister_open_trades` and left tracked. They are NOT
+        terminalized: an order that vanished across a 1101 may well have
+        filled, and guessing "cancelled" is exactly how 15 filled positions
+        became phantoms on 2026-09-18.
+        """
+        await self._page_connectivity_data_lost(error_code)
+        if self._ib is None:
+            return
+        try:
+            open_trades = list(await self._ib.reqOpenOrdersAsync())
+        except Exception:
+            self._logger.exception(
+                "Failed to re-request open orders after IB Error 1101 — the "
+                "executor may be blind to fills; verify via broker "
+                "reconciliation",
+                error_code=error_code,
+            )
+            return
+        self._reregister_open_trades(open_trades=open_trades)
+
+    async def _page_connectivity_data_lost(self, error_code: int) -> None:
+        """Best-effort operator page; a dead alert path must not stop recovery."""
+        if self._connectivity_alert_handler is None:
+            return
+        try:
+            await self._connectivity_alert_handler({
+                "error_code": error_code,
+                "host": self._host,
+                "port": self._port,
+                "tracked_order_ids": sorted(self._trade_meta),
+            })
+        except Exception:
+            self._logger.exception(
+                "Failed to publish IB Error 1101 alert", error_code=error_code
+            )
 
     def _mark_connectivity_lost(self) -> None:
         if self._conn_marker is None:
@@ -297,6 +399,12 @@ class IBExecutor:
     def set_order_status_handler(self, handler: OrderStatusHandler) -> None:
         """Register the callback for broker lifecycle status changes."""
         self._order_status_handler = handler
+
+    def set_connectivity_alert_handler(
+        self, handler: ConnectivityAlertHandler
+    ) -> None:
+        """Register the async callback that pages an operator on Error 1101."""
+        self._connectivity_alert_handler = handler
 
     @staticmethod
     def _status_reason(trade: Any) -> str:
@@ -407,7 +515,7 @@ class IBExecutor:
             self._ib.disconnect()
             self._logger.info("Disconnected from IB")
 
-    def _reregister_open_trades(self) -> None:
+    def _reregister_open_trades(self, open_trades: list[Any] | None = None) -> None:
         """Re-bind fill/status callbacks onto the fresh Trade objects after a
         reconnect, for every tracked order still open at IB.
 
@@ -417,14 +525,21 @@ class IBExecutor:
         here — that divergence is caught by the daily broker reconciliation
         (``scripts/reconcile_paper.py``). Such orders are logged as a warning so
         the gap is visible rather than silent.
+
+        ``open_trades`` lets the Error 1101 path pass the trades IB just
+        returned from ``reqOpenOrders`` instead of the local ``openTrades()``
+        cache. Over a socket that never dropped, that cache still shows an
+        order that filled unobserved as open, which would hide exactly the gap
+        this warns about.
         """
         if self._ib is None or not self._trade_meta:
             return
-        try:
-            open_trades = list(self._ib.openTrades())
-        except Exception:  # pragma: no cover - defensive
-            self._logger.exception("Could not list open trades on reconnect")
-            return
+        if open_trades is None:
+            try:
+                open_trades = list(self._ib.openTrades())
+            except Exception:  # pragma: no cover - defensive
+                self._logger.exception("Could not list open trades on reconnect")
+                return
         open_ids = set()
         reattached = 0
         for trade in open_trades:
@@ -434,6 +549,13 @@ class IBExecutor:
             if meta is None:
                 continue
             open_ids.add(order_id)
+            if self._trades.get(order_id) is trade:
+                # Same Python object: ib_insync keys its Trade cache on
+                # (clientId, orderId), so a re-request over a live socket hands
+                # back the object we are already bound to. eventkit invokes a
+                # listener once per registration, so binding again would double
+                # every subsequent fill.
+                continue
             ticker, side = meta
             self._register_trade(order_id, trade, ticker, side)
             reattached += 1
