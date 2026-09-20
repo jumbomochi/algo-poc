@@ -84,7 +84,7 @@ def _write_csv(path, rows):
 
 def test_a_statement_row_becomes_an_execution():
     """AC2. Every economic value comes from the file; none is defaulted."""
-    [execution] = parse_statement([_row()])
+    [execution] = parse_statement([_row()]).executions
 
     assert execution.execution_id == "0000e0d5.68cb1234.01.01"
     assert execution.account_id == "DUN551088"
@@ -118,7 +118,7 @@ def test_a_commission_is_recorded_as_a_magnitude():
     """IB reports a commission CHARGE as negative. FillProjector._validate
     rejects a negative commission outright, so a verbatim copy would refuse
     every real row in the statement."""
-    [execution] = parse_statement([_row(IBCommission="-1.00")])
+    [execution] = parse_statement([_row(IBCommission="-1.00")]).executions
 
     assert execution.commission == 1.0
 
@@ -168,7 +168,7 @@ def test_partial_executions_of_one_order_accumulate():
         _row(TradeID="b", Quantity="3", **{"DateTime": "2026-09-18 13:34:00"}),
     ]
 
-    first, second = parse_statement(rows)
+    first, second = parse_statement(rows).executions
 
     assert (first.quantity, first.cumulative_quantity) == (2.0, 2.0)
     assert (second.quantity, second.cumulative_quantity) == (3.0, 5.0)
@@ -182,7 +182,7 @@ def test_executions_of_one_order_accumulate_in_time_order():
         _row(TradeID="a", Quantity="2", **{"DateTime": "2026-09-18 13:31:02"}),
     ]
 
-    first, second = parse_statement(rows)
+    first, second = parse_statement(rows).executions
 
     assert (first.execution_id, first.cumulative_quantity) == ("a", 2.0)
     assert (second.execution_id, second.cumulative_quantity) == ("b", 5.0)
@@ -191,7 +191,7 @@ def test_executions_of_one_order_accumulate_in_time_order():
 def test_separate_orders_do_not_share_a_running_total():
     rows = [_row(TradeID="a"), _row(TradeID="b", IBOrderID="190", Symbol="NVDA")]
 
-    first, second = parse_statement(rows)
+    first, second = parse_statement(rows).executions
 
     assert first.cumulative_quantity == 5.0
     assert second.cumulative_quantity == 5.0
@@ -199,8 +199,8 @@ def test_separate_orders_do_not_share_a_running_total():
 
 def test_both_ib_datetime_formats_are_read():
     """Flex serves 'YYYYMMDD;HHMMSS'; an Activity Statement CSV serves ISO."""
-    [flex] = parse_statement([_row(**{"DateTime": "20260918;133102"})])
-    [iso] = parse_statement([_row(**{"DateTime": "2026-09-18 13:31:02"})])
+    [flex] = parse_statement([_row(**{"DateTime": "20260918;133102"})]).executions
+    [iso] = parse_statement([_row(**{"DateTime": "2026-09-18 13:31:02"})]).executions
 
     assert flex.executed_at == iso.executed_at
 
@@ -228,9 +228,10 @@ def test_an_empty_statement_is_refused():
 def test_a_statement_file_is_read_from_disk(tmp_path):
     path = _write_csv(tmp_path / "trades.csv", [_row()])
 
-    [execution] = load_statement(path)
+    statement = load_statement(path)
 
-    assert execution.ticker == "AMD"
+    assert statement.executions[0].ticker == "AMD"
+    assert statement.source_sha256
 
 
 # --------------------------------------------------------------------------
@@ -296,8 +297,9 @@ def _expired_intent(
 
 
 def _plan(session, rows=None):
+    statement = parse_statement(rows if rows is not None else [_row()])
     return plan_sweep(
-        parse_statement(rows if rows is not None else [_row()]),
+        statement.executions,
         OrderLedger(session),
         recovery_source=RECOVERY_SOURCE_STATEMENT,
     )
@@ -396,7 +398,7 @@ def test_re_running_the_repair_changes_nothing(session):
     second = _plan(session)
     assert second.recovered == ()
     assert second.already_recorded == 1
-    assert apply_recovery(session, second, confirm=CONFIRMATION) == []
+    assert apply_recovery(session, second, confirm=CONFIRMATION).applied == ()
 
     assert session.scalar(
         select(func.count()).select_from(Position)
@@ -437,6 +439,11 @@ def test_a_dry_run_writes_nothing(tmp_path, capsys):
     engine = create_engine(url)
     Base.metadata.create_all(engine)
     with Session(engine) as db_session:
+        db_session.add(PortfolioConfig(
+            portfolio="momentum", capital=30_000, cash=30_000,
+            created_at=NOW, updated_at=NOW,
+        ))
+        db_session.commit()
         _expired_intent(db_session)
 
     statement = _write_csv(tmp_path / "trades.csv", [_row()])
@@ -542,3 +549,236 @@ def test_the_applied_artifact_dates_and_explains_the_equity_gap(tmp_path, monkey
     assert payload["applied"][0]["price"] == 161.42
     assert "equity_snapshots" in payload["equity_series_note"]
     assert payload["statement_sha256"]
+
+
+# --------------------------------------------------------------------------
+# Review follow-ups: the tool's own failure path
+# --------------------------------------------------------------------------
+
+
+def test_a_projection_failure_stops_the_batch_and_is_reported(session):
+    """CRITICAL. FillProjector.apply commits its immutable execution_fills
+    audit row BEFORE it validates, then raises. execution_fill_exists does
+    not filter on projection_applied, so a rejected fill reads as
+    already_recorded FOREVER -- and unlike the nightly sweep there is no
+    tomorrow here: reqExecutions cannot re-serve this. So a failure must
+    stop the loop rather than burn the rest of the batch."""
+    _expired_intent(session)
+    _expired_intent(
+        session, recommendation_id="rec-nvda", ib_order_id="190",
+        ticker="NVDA", con_id=4815747, requested=4.0,
+    )
+    # Not enough cash for the first fill: _apply_fill_accounting raises
+    # ValueError("fill would make sleeve cash negative").
+    config = session.scalar(select(PortfolioConfig))
+    config.cash = 10.0
+    session.commit()
+
+    rows = [_row(), _row(TradeID="t-190", IBOrderID="190", Symbol="NVDA",
+                 ConID="4815747", Quantity="4", TradePrice="180.00")]
+    result = apply_recovery(session, _plan(session, rows), confirm=CONFIRMATION)
+
+    assert result.applied == ()
+    assert len(result.failed) == 1
+    assert "negative" in result.failed[0][1]
+    # The second execution was never attempted, so it is NOT burned and a
+    # later run can still recover it.
+    assert session.scalar(
+        select(func.count()).select_from(ExecutionFill).where(
+            ExecutionFill.execution_id == "t-190"
+        )
+    ) == 0
+
+
+def test_a_burned_execution_is_reported_not_counted_as_recorded(tmp_path, capsys):
+    """A rejected fill leaves an execution_fills row with
+    projection_applied False. The next dry run must say so rather than
+    print 'already recorded -- nothing to do', which reads as success while
+    a real position is missing forever."""
+    url = f"sqlite:///{tmp_path / 'book.db'}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    with Session(engine) as db_session:
+        db_session.add(PortfolioConfig(
+            portfolio="momentum", capital=30_000, cash=30_000,
+            created_at=NOW, updated_at=NOW,
+        ))
+        db_session.commit()
+        _expired_intent(db_session)
+        db_session.add(ExecutionFill(
+            account_id="DUN551088",
+            execution_id="0000e0d5.68cb1234.01.01",
+            ib_order_id="189", recommendation_id="rec-amd",
+            portfolio="momentum", con_id=4391, symbol="AMD",
+            exchange="NASDAQ", currency="USD", side="BUY",
+            quantity=5.0, price=161.42, commission=1.0,
+            executed_at=NOW, projection_applied=False,
+        ))
+        db_session.commit()
+
+    statement = _write_csv(tmp_path / "trades.csv", [_row()])
+    assert main(["--statement", str(statement), "--database-url", url]) == 1
+
+    out = capsys.readouterr().out
+    assert "never projected" in out
+
+
+def test_a_preflight_refuses_before_burning_anything(tmp_path, capsys):
+    """The predictable rejection -- not enough sleeve cash -- is knowable
+    from the plan alone. Refusing up front costs nothing; discovering it
+    inside the loop costs a real fill."""
+    url = f"sqlite:///{tmp_path / 'book.db'}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    with Session(engine) as db_session:
+        db_session.add(PortfolioConfig(
+            portfolio="momentum", capital=100, cash=100,
+            created_at=NOW, updated_at=NOW,
+        ))
+        db_session.commit()
+        _expired_intent(db_session)
+
+    statement = _write_csv(tmp_path / "trades.csv", [_row()])
+    assert main(["--statement", str(statement), "--database-url", url]) == 1
+
+    out = capsys.readouterr().out
+    assert "cash" in out.lower()
+    with Session(engine) as db_session:
+        assert db_session.scalar(
+            select(func.count()).select_from(ExecutionFill)
+        ) == 0
+
+
+def test_a_preflight_refuses_an_account_less_position_on_the_same_contract(
+    tmp_path, capsys
+):
+    """_apply_fill_accounting raises 'position account ownership is
+    unresolved' for ANY open position sharing the con_id with a NULL
+    account_id, whatever its sleeve. Knowable before writing."""
+    url = f"sqlite:///{tmp_path / 'book.db'}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    with Session(engine) as db_session:
+        db_session.add(PortfolioConfig(
+            portfolio="momentum", capital=30_000, cash=30_000,
+            created_at=NOW, updated_at=NOW,
+        ))
+        db_session.add(Position(
+            ticker="AMD", portfolio="legacy", con_id=4391, quantity=3.0,
+            avg_entry_price=150.0, current_price=150.0, peak_price=150.0,
+            highest_price_since_entry=150.0,
+            status="open", account_id=None, opened_at=NOW,
+        ))
+        db_session.commit()
+        _expired_intent(db_session)
+
+    statement = _write_csv(tmp_path / "trades.csv", [_row()])
+    assert main(["--statement", str(statement), "--database-url", url]) == 1
+
+    assert "ownership is unresolved" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# Review follow-ups: inputs the refusal discipline did not reach
+# --------------------------------------------------------------------------
+
+
+def test_a_sell_row_is_skipped_and_named_not_misdiagnosed():
+    """IB Flex reports Quantity SIGNED -- negative for sales -- so a sell
+    row used to hit the positive-quantity guard and be refused as 'the
+    export is wrong', sending the operator to re-export a perfectly good
+    file. A Trades export over a date range will contain sells."""
+    statement = parse_statement([
+        _row(),
+        _row(TradeID="t-sell", IBOrderID="200", Symbol="LLY",
+             ConID="9160", Quantity="-2", **{"Buy/Sell": "SELL"}),
+    ])
+
+    assert [e.execution_id for e in statement.executions] == [
+        "0000e0d5.68cb1234.01.01"
+    ]
+    assert statement.skipped_sells == ("t-sell",)
+
+
+def test_a_statement_of_only_sells_is_refused():
+    """Nothing to do, and 'nothing to recover' must never be the report for
+    a file the operator believes contains the repair."""
+    with pytest.raises(StatementRefusedError, match="SELL"):
+        parse_statement([_row(Quantity="-5", **{"Buy/Sell": "SELL"})])
+
+
+def test_the_account_is_adopted_from_the_first_row_when_not_given():
+    """--account is optional, so without this a two-account export would
+    silently mix two books. The runbook promises one account per file."""
+    with pytest.raises(StatementRefusedError, match="DUN551088"):
+        parse_statement([
+            _row(),
+            _row(TradeID="t-2", ClientAccountID="DU9999999"),
+        ])
+
+
+def test_a_fill_outside_us_market_hours_is_flagged(tmp_path, capsys):
+    """A local-time export with no offset reads as UTC -- a 4-5 hour shift
+    that files the fill against the wrong session. 09:31 EDT exported as
+    local time reads 09:31Z, four hours before any US open."""
+    url = f"sqlite:///{tmp_path / 'book.db'}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    with Session(engine) as db_session:
+        db_session.add(PortfolioConfig(
+            portfolio="momentum", capital=30_000, cash=30_000,
+            created_at=NOW, updated_at=NOW,
+        ))
+        db_session.commit()
+        _expired_intent(db_session)
+
+    statement = _write_csv(
+        tmp_path / "trades.csv",
+        [_row(**{"DateTime": "2026-09-18 09:31:02"})],
+    )
+    main(["--statement", str(statement), "--database-url", url])
+
+    out = capsys.readouterr().out
+    assert "09:31" in out
+    assert "UTC" in out
+
+
+def test_the_dry_run_reports_the_intents_it_would_un_expire(tmp_path, capsys):
+    """The operator is authorizing 15 intents out of a terminal state, and
+    the rollback section says that matters as much as the positions."""
+    url = f"sqlite:///{tmp_path / 'book.db'}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    with Session(engine) as db_session:
+        db_session.add(PortfolioConfig(
+            portfolio="momentum", capital=30_000, cash=30_000,
+            created_at=NOW, updated_at=NOW,
+        ))
+        db_session.commit()
+        _expired_intent(db_session)
+
+    statement = _write_csv(tmp_path / "trades.csv", [_row()])
+    main(["--statement", str(statement), "--database-url", url])
+
+    assert "1 intent" in capsys.readouterr().out
+
+
+def test_a_byte_order_mark_does_not_hide_the_first_column(tmp_path):
+    """IB CSV exports commonly carry a UTF-8 BOM, which turns the first
+    header into '﻿ClientAccountID' and produced a confusing 'missing
+    required column: ClientAccountID' on a file that visibly contains it."""
+    path = tmp_path / "bom.csv"
+    body = _write_csv(tmp_path / "plain.csv", [_row()]).read_text()
+    path.write_text("﻿" + body)
+
+    statement = load_statement(path)
+
+    assert statement.executions[0].ticker == "AMD"
+
+
+def test_a_refusal_is_a_message_not_a_traceback(tmp_path, capsys):
+    """The refusal strings are the product. Arriving wrapped in a stack
+    trace at 05:00 wastes the effort that went into them."""
+    assert main(["--statement", str(tmp_path / "nope.csv")]) == 2
+
+    assert "no statement file" in capsys.readouterr().err

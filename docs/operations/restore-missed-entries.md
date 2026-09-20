@@ -47,7 +47,13 @@ Settings that matter:
   every fill four or five hours off and land it against the wrong session.
 - **Date range:** the trade date(s) being recovered.
 - **Format:** CSV.
-- **One account per file.** A statement covering two accounts is refused.
+- **One account per file.** A statement covering two accounts is refused,
+  whether or not you pass `--account` — without the flag the first row's
+  account is adopted and enforced on the rest.
+- **SELL rows are fine.** A Trades export over a date range contains the
+  day's exits; they are skipped and counted, not refused. (A statement of
+  *only* sells is refused — that means you want
+  [`restore_missed_exit.py`](../../scripts/ops/restore_missed_exit.py).)
 
 Save it somewhere outside the repo — it is broker data, not source.
 
@@ -66,7 +72,28 @@ It writes nothing. Read every line before going further.
   ...
   15 to recover, 0 already recorded, 0 untracked, 0 deferred
   cost basis to be restored: 25,600.00
+  15 intent(s) will be moved out of EXPIRED so the fill can terminalize them properly
+  3 SELL row(s) skipped -- this tool restores ENTRIES; a missed exit is restore_missed_exit.py
 ```
+
+Two warnings can appear here, and both refuse `--apply`:
+
+- **`⚠ PREVIOUSLY BURNED`** — those executions have an `execution_fills`
+  row but `projection_applied` is false: a previous run committed the
+  audit row and then the projector rejected the fill. Because
+  `execution_fill_exists` does not look at `projection_applied`, they now
+  read as "already recorded" and **this tool can never recover them**. Go
+  to [backups.md](backups.md).
+- **`⚠ TIME ZONE`** — fills whose UTC time-of-day falls outside US trading
+  hours, which is the signature of a statement exported in local time.
+  Re-export in UTC. (Not a hard refusal in the parser, because a genuine
+  extended-hours fill is legal — but check it before applying.)
+
+It also refuses to apply when a **preflight** finds a rejection the
+projector would raise *after* committing the audit row — insufficient
+sleeve cash, or an open position on the same `con_id` with no
+`account_id`. Those are the two failures that would otherwise burn a fill
+permanently, so they are caught before anything is written.
 
 - **RECOVER** — will be projected through `FillProjector`, the same path a
   live fill takes.
@@ -147,10 +174,23 @@ affected dates.
 
 ## Rollback
 
-Restore from `paper_state_pre_entry_restore_<stamp>.json`. Restoring
-`order_intents` matters as much as the positions: leaving the intents
-`FILLED` while removing the positions would hide the divergence from
-reconciliation entirely.
+**The real restore path is the nightly `pg_dump`** — see
+[backups.md](backups.md). There is no loader for the JSON dump; nothing in
+this repo reads one back. Note the RPO: the dump is taken at 05:15, so a
+full restore of a repair applied after it also loses the day's other
+writes.
+
+`paper_state_pre_entry_restore_<stamp>.json` is a **reference copy for
+hand-repair and verification**, not a restore input. It is still the thing
+to read first, because it is the only record of the exact pre-repair state
+of the six tables this repair touches — in particular `order_intents`,
+which matters as much as the positions: leaving the intents `FILLED` while
+removing the positions would hide the divergence from reconciliation
+entirely.
+
+If the apply stopped partway, `entry_restore_<stamp>.json` names which
+executions landed (`applied`) and which one was rejected (`failed`). The
+rejected one is burned; do not re-run `--apply` hoping to catch it.
 
 ## Refusals, and what each one means
 
@@ -164,6 +204,10 @@ reconciliation entirely.
 | `no rows` | Empty export | Check the date range and section |
 | `Refusing to apply` | UNTRACKED or DEFERRED present | Resolve those first |
 | `--apply requires an interactive TTY` | Piped or automated | Run it by hand. This is deliberate |
+| `contains only SELL rows` | Wrong tool | Use `restore_missed_exit.py` |
+| `Refusing to apply ... sleeve cash` | Preflight: not enough cash | Check the sleeve's `portfolio_config.cash` before repairing |
+| `Refusing to apply ... ownership is unresolved` | Open position on the con_id with no `account_id` | Resolve that position's ownership first |
+| `Refusing to apply ... never projected` | A previous burn | Unrecoverable by this tool; see [backups.md](backups.md) |
 
 ## Background
 
