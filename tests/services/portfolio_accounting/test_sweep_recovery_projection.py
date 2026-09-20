@@ -288,3 +288,43 @@ def test_an_sgd_commission_survives_the_projector(projector, session) -> None:
 
     assert projector.apply(outcome.recovered[0]) is True
     assert _recovered_fill(session).projection_applied is True
+
+
+def test_a_recovered_fill_records_when_it_was_recovered(
+    projector, session
+) -> None:
+    """KAN-88 AC6. ``executed_at`` is the broker's clock and can be weeks
+    older than the repair; ``recovered_at`` is when the book learned, which
+    is the question the 04:52 digest actually asks."""
+    _open_the_position(projector, session)
+    _intent(
+        session,
+        recommendation_id="rec-sell",
+        action="SELL",
+        quantity=6.0,
+        ib_order_id="148",
+    )
+    long_ago = datetime(2026, 9, 18, 13, 31, tzinfo=timezone.utc)
+
+    outcome = plan_sweep([_execution(executed_at=long_ago)], OrderLedger(session))
+    session.commit()
+    before = datetime.now(timezone.utc)
+    assert projector.apply(outcome.recovered[0]) is True
+
+    fill = _recovered_fill(session)
+    assert fill.executed_at.replace(tzinfo=timezone.utc) == long_ago
+    assert fill.recovered_at is not None
+    assert fill.recovered_at.replace(tzinfo=timezone.utc) >= before
+
+
+def test_a_live_fill_carries_no_recovery_timestamp(projector, session) -> None:
+    """A fill the callback delivered was never recovered. Stamping it would
+    make every ordinary fill look like a repair and the digest's recovered
+    count would report the whole book."""
+    _open_the_position(projector, session)
+
+    fill = session.scalar(
+        select(ExecutionFill).where(ExecutionFill.execution_id == "exec-buy")
+    )
+    assert fill.recovery_source is None
+    assert fill.recovered_at is None

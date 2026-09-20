@@ -70,13 +70,14 @@ def _halt(session, *, mode="paper", active=True, reason="daily drawdown -6.2%",
     session.commit()
 
 
-def _fill(session, *, at=DURING, symbol="AAPL", recovery_source=None):
+def _fill(session, *, at=DURING, symbol="AAPL", recovery_source=None,
+          recovered_at=None):
     n = session.query(ExecutionFill).count()
     session.add(ExecutionFill(
         account_id="DUN551088", execution_id=f"exec-{n}", ib_order_id=str(n),
         con_id=1 + n, symbol=symbol, exchange="SMART", currency="USD",
         side="BUY", quantity=10.0, price=100.0, executed_at=at,
-        recovery_source=recovery_source,
+        recovery_source=recovery_source, recovered_at=recovered_at,
     ))
     session.commit()
 
@@ -211,6 +212,29 @@ def test_a_recovered_fill_from_before_the_window_is_still_counted(session):
     assert facts.fills == 0
     assert "1 recovered" in render_summary(facts)
     assert "2-day window" in render_summary(facts)
+
+
+def test_a_statement_repair_is_counted_on_the_night_it_is_applied(session):
+    """KAN-88 AC6. The execution is nine days old -- it is the REPAIR that is
+    tonight's news. Bounded on the broker's clock alone this reported zero on
+    exactly the night the operator did the work, which is the same blind spot
+    the sweep had before I5."""
+    _fill(session, at=SINCE - timedelta(days=9),
+          recovery_source="ib_statement", recovered_at=DURING)
+
+    facts = _facts(session)
+
+    assert facts.fills_recovered == 1
+    assert "1 recovered" in render_summary(facts)
+
+
+def test_a_statement_repair_applied_before_the_window_is_excluded(session):
+    """Wider, not unbounded -- last week's repair is not tonight's news,
+    however recent the execution it rebuilt."""
+    _fill(session, at=DURING, recovery_source="ib_statement",
+          recovered_at=SINCE - timedelta(days=2))
+
+    assert _facts(session).fills_recovered == 0
 
 
 def test_a_recovered_fill_older_than_the_wider_window_is_excluded(session):
