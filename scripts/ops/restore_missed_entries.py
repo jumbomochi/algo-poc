@@ -68,18 +68,34 @@ Usage (dry run first, always):
 """
 from __future__ import annotations
 
+import argparse
 import csv
+import json
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timezone
+from hashlib import sha256
 from math import isfinite
 from pathlib import Path
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from services.execution.execution_sweep import SweptExecution  # noqa: E402
+from scripts.run_paper import STATE_TABLES  # noqa: E402
+from services.execution.execution_sweep import (  # noqa: E402
+    RECOVERY_SOURCE_STATEMENT,
+    SweepOutcome,
+    SweptExecution,
+    plan_sweep,
+)
+from services.portfolio_accounting.projector import FillProjector  # noqa: E402
+from shared.config import load_config  # noqa: E402
+from shared.models import ExecutionFill, OrderIntent  # noqa: E402
+from shared.order_ledger import OrderLedger  # noqa: E402
 
 
 class StatementRefusedError(RuntimeError):
@@ -288,3 +304,282 @@ def load_statement(
         raise StatementRefusedError(f"no statement file at {path}")
     with path.open(newline="") as handle:
         return parse_statement(csv.DictReader(handle), account_id=account_id)
+
+
+# --------------------------------------------------------------------------
+# Applying
+# --------------------------------------------------------------------------
+
+#: Typed by the operator, in full, to apply. Same shape as the repair tool's
+#: "APPLY PAPER REPAIR" -- a confirmation you can produce by accident is not
+#: one.
+CONFIRMATION = "RESTORE MISSED ENTRIES"
+
+
+class RecoveryRefusedError(RuntimeError):
+    """The recovery cannot be applied safely.
+
+    Kept distinct from :class:`StatementRefusedError` so an unreadable file
+    and a bad confirmation are never confused in a traceback.
+    """
+
+
+def apply_recovery(
+    session: Session, outcome: SweepOutcome, *, confirm: str
+) -> list[str]:
+    """Project every recovered fill. Returns the execution ids written.
+
+    One transaction per fill, because ``FillProjector.apply`` owns its own
+    and refuses a session carrying pending work. A failure partway therefore
+    leaves the fills before it COMMITTED -- which is right: a purchase that
+    really happened must never be rolled back to tidy up a later row's
+    failure. The caller reports how far it got, and a re-run resumes
+    (``already_recorded`` skips what landed).
+    """
+    if confirm != CONFIRMATION:
+        raise RecoveryRefusedError(
+            f"exact confirmation required: expected {CONFIRMATION!r}"
+        )
+    # `plan_sweep` un-expired the intents whose EXPIRED was written on
+    # absence (AC4), and `restore_absent_terminalization` only FLUSHES.
+    # `FillProjector.apply` opens with `_end_read_only_autobegin`, which
+    # ROLLS BACK a clean in-transaction session -- so without this commit the
+    # correction is silently undone and the fill lands against an intent that
+    # is still EXPIRED. The projector accepts that (EXPIRED is in its
+    # fillable set) and `_advance_intent` returns early on a terminal status,
+    # leaving the intent terminal-and-wrong forever. Committing here rather
+    # than asking callers to remember it: this failure is invisible at the
+    # call site and permanent in the book.
+    session.commit()
+    projector = FillProjector(session)
+    applied: list[str] = []
+    for fill in outcome.recovered:
+        if projector.apply(fill):
+            applied.append(fill.execution_id)
+    return applied
+
+
+def _render(outcome: SweepOutcome, executions: Sequence[SweptExecution]) -> str:
+    by_id = {execution.execution_id: execution for execution in executions}
+    lines = []
+    cost = 0.0
+    for fill in outcome.recovered:
+        execution = by_id[fill.execution_id]
+        notional = execution.quantity * execution.price
+        cost += notional + execution.commission
+        lines.append(
+            f"  RECOVER  {execution.ticker:<6} order {execution.ib_order_id:<5} "
+            f"{execution.quantity:>10,.4f} @ {execution.price:>10,.4f}  "
+            f"commission {execution.commission:>7,.2f}  "
+            f"= {notional:>12,.2f}  ({execution.execution_id})"
+        )
+    for order_id in outcome.untracked:
+        lines.append(
+            f"  UNTRACKED order {order_id} -- no order_intents row the book "
+            "can attribute this to, or an intent terminal for a reason the "
+            "broker record does not refute. NOT projected."
+        )
+    for execution_id in outcome.deferred:
+        lines.append(
+            f"  DEFERRED {execution_id} -- the commission cannot be expressed "
+            "in USD, and the projector would reject the message permanently. "
+            "Left entirely alone so it can be decided again."
+        )
+    lines.append("")
+    lines.append(
+        f"  {len(outcome.recovered)} to recover, "
+        f"{outcome.already_recorded} already recorded, "
+        f"{len(outcome.untracked)} untracked, "
+        f"{len(outcome.deferred)} deferred"
+    )
+    lines.append(f"  cost basis to be restored: {cost:,.2f}")
+    return "\n".join(lines)
+
+
+#: What a rollback of THIS repair needs. ``dump_paper_state`` covers
+#: equity_snapshots, trades, positions and portfolio_config — the four
+#: tables ``--reset`` wipes — but this repair also writes ``order_intents``
+#: (the AC4 correction) and ``execution_fills`` (the immutable audit row),
+#: and a dump without them cannot put either back. They are added here
+#: rather than to ``STATE_TABLES`` because that tuple also drives
+#: ``reset_paper_state``, which would then start DELETING the ledger.
+_DUMP_TABLES = (*STATE_TABLES, OrderIntent, ExecutionFill)
+
+
+def _dump_pre_repair(engine, out_path: Path) -> Path:
+    """Serialize the book as it stands, through a session of its own.
+
+    The session that planned the repair is carrying the un-expiring
+    ``plan_sweep`` performed (AC4), unflushed. Dumping through it would
+    autoflush and record those intents SUBMITTED — so restoring from the
+    "pre-repair" dump would leave them non-terminal, holding reservations
+    nothing will ever release. A fresh session sees committed state only,
+    which is what "before the repair" means.
+    """
+    payload = {}
+    with Session(engine) as reader:
+        for model in _DUMP_TABLES:
+            columns = [column.name for column in model.__table__.columns]
+            payload[model.__table__.name] = [
+                {column: getattr(row, column) for column in columns}
+                for row in reader.query(model).all()
+            ]
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2, default=str))
+    return out_path
+
+
+def _artifact(
+    *,
+    statement: Path,
+    outcome: SweepOutcome,
+    executions: Sequence[SweptExecution],
+    applied: Sequence[str],
+    stamp: str,
+) -> dict:
+    by_id = {execution.execution_id: execution for execution in executions}
+    dates = sorted({by_id[e].executed_at.date().isoformat() for e in applied})
+    return {
+        "repair": "KAN-88 restore_missed_entries",
+        "applied_at": stamp,
+        "statement": str(statement),
+        "statement_sha256": sha256(statement.read_bytes()).hexdigest(),
+        "recovery_source": RECOVERY_SOURCE_STATEMENT,
+        "execution_dates": dates,
+        "applied": [
+            {
+                "execution_id": execution_id,
+                "ib_order_id": by_id[execution_id].ib_order_id,
+                "ticker": by_id[execution_id].ticker,
+                "con_id": by_id[execution_id].con_id,
+                "side": by_id[execution_id].side,
+                "quantity": by_id[execution_id].quantity,
+                "price": by_id[execution_id].price,
+                "commission": by_id[execution_id].commission,
+                "commission_currency": by_id[execution_id].commission_currency,
+                "executed_at": by_id[execution_id].executed_at.isoformat(),
+            }
+            for execution_id in applied
+        ],
+        "untracked": list(outcome.untracked),
+        "deferred": list(outcome.deferred),
+        # AC3's "explicitly dated and explained" branch. The ledger is
+        # corrected; the recorded series is not, and saying so here is the
+        # correction.
+        "equity_series_note": (
+            "equity_snapshots rows dated from "
+            f"{dates[0] if dates else 'the execution date'} to {stamp[:10]} "
+            "overstate cash and understate market value by the cost basis "
+            "restored above, because the book did not know it held these "
+            "positions. Those rows are NOT rewritten: correcting them needs "
+            "per-position daily marks that were never stored (the same "
+            "limitation scripts/ops/backfill_restored_equity.py documents). "
+            "The series is correct from the next snapshot after applied_at; "
+            "the step between is this repair, not a trade."
+        ),
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Rebuild entry fills from an IB Account Management statement, "
+            "for executions reqExecutions can no longer serve."
+        )
+    )
+    parser.add_argument(
+        "--statement", required=True,
+        help="IB Flex Query 'Trades' CSV, exported with DateTime in UTC",
+    )
+    parser.add_argument(
+        "--account", default=None,
+        help="the paper account this repair is for; any other is refused",
+    )
+    parser.add_argument("--database-url", default=None)
+    parser.add_argument(
+        "--artifact-dir", default="output/repairs",
+        help="where the pre-repair state dump and the applied artifact land",
+    )
+    parser.add_argument(
+        "--apply", action="store_true",
+        help="Write the recovery (default: dry-run report only).",
+    )
+    args = parser.parse_args(argv)
+
+    statement = Path(args.statement)
+    executions = load_statement(statement, account_id=args.account)
+    url = args.database_url or load_config("config/default.yaml").database.url
+    engine = create_engine(url)
+
+    with Session(engine) as session:
+        outcome = plan_sweep(
+            executions,
+            OrderLedger(session),
+            recovery_source=RECOVERY_SOURCE_STATEMENT,
+        )
+        # NOT committed here. Planning un-expires intents as a side effect
+        # (AC4), and on any path that does not go on to apply, that
+        # correction must be discarded -- a report-only command that quietly
+        # moves 15 intents out of a terminal state is a write, whatever it
+        # prints. `apply_recovery` commits it when the operator confirms.
+        print(f"\n{statement}\n")
+        print(_render(outcome, executions))
+
+        # A partial repair leaves the book half-right and reconciliation
+        # still fail-closed, which is the state this whole exercise exists
+        # to leave. The operator sees why first.
+        if outcome.untracked or outcome.deferred:
+            print(
+                "\nRefusing to apply: the statement contains executions this "
+                "cannot recover (listed above). Resolve them first -- a "
+                "partial repair leaves entries fail-closed anyway."
+            )
+            session.rollback()
+            return 1
+        if not outcome.recovered:
+            print("\nNothing to recover. The book already has these fills.")
+            session.rollback()
+            return 0
+        if not args.apply:
+            print("\nDry-run only. Re-run with --apply to write it.")
+            session.rollback()
+            return 0
+        if not sys.stdin.isatty():
+            session.rollback()
+            raise RecoveryRefusedError("--apply requires an interactive TTY")
+
+        artifact_dir = Path(args.artifact_dir)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        # The rollback path, written BEFORE the prompt so it exists even if
+        # the operator walks away at the confirmation.
+        dump = _dump_pre_repair(
+            engine, artifact_dir / f"paper_state_pre_entry_restore_{stamp}.json"
+        )
+        print(f"\nPre-repair state dumped to {dump}")
+
+        answer = input(f"\nType {CONFIRMATION} to write these entries: ")
+        applied = apply_recovery(session, outcome, confirm=answer.strip())
+
+        artifact_path = artifact_dir / f"entry_restore_{stamp}.json"
+        artifact_path.write_text(json.dumps(
+            _artifact(
+                statement=statement,
+                outcome=outcome,
+                executions=executions,
+                applied=applied,
+                stamp=datetime.now(timezone.utc).isoformat(),
+            ),
+            indent=2,
+        ))
+        print(f"Recovered {len(applied)} fill(s). Artifact: {artifact_path}")
+        print(
+            "\nNow run:  python scripts/reconcile_paper.py --report\n"
+            "and confirm severity: ok / entries_allowed: true before the "
+            "next 04:15."
+        )
+        return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

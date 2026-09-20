@@ -8,16 +8,41 @@ the AMD row below is the first of them.
 from __future__ import annotations
 
 import csv
+import io
+import json
 from datetime import datetime, timezone
 
 import pytest
 
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.orm import Session
+
 from scripts.ops.restore_missed_entries import (
+    CONFIRMATION,
     REQUIRED_COLUMNS,
+    RecoveryRefusedError,
     StatementRefusedError,
+    apply_recovery,
     load_statement,
+    main,
     parse_statement,
 )
+from services.execution.execution_sweep import (
+    RECOVERY_SOURCE_STATEMENT,
+    plan_sweep,
+)
+from shared.models import (
+    Base,
+    ExecutionFill,
+    OrderIntent,
+    OrderStatus,
+    PortfolioConfig,
+    Position,
+    Trade,
+)
+from shared.order_ledger import ABSENT_AT_IB_REASON, OrderLedger
+
+NOW = datetime(2026, 9, 18, 13, 31, 2, tzinfo=timezone.utc)
 
 
 def _row(**overrides) -> dict[str, str]:
@@ -206,3 +231,314 @@ def test_a_statement_file_is_read_from_disk(tmp_path):
     [execution] = load_statement(path)
 
     assert execution.ticker == "AMD"
+
+
+# --------------------------------------------------------------------------
+# Applying
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def session():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db_session:
+        db_session.add(PortfolioConfig(
+            portfolio="momentum", capital=30_000, cash=30_000,
+            created_at=NOW, updated_at=NOW,
+        ))
+        db_session.commit()
+        yield db_session
+
+
+def _expired_intent(
+    session,
+    *,
+    recommendation_id: str = "rec-amd",
+    ib_order_id: str = "189",
+    ticker: str = "AMD",
+    con_id: int = 4391,
+    requested: float = 5.0809,
+    reason: str = ABSENT_AT_IB_REASON,
+) -> OrderIntent:
+    """An intent as the 2026-09-19 restart left it.
+
+    ``restore_broker_tracking -> restore_order_by_ref`` terminalized all 17
+    intents for orders 189-205 EXPIRED with ABSENT_AT_IB_REASON. For the 15
+    that filled, that status is factually wrong.
+    """
+    intent = OrderIntent(
+        recommendation_id=recommendation_id,
+        account_id="DUN551088",
+        mode="paper",
+        portfolio="momentum",
+        con_id=con_id,
+        symbol=ticker,
+        exchange="NASDAQ",
+        currency="USD",
+        action="BUY",
+        requested_quantity=requested,
+        limit_price=162.0,
+        order_type="LMT",
+        reserved_notional=requested * 162.0,
+        filled_quantity=0,
+        status=OrderStatus.EXPIRED.value,
+        reason=reason,
+        ib_order_id=ib_order_id,
+        created_at=NOW,
+        updated_at=NOW,
+        submitted_at=NOW,
+        terminal_at=NOW,
+    )
+    session.add(intent)
+    session.commit()
+    return intent
+
+
+def _plan(session, rows=None):
+    return plan_sweep(
+        parse_statement(rows if rows is not None else [_row()]),
+        OrderLedger(session),
+        recovery_source=RECOVERY_SOURCE_STATEMENT,
+    )
+
+
+def test_a_statement_fill_opens_the_position(session):
+    """AC1/AC2/AC3. The position, the trade at the statement price and the
+    cash movement all come out of the ordinary projector path -- the same
+    one a live fill takes, which is why the accounting is trustworthy."""
+    _expired_intent(session)
+
+    apply_recovery(session, _plan(session), confirm=CONFIRMATION)
+
+    position = session.scalar(
+        select(Position).where(Position.con_id == 4391)
+    )
+    assert position is not None
+    assert position.quantity == 5.0
+    assert position.avg_entry_price == 161.42
+
+    # AC2. `trades` rows are ROUND TRIPS in this schema -- paper_state.py:277
+    # writes one only on the sell, carrying entry_price off the position. So
+    # an entry's real fill price lives on the position and on the immutable
+    # execution_fills audit row, and reaches `trades` when the position is
+    # closed. Writing a buy-side Trade row here would be a shape nothing else
+    # in the book produces, and would double-count on the eventual sell.
+    fill = session.scalar(select(ExecutionFill))
+    assert fill.price == 161.42
+    assert fill.commission == 1.0
+    assert session.scalar(select(func.count()).select_from(Trade)) == 0
+
+    # 30,000 - (5 x 161.42) - 1.00 commission
+    config = session.scalar(
+        select(PortfolioConfig).where(PortfolioConfig.portfolio == "momentum")
+    )
+    assert config.cash == pytest.approx(30_000 - 807.10 - 1.0)
+
+
+def test_a_wrongly_expired_intent_is_restored_then_filled(session):
+    """AC4. _advance_intent returns early on a terminal status, so the
+    projector alone would leave these EXPIRED forever even once the fill is
+    recorded. 5.0809 requested against 5 filled is whole-share rounding --
+    a sub-one-share shortfall -- so FILLED is the correct end state."""
+    _expired_intent(session)
+
+    apply_recovery(session, _plan(session), confirm=CONFIRMATION)
+
+    intent = session.scalar(select(OrderIntent))
+    assert intent.status == OrderStatus.FILLED.value
+    assert intent.reason is None
+    assert intent.filled_quantity == 5.0
+
+
+def test_the_intent_correction_survives_into_the_projection(session):
+    """restore_absent_terminalization only FLUSHES, and FillProjector.apply
+    opens with _end_read_only_autobegin, which rolls back a clean
+    in-transaction session. Without a commit in between, the AC4 correction
+    is silently undone and the fill lands against an EXPIRED intent -- which
+    the projector accepts, leaving the intent terminal-and-wrong forever.
+    apply_recovery owns that commit so no caller can forget it."""
+    _expired_intent(session)
+
+    outcome = _plan(session)          # deliberately NO commit here
+    apply_recovery(session, outcome, confirm=CONFIRMATION)
+
+    assert session.scalar(select(OrderIntent)).status == OrderStatus.FILLED.value
+
+
+def test_an_intent_expired_for_a_real_reason_is_left_alone(session):
+    """restore_absent_terminalization refuses any reason but absence. A
+    genuinely expired order stays expired, and the execution is reported
+    untracked rather than forced through."""
+    _expired_intent(session, reason="cancelled by risk")
+
+    outcome = _plan(session)
+
+    assert outcome.recovered == ()
+    assert outcome.untracked == ("189",)
+    assert session.scalar(select(OrderIntent)).status == OrderStatus.EXPIRED.value
+
+
+def test_an_execution_with_no_intent_is_never_projected(session):
+    """No order_intents row means the book cannot attribute the fill to a
+    sleeve, and the projector would reject it anyway."""
+    outcome = _plan(session)
+
+    assert outcome.recovered == ()
+    assert outcome.untracked == ("189",)
+
+
+def test_re_running_the_repair_changes_nothing(session):
+    """AC7. Idempotent: the second run recognises the execution and skips."""
+    _expired_intent(session)
+    apply_recovery(session, _plan(session), confirm=CONFIRMATION)
+
+    second = _plan(session)
+    assert second.recovered == ()
+    assert second.already_recorded == 1
+    assert apply_recovery(session, second, confirm=CONFIRMATION) == []
+
+    assert session.scalar(
+        select(func.count()).select_from(Position)
+    ) == 1
+    assert session.scalar(select(func.count()).select_from(ExecutionFill)) == 1
+    assert session.scalar(select(Position)).quantity == 5.0
+
+
+def test_every_recovered_fill_is_marked(session):
+    """AC6. Evidence rebuilt from a statement weeks later must never be
+    indistinguishable from evidence observed on the day."""
+    _expired_intent(session)
+
+    apply_recovery(session, _plan(session), confirm=CONFIRMATION)
+
+    fill = session.scalar(select(ExecutionFill))
+    assert fill.recovery_source == "ib_statement"
+    assert fill.recovered_at is not None
+    assert fill.projection_applied is True
+
+
+def test_a_wrong_confirmation_writes_nothing(session):
+    _expired_intent(session)
+    outcome = _plan(session)
+
+    with pytest.raises(RecoveryRefusedError, match="RESTORE MISSED ENTRIES"):
+        apply_recovery(session, outcome, confirm="yes")
+
+    assert session.scalar(
+        select(func.count()).select_from(ExecutionFill)
+    ) == 0
+    assert session.scalar(select(func.count()).select_from(Position)) == 0
+
+
+def test_a_dry_run_writes_nothing(tmp_path, capsys):
+    """The default is report-only; --apply is the only way to touch a book."""
+    url = f"sqlite:///{tmp_path / 'book.db'}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    with Session(engine) as db_session:
+        _expired_intent(db_session)
+
+    statement = _write_csv(tmp_path / "trades.csv", [_row()])
+    assert main(["--statement", str(statement), "--database-url", url]) == 0
+
+    out = capsys.readouterr().out
+    assert "Dry-run" in out
+    assert "AMD" in out
+    with Session(engine) as db_session:
+        assert db_session.scalar(
+            select(func.count()).select_from(ExecutionFill)
+        ) == 0
+        # plan_sweep un-expires intents as it plans (AC4). On a dry run that
+        # correction must not survive: a report-only command that quietly
+        # moves 15 intents out of a terminal state is a write.
+        assert db_session.scalar(
+            select(OrderIntent)
+        ).status == OrderStatus.EXPIRED.value
+
+
+def test_a_dry_run_names_what_it_cannot_recover(tmp_path, capsys):
+    """An untracked execution must be visible BEFORE --apply: a partial
+    repair leaves the book half-right and reconciliation still fail-closed."""
+    url = f"sqlite:///{tmp_path / 'book.db'}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+
+    statement = _write_csv(tmp_path / "trades.csv", [_row()])
+    assert main(["--statement", str(statement), "--database-url", url]) == 1
+
+    assert "untracked" in capsys.readouterr().out
+
+
+def test_the_rollback_dump_records_the_state_before_the_repair(tmp_path, monkeypatch):
+    """The dump is the ROLLBACK path, so it must show the book as it stood
+    BEFORE anything was corrected. Planning un-expires intents in the
+    session, and a dump taken through that session would autoflush and
+    record them SUBMITTED -- restoring from it would leave 15 non-terminal
+    intents holding reservations nothing will ever release."""
+    url = f"sqlite:///{tmp_path / 'book.db'}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    with Session(engine) as db_session:
+        db_session.add(PortfolioConfig(
+            portfolio="momentum", capital=30_000, cash=30_000,
+            created_at=NOW, updated_at=NOW,
+        ))
+        db_session.commit()
+        _expired_intent(db_session)
+
+    statement = _write_csv(tmp_path / "trades.csv", [_row()])
+    monkeypatch.setattr("sys.stdin", io.StringIO(CONFIRMATION + "\n"))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("builtins.input", lambda *a: CONFIRMATION)
+
+    assert main([
+        "--statement", str(statement), "--database-url", url,
+        "--artifact-dir", str(tmp_path / "repairs"), "--apply",
+    ]) == 0
+
+    [dump] = list((tmp_path / "repairs").glob("paper_state_pre_entry_restore_*.json"))
+    payload = json.loads(dump.read_text())
+    [intent] = payload["order_intents"]
+    assert intent["status"] == "EXPIRED"
+    assert intent["reason"] == ABSENT_AT_IB_REASON
+
+    # And the repair itself still landed.
+    with Session(engine) as db_session:
+        assert db_session.scalar(select(OrderIntent)).status == "FILLED"
+
+
+def test_the_applied_artifact_dates_and_explains_the_equity_gap(tmp_path, monkeypatch):
+    """AC3's second branch. The ledger is corrected; equity_snapshots is a
+    RECORDED series and is not rewritten, so the artifact is where that
+    discontinuity is dated and explained."""
+    url = f"sqlite:///{tmp_path / 'book.db'}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    with Session(engine) as db_session:
+        db_session.add(PortfolioConfig(
+            portfolio="momentum", capital=30_000, cash=30_000,
+            created_at=NOW, updated_at=NOW,
+        ))
+        db_session.commit()
+        _expired_intent(db_session)
+
+    statement = _write_csv(tmp_path / "trades.csv", [_row()])
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("builtins.input", lambda *a: CONFIRMATION)
+
+    main([
+        "--statement", str(statement), "--database-url", url,
+        "--artifact-dir", str(tmp_path / "repairs"), "--apply",
+    ])
+
+    [artifact] = list((tmp_path / "repairs").glob("entry_restore_*.json"))
+    payload = json.loads(artifact.read_text())
+    assert payload["recovery_source"] == "ib_statement"
+    assert payload["execution_dates"] == ["2026-09-18"]
+    assert [a["execution_id"] for a in payload["applied"]] == [
+        "0000e0d5.68cb1234.01.01"
+    ]
+    assert payload["applied"][0]["price"] == 161.42
+    assert "equity_snapshots" in payload["equity_series_note"]
+    assert payload["statement_sha256"]
