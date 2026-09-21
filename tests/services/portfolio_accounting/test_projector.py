@@ -723,6 +723,42 @@ def test_material_partial_then_done_stays_partial_not_filled(session, projector)
     session.rollback()
 
 
+def test_a_swept_fill_records_its_provenance(projector, session):
+    """A fill recovered by the sweep is distinguishable from a live one.
+
+    The 04:52 digest counts recovered fills; without a marker on the row
+    there is nothing to count, because the projector is the only writer
+    and it cannot tell where the message came from.
+    """
+    seed_intent(session)
+    fill = make_fill(execution_id="exec-swept-1")
+    fill = fill.model_copy(update={"recovery_source": "ib_execution_sweep"})
+
+    assert projector.apply(fill) is True
+
+    row = session.scalar(
+        select(ExecutionFill).where(
+            ExecutionFill.execution_id == "exec-swept-1"
+        )
+    )
+    assert row.recovery_source == "ib_execution_sweep"
+
+
+def test_a_live_fill_has_no_recovery_source(projector, session):
+    """The default stays None so every existing fill reads as live."""
+    seed_intent(session)
+    fill = make_fill(execution_id="exec-live-1")
+
+    assert projector.apply(fill) is True
+
+    row = session.scalar(
+        select(ExecutionFill).where(
+            ExecutionFill.execution_id == "exec-live-1"
+        )
+    )
+    assert row.recovery_source is None
+
+
 def test_column_overflow_is_audited_and_raised_not_crashed(projector, session):
     """A DataError from sleeve accounting must behave like any unprojectable fill.
 

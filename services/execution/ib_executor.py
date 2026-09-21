@@ -8,8 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
 
-from shared.broker_state import optional_float, optional_str
+from shared.broker_state import commission_in_usd, optional_float, optional_str
 from shared.logging import get_logger
+from shared.order_ledger import ABSENT_AT_IB_REASON
 
 logger = get_logger("ib_executor")
 
@@ -34,20 +35,6 @@ OrderStatusHandler = Callable[[dict[str, Any]], Awaitable[None]]
 # resolve on its own (Error 1101). The executor has no alert publisher of its
 # own; ExecutionServiceRunner wires this to its ``_publish_alert``.
 ConnectivityAlertHandler = Callable[[dict[str, Any]], Awaitable[None]]
-
-
-def _commission_in_usd(
-    amount: float,
-    currency: str,
-    *,
-    fx_base_per_trading: float | None,
-) -> float | None:
-    if currency == "USD":
-        return amount
-    if currency == "SGD" and fx_base_per_trading is not None:
-        if math.isfinite(fx_base_per_trading) and fx_base_per_trading > 0:
-            return amount / fx_base_per_trading
-    return None
 
 
 @dataclass(frozen=True)
@@ -670,7 +657,7 @@ class IBExecutor:
                 "fill_price": float(fill.execution.price),
                 "commission": commission,
                 "commission_currency": commission_currency,
-                "commission_trading": _commission_in_usd(
+                "commission_trading": commission_in_usd(
                     commission,
                     commission_currency,
                     fx_base_per_trading=commission_fx_base_per_trading,
@@ -939,7 +926,7 @@ class IBExecutor:
             await self._order_status_handler({
                 "order_id": str(expected_order_id),
                 "status": "Expired",
-                "reason": "order absent from IB after session boundary",
+                "reason": ABSENT_AT_IB_REASON,
                 "order_absent_at_ib": True,
             })
             return False

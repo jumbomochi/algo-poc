@@ -33,7 +33,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import create_engine, func, select
@@ -47,6 +47,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from services.execution.execution_sweep import RECOVERY_SOURCE_SWEEP  # noqa: E402
 from shared.halt_state import HaltStateRepository  # noqa: E402
 from shared.models.market_data import OHLCVDaily  # noqa: E402
 from shared.models.order_ledger import (  # noqa: E402
@@ -91,6 +92,21 @@ class RunFacts:
     # when capture is disabled.
     capture_written: int = 0
     capture_expected: int = 0
+    # KAN-87. Recovered by the daily IB execution sweep. Counted the same way
+    # as `fills` (unscoped by mode; see the comment on `fills` in
+    # collect_facts) but over a window one day wider, and therefore NOT a
+    # subset of it — see RECOVERED_LOOKBACK. Reported whether zero or not: a
+    # sweep that silently recovers fills every day is hiding a worsening
+    # upstream problem, and the only way to notice the rate rising is to see
+    # the rate when it is normal.
+    fills_recovered: int = 0
+
+
+#: How far back of ``since`` the recovered-fill count reaches. One day: the
+#: recovered fill executed at the US open, which is the previous local
+#: calendar day in SGT. Wider, not unbounded — yesterday's recovery is not
+#: today's news.
+RECOVERED_LOOKBACK = timedelta(days=1)
 
 
 def collect_facts(
@@ -116,6 +132,23 @@ def collect_facts(
         select(func.count())
         .select_from(ExecutionFill)
         .where(ExecutionFill.executed_at >= since)
+    ) or 0
+
+    # Deliberately a day wider than `fills`. `since` is local (SGT) midnight,
+    # i.e. 16:00 UTC the previous day; the fill the sweep exists to recover is
+    # a resting day order that filled at the US open, 13:30 UTC — 21:30 SGT
+    # the *previous* calendar day. Bounded at `since` like everything else,
+    # this count read zero on exactly the nights the sweep did its job. The
+    # render labels the wider window so the two figures are not misread as
+    # subset and superset. (The narrower `fills` bound is left alone: that
+    # under-count predates KAN-87.)
+    fills_recovered = session.scalar(
+        select(func.count())
+        .select_from(ExecutionFill)
+        .where(
+            ExecutionFill.executed_at >= since - RECOVERED_LOOKBACK,
+            ExecutionFill.recovery_source == RECOVERY_SOURCE_SWEEP,
+        )
     ) or 0
 
     rejected = dict(
@@ -151,6 +184,7 @@ def collect_facts(
         submission_failed=int(rejected.get(OrderStatus.SUBMISSION_FAILED, 0)),
         capture_written=int(captured),
         capture_expected=int(capture_expected),
+        fills_recovered=int(fills_recovered),
     )
 
 
@@ -170,6 +204,7 @@ def render_summary(facts: RunFacts) -> str:
 
     line = (
         f"{halt} · fills:{facts.fills}"
+        f" ({facts.fills_recovered} recovered, 2-day window)"
         f" · rejected: risk {facts.risk_rejected}"
         f" / broker {facts.submission_failed}"
     )

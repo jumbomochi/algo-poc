@@ -166,6 +166,11 @@ class FillMessage(StreamSerializable):
     # True when IB reports the order terminal on this fill. Lets the projector
     # terminalize a whole-share-rounded order (placed < requested) as FILLED.
     order_done: bool = False
+    # Provenance. None = live execDetails callback. "ib_execution_sweep" =
+    # recovered by the daily sweep (KAN-87). Additive optional field with a
+    # default, so per the evolution rule at the top of this module it does
+    # NOT require a CURRENT_SCHEMA_VERSION bump.
+    recovery_source: str | None = None
 
 
 class AlertMessage(StreamSerializable):
