@@ -149,6 +149,19 @@ class ExecutionFill(Base):
     recovery_source: Mapped[str | None] = mapped_column(
         String(32), nullable=True
     )
+    #: When the book LEARNED of this fill, set only when it was recovered
+    #: rather than observed. ``executed_at`` is the broker's clock and can be
+    #: weeks older than the repair — KAN-88 rebuilt 2026-09-18 executions on
+    #: 2026-09-21 — so it cannot answer "what did we recover tonight", which
+    #: is the question the 04:52 digest exists to ask. ``None`` for every
+    #: fill the live callback delivered, and for every row written before
+    #: this column existed; the digest coalesces to ``executed_at`` there.
+    #:
+    #: Excluded from ``_IMMUTABLE_FILL_FIELDS`` for the same reason
+    #: ``recovery_source`` is — see the note above.
+    recovered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class CapitalSnapshot(Base):

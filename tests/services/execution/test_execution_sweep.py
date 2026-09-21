@@ -17,6 +17,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from services.execution.execution_sweep import (
+    RECOVERY_SOURCE_STATEMENT,
     RECOVERY_SOURCE_SWEEP,
     SweptExecution,
     executions_from_ib_fills,
@@ -528,3 +529,33 @@ def test_a_usd_execution_carries_no_fx_rate() -> None:
     [swept] = executions_from_ib_fills([fill], fx_base_per_trading=1.30)
 
     assert swept.commission_fx_base_per_trading is None
+
+
+def test_a_caller_can_name_the_recovery_source(session) -> None:
+    """KAN-88 AC6. A statement repair and the nightly sweep must be countable
+    apart: 15 fills rebuilt by hand on one day and 15 recovered by the sweep
+    over two weeks say very different things about the system's health."""
+    ledger = OrderLedger(session)
+    _submitted_intent(session, ledger, "rec-amd", ib_order_id="189")
+
+    outcome = plan_sweep(
+        [_execution(ib_order_id="189", execution_id="stmt-189")],
+        ledger,
+        recovery_source=RECOVERY_SOURCE_STATEMENT,
+    )
+
+    assert [fill.recovery_source for fill in outcome.recovered] == ["ib_statement"]
+
+
+def test_the_sweep_source_is_still_the_default(session) -> None:
+    """The nightly sweep passes nothing and must be entirely unaffected."""
+    ledger = OrderLedger(session)
+    _submitted_intent(session, ledger, "rec-nvda", ib_order_id="190")
+
+    outcome = plan_sweep(
+        [_execution(ib_order_id="190", execution_id="exec-190")], ledger
+    )
+
+    assert [fill.recovery_source for fill in outcome.recovered] == [
+        "ib_execution_sweep"
+    ]

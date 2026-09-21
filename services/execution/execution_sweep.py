@@ -27,6 +27,14 @@ from shared.schemas.messages import FillMessage
 #: recovers fills every day is hiding a worsening upstream problem.
 RECOVERY_SOURCE_SWEEP = "ib_execution_sweep"
 
+#: Written instead for a fill rebuilt from an IB Account Management
+#: statement, weeks after the fact (KAN-88). Distinct from the sweep's
+#: value on purpose: the sweep recovering fills night after night is a
+#: worsening upstream problem, whereas a statement repair is a one-off
+#: with a human behind it. Counting them together would hide the first
+#: inside the second.
+RECOVERY_SOURCE_STATEMENT = "ib_statement"
+
 #: The states the projector can advance to FILLED/PARTIALLY_FILLED.
 #: Mirrors ``ALLOWED_TRANSITIONS`` in ``shared.order_ledger``.
 _FILLABLE_STATUSES = ("SUBMITTED", "PARTIALLY_FILLED")
@@ -76,7 +84,10 @@ class SweepOutcome:
 
 
 def plan_sweep(
-    executions: Sequence[SweptExecution], ledger: OrderLedger
+    executions: Sequence[SweptExecution],
+    ledger: OrderLedger,
+    *,
+    recovery_source: str = RECOVERY_SOURCE_SWEEP,
 ) -> SweepOutcome:
     """Decide what to do with each execution IB reports.
 
@@ -146,7 +157,9 @@ def plan_sweep(
             continue
 
         recovered.append(
-            _to_fill_message(execution, intent, commission_trading)
+            _to_fill_message(
+                execution, intent, commission_trading, recovery_source
+            )
         )
 
     return SweepOutcome(
@@ -159,7 +172,10 @@ def plan_sweep(
 
 
 def _to_fill_message(
-    execution: SweptExecution, intent: object, commission_trading: float
+    execution: SweptExecution,
+    intent: object,
+    commission_trading: float,
+    recovery_source: str = RECOVERY_SOURCE_SWEEP,
 ) -> FillMessage:
     """Build the same message the live callback would have published.
 
@@ -205,7 +221,7 @@ def _to_fill_message(
         # NOTE: the field is `requested_quantity` on OrderIntent — there is
         # no `intent.quantity`. `quantity` belongs to ExecutionFill.
         order_done=shortfall < 1.0,
-        recovery_source=RECOVERY_SOURCE_SWEEP,
+        recovery_source=recovery_source,
     )
 
 

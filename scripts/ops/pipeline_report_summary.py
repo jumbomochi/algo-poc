@@ -47,7 +47,6 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from services.execution.execution_sweep import RECOVERY_SOURCE_SWEEP  # noqa: E402
 from shared.halt_state import HaltStateRepository  # noqa: E402
 from shared.models.market_data import OHLCVDaily  # noqa: E402
 from shared.models.order_ledger import (  # noqa: E402
@@ -142,12 +141,22 @@ def collect_facts(
     # render labels the wider window so the two figures are not misread as
     # subset and superset. (The narrower `fills` bound is left alone: that
     # under-count predates KAN-87.)
+    #
+    # Any recovery, not only the sweep's: KAN-88 rebuilds fills from an IB
+    # Account Management statement and those must be counted too. Bounded on
+    # `recovered_at` where it exists, falling back to `executed_at` for rows
+    # written before that column did. A statement repair carries an
+    # `executed_at` days older than any window, so bounding on the broker's
+    # clock alone reported zero on exactly the night the operator did the
+    # work — the same blind spot described above, one level up.
     fills_recovered = session.scalar(
         select(func.count())
         .select_from(ExecutionFill)
         .where(
-            ExecutionFill.executed_at >= since - RECOVERED_LOOKBACK,
-            ExecutionFill.recovery_source == RECOVERY_SOURCE_SWEEP,
+            func.coalesce(
+                ExecutionFill.recovered_at, ExecutionFill.executed_at
+            ) >= since - RECOVERED_LOOKBACK,
+            ExecutionFill.recovery_source.is_not(None),
         )
     ) or 0
 

@@ -113,6 +113,19 @@ execution service under `ib.client_id`. Full reasoning, and the
 `execution_sweep_blind` alert that fires if the setting is lost, are in
 [deploy/launchd/README.md](../../deploy/launchd/README.md#ib-gateway-api-settings-master-api-client-id-kan-87).
 
+## Recovering fills the executor never saw
+
+The sweep above covers the previous session. Anything older is beyond
+`reqExecutions` and has to come from an IB Account Management statement:
+
+- a position the book does not know it **owns** →
+  [restore-missed-entries.md](restore-missed-entries.md)
+- a position the book thinks it **holds** and IB does not →
+  `scripts/ops/restore_missed_exit.py`
+
+Both are operator procedures with a dry run, an exact confirmation and a
+rollback dump.
+
 ## How to re-check these numbers
 
 ```bash
