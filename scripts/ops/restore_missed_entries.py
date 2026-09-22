@@ -130,6 +130,15 @@ REQUIRED_COLUMNS = frozenset({
     "DateTime",
 })
 
+#: Canonical spelling of every required column, keyed by its casefolded
+#: form. IB is not consistent with itself: the documented Flex field is
+#: ``ConID``, the picker labels it "Conid", and the CSV the 2026-09-18
+#: export actually produced writes ``Conid``. Matching a broker's
+#: capitalisation is not a safety guard -- it is an accident, and it
+#: refused a correct export. Nothing downstream is case-sensitive, so the
+#: header is normalized once, here.
+_CANONICAL_COLUMNS = {column.casefold(): column for column in REQUIRED_COLUMNS}
+
 _SIDE = {"BUY": "buy", "SELL": "sell"}
 
 #: Regular US trading hours in UTC, widened either side. Used only to FLAG a
@@ -181,6 +190,36 @@ _DATETIME_FORMATS = (
     "%Y-%m-%d, %H:%M:%S",
     "%Y-%m-%dT%H:%M:%S",
 )
+
+
+def _canonical_row(row: Mapping[str, str], index: int) -> dict[str, str]:
+    """Map a statement row onto canonical column names, ignoring casing.
+
+    Columns this tool does not need are dropped rather than refused: a Flex
+    query with extra fields ticked is a fine export, and demanding exactly
+    thirteen would send the operator back to the UI for nothing.
+
+    Two spellings of ONE column in the same file IS refused. That is an
+    ambiguous export, not a convenience -- silently picking one could pick
+    the wrong one, and the value that lost would never be seen again.
+    """
+    canonical: dict[str, str] = {}
+    source: dict[str, str] = {}
+    for key, value in row.items():
+        if key is None:
+            continue
+        column = _CANONICAL_COLUMNS.get(str(key).strip().casefold())
+        if column is None:
+            continue
+        if column in canonical:
+            raise StatementRefusedError(
+                f"row {index} carries {column} twice, as {source[column]!r} "
+                f"and {key!r}. Which one is authoritative cannot be guessed, "
+                "so re-export without the duplicate."
+            )
+        canonical[column] = value
+        source[column] = key
+    return canonical
 
 
 def _text(row: Mapping[str, str], column: str, index: int) -> str:
@@ -259,7 +298,8 @@ def parse_statement(
     skipped_sells: list[str] = []
     seen: set[str] = set()
 
-    for index, row in enumerate(rows, start=1):
+    for index, raw_row in enumerate(rows, start=1):
+        row = _canonical_row(raw_row, index)
         missing = sorted(REQUIRED_COLUMNS - set(row))
         if missing:
             raise StatementRefusedError(

@@ -30,7 +30,12 @@ If instead the book holds a position IB does not, stop — that is
 In IB Account Management: **Performance & Reports > Flex Queries**, an
 **Activity Flex Query** with the **Trades** section.
 
-Required fields, exactly these thirteen:
+Required fields, these thirteen — **capitalisation does not matter**, and
+extra fields are ignored, so tick more if it is easier. IB is not
+consistent with itself here: the documented field is `ConID`, the picker
+says "Conid", and the export writes `Conid`. All three are accepted. What
+*is* refused is the same column twice in two spellings, which is an
+ambiguous export.
 
 ```
 ClientAccountID  TradeID     IBOrderID  ConID    Symbol
@@ -196,7 +201,9 @@ rejected one is burned; do not re-run `--apply` hoping to catch it.
 
 | Refusal | Cause | Do this |
 |---|---|---|
-| `missing required column(s)` | Wrong Flex field set | Re-export with all thirteen |
+| `missing required column(s)` | Wrong Flex field set | Re-export with all thirteen (casing is irrelevant) |
+| `carries <column> twice` | Two spellings of one field ticked | Re-export without the duplicate |
+| Header-only file (0 rows) | Date range missed the trade date | Re-run with a **custom** range covering the trade date, not "Last Business Day" |
 | `unreadable DateTime` | Unsupported format | Re-export; UTC, one of the listed formats |
 | `has no TradePrice` / `not usable` | Blank or zero economics | Re-export. Never fill in by hand |
 | `not an IB paper account` | A `U*` account | Live ledgers are not reconstructed by script |
