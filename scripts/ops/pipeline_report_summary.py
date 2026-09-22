@@ -33,7 +33,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import create_engine, func, select
@@ -91,6 +91,21 @@ class RunFacts:
     # when capture is disabled.
     capture_written: int = 0
     capture_expected: int = 0
+    # KAN-87. Recovered by the daily IB execution sweep. Counted the same way
+    # as `fills` (unscoped by mode; see the comment on `fills` in
+    # collect_facts) but over a window one day wider, and therefore NOT a
+    # subset of it — see RECOVERED_LOOKBACK. Reported whether zero or not: a
+    # sweep that silently recovers fills every day is hiding a worsening
+    # upstream problem, and the only way to notice the rate rising is to see
+    # the rate when it is normal.
+    fills_recovered: int = 0
+
+
+#: How far back of ``since`` the recovered-fill count reaches. One day: the
+#: recovered fill executed at the US open, which is the previous local
+#: calendar day in SGT. Wider, not unbounded — yesterday's recovery is not
+#: today's news.
+RECOVERED_LOOKBACK = timedelta(days=1)
 
 
 def collect_facts(
@@ -116,6 +131,33 @@ def collect_facts(
         select(func.count())
         .select_from(ExecutionFill)
         .where(ExecutionFill.executed_at >= since)
+    ) or 0
+
+    # Deliberately a day wider than `fills`. `since` is local (SGT) midnight,
+    # i.e. 16:00 UTC the previous day; the fill the sweep exists to recover is
+    # a resting day order that filled at the US open, 13:30 UTC — 21:30 SGT
+    # the *previous* calendar day. Bounded at `since` like everything else,
+    # this count read zero on exactly the nights the sweep did its job. The
+    # render labels the wider window so the two figures are not misread as
+    # subset and superset. (The narrower `fills` bound is left alone: that
+    # under-count predates KAN-87.)
+    #
+    # Any recovery, not only the sweep's: KAN-88 rebuilds fills from an IB
+    # Account Management statement and those must be counted too. Bounded on
+    # `recovered_at` where it exists, falling back to `executed_at` for rows
+    # written before that column did. A statement repair carries an
+    # `executed_at` days older than any window, so bounding on the broker's
+    # clock alone reported zero on exactly the night the operator did the
+    # work — the same blind spot described above, one level up.
+    fills_recovered = session.scalar(
+        select(func.count())
+        .select_from(ExecutionFill)
+        .where(
+            func.coalesce(
+                ExecutionFill.recovered_at, ExecutionFill.executed_at
+            ) >= since - RECOVERED_LOOKBACK,
+            ExecutionFill.recovery_source.is_not(None),
+        )
     ) or 0
 
     rejected = dict(
@@ -151,6 +193,7 @@ def collect_facts(
         submission_failed=int(rejected.get(OrderStatus.SUBMISSION_FAILED, 0)),
         capture_written=int(captured),
         capture_expected=int(capture_expected),
+        fills_recovered=int(fills_recovered),
     )
 
 
@@ -170,6 +213,7 @@ def render_summary(facts: RunFacts) -> str:
 
     line = (
         f"{halt} · fills:{facts.fills}"
+        f" ({facts.fills_recovered} recovered, 2-day window)"
         f" · rejected: risk {facts.risk_rejected}"
         f" / broker {facts.submission_failed}"
     )

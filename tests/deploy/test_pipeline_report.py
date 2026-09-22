@@ -70,12 +70,14 @@ def _halt(session, *, mode="paper", active=True, reason="daily drawdown -6.2%",
     session.commit()
 
 
-def _fill(session, *, at=DURING, symbol="AAPL"):
+def _fill(session, *, at=DURING, symbol="AAPL", recovery_source=None,
+          recovered_at=None):
     n = session.query(ExecutionFill).count()
     session.add(ExecutionFill(
         account_id="DUN551088", execution_id=f"exec-{n}", ib_order_id=str(n),
         con_id=1 + n, symbol=symbol, exchange="SMART", currency="USD",
         side="BUY", quantity=10.0, price=100.0, executed_at=at,
+        recovery_source=recovery_source, recovered_at=recovered_at,
     ))
     session.commit()
 
@@ -168,6 +170,79 @@ def test_non_rejected_intents_are_not_counted_as_rejections(session):
     summary = render_summary(_facts(session))
     assert "risk 0" in summary
     assert "broker 0" in summary
+
+
+def test_recovered_fills_are_counted_and_rendered(session):
+    _fill(session, recovery_source=None)
+    _fill(session, symbol="MSFT", recovery_source="ib_execution_sweep")
+
+    facts = _facts(session)
+
+    assert facts.fills == 2
+    assert facts.fills_recovered == 1
+    assert "1 recovered" in render_summary(facts)
+
+
+def test_zero_recovered_is_still_reported(session):
+    """Whether zero or not — a silent sweep hides a worsening problem."""
+    _fill(session, recovery_source=None)
+
+    facts = _facts(session)
+
+    assert facts.fills_recovered == 0
+    assert "0 recovered" in render_summary(facts)
+
+
+def test_a_recovered_fill_from_before_the_window_is_still_counted(session):
+    """KAN-87 / I5. ``SINCE`` is local (SGT) midnight = 16:00 UTC the previous
+    day. The fill this sweep exists to recover is a resting day order filling
+    at the US open — 13:30 UTC, i.e. 21:30 SGT the *previous* calendar day. On
+    the ``executed_at >= since`` bound the recovered count therefore read zero
+    on precisely the nights the sweep did its job, so the recovered figure is
+    bounded a day wider and labelled as such.
+    """
+    _fill(session, at=SINCE - timedelta(hours=3),
+          recovery_source="ib_execution_sweep")
+
+    facts = _facts(session)
+
+    assert facts.fills_recovered == 1
+    # The pre-existing `fills` bound is deliberately untouched: that
+    # under-count is not new and is out of scope here.
+    assert facts.fills == 0
+    assert "1 recovered" in render_summary(facts)
+    assert "2-day window" in render_summary(facts)
+
+
+def test_a_statement_repair_is_counted_on_the_night_it_is_applied(session):
+    """KAN-88 AC6. The execution is nine days old -- it is the REPAIR that is
+    tonight's news. Bounded on the broker's clock alone this reported zero on
+    exactly the night the operator did the work, which is the same blind spot
+    the sweep had before I5."""
+    _fill(session, at=SINCE - timedelta(days=9),
+          recovery_source="ib_statement", recovered_at=DURING)
+
+    facts = _facts(session)
+
+    assert facts.fills_recovered == 1
+    assert "1 recovered" in render_summary(facts)
+
+
+def test_a_statement_repair_applied_before_the_window_is_excluded(session):
+    """Wider, not unbounded -- last week's repair is not tonight's news,
+    however recent the execution it rebuilt."""
+    _fill(session, at=DURING, recovery_source="ib_statement",
+          recovered_at=SINCE - timedelta(days=2))
+
+    assert _facts(session).fills_recovered == 0
+
+
+def test_a_recovered_fill_older_than_the_wider_window_is_excluded(session):
+    """Wider, not unbounded — yesterday's recovery is not today's news."""
+    _fill(session, at=SINCE - timedelta(days=2),
+          recovery_source="ib_execution_sweep")
+
+    assert _facts(session).fills_recovered == 0
 
 
 def test_activity_before_the_window_is_excluded(session):

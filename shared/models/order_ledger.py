@@ -135,6 +135,33 @@ class ExecutionFill(Base):
     projection_applied: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
+    #: How this fill reached the book. ``None`` is the live ``execDetails``
+    #: callback — every row written before KAN-87 and every row written by
+    #: the normal path. ``"ib_execution_sweep"`` means the callback was
+    #: missed and the daily sweep re-read the execution from IB.
+    #:
+    #: Deliberately NOT in ``_IMMUTABLE_FILL_FIELDS``: a live callback can
+    #: legitimately re-report an execution the sweep already recorded (the
+    #: execution service reconnects and replays), and that arrives with
+    #: ``recovery_source=None`` against a stored ``"ib_execution_sweep"``.
+    #: Treating that as an identity conflict would dead-letter a fill whose
+    #: economics match perfectly.
+    recovery_source: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    #: When the book LEARNED of this fill, set only when it was recovered
+    #: rather than observed. ``executed_at`` is the broker's clock and can be
+    #: weeks older than the repair — KAN-88 rebuilt 2026-09-18 executions on
+    #: 2026-09-21 — so it cannot answer "what did we recover tonight", which
+    #: is the question the 04:52 digest exists to ask. ``None`` for every
+    #: fill the live callback delivered, and for every row written before
+    #: this column existed; the digest coalesces to ``executed_at`` there.
+    #:
+    #: Excluded from ``_IMMUTABLE_FILL_FIELDS`` for the same reason
+    #: ``recovery_source`` is — see the note above.
+    recovered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class CapitalSnapshot(Base):

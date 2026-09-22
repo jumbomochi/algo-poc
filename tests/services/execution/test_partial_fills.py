@@ -364,3 +364,32 @@ class TestIBExecutionIdentity:
         assert handler.await_args.args[0]["reason"] == (
             "IB completed order is Inactive"
         )
+
+    @pytest.mark.asyncio
+    async def test_absent_order_reason_is_the_shared_constant(self):
+        """The reason string is a contract between two modules.
+
+        ``OrderLedger.restore_absent_terminalization`` (and so the KAN-87
+        AC4 correction) only fires on an intent whose reason is *exactly*
+        ``ABSENT_AT_IB_REASON``. While the executor repeated the literal, an
+        edit to it here would have disabled that whole path with every test
+        still green — including the ledger's own, which builds its reason
+        from the constant. Both sides now read the one definition.
+        """
+        from services.execution.ib_executor import IBExecutor
+        from shared.order_ledger import ABSENT_AT_IB_REASON
+
+        executor = IBExecutor("h", 7497, 1)
+        fake_ib = MagicMock()
+        fake_ib.isConnected.return_value = True
+        fake_ib.openTrades.return_value = []
+        fake_ib.reqCompletedOrdersAsync = AsyncMock(return_value=[])
+        executor._ib = fake_ib
+        handler = AsyncMock()
+        executor.set_order_status_handler(handler)
+
+        assert await executor.restore_order_by_ref("rec-1", "9") is False
+
+        payload = handler.await_args.args[0]
+        assert payload["reason"] == ABSENT_AT_IB_REASON
+        assert payload["order_absent_at_ib"] is True

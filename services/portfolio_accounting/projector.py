@@ -210,6 +210,15 @@ class FillProjector:
             ),
             "cumulative_quantity": fill.cumulative_quantity,
             "executed_at": fill.timestamp,
+            "recovery_source": fill.recovery_source,
+            # Stamped here rather than carried on the message: the recovery
+            # time is a property of the WRITE, not of the broker's record.
+            # A message replayed twice would otherwise claim it was
+            # recovered when it was first built.
+            "recovered_at": (
+                datetime.now(timezone.utc)
+                if fill.recovery_source is not None else None
+            ),
         }
 
     def _existing_fill(self, values: dict[str, Any]) -> ExecutionFill | None:
