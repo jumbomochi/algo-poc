@@ -782,3 +782,77 @@ def test_a_refusal_is_a_message_not_a_traceback(tmp_path, capsys):
     assert main(["--statement", str(tmp_path / "nope.csv")]) == 2
 
     assert "no statement file" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# Header casing: IB's own field names are not stable across its surfaces
+# --------------------------------------------------------------------------
+
+
+def test_ib_header_casing_is_not_a_refusal():
+    """IB's Flex picker labels a field one way and exports it another: the
+    real 2026-09-18 export writes 'Conid', while the documented field name
+    is 'ConID'. Matching a broker's capitalisation is not a safety guard,
+    it is an accident -- and it refused a perfectly correct export."""
+    row = {
+        ("Conid" if key == "ConID" else key): value
+        for key, value in _row().items()
+    }
+
+    [execution] = parse_statement([row]).executions
+
+    assert execution.con_id == 4391
+
+
+def test_every_required_column_tolerates_any_casing():
+    """Not just ConID. Nothing about this file is case-sensitive to us."""
+    row = {key.upper(): value for key, value in _row().items()}
+
+    [execution] = parse_statement([row]).executions
+
+    assert execution.ticker == "AMD"
+    assert execution.side == "buy"
+    assert execution.price == 161.42
+    assert execution.executed_at == datetime(
+        2026, 9, 18, 13, 31, 2, tzinfo=timezone.utc
+    )
+
+
+def test_a_genuinely_missing_column_is_still_refused_by_name():
+    """Case-insensitivity must not become "accept anything"."""
+    row = {key.lower(): value for key, value in _row().items()}
+    del row["tradeprice"]
+
+    with pytest.raises(StatementRefusedError, match="TradePrice"):
+        parse_statement([row])
+
+
+def test_a_column_repeated_in_two_casings_is_refused():
+    """'Quantity' and 'QUANTITY' in one file is an ambiguous export, not a
+    convenience. Picking one silently could pick the wrong one."""
+    row = _row()
+    row["QUANTITY"] = "999"
+
+    with pytest.raises(StatementRefusedError, match="[Qq]uantity"):
+        parse_statement([row])
+
+
+def test_the_real_ib_export_header_is_accepted(tmp_path):
+    """The exact header IB produced for DUN551088 on 2026-09-22, verbatim."""
+    header = (
+        '"ClientAccountID","CurrencyPrimary","Symbol","Conid","TradeID",'
+        '"DateTime","Exchange","Quantity","TradePrice","IBCommission",'
+        '"IBCommissionCurrency","Buy/Sell","IBOrderID"'
+    )
+    values = (
+        '"DUN551088","USD","AMD","4391","0000e0d5.68cb1234.01.01",'
+        '"2026-09-18 13:31:02","NASDAQ","5","161.42","-1.00",'
+        '"USD","BUY","189"'
+    )
+    path = tmp_path / "newQuery.csv"
+    path.write_text(f"{header}\n{values}\n")
+
+    statement = load_statement(path)
+
+    assert [e.ticker for e in statement.executions] == ["AMD"]
+    assert statement.executions[0].con_id == 4391
