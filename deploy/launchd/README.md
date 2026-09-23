@@ -230,6 +230,41 @@ produced the "everything in sync" on 2026-09-08 that was true and meaningless:
 it had compared a three-commits-stale checkout against `~/ibc`, found no
 differences, and copied nothing.
 
+### Bootstrapping the deploy clone (once, and again if it is ever lost)
+
+```bash
+git clone --branch main https://github.com/jumbomochi/algo-poc.git /Users/huiliang/algo-poc-deploy
+cd /Users/huiliang/algo-poc-deploy
+
+# Its own venv, built HERE and pinned like CI. Never copy or symlink the dev
+# checkout's .venv: its editable-install .pth points at ~/GitHub/algo-poc, so
+# scripts/divergence_monitor.py would import the dev tree's code while every
+# other job ran the clone's.
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements-dev.lock
+.venv/bin/pip install --no-deps -e .
+
+# Host state the clone does not carry (all gitignored):
+cp ~/GitHub/algo-poc/docker-compose.override.yml .     # ports 55432/56379
+mkdir -p output/logs
+# The divergence baseline of record (config/default.yaml: divergence.baseline_pin).
+# cp -p, NOT cp: lib/baseline_age.sh ages the pin by mtime, and a plain copy
+# resets the staleness clock, hiding a stale baseline for up to a month.
+cp -p ~/GitHub/algo-poc/output/backtest_multi_20260915_102125.json output/
+
+git status --short && git branch --show-current && git worktree list   # clean, main, one tree
+```
+
+**Cut-over order matters.** The clone must exist, with its venv, *before* the
+KAN-72 wrappers reach `~/ibc`: a wrapper whose `$ALGO_DIR` is missing cannot
+source `secrets.sh`, so it has no `algo_alert_local` either and dies without an
+alert — and the gateway watchdog stops restarting the gateway. Bootstrap, then
+promote, then `git pull` + `deploy.sh` from the clone.
+
+After the cut-over, `~/GitHub/algo-poc/output/` stops updating. Divergence,
+shadow and reconciliation artifacts are written under the clone's `output/`;
+read them there.
+
 ### Sourced by path from the tree — live the moment the clone is pulled
 
 `deploy.sh` deliberately does **not** copy these. They are read from
@@ -285,8 +320,14 @@ deploy clone**:
 
 ```bash
 eval "$(deploy/launchd/secrets.sh --export)"
+export ALGO_IB_ACCOUNT_ID=DUN551088   # not a secret, so --export omits it
+: "${ALGO_IB_ACCOUNT_ID:?set the IB account pin before rebuilding execution}"
 docker compose -p algo-poc up -d --build --force-recreate
 ```
+
+That is the shape; for `risk-management`/`execution`, follow
+[`docs/operations/container-deploy.md`](../../docs/operations/container-deploy.md),
+which adds the before/after image and environment evidence and `--no-deps`.
 
 - **`-p algo-poc` is not optional.** Compose names the project after the
   directory, so a bare `docker compose up` in `algo-poc-deploy` starts a *new*
@@ -296,6 +337,11 @@ docker compose -p algo-poc up -d --build --force-recreate
   (`ALGO_COMPOSE_PROJECT`).
 - **`--force-recreate`**, because `--build` alone rebuilds the image and leaves
   the running containers on the old one.
+- **The account pin.** The dev checkout's compose interpolation got
+  `ALGO_IB_ACCOUNT_ID` from its 1Password `.env`. The clone has no `.env`, and
+  the pin is not a secret, so nothing supplies it unless you export it. Without
+  it `execution` comes back *unpinned* — silently, since an empty pin reads as
+  "no pin" — leaving only the `DU`/`U` prefix guard. The `:?` line refuses.
 - The clone needs its own copy of the gitignored `docker-compose.override.yml`
   (the machine-local ports 55432/56379 the wrappers wait on). Without it the
   stack comes up on the default ports and the 04:15 run times out waiting for

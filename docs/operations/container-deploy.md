@@ -21,32 +21,36 @@ the names — but recreating `redis` has a consequence of its own (see
 | # | Check | Why |
 |---|---|---|
 | 1 | Run the whole runbook in **bash**, not zsh (`bash` then proceed) | `deploy/launchd/secrets.sh` is bash-only, and the exports it sets must survive into the `docker compose` calls |
-| 2 | 1Password unlocked, and the login keychain unlocked | `.env` on this host is a **1Password-served FIFO**, not a file. Compose reads it for interpolation; if nothing is serving it, the read blocks ~60s and returns empty (the 2026-08-12 outage) |
+| 2 | The login keychain unlocked | Secrets come from the keychain via `secrets.sh --export` (KAN-16). The deploy clone has no `.env` — which also means nothing supplies the non-secret `ALGO_IB_ACCOUNT_ID` unless you export it (below) |
 | 3 | Deploy outside the scheduled window and outside NYSE hours | The launchd block runs 04:15–05:15 local (paper run 04:15 Tue–Sat, divergence 04:45, pipeline report 04:52, backtest refresh Tue 05:00, backup 05:15; the evidence digest sits apart at Mon 08:00). Recreating `execution` mid-session drops the IB connection |
-| 4 | Stack already up: `docker compose ps` shows every service healthy | These steps recreate two containers in place; they do not bring up a cold stack |
-| 5 | Working tree is the commit you intend to ship (`git log -1`, `git status`) | The image is built from the working tree, not from a ref |
+| 4 | Stack already up: `docker compose -p algo-poc ps` shows every service healthy | These steps recreate two containers in place; they do not bring up a cold stack |
+| 5 | You are in the **deploy clone**, `/Users/huiliang/algo-poc-deploy`, freshly `git pull --ff-only`ed to a promoted `main` (`git log -1`, `git status` clean) | The image is built from the working tree, not from a ref — so it must be the tree production runs, never the dev checkout on whatever branch it was left on (KAN-72, `deploy/launchd/README.md`) |
+| 6 | Every compose call carries **`-p algo-poc`** | Compose names the project after the directory. Bare `docker compose` in `algo-poc-deploy` addresses a new, empty project — `ps` shows nothing, and `up` starts a second stack on fresh volumes |
 
 ```bash
-cd ~/GitHub/algo-poc
+cd /Users/huiliang/algo-poc-deploy
 bash                       # secrets.sh is bash-only
-. deploy/launchd/secrets.sh
-algo_load_secrets POSTGRES_PASSWORD REDIS_PASSWORD || echo "$ALGO_SECRETS_ERROR"
+git pull --ff-only origin main
 git log -1 --oneline && git status --short
-docker compose ps
+eval "$(deploy/launchd/secrets.sh --export)"
+export ALGO_IB_ACCOUNT_ID=DUN551088   # the account execution is pinned to
+: "${ALGO_IB_ACCOUNT_ID:?set the IB account pin before touching execution}"
+docker compose -p algo-poc ps
 ```
 
-Pre-flight that the FIFO is actually being served — this must return in about a
-second, not after a minute:
+**The account pin is not a secret, so `secrets.sh --export` does not supply
+it.** In the dev checkout it came from the 1Password `.env`; the deploy clone
+has no `.env`. Proceeding without it recreates `execution` with an **empty
+`ALGO_IB_ACCOUNT_ID`**, silently removing the account pin and leaving the
+`DU`/`U` prefix guard as the only thing between the bot and the live account.
+The `:?` line above refuses before that; step 4's environment diff catches it
+after the fact. Confirm the value against the running container first:
 
 ```bash
-time docker compose config --quiet && echo "interpolation OK"
+docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  "$(docker compose -p algo-poc ps -q execution)" | grep '^ALGO_IB_ACCOUNT_ID='
+time docker compose -p algo-poc config --quiet && echo "interpolation OK"
 ```
-
-A hang here means 1Password is not serving `.env`. Stop and fix that first: a
-deploy that proceeds with empty interpolation recreates `execution` with an
-**empty `ALGO_IB_ACCOUNT_ID`**, silently removing the account pin and leaving
-the `DU`/`U` prefix guard as the only thing between the bot and the live
-account. Step 4 below catches it after the fact; this catches it before.
 
 ---
 
@@ -62,7 +66,7 @@ mkdir -p "$EVID"
 
 : > "$EVID/images-before.txt"          # truncate, so a re-run does not append
 for svc in risk-management execution; do
-  cid=$(docker compose ps -q "$svc")
+  cid=$(docker compose -p algo-poc ps -q "$svc")
   printf '%s %s\n' "$svc" "$(docker inspect --format '{{.Image}}' "$cid")" >> "$EVID/images-before.txt"
   docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$cid" \
     | sed -E 's/:[^:@/]+@/:***@/' | sort > "$EVID/env-$svc-before.txt"
@@ -97,7 +101,7 @@ adds a name to the existing image, it does not copy anything.
 ## Step 2 — Build
 
 ```bash
-docker compose build risk-management execution
+docker compose -p algo-poc build risk-management execution
 ```
 
 Build only. Nothing is running the new image yet, so this step is safe to do
@@ -106,7 +110,7 @@ early and safe to abandon.
 ## Step 3 — Recreate
 
 ```bash
-docker compose up -d --force-recreate --no-deps risk-management execution
+docker compose -p algo-poc up -d --force-recreate --no-deps risk-management execution
 ```
 
 Both flags are load-bearing:
@@ -122,7 +126,7 @@ Both flags are load-bearing:
   (`docker-compose.yml` declares only `pgdata`): recreating it discards every
   stream, including any unacked entry on `stream:approved_orders` or
   `stream:fills`. Consumer groups are recreated at service startup, so the
-  damage is invisible in `docker compose ps` — you would simply lose whatever
+  damage is invisible in `docker compose -p algo-poc ps` — you would simply lose whatever
   was in flight.
 
 ## Step 4 — Verify the running image actually changed
@@ -130,7 +134,7 @@ Both flags are load-bearing:
 ```bash
 : > "$EVID/images-after.txt"
 for svc in risk-management execution; do
-  cid=$(docker compose ps -q "$svc")
+  cid=$(docker compose -p algo-poc ps -q "$svc")
   printf '%s %s\n' "$svc" "$(docker inspect --format '{{.Image}}' "$cid")" >> "$EVID/images-after.txt"
   docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$cid" \
     | sed -E 's/:[^:@/]+@/:***@/' | sort > "$EVID/env-$svc-after.txt"
@@ -159,8 +163,8 @@ Three assertions, all of which must hold:
 
    A line appearing here means compose interpolated differently than last time.
    The one that matters most is `ALGO_IB_ACCOUNT_ID=DUN551088` turning into
-   `ALGO_IB_ACCOUNT_ID=` — the account pin, dropped because `.env` was not
-   served (precondition 2). Roll back and fix the environment before retrying.
+   `ALGO_IB_ACCOUNT_ID=` — the account pin, dropped because it was not
+   exported before the rebuild (see the pre-flight above). Roll back and fix the environment before retrying.
 
 Once all three hold, name the deployed images so the rollback drill below is a
 retag in both directions rather than a rebuild:
@@ -170,22 +174,22 @@ docker tag algo-poc-risk-management:latest algo-poc-risk-management:tranche1
 docker tag algo-poc-execution:latest       algo-poc-execution:tranche1
 ```
 
-Note the ordering trap: `docker compose images --quiet risk-management
+Note the ordering trap: `docker compose -p algo-poc images --quiet risk-management
 execution` prints hashes in **container-name order, not argument order**, so
 zipping its output against your service list silently pairs each hash with the
 wrong service. Address one service at a time, as above, or read the service
 name back out of the JSON:
 
 ```bash
-docker compose images --format json risk-management
+docker compose -p algo-poc images --format json risk-management
 ```
 
 ## Step 5 — Smoke test
 
 ```bash
-docker compose ps risk-management execution        # both Up and (healthy)
-docker compose logs --tail=30 risk-management
-docker compose logs --tail=30 execution
+docker compose -p algo-poc ps risk-management execution        # both Up and (healthy)
+docker compose -p algo-poc logs --tail=30 risk-management
+docker compose -p algo-poc logs --tail=30 execution
 ```
 
 Expected within ~30 seconds of the recreate:
@@ -227,16 +231,16 @@ rollback path first exercised during an incident is not a rollback path.
 
 ```bash
 docker tag algo-poc-risk-management:pre-tranche1 algo-poc-risk-management:latest
-docker compose up -d --force-recreate --no-deps risk-management
-docker inspect --format '{{.Image}}' "$(docker compose ps -q risk-management)"   # == the pre- hash
+docker compose -p algo-poc up -d --force-recreate --no-deps risk-management
+docker inspect --format '{{.Image}}' "$(docker compose -p algo-poc ps -q risk-management)"   # == the pre- hash
 ```
 
 Then return to the deployed image and confirm the hash is the new one again:
 
 ```bash
 docker tag algo-poc-risk-management:tranche1 algo-poc-risk-management:latest
-docker compose up -d --force-recreate --no-deps risk-management
-docker inspect --format '{{.Image}}' "$(docker compose ps -q risk-management)"
+docker compose -p algo-poc up -d --force-recreate --no-deps risk-management
+docker inspect --format '{{.Image}}' "$(docker compose -p algo-poc ps -q risk-management)"
 ```
 
 Record both hashes. Both directions are retag + recreate — no rebuild, which is
@@ -251,8 +255,8 @@ The morning after (04:15 local, Tue–Sat):
 
 ```bash
 tail -50 ~/ibc/logs/paper_trading_$(date +%Y%m%d).log
-docker compose logs --since=6h execution | grep "Processing approved order"
-docker compose logs --since=6h risk-management | grep -iE "error|traceback"
+docker compose -p algo-poc logs --since=6h execution | grep "Processing approved order"
+docker compose -p algo-poc logs --since=6h risk-management | grep -iE "error|traceback"
 ```
 
 Confirm the run completed, reconciliation reported `ok`, and the digest arrived
@@ -282,7 +286,7 @@ does not.
    healthy), **7 launchd jobs**, and zero drift:
 
 ```bash
-docker compose ps
+docker compose -p algo-poc ps
 launchctl list | grep local.algo
 deploy/launchd/deploy.sh --dry-run    # expect "Everything is already in sync."
 ```
@@ -290,7 +294,7 @@ deploy/launchd/deploy.sh --dry-run    # expect "Everything is already in sync."
 Every app service and both infrastructure services carry
 `restart: unless-stopped`, so the containers should return without any command.
 `migrate` is `restart: "no"` by design and correctly does **not** appear in
-`docker compose ps` afterwards — it runs to completion and exits.
+`docker compose -p algo-poc ps` afterwards — it runs to completion and exits.
 
 If Docker Desktop itself did not start, no container returns: enable *Start
 Docker Desktop when you sign in* in its settings. That is a host setting, not
@@ -336,7 +340,7 @@ Retag and recreate — one command per service, no rebuild:
 ```bash
 docker tag algo-poc-risk-management:pre-tranche1 algo-poc-risk-management:latest
 docker tag algo-poc-execution:pre-tranche1       algo-poc-execution:latest
-docker compose up -d --force-recreate --no-deps risk-management execution
+docker compose -p algo-poc up -d --force-recreate --no-deps risk-management execution
 ```
 
 The paper book is unaffected by a container swap: all state is in Postgres and

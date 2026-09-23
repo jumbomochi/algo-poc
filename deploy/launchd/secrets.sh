@@ -65,7 +65,9 @@
 #   eval "$(deploy/launchd/secrets.sh --export)"   # for docker compose / shells
 
 ALGO_KEYCHAIN_SERVICE="${ALGO_KEYCHAIN_SERVICE:-algo-poc}"
-ALGO_SECRETS_ENV_FILE="${ALGO_SECRETS_ENV_FILE:-/Users/huiliang/GitHub/algo-poc/.env}"
+# Default: the .env of the tree THIS file lives in, so the CLI modes run in the
+# deploy clone (KAN-72) check the clone, not whichever checkout was hardcoded.
+ALGO_SECRETS_ENV_FILE="${ALGO_SECRETS_ENV_FILE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/.env}"
 
 # Absolute path by default so a hijacked PATH cannot substitute the binary that
 # reads our secrets. Overridable only so the test suite can stub it.
