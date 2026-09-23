@@ -230,6 +230,22 @@ produced the "everything in sync" on 2026-09-08 that was true and meaningless:
 it had compared a three-commits-stale checkout against `~/ibc`, found no
 differences, and copied nothing.
 
+**`deploy.sh` refuses to install from anywhere else (KAN-89).** It copies
+whatever tree it lives in, so one run out of habit from `~/GitHub/algo-poc` or a
+`.worktrees/<key>` tree used to put develop or feature-branch wrappers into
+`~/ibc` and report success. It now exits nonzero, copying nothing, unless:
+
+1. its own tree is the deploy clone — the `ALGO_DIR` default in `run_paper.sh`,
+   read from there rather than restated, so the two cannot drift; and
+2. that tree passes `lib/branch_guard.sh` as `promoted`. `behind` refuses too —
+   installing older code than main is the 2026-09-08 rollback — and so does
+   `unknown`.
+
+`--dry-run` never refuses; it prints `a real deploy would refuse: …` above the
+usual diff. `--from-any-tree` overrides the guard for tests and genuine
+emergencies only: it prints the tree and branch it installed from and appends
+the same line to `~/ibc/logs/deploy.log`, so an override is never silent.
+
 ### Bootstrapping the deploy clone (once, and again if it is ever lost)
 
 ```bash
@@ -356,6 +372,9 @@ plists to their live locations. It replaces the manual per-file `cp`:
 deploy/launchd/deploy.sh --dry-run   # show what would change, write nothing
 deploy/launchd/deploy.sh             # copy changed *.sh -> ~/ibc, *.plist -> ~/Library/LaunchAgents
 ```
+
+Run it from the deploy clone on promoted `main` — anywhere else it refuses (see
+"The deployment procedure" above).
 
 It skips unchanged files, prints a diff of each change, and — for any plist it
 touched — prints the `launchctl bootout/bootstrap` reload commands for you to
