@@ -248,6 +248,7 @@ logic silently stays behind.
 | `lib/docker_health.sh` | docker engine + stack liveness (KAN-66) |
 | `lib/launchd_wiring.sh` | installed-but-not-loaded reconciliation (KAN-64) |
 | `lib/power.sh` | the caffeinate power assertion (KAN-77) |
+| `lib/reconciliation.sh` | how long the book has been fail-closed (KAN-86) |
 | `lib/telegram.sh` | the shared Telegram sender (KAN-43) |
 
 `scripts/` and `config/` are read from the tree the same way, so a pull changes
@@ -273,6 +274,32 @@ canonical` line if it was launched from a drifted copy.
 
 Plists go to `~/Library/LaunchAgents`, and a copied plist is **not** a loaded
 job: see the KAN-64 section below.
+
+### Rebuilt in Docker — neither a pull nor `deploy.sh` moves these
+
+`services/*` (risk management, execution, portfolio accounting, …) run in the
+docker compose stack, so they only change when their images are rebuilt. A pull
+plus `deploy.sh` alone left the 2026-09-17 fix undeployed. When a promotion
+touches `services/`, `shared/`, a Dockerfile or a migration, also run, **in the
+deploy clone**:
+
+```bash
+eval "$(deploy/launchd/secrets.sh --export)"
+docker compose -p algo-poc up -d --build --force-recreate
+```
+
+- **`-p algo-poc` is not optional.** Compose names the project after the
+  directory, so a bare `docker compose up` in `algo-poc-deploy` starts a *new*
+  project, `algo-poc-deploy`, on new, empty `pgdata`/`redisdata` volumes: a
+  paper book with no history. `-p algo-poc` keeps the clone driving the existing
+  stack and its volumes, and it is the project `lib/docker_health.sh` watches
+  (`ALGO_COMPOSE_PROJECT`).
+- **`--force-recreate`**, because `--build` alone rebuilds the image and leaves
+  the running containers on the old one.
+- The clone needs its own copy of the gitignored `docker-compose.override.yml`
+  (the machine-local ports 55432/56379 the wrappers wait on). Without it the
+  stack comes up on the default ports and the 04:15 run times out waiting for
+  the paper DB.
 
 ## Deploying / syncing
 

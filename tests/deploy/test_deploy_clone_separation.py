@@ -182,3 +182,26 @@ def test_the_readme_states_the_deployment_procedure() -> None:
         "the README must show `git pull` before `deploy.sh` — deploy.sh run "
         "against a stale clone reports 'in sync' and copies nothing"
     )
+
+
+def test_the_readme_rebuilds_the_docker_services_from_the_clone_under_the_pinned_project() -> None:
+    """AC3, the third half. ``services/*`` run in Docker, so neither a pull nor
+    deploy.sh moves them — the 2026-09-17 fix sat undeployed that way.
+
+    The rebuild must name the compose project. Compose defaults the project to
+    the directory's basename, so ``docker compose up`` in ``algo-poc-deploy``
+    creates a *new* project, ``algo-poc-deploy``, with new, empty ``pgdata`` and
+    ``redisdata`` volumes — a paper book with no history. ``-p algo-poc`` is what
+    keeps the clone driving the existing stack and volumes. And ``--build`` alone
+    leaves running containers on the old image; ``--force-recreate`` is needed.
+    """
+    section = _readme_section("## What is live on `git pull`, and what needs `deploy.sh`")
+    assert "docker compose -p algo-poc" in section, (
+        "the README must rebuild the services with `-p algo-poc`; without it, "
+        "compose run from the deploy clone starts a fresh project on empty volumes"
+    )
+    assert "--force-recreate" in section, section[-600:]
+    # And the watchdog must look for the same project the README tells the
+    # operator to start, or a correct rebuild reads as a missing stack.
+    docker_health = (DEPLOY_DIR / "lib" / "docker_health.sh").read_text()
+    assert 'ALGO_COMPOSE_PROJECT="${ALGO_COMPOSE_PROJECT:-algo-poc}"' in docker_health
