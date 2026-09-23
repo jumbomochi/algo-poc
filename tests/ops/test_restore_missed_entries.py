@@ -23,9 +23,11 @@ from scripts.ops.restore_missed_entries import (
     RecoveryRefusedError,
     StatementRefusedError,
     apply_recovery,
+    attribute_by_order_ref,
     load_statement,
     main,
     parse_statement,
+    resolve_statement_tz,
 )
 from services.execution.execution_sweep import (
     RECOVERY_SOURCE_STATEMENT,
@@ -49,11 +51,14 @@ def _row(**overrides) -> dict[str, str]:
     """One AMD row from the 2026-09-18 batch, in IB Flex "Trades" shape.
 
     ``DateTime`` is UTC: 13:31:02Z is 09:31:02 EDT, a minute after the open.
+    ``IBOrderID`` is IB's PERMANENT id, as Flex exports it -- not the API
+    ``orderId`` (189) the intent holds. ``OrderReference`` is what links
+    the two.
     """
     row = {
         "ClientAccountID": "DUN551088",
         "TradeID": "0000e0d5.68cb1234.01.01",
-        "IBOrderID": "189",
+        "IBOrderID": "751093106",
         "ConID": "4391",
         "Symbol": "AMD",
         "Exchange": "NASDAQ",
@@ -64,6 +69,7 @@ def _row(**overrides) -> dict[str, str]:
         "IBCommission": "-1.00",
         "IBCommissionCurrency": "USD",
         "DateTime": "2026-09-18 13:31:02",
+        "OrderReference": "rec-amd",
     }
     row.update(overrides)
     return row
@@ -88,7 +94,8 @@ def test_a_statement_row_becomes_an_execution():
 
     assert execution.execution_id == "0000e0d5.68cb1234.01.01"
     assert execution.account_id == "DUN551088"
-    assert execution.ib_order_id == "189"
+    # Verbatim until attribute_by_order_ref re-keys it onto the intent.
+    assert execution.ib_order_id == "751093106"
     assert execution.con_id == 4391
     assert execution.ticker == "AMD"
     assert execution.exchange == "NASDAQ"
@@ -297,7 +304,9 @@ def _expired_intent(
 
 
 def _plan(session, rows=None):
-    statement = parse_statement(rows if rows is not None else [_row()])
+    statement = attribute_by_order_ref(
+        session, parse_statement(rows if rows is not None else [_row()])
+    )
     return plan_sweep(
         statement.executions,
         OrderLedger(session),
@@ -387,7 +396,7 @@ def test_an_execution_with_no_intent_is_never_projected(session):
     outcome = _plan(session)
 
     assert outcome.recovered == ()
-    assert outcome.untracked == ("189",)
+    assert outcome.untracked == ("751093106",)
 
 
 def test_re_running_the_repair_changes_nothing(session):
@@ -447,7 +456,7 @@ def test_a_dry_run_writes_nothing(tmp_path, capsys):
         _expired_intent(db_session)
 
     statement = _write_csv(tmp_path / "trades.csv", [_row()])
-    assert main(["--statement", str(statement), "--database-url", url]) == 0
+    assert main(["--statement-tz", "UTC", "--statement", str(statement), "--database-url", url]) == 0
 
     out = capsys.readouterr().out
     assert "Dry-run" in out
@@ -472,7 +481,7 @@ def test_a_dry_run_names_what_it_cannot_recover(tmp_path, capsys):
     Base.metadata.create_all(engine)
 
     statement = _write_csv(tmp_path / "trades.csv", [_row()])
-    assert main(["--statement", str(statement), "--database-url", url]) == 1
+    assert main(["--statement-tz", "UTC", "--statement", str(statement), "--database-url", url]) == 1
 
     assert "untracked" in capsys.readouterr().out
 
@@ -500,7 +509,7 @@ def test_the_rollback_dump_records_the_state_before_the_repair(tmp_path, monkeyp
     monkeypatch.setattr("builtins.input", lambda *a: CONFIRMATION)
 
     assert main([
-        "--statement", str(statement), "--database-url", url,
+        "--statement-tz", "UTC", "--statement", str(statement), "--database-url", url,
         "--artifact-dir", str(tmp_path / "repairs"), "--apply",
     ]) == 0
 
@@ -535,7 +544,7 @@ def test_the_applied_artifact_dates_and_explains_the_equity_gap(tmp_path, monkey
     monkeypatch.setattr("builtins.input", lambda *a: CONFIRMATION)
 
     main([
-        "--statement", str(statement), "--database-url", url,
+        "--statement-tz", "UTC", "--statement", str(statement), "--database-url", url,
         "--artifact-dir", str(tmp_path / "repairs"), "--apply",
     ])
 
@@ -574,8 +583,9 @@ def test_a_projection_failure_stops_the_batch_and_is_reported(session):
     config.cash = 10.0
     session.commit()
 
-    rows = [_row(), _row(TradeID="t-190", IBOrderID="190", Symbol="NVDA",
-                 ConID="4815747", Quantity="4", TradePrice="180.00")]
+    rows = [_row(), _row(TradeID="t-190", IBOrderID="751085646", Symbol="NVDA",
+                 ConID="4815747", Quantity="4", TradePrice="180.00",
+                 OrderReference="rec-nvda")]
     result = apply_recovery(session, _plan(session, rows), confirm=CONFIRMATION)
 
     assert result.applied == ()
@@ -617,7 +627,7 @@ def test_a_burned_execution_is_reported_not_counted_as_recorded(tmp_path, capsys
         db_session.commit()
 
     statement = _write_csv(tmp_path / "trades.csv", [_row()])
-    assert main(["--statement", str(statement), "--database-url", url]) == 1
+    assert main(["--statement-tz", "UTC", "--statement", str(statement), "--database-url", url]) == 1
 
     out = capsys.readouterr().out
     assert "never projected" in out
@@ -639,7 +649,7 @@ def test_a_preflight_refuses_before_burning_anything(tmp_path, capsys):
         _expired_intent(db_session)
 
     statement = _write_csv(tmp_path / "trades.csv", [_row()])
-    assert main(["--statement", str(statement), "--database-url", url]) == 1
+    assert main(["--statement-tz", "UTC", "--statement", str(statement), "--database-url", url]) == 1
 
     out = capsys.readouterr().out
     assert "cash" in out.lower()
@@ -673,7 +683,7 @@ def test_a_preflight_refuses_an_account_less_position_on_the_same_contract(
         _expired_intent(db_session)
 
     statement = _write_csv(tmp_path / "trades.csv", [_row()])
-    assert main(["--statement", str(statement), "--database-url", url]) == 1
+    assert main(["--statement-tz", "UTC", "--statement", str(statement), "--database-url", url]) == 1
 
     assert "ownership is unresolved" in capsys.readouterr().out
 
@@ -736,7 +746,7 @@ def test_a_fill_outside_us_market_hours_is_flagged(tmp_path, capsys):
         tmp_path / "trades.csv",
         [_row(**{"DateTime": "2026-09-18 09:31:02"})],
     )
-    main(["--statement", str(statement), "--database-url", url])
+    main(["--statement-tz", "UTC", "--statement", str(statement), "--database-url", url])
 
     out = capsys.readouterr().out
     assert "09:31" in out
@@ -758,7 +768,7 @@ def test_the_dry_run_reports_the_intents_it_would_un_expire(tmp_path, capsys):
         _expired_intent(db_session)
 
     statement = _write_csv(tmp_path / "trades.csv", [_row()])
-    main(["--statement", str(statement), "--database-url", url])
+    main(["--statement-tz", "UTC", "--statement", str(statement), "--database-url", url])
 
     assert "1 intent" in capsys.readouterr().out
 
@@ -779,7 +789,7 @@ def test_a_byte_order_mark_does_not_hide_the_first_column(tmp_path):
 def test_a_refusal_is_a_message_not_a_traceback(tmp_path, capsys):
     """The refusal strings are the product. Arriving wrapped in a stack
     trace at 05:00 wastes the effort that went into them."""
-    assert main(["--statement", str(tmp_path / "nope.csv")]) == 2
+    assert main(["--statement-tz", "UTC", "--statement", str(tmp_path / "nope.csv")]) == 2
 
     assert "no statement file" in capsys.readouterr().err
 
@@ -837,22 +847,193 @@ def test_a_column_repeated_in_two_casings_is_refused():
         parse_statement([row])
 
 
-def test_the_real_ib_export_header_is_accepted(tmp_path):
-    """The exact header IB produced for DUN551088 on 2026-09-22, verbatim."""
-    header = (
-        '"ClientAccountID","CurrencyPrimary","Symbol","Conid","TradeID",'
-        '"DateTime","Exchange","Quantity","TradePrice","IBCommission",'
-        '"IBCommissionCurrency","Buy/Sell","IBOrderID"'
-    )
-    values = (
-        '"DUN551088","USD","AMD","4391","0000e0d5.68cb1234.01.01",'
-        '"2026-09-18 13:31:02","NASDAQ","5","161.42","-1.00",'
-        '"USD","BUY","189"'
-    )
+_REAL_HEADER_20260922 = (
+    '"ClientAccountID","CurrencyPrimary","Symbol","Conid","TradeID",'
+    '"DateTime","Exchange","Quantity","TradePrice","IBCommission",'
+    '"IBCommissionCurrency","Buy/Sell","IBOrderID"'
+)
+#: The AMD row of that export, verbatim: US Eastern time, dashed date with a
+#: ';' separator, IB's permanent order id.
+_REAL_AMD_20260922 = (
+    '"DUN551088","USD","AMD","4391","1854679028","2026-09-18;09:30:22",'
+    '"NASDAQ","5","545.09","-1.000015","USD","BUY","751093106"'
+)
+
+
+def test_the_real_ib_export_without_order_reference_is_refused_by_name(tmp_path):
+    """The exact file IB produced for DUN551088 on 2026-09-22. Without
+    OrderReference its IBOrderID (a permanent id) matches no intent, and all
+    15 rows would come back UNTRACKED -- so it is refused up front, naming
+    the one field to add."""
     path = tmp_path / "newQuery.csv"
-    path.write_text(f"{header}\n{values}\n")
+    path.write_text(f"{_REAL_HEADER_20260922}\n{_REAL_AMD_20260922}\n")
 
-    statement = load_statement(path)
+    with pytest.raises(StatementRefusedError, match="OrderReference"):
+        load_statement(path)
 
-    assert [e.ticker for e in statement.executions] == ["AMD"]
-    assert statement.executions[0].con_id == 4391
+
+def test_the_real_ib_export_is_read_in_eastern_time(tmp_path):
+    """The same export with OrderReference ticked. Its DateTime is the NY
+    open in EDT, and must land at 13:30:22Z -- not 09:30:22Z, four hours
+    before any US session."""
+    path = tmp_path / "newQuery.csv"
+    path.write_text(
+        f'{_REAL_HEADER_20260922},"OrderReference"\n'
+        f'{_REAL_AMD_20260922},"rec-amd"\n'
+    )
+
+    statement = load_statement(
+        path, statement_tz=resolve_statement_tz("America/New_York")
+    )
+
+    [execution] = statement.executions
+    assert execution.con_id == 4391
+    assert execution.executed_at == datetime(
+        2026, 9, 18, 13, 30, 22, tzinfo=timezone.utc
+    )
+    assert statement.raw_datetimes["1854679028"] == "2026-09-18;09:30:22"
+    assert statement.broker_order_ids["1854679028"] == "751093106"
+    assert statement.statement_tz == "America/New_York"
+
+
+# --------------------------------------------------------------------------
+# Statement time zone: Flex has no UTC setting, so the operator names it
+# --------------------------------------------------------------------------
+
+
+def test_eastern_time_follows_daylight_saving():
+    """EST in winter is UTC-5, EDT in summer UTC-4. A fixed offset would
+    be an hour wrong for half the year."""
+    zone = resolve_statement_tz("America/New_York")
+    [winter] = parse_statement(
+        [_row(DateTime="2026-01-15 09:30:00")], statement_tz=zone
+    ).executions
+
+    assert winter.executed_at == datetime(2026, 1, 15, 14, 30, tzinfo=timezone.utc)
+
+
+def test_a_time_in_a_daylight_saving_transition_is_refused():
+    """01:30 on 2026-11-01 happens twice in New York. Choosing one is a
+    guess about broker evidence."""
+    zone = resolve_statement_tz("America/New_York")
+    with pytest.raises(StatementRefusedError, match="daylight-saving"):
+        parse_statement([_row(DateTime="2026-11-01 01:30:00")], statement_tz=zone)
+
+
+def test_an_unknown_time_zone_is_refused_by_name():
+    with pytest.raises(StatementRefusedError, match="Mars/Olympus"):
+        resolve_statement_tz("Mars/Olympus")
+
+
+def test_the_statement_time_zone_must_be_named(tmp_path):
+    """No default at the CLI: an unstated zone is how a 4-hour shift gets in."""
+    statement = _write_csv(tmp_path / "trades.csv", [_row()])
+    with pytest.raises(SystemExit):
+        main(["--statement", str(statement)])
+
+
+def _book_with_amd_intent(tmp_path):
+    url = f"sqlite:///{tmp_path / 'book.db'}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    with Session(engine) as db_session:
+        db_session.add(PortfolioConfig(
+            portfolio="momentum", capital=30_000, cash=30_000,
+            created_at=NOW, updated_at=NOW,
+        ))
+        db_session.commit()
+        _expired_intent(db_session)
+    return url, engine
+
+
+def test_a_fill_outside_the_session_refuses_apply(tmp_path, monkeypatch, capsys):
+    """The warning used to be advice only, so a wrong zone applied anyway."""
+    url, engine = _book_with_amd_intent(tmp_path)
+    statement = _write_csv(
+        tmp_path / "trades.csv", [_row(DateTime="2026-09-18 09:31:02")]
+    )
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("builtins.input", lambda *a: CONFIRMATION)
+
+    assert main([
+        "--statement-tz", "UTC", "--statement", str(statement),
+        "--database-url", url, "--artifact-dir", str(tmp_path / "repairs"),
+        "--apply",
+    ]) == 1
+
+    assert "--accept-outside-session" in capsys.readouterr().out
+    with Session(engine) as db_session:
+        assert db_session.scalar(
+            select(func.count()).select_from(ExecutionFill)
+        ) == 0
+
+
+def test_an_accepted_outside_session_fill_is_applied_and_recorded(
+    tmp_path, monkeypatch
+):
+    url, _ = _book_with_amd_intent(tmp_path)
+    statement = _write_csv(
+        tmp_path / "trades.csv", [_row(DateTime="2026-09-18 09:31:02")]
+    )
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("builtins.input", lambda *a: CONFIRMATION)
+
+    assert main([
+        "--statement-tz", "UTC", "--statement", str(statement),
+        "--database-url", url, "--artifact-dir", str(tmp_path / "repairs"),
+        "--apply", "--accept-outside-session",
+    ]) == 0
+
+    [artifact] = list((tmp_path / "repairs").glob("entry_restore_*.json"))
+    assert json.loads(artifact.read_text())["accepted_outside_session"] is True
+
+
+# --------------------------------------------------------------------------
+# Attribution: Flex IBOrderID is IB's permanent id, the intent holds orderId
+# --------------------------------------------------------------------------
+
+
+def test_a_permanent_order_id_is_attributed_through_order_reference(
+    tmp_path, monkeypatch
+):
+    """The 2026-09-18 intents hold ib_order_id 189-205; the statement says
+    751093106. Matching those verbatim made every row UNTRACKED. The fill
+    must land under the book's id, and the artifact must keep IB's."""
+    url, engine = _book_with_amd_intent(tmp_path)
+    statement = _write_csv(tmp_path / "trades.csv", [_row()])
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("builtins.input", lambda *a: CONFIRMATION)
+
+    assert main([
+        "--statement-tz", "UTC", "--statement", str(statement),
+        "--database-url", url, "--artifact-dir", str(tmp_path / "repairs"),
+        "--apply",
+    ]) == 0
+
+    with Session(engine) as db_session:
+        fill = db_session.scalar(select(ExecutionFill))
+        assert fill.ib_order_id == "189"
+        assert db_session.scalar(select(OrderIntent)).status == "FILLED"
+    [artifact] = list((tmp_path / "repairs").glob("entry_restore_*.json"))
+    payload = json.loads(artifact.read_text())
+    [applied] = payload["applied"]
+    assert applied["broker_order_id"] == "751093106"
+    assert applied["order_ref"] == "rec-amd"
+    assert applied["statement_datetime"] == "2026-09-18 13:31:02"
+    assert payload["statement_tz"] == "UTC"
+
+
+def test_an_order_reference_naming_a_different_contract_is_refused(session):
+    """The statement and the book disagree about what the order was."""
+    _expired_intent(session)
+    with pytest.raises(StatementRefusedError, match="con_id"):
+        _plan(session, [_row(ConID="4815747")])
+
+
+def test_an_order_reference_with_no_intent_stays_untracked(session):
+    """Not refused here: plan_sweep reports it, and --apply refuses."""
+    _expired_intent(session)
+    outcome = _plan(session, [_row(OrderReference="rec-unknown")])
+
+    assert outcome.untracked == ("751093106",)
+    assert outcome.recovered == ()

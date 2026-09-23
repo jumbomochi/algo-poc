@@ -30,7 +30,7 @@ If instead the book holds a position IB does not, stop — that is
 In IB Account Management: **Performance & Reports > Flex Queries**, an
 **Activity Flex Query** with the **Trades** section.
 
-Required fields, these thirteen — **capitalisation does not matter**, and
+Required fields, these fourteen — **capitalisation does not matter**, and
 extra fields are ignored, so tick more if it is easier. IB is not
 consistent with itself here: the documented field is `ConID`, the picker
 says "Conid", and the export writes `Conid`. All three are accepted. What
@@ -41,15 +41,28 @@ ambiguous export.
 ClientAccountID  TradeID     IBOrderID  ConID    Symbol
 Exchange         CurrencyPrimary        Buy/Sell Quantity
 TradePrice       IBCommission           IBCommissionCurrency
-DateTime
+DateTime         OrderReference
 ```
+
+**`OrderReference` is how a fill finds its order.** Flex `IBOrderID` is IB's
+*permanent* order id (751093106 for AMD on 2026-09-18), while
+`order_intents.ib_order_id` holds the API `orderId` the executor was given
+(189). They never match. The executor stamps every order's `orderRef` with
+its `recommendation_id`, and Flex exports that as `OrderReference`, so the
+tool looks the intent up by it and checks account, `con_id` and side agree.
+Without the column every row would be UNTRACKED, so a file lacking it is
+refused by name.
 
 Settings that matter:
 
-- **Date/Time format:** any of `yyyyMMdd;HHmmss`, `yyyy-MM-dd HH:mm:ss` or
-  ISO. **Time zone must be UTC.** The parser reads `DateTime` as UTC and
-  never guesses a zone; an export in the account's local time would file
-  every fill four or five hours off and land it against the wrong session.
+- **Date/Time format:** any of `yyyyMMdd;HHmmss`, `yyyy-MM-dd;HH:mm:ss`,
+  `yyyy-MM-dd HH:mm:ss` or ISO.
+- **Time zone:** Flex has no time-zone setting and writes no offset. The
+  2026-09-22 export wrote US trades in **US Eastern** (`09:30:22` is the
+  open). Name the zone with `--statement-tz America/New_York`; it is
+  required and never guessed, and daylight saving is handled. A time that
+  falls in a DST transition is refused rather than resolved by picking an
+  offset.
 - **Date range:** the trade date(s) being recovered.
 - **Format:** CSV.
 - **One account per file.** A statement covering two accounts is refused,
@@ -67,7 +80,7 @@ Save it somewhere outside the repo — it is broker data, not source.
 ```bash
 python scripts/ops/restore_missed_entries.py \
     --statement ~/Downloads/DUN551088_trades_20260918.csv \
-    --account DUN551088
+    --account DUN551088 --statement-tz America/New_York
 ```
 
 It writes nothing. Read every line before going further.
@@ -89,10 +102,10 @@ Two warnings can appear here, and both refuse `--apply`:
   `execution_fill_exists` does not look at `projection_applied`, they now
   read as "already recorded" and **this tool can never recover them**. Go
   to [backups.md](backups.md).
-- **`⚠ TIME ZONE`** — fills whose UTC time-of-day falls outside US trading
-  hours, which is the signature of a statement exported in local time.
-  Re-export in UTC. (Not a hard refusal in the parser, because a genuine
-  extended-hours fill is legal — but check it before applying.)
+- **`⚠ TIME ZONE`** — fills that, read in `--statement-tz`, fall outside US
+  trading hours: almost always the wrong zone. `--apply` is refused. For a
+  genuine extended-hours fill, pass `--accept-outside-session`; the
+  artifact records that you did.
 
 It also refuses to apply when a **preflight** finds a rejection the
 projector would raise *after* committing the audit row — insufficient
@@ -124,7 +137,7 @@ quantities should match `ib_qty` per ticker exactly.
 ```bash
 python scripts/ops/restore_missed_entries.py \
     --statement ~/Downloads/DUN551088_trades_20260918.csv \
-    --account DUN551088 --apply
+    --account DUN551088 --statement-tz America/New_York --apply
 ```
 
 Requires an interactive TTY and the exact confirmation
@@ -201,10 +214,15 @@ rejected one is burned; do not re-run `--apply` hoping to catch it.
 
 | Refusal | Cause | Do this |
 |---|---|---|
-| `missing required column(s)` | Wrong Flex field set | Re-export with all thirteen (casing is irrelevant) |
+| `missing required column(s)` | Wrong Flex field set | Re-export with all fourteen (casing is irrelevant) |
+| `missing required column(s): OrderReference` | Field not ticked | Re-export with Order Reference added |
+| `--statement-tz ... is not an IANA time zone` | Typo or abbreviation | Use `America/New_York`, not `EST`/`ET` |
+| `ambiguous or does not exist` | DateTime inside a DST transition | Check the export; no US fill lands there |
+| `OrderReference ... disagrees on` | Statement and intent describe different orders | Stop; investigate before repairing |
+| `Refusing to apply: fills fall outside US trading hours` | Wrong `--statement-tz` | Fix the zone; `--accept-outside-session` only for real extended-hours fills |
 | `carries <column> twice` | Two spellings of one field ticked | Re-export without the duplicate |
 | Header-only file (0 rows) | Date range missed the trade date | Re-run with a **custom** range covering the trade date, not "Last Business Day" |
-| `unreadable DateTime` | Unsupported format | Re-export; UTC, one of the listed formats |
+| `unreadable DateTime` | Unsupported format | Re-export in one of the listed formats |
 | `has no TradePrice` / `not usable` | Blank or zero economics | Re-export. Never fill in by hand |
 | `not an IB paper account` | A `U*` account | Live ledgers are not reconstructed by script |
 | `repeats TradeID` | Duplicate rows | De-duplicate the export |
