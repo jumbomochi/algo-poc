@@ -100,7 +100,9 @@ def host(tmp_path):
 def _deploy(host) -> subprocess.CompletedProcess:
     src, home, launchctl = host
     return subprocess.run(
-        [str(src / "deploy.sh")],
+        # The fake tree is not the deploy clone, so the KAN-89 tree guard would
+        # refuse; these tests are about HOW files install, not from where.
+        [str(src / "deploy.sh"), "--from-any-tree"],
         capture_output=True, text=True, timeout=120,
         env=dict(os.environ, HOME=str(home), ALGO_LAUNCHCTL_BIN=str(launchctl)),
     )
@@ -186,7 +188,8 @@ def test_no_leftover_staging_files_in_the_destination(host):
     src, home, _ = host
     (src / "victim.sh").write_text("#!/bin/bash\nexit 0\n")
     assert _deploy(host).returncode == 0
-    leftovers = [p.name for p in (home / "ibc").iterdir() if p.name != "victim.sh"]
+    # logs/ holds --from-any-tree's durable record (KAN-89), not a staged file.
+    leftovers = [p.name for p in (home / "ibc").iterdir() if p.name not in ("victim.sh", "logs")]
     assert not leftovers, leftovers
 
 
