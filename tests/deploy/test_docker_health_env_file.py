@@ -56,12 +56,20 @@ def _fake_docker(bin_dir: Path, *, argv_log: Path, require_secret: bool = False)
     Without ``--env-file`` it reads ``./.env`` before answering, exactly as
     ``docker compose config`` does — so an unserved FIFO blocks it. With
     ``--env-file`` it does not, and answers from the environment.
+
+    With ``require_secret`` it also models the compose file's
+    ``${POSTGRES_PASSWORD:?}`` guard: interpolation fails when the variable is
+    unset — unless ``--no-interpolate`` is passed, which skips it, exactly as
+    the real binary does.
     """
     secret_check = (
-        '      if [ -z "${POSTGRES_PASSWORD:-}" ]; then\n'
-        '        echo "required variable POSTGRES_PASSWORD is missing a value" >&2\n'
-        "        exit 1\n"
-        "      fi\n"
+        '      case "$*" in\n'
+        "        *--no-interpolate*) ;;\n"
+        '        *) if [ -z "${POSTGRES_PASSWORD:-}" ]; then\n'
+        '             echo "required variable POSTGRES_PASSWORD is missing a value" >&2\n'
+        "             exit 1\n"
+        "           fi ;;\n"
+        "      esac\n"
         if require_secret
         else ""
     )
@@ -151,18 +159,43 @@ def test_the_env_file_precedes_the_subcommand(project, bin_dir, tmp_path):
         assert parts.index("--env-file") < parts.index("config"), call
 
 
-def test_missing_secrets_still_degrade_to_empty_rather_than_a_false_list(
-    project, bin_dir, tmp_path
-):
-    """A locked keychain must keep the documented behaviour — 'compare nothing',
-    never a false healthy — and must now do it promptly instead of by blocking."""
+def test_unexported_secrets_do_not_empty_the_service_list(project, bin_dir, tmp_path):
+    """The defect after KAN-70. The watchdog sources secrets.sh but never calls
+    ``algo_load_secrets``, so POSTGRES_PASSWORD is unset in its environment and
+    interpolation fails on the ``${POSTGRES_PASSWORD:?}`` guard. That took the
+    "could not read" branch on 132 of 134 cycles on 2026-09-23 (287 on 09-10),
+    and ``gateway-watchdog-launchd.log`` holds the interpolation error 2,467
+    times. The service NAMES do not depend on any secret, so the list must come
+    back whole whether or not a secret is exported."""
     argv_log = tmp_path / "argv"
     _fake_docker(bin_dir, argv_log=argv_log, require_secret=True)
-    res = _call_expected_services(project, bin_dir)
-    assert res.stdout.strip() == "", res.stdout
+    env_without_secret = {k: v for k, v in os.environ.items() if k != "POSTGRES_PASSWORD"}
+    body = (
+        f'ALGO_DIR="{project}"\n'
+        f'ALGO_DOCKER_BIN="{bin_dir / "docker"}"\n'
+        f'. "{DOCKER_HEALTH}"\n'
+        "algo_docker_expected_services\n"
+    )
+    res = subprocess.run(
+        ["bash", "-c", body], capture_output=True, text=True,
+        timeout=BOUND_SECONDS,
+        env=dict(env_without_secret, PATH=f"{bin_dir}:{os.environ['PATH']}"),
+    )
+    assert res.stdout.split() == SERVICES, res
 
 
-def test_no_launchd_code_runs_compose_config_without_env_file():
+def test_the_compose_invocation_skips_interpolation(project, bin_dir, tmp_path):
+    """Pin the mechanism: ``--no-interpolate`` is what makes the list independent
+    of the keychain. Dropping it silently brings back every-cycle "could not read"."""
+    argv_log = tmp_path / "argv"
+    _fake_docker(bin_dir, argv_log=argv_log)
+    _call_expected_services(project, bin_dir)
+    compose = [c for c in argv_log.read_text().splitlines() if c.startswith("compose")]
+    assert compose
+    assert all("--no-interpolate" in c for c in compose), compose
+
+
+def test_no_launchd_code_runs_compose_config_that_can_block_or_fail():
     """The reverse drift. Any other consumer that grows a `compose config` call
     inherits the same FIFO block, and the failure is silent by construction."""
     offenders: list[str] = []
@@ -176,6 +209,11 @@ def test_no_launchd_code_runs_compose_config_without_env_file():
                 continue
             if not re.search(r"(\$ALGO_DOCKER_BIN|\bdocker)\S*[\"']?\s+compose\s", stripped):
                 continue
-            if re.search(r"compose\s+(?:\S+\s+)*?config\b", stripped) and "--env-file" not in stripped:
+            if re.search(r"compose\s+(?:\S+\s+)*?config\b", stripped) and (
+                "--env-file" not in stripped or "--no-interpolate" not in stripped
+            ):
                 offenders.append(f"{path.relative_to(REPO)}:{n}: {stripped}")
-    assert not offenders, "compose config without --env-file reads the .env FIFO:\n" + "\n".join(offenders)
+    assert not offenders, (
+        "compose config needs --env-file (else it reads the .env FIFO) and "
+        "--no-interpolate (else it fails on unexported secrets):\n" + "\n".join(offenders)
+    )
