@@ -214,7 +214,7 @@ def test_runbook_records_the_image_hash_and_rollback_steps() -> None:
     """The two acceptance criteria that turn "we deployed" into evidence."""
     text = RUNBOOK.read_text()
 
-    assert "docker compose images" in text, "no image-hash capture step"
+    assert "docker compose -p algo-poc images" in text, "no image-hash capture step"
     assert "docker tag" in text, "no pre-deploy retag, so no one-command rollback"
 
 

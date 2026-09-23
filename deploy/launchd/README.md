@@ -200,6 +200,153 @@ error instead of hanging — see
 `tests/deploy/test_launchd_secrets_keychain.py`, whose FIFO test blocks and
 times out if that guard is ever removed.
 
+## What is live on `git pull`, and what needs `deploy.sh`
+
+**Production runs from `/Users/huiliang/algo-poc-deploy`, not from
+`~/GitHub/algo-poc`.** That is the whole point of KAN-72: the deploy clone
+exists only to be deployed from, tracks `main`, and nobody develops in it.
+Before this split, every wrapper defaulted to the interactive checkout — which
+names a *working tree*, not a branch — so production ran whatever branch was
+last left checked out there. On 2026-09-08 that was `develop`, four commits
+ahead of `main`, and merging any PR to `develop` reached the live paper host
+immediately. Promotion to `main` changed nothing on the host, so the gate was
+decorative.
+
+### The deployment procedure
+
+Promotion is the only thing that changes what production runs:
+
+```bash
+# 1. Promote develop -> main through a PR, as usual.
+# 2. Then, in the DEPLOY CLONE:
+cd /Users/huiliang/algo-poc-deploy
+git pull --ff-only origin main      # FIRST. deploy.sh reads this tree.
+deploy/launchd/deploy.sh --dry-run  # show what would change
+deploy/launchd/deploy.sh            # copy the wrappers/plists that changed
+```
+
+`git pull` before `deploy.sh`, in that order. Running `deploy.sh` first is what
+produced the "everything in sync" on 2026-09-08 that was true and meaningless:
+it had compared a three-commits-stale checkout against `~/ibc`, found no
+differences, and copied nothing.
+
+### Bootstrapping the deploy clone (once, and again if it is ever lost)
+
+```bash
+git clone --branch main https://github.com/jumbomochi/algo-poc.git /Users/huiliang/algo-poc-deploy
+cd /Users/huiliang/algo-poc-deploy
+
+# Its own venv, built HERE and pinned like CI. Never copy or symlink the dev
+# checkout's .venv: its editable-install .pth points at ~/GitHub/algo-poc, so
+# scripts/divergence_monitor.py would import the dev tree's code while every
+# other job ran the clone's.
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements-dev.lock
+.venv/bin/pip install --no-deps -e .
+
+# Host state the clone does not carry (all gitignored):
+cp ~/GitHub/algo-poc/docker-compose.override.yml .     # ports 55432/56379
+mkdir -p output/logs
+# The divergence baseline of record (config/default.yaml: divergence.baseline_pin).
+# cp -p, NOT cp: lib/baseline_age.sh ages the pin by mtime, and a plain copy
+# resets the staleness clock, hiding a stale baseline for up to a month.
+cp -p ~/GitHub/algo-poc/output/backtest_multi_20260915_102125.json output/
+
+git status --short && git branch --show-current && git worktree list   # clean, main, one tree
+```
+
+**Cut-over order matters.** The clone must exist, with its venv, *before* the
+KAN-72 wrappers reach `~/ibc`: a wrapper whose `$ALGO_DIR` is missing cannot
+source `secrets.sh`, so it has no `algo_alert_local` either and dies without an
+alert — and the gateway watchdog stops restarting the gateway. Bootstrap, then
+promote, then `git pull` + `deploy.sh` from the clone.
+
+After the cut-over, `~/GitHub/algo-poc/output/` stops updating. Divergence,
+shadow and reconciliation artifacts are written under the clone's `output/`;
+read them there.
+
+### Sourced by path from the tree — live the moment the clone is pulled
+
+`deploy.sh` deliberately does **not** copy these. They are read from
+`$ALGO_DIR` at run time, so a copy under `~/ibc` would never be executed and
+would only ever be a decoy — the stale-copy trap that broke the 2026-08-11 cold
+boot, where an operator edits the `~/ibc` file, sees no effect, and the real
+logic silently stays behind.
+
+| file | what it is |
+|---|---|
+| `secrets.sh` | keychain loader, `algo_alert_local` |
+| `deadman.sh` | the external dead-man ping |
+| `lib/baseline_age.sh` | divergence baseline age, for the daily report |
+| `lib/bounded.sh` | wall-clock bounded execution (KAN-75) |
+| `lib/branch_guard.sh` | is the deploy tree running promoted code (KAN-73) |
+| `lib/docker_health.sh` | docker engine + stack liveness (KAN-66) |
+| `lib/launchd_wiring.sh` | installed-but-not-loaded reconciliation (KAN-64) |
+| `lib/power.sh` | the caffeinate power assertion (KAN-77) |
+| `lib/reconciliation.sh` | how long the book has been fail-closed (KAN-86) |
+| `lib/telegram.sh` | the shared Telegram sender (KAN-43) |
+
+`scripts/` and `config/` are read from the tree the same way, so a pull changes
+what the next run executes without any deploy step.
+
+### Copied to `~/ibc` — a pull alone changes nothing
+
+launchd executes these from `~/ibc`, so they need `deploy.sh` to move. Each one
+also self-checks at startup and logs a loud `WARNING - … differs from repo
+canonical` line if it was launched from a drifted copy.
+
+| file | job |
+|---|---|
+| `gateway_watchdog.sh` | IB Gateway watchdog, every 5 min |
+| `run_backtest_refresh.sh` | weekly backtest refresh, Tue 05:00 |
+| `run_db_backup.sh` | daily paper-DB backup |
+| `run_divergence.sh` | daily divergence monitor, 04:45 |
+| `run_evidence_digest.sh` | evidence digest |
+| `run_paper.sh` | daily paper trading run, 04:15 |
+| `run_pipeline_report.sh` | daily pipeline report, 04:52 |
+
+`deploy.sh` itself is not deployed — it is the deployer.
+
+Plists go to `~/Library/LaunchAgents`, and a copied plist is **not** a loaded
+job: see the KAN-64 section below.
+
+### Rebuilt in Docker — neither a pull nor `deploy.sh` moves these
+
+`services/*` (risk management, execution, portfolio accounting, …) run in the
+docker compose stack, so they only change when their images are rebuilt. A pull
+plus `deploy.sh` alone left the 2026-09-17 fix undeployed. When a promotion
+touches `services/`, `shared/`, a Dockerfile or a migration, also run, **in the
+deploy clone**:
+
+```bash
+eval "$(deploy/launchd/secrets.sh --export)"
+export ALGO_IB_ACCOUNT_ID=DUN551088   # not a secret, so --export omits it
+: "${ALGO_IB_ACCOUNT_ID:?set the IB account pin before rebuilding execution}"
+docker compose -p algo-poc up -d --build --force-recreate
+```
+
+That is the shape; for `risk-management`/`execution`, follow
+[`docs/operations/container-deploy.md`](../../docs/operations/container-deploy.md),
+which adds the before/after image and environment evidence and `--no-deps`.
+
+- **`-p algo-poc` is not optional.** Compose names the project after the
+  directory, so a bare `docker compose up` in `algo-poc-deploy` starts a *new*
+  project, `algo-poc-deploy`, on new, empty `pgdata`/`redisdata` volumes: a
+  paper book with no history. `-p algo-poc` keeps the clone driving the existing
+  stack and its volumes, and it is the project `lib/docker_health.sh` watches
+  (`ALGO_COMPOSE_PROJECT`).
+- **`--force-recreate`**, because `--build` alone rebuilds the image and leaves
+  the running containers on the old one.
+- **The account pin.** The dev checkout's compose interpolation got
+  `ALGO_IB_ACCOUNT_ID` from its 1Password `.env`. The clone has no `.env`, and
+  the pin is not a secret, so nothing supplies it unless you export it. Without
+  it `execution` comes back *unpinned* — silently, since an empty pin reads as
+  "no pin" — leaving only the `DU`/`U` prefix guard. The `:?` line refuses.
+- The clone needs its own copy of the gitignored `docker-compose.override.yml`
+  (the machine-local ports 55432/56379 the wrappers wait on). Without it the
+  stack comes up on the default ports and the 04:15 run times out waiting for
+  the paper DB.
+
 ## Deploying / syncing
 
 `deploy/launchd/deploy.sh` is the one command that pushes these wrappers +
