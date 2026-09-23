@@ -63,7 +63,7 @@ Usage (dry run first, always):
 
     python scripts/ops/restore_missed_entries.py \\
         --statement ~/Downloads/DUN551088_trades_20260918.csv \\
-        --account DUN551088
+        --account DUN551088 --statement-tz America/New_York
     python scripts/ops/restore_missed_entries.py ... --apply
 """
 from __future__ import annotations
@@ -73,11 +73,12 @@ import csv
 import json
 import sys
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
-from datetime import datetime, time, timezone
+from dataclasses import dataclass, field, replace
+from datetime import datetime, time, timezone, tzinfo
 from hashlib import sha256
 from math import isfinite
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
@@ -128,6 +129,7 @@ REQUIRED_COLUMNS = frozenset({
     "IBCommission",
     "IBCommissionCurrency",
     "DateTime",
+    "OrderReference",
 })
 
 #: Canonical spelling of every required column, keyed by its casefolded
@@ -141,10 +143,11 @@ _CANONICAL_COLUMNS = {column.casefold(): column for column in REQUIRED_COLUMNS}
 
 _SIDE = {"BUY": "buy", "SELL": "sell"}
 
-#: Regular US trading hours in UTC, widened either side. Used only to FLAG a
-#: statement that looks like it was exported in local time -- see
-#: :func:`suspicious_times`. Deliberately not a refusal: a genuine
-#: extended-hours fill is legal and must not be blocked by a heuristic.
+#: Regular US trading hours in UTC, widened either side. A fill outside it
+#: almost always means a wrong ``--statement-tz`` -- see
+#: :func:`suspicious_times`. It refuses ``--apply`` unless the operator
+#: passes ``--accept-outside-session``: a genuine extended-hours fill is
+#: legal, so the heuristic can be overridden, but only out loud.
 _US_SESSION_UTC = (time(12, 0), time(21, 30))
 
 
@@ -160,6 +163,15 @@ class Statement:
     skipped_sells: tuple[str, ...] = ()
     source: str | None = None
     source_sha256: str | None = None
+    #: The zone every ``DateTime`` was read in, as the operator named it.
+    statement_tz: str = "UTC"
+    #: Per execution_id, the broker evidence as the file wrote it: the
+    #: verbatim ``DateTime``, IB's ``IBOrderID``, and ``OrderReference``.
+    #: Kept because both the time and the order id are rewritten before
+    #: projection, and the applied artifact must show what they were.
+    raw_datetimes: Mapping[str, str] = field(default_factory=dict)
+    broker_order_ids: Mapping[str, str] = field(default_factory=dict)
+    order_refs: Mapping[str, str] = field(default_factory=dict)
 
 
 def suspicious_times(
@@ -179,13 +191,16 @@ def suspicious_times(
         if not (low <= execution.executed_at.timetz().replace(tzinfo=None) <= high)
     )
 
-#: ``DateTime`` is read as UTC. Flex can export in the account's local time,
-#: and a silent 4-hour shift would file a fill against the wrong session, so
-#: the runbook tells the operator to export in UTC and this never guesses a
-#: zone.
+#: ``DateTime`` carries no offset, and IB Flex offers no time-zone setting:
+#: the real 2026-09-22 export for DUN551088 wrote the fills in US Eastern
+#: (``2026-09-18;09:30:22``, the open). So the zone is never guessed and
+#: never defaulted at the CLI -- the operator names it with
+#: ``--statement-tz`` and :func:`suspicious_times` checks the result.
 _DATETIME_FORMATS = (
     "%Y%m%d;%H%M%S",
     "%Y%m%d;%H:%M:%S",
+    "%Y-%m-%d;%H:%M:%S",
+    "%Y-%m-%d;%H%M%S",
     "%Y-%m-%d %H:%M:%S",
     "%Y-%m-%d, %H:%M:%S",
     "%Y-%m-%dT%H:%M:%S",
@@ -269,22 +284,49 @@ def _integer(row: Mapping[str, str], column: str, index: int) -> int:
         ) from exc
 
 
-def _moment(row: Mapping[str, str], index: int) -> datetime:
+def _moment(row: Mapping[str, str], index: int, zone: tzinfo) -> datetime:
+    """The row's ``DateTime``, read in ``zone`` and returned in UTC."""
     raw = _text(row, "DateTime", index)
     for fmt in _DATETIME_FORMATS:
         try:
-            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+            naive = datetime.strptime(raw, fmt)
         except ValueError:
             continue
+        local = naive.replace(tzinfo=zone)
+        # A wall-clock time the zone skips (spring forward) or repeats (fall
+        # back) has two offsets. Picking one is a guess about broker
+        # evidence, so it is refused. No US-equity fill lands in that hour.
+        if local.utcoffset() != local.replace(fold=1).utcoffset():
+            raise StatementRefusedError(
+                f"row {index} DateTime {raw!r} is ambiguous or does not "
+                f"exist in {zone}: it falls in a daylight-saving transition."
+            )
+        return local.astimezone(timezone.utc)
     raise StatementRefusedError(
         f"row {index} has an unreadable DateTime: {raw!r}. Expected one of "
         + ", ".join(repr(fmt) for fmt in _DATETIME_FORMATS)
-        + ", in UTC."
+        + "."
     )
 
 
+def resolve_statement_tz(name: str) -> tzinfo:
+    """An IANA zone name, or a refusal naming it. Never a fallback."""
+    if name.upper() == "UTC":
+        return timezone.utc
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise StatementRefusedError(
+            f"--statement-tz {name!r} is not an IANA time zone. IB Flex "
+            "writes US-equity trades in exchange time: America/New_York."
+        ) from None
+
+
 def parse_statement(
-    rows: Iterable[Mapping[str, str]], *, account_id: str | None = None
+    rows: Iterable[Mapping[str, str]],
+    *,
+    account_id: str | None = None,
+    statement_tz: tzinfo = timezone.utc,
 ) -> Statement:
     """Turn IB statement rows into the executions ``plan_sweep`` consumes.
 
@@ -293,10 +335,16 @@ def parse_statement(
     match it: a statement covering two accounts must never leak one book
     into the other, and leaving that guarantee to the operator remembering
     a flag is not a guarantee.
+
+    ``statement_tz`` is the zone ``DateTime`` is written in. The CLI makes
+    the operator name it; UTC here is only the library default.
     """
     parsed: list[SweptExecution] = []
     skipped_sells: list[str] = []
     seen: set[str] = set()
+    raw_datetimes: dict[str, str] = {}
+    broker_order_ids: dict[str, str] = {}
+    order_refs: dict[str, str] = {}
 
     for index, raw_row in enumerate(rows, start=1):
         row = _canonical_row(raw_row, index)
@@ -351,6 +399,9 @@ def parse_statement(
             skipped_sells.append(execution_id)
             continue
 
+        raw_datetimes[execution_id] = _text(row, "DateTime", index)
+        broker_order_ids[execution_id] = _text(row, "IBOrderID", index)
+        order_refs[execution_id] = _text(row, "OrderReference", index)
         parsed.append(SweptExecution(
             execution_id=execution_id,
             account_id=account,
@@ -370,7 +421,7 @@ def parse_statement(
             # magnitude, matching what the live callback records.
             commission=abs(_number(row, "IBCommission", index)),
             commission_currency=_text(row, "IBCommissionCurrency", index),
-            executed_at=_moment(row, index),
+            executed_at=_moment(row, index, statement_tz),
         ))
 
     if not parsed:
@@ -389,6 +440,10 @@ def parse_statement(
     return Statement(
         executions=tuple(_with_cumulative(parsed)),
         skipped_sells=tuple(skipped_sells),
+        statement_tz=str(statement_tz),
+        raw_datetimes=raw_datetimes,
+        broker_order_ids=broker_order_ids,
+        order_refs=order_refs,
     )
 
 
@@ -417,7 +472,10 @@ def _with_cumulative(
 
 
 def load_statement(
-    path: Path | str, *, account_id: str | None = None
+    path: Path | str,
+    *,
+    account_id: str | None = None,
+    statement_tz: tzinfo = timezone.utc,
 ) -> Statement:
     """Read an IB statement CSV off disk.
 
@@ -431,13 +489,64 @@ def load_statement(
         raise StatementRefusedError(f"no statement file at {path}")
     raw = path.read_bytes()
     with path.open(newline="", encoding="utf-8-sig") as handle:
-        statement = parse_statement(csv.DictReader(handle), account_id=account_id)
+        statement = parse_statement(
+            csv.DictReader(handle),
+            account_id=account_id,
+            statement_tz=statement_tz,
+        )
     # Hashed at read time, so the digest describes the bytes that were
     # actually parsed rather than the file as it stood when the artifact
     # was written.
     return replace(
         statement, source=str(path), source_sha256=sha256(raw).hexdigest()
     )
+
+
+def attribute_by_order_ref(session: Session, statement: Statement) -> Statement:
+    """Re-key each execution onto the book's order id, via ``orderRef``.
+
+    Flex ``IBOrderID`` is IB's *permanent* order id (751093106 for AMD on
+    2026-09-18). ``order_intents.ib_order_id`` holds the API ``orderId`` the
+    executor was handed (189), and ``plan_sweep`` attributes by that -- so
+    every statement row read verbatim is UNTRACKED. The link that survives
+    both is ``orderRef``: the executor stamps every order with its
+    ``recommendation_id``, and Flex exports it as ``OrderReference``.
+
+    An ``OrderReference`` with no intent is left alone, so ``plan_sweep``
+    reports it untracked and ``--apply`` refuses. One that names an intent
+    for a different account, contract or side is refused outright: the
+    statement and the book disagree about what the order was.
+    """
+    executions = []
+    for execution in statement.executions:
+        ref = statement.order_refs.get(execution.execution_id)
+        intent = session.scalar(
+            select(OrderIntent).where(OrderIntent.recommendation_id == ref)
+        ) if ref else None
+        if intent is None:
+            executions.append(execution)
+            continue
+        mismatch = [
+            name for name, ours, theirs in (
+                ("account", intent.account_id, execution.account_id),
+                ("con_id", int(intent.con_id), execution.con_id),
+                ("side", intent.action.lower(), execution.side),
+            ) if ours != theirs
+        ]
+        if mismatch:
+            raise StatementRefusedError(
+                f"TradeID {execution.execution_id} has OrderReference {ref!r}, "
+                f"but that intent disagrees on {', '.join(mismatch)}. The "
+                "statement and the book describe different orders."
+            )
+        if intent.ib_order_id is None:
+            raise StatementRefusedError(
+                f"intent {ref!r} was never bound to an IB order id, so the "
+                f"fill for TradeID {execution.execution_id} cannot be "
+                "attributed through the ledger."
+            )
+        executions.append(replace(execution, ib_order_id=intent.ib_order_id))
+    return replace(statement, executions=tuple(executions))
 
 
 # --------------------------------------------------------------------------
@@ -719,10 +828,9 @@ def _render(
     if odd_hours:
         lines.append("")
         lines.append(
-            "  ⚠ TIME ZONE: every DateTime is read as UTC, and these fall "
-            "outside US trading hours. If the statement was exported in "
-            "local time every fill is hours off and will be filed against "
-            "the wrong session -- re-export in UTC:"
+            "  ⚠ TIME ZONE: read in the --statement-tz given, these fall "
+            "outside US trading hours. A wrong zone puts every fill hours "
+            "off and against the wrong session -- check --statement-tz:"
         )
         for execution in odd_hours:
             lines.append(
@@ -775,6 +883,7 @@ def _artifact(
     applied: Sequence[str],
     stamp: str,
     failed: Sequence[tuple[str, str]] = (),
+    accepted_outside_session: bool = False,
 ) -> dict:
     by_id = {execution.execution_id: execution for execution in executions}
     dates = sorted({by_id[e].executed_at.date().isoformat() for e in applied})
@@ -783,6 +892,8 @@ def _artifact(
         "applied_at": stamp,
         "statement": statement.source,
         "statement_sha256": statement.source_sha256,
+        "statement_tz": statement.statement_tz,
+        "accepted_outside_session": accepted_outside_session,
         "recovery_source": RECOVERY_SOURCE_STATEMENT,
         "execution_dates": dates,
         "applied": [
@@ -797,6 +908,9 @@ def _artifact(
                 "commission": by_id[execution_id].commission,
                 "commission_currency": by_id[execution_id].commission_currency,
                 "executed_at": by_id[execution_id].executed_at.isoformat(),
+                "statement_datetime": statement.raw_datetimes.get(execution_id),
+                "broker_order_id": statement.broker_order_ids.get(execution_id),
+                "order_ref": statement.order_refs.get(execution_id),
             }
             for execution_id in applied
         ],
@@ -835,7 +949,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--statement", required=True,
-        help="IB Flex Query 'Trades' CSV, exported with DateTime in UTC",
+        help="IB Flex Query 'Trades' CSV, including OrderReference",
+    )
+    parser.add_argument(
+        "--statement-tz", required=True,
+        help="IANA zone the statement's DateTime is written in. Required, "
+             "never guessed: IB Flex writes US trades in America/New_York.",
+    )
+    parser.add_argument(
+        "--accept-outside-session", action="store_true",
+        help="apply even though some fills fall outside US trading hours "
+             "(genuine extended-hours fills only; recorded in the artifact).",
     )
     parser.add_argument(
         "--account", default=None,
@@ -863,12 +987,17 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _run(args) -> int:
-    statement = load_statement(args.statement, account_id=args.account)
-    executions = statement.executions
+    statement = load_statement(
+        args.statement,
+        account_id=args.account,
+        statement_tz=resolve_statement_tz(args.statement_tz),
+    )
     url = args.database_url or load_config("config/default.yaml").database.url
     engine = create_engine(url)
 
     with Session(engine) as session:
+        statement = attribute_by_order_ref(session, statement)
+        executions = statement.executions
         outcome = plan_sweep(
             executions,
             OrderLedger(session),
@@ -905,6 +1034,16 @@ def _run(args) -> int:
                 "\nRefusing to apply: executions listed above are recorded "
                 "but were never projected. They cannot be recovered by this "
                 "tool -- see docs/operations/backups.md for the restore path."
+            )
+            session.rollback()
+            return 1
+
+        if odd_hours and not args.accept_outside_session:
+            print(
+                "\nRefusing to apply: fills fall outside US trading hours in "
+                f"{statement.statement_tz}. Almost always a wrong "
+                "--statement-tz; pass --accept-outside-session only for "
+                "genuine extended-hours fills."
             )
             session.rollback()
             return 1
@@ -955,6 +1094,7 @@ def _run(args) -> int:
                 applied=result.applied,
                 failed=result.failed,
                 stamp=datetime.now(timezone.utc).isoformat(),
+                accepted_outside_session=bool(odd_hours),
             ),
             indent=2,
         ))
