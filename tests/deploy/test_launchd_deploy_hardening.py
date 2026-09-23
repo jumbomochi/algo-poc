@@ -31,7 +31,7 @@ PAPER_PLIST = DEPLOY_DIR / "local.algo-paper-trading.plist"
 # Every wrapper deploy.sh copies to ~/ibc — i.e. every .sh that is *executed*
 # from the deployed location and can therefore drift from the repo. secrets.sh
 # and deadman.sh are excluded because they are sourced by path from the repo and
-# deploy.sh deliberately refuses to copy them (deploy.sh:78-85).
+# deploy.sh deliberately refuses to copy them (see the secrets.sh / deadman.sh skips in deploy.sh).
 WRAPPERS = (
     RUN_PAPER,
     RUN_DIVERGENCE,

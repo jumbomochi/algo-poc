@@ -14,17 +14,76 @@
 # for you to run.
 #
 # Usage:
-#   deploy/launchd/deploy.sh            # apply (copy changed files)
-#   deploy/launchd/deploy.sh --dry-run  # show what would change, copy nothing
+#   deploy/launchd/deploy.sh                  # apply (copy changed files)
+#   deploy/launchd/deploy.sh --dry-run        # show what would change, copy nothing
+#   deploy/launchd/deploy.sh --from-any-tree  # override the tree guard (logged)
 set -uo pipefail
 
 DRY_RUN=0
-[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+FROM_ANY_TREE=0
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run)       DRY_RUN=1 ;;
+        --from-any-tree) FROM_ANY_TREE=1 ;;
+        *) echo "deploy.sh: unknown argument: $arg" >&2; exit 2 ;;
+    esac
+done
 
-ALGO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ALGO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 SRC="$ALGO_DIR/deploy/launchd"
 IBC="$HOME/ibc"
 LA="$HOME/Library/LaunchAgents"
+
+# TREE GUARD — KAN-89. This script installs whatever tree it lives in, so one
+# run from the dev checkout or a .worktrees/<key> tree used to put develop or
+# feature-branch wrappers into production and report success — bypassing the
+# promotion gate KAN-72 exists to restore. So it installs only when:
+#   1. its own tree IS the deploy clone — the wrappers' ALGO_DIR default, read
+#      from run_paper.sh rather than restated here so the two cannot drift; and
+#   2. that tree is on promoted code (lib/branch_guard.sh says "promoted").
+#      "behind" refuses too: installing older code than main is the 2026-09-08
+#      rollback. "unknown" refuses: absence of evidence is not promoted.
+# --dry-run copies nothing, so it never refuses; it prints the reason instead.
+# --from-any-tree is the explicit escape hatch (tests, genuine emergencies); it
+# says, and records in ~/ibc/logs/deploy.log, exactly what it installed from.
+guard_reason=""
+expected_clone="$(sed -n 's/^ALGO_DIR="\${ALGO_DIR:-\([^}]*\)}"$/\1/p' "$SRC/run_paper.sh" 2>/dev/null | head -n1)"
+expected_resolved="$( [ -n "$expected_clone" ] && cd "$expected_clone" 2>/dev/null && pwd -P )"
+if [ -z "$expected_clone" ]; then
+    guard_reason="cannot read the deploy clone path (ALGO_DIR default) from $SRC/run_paper.sh"
+elif [ "$ALGO_DIR" != "$expected_resolved" ]; then
+    guard_reason="running from $ALGO_DIR, which is not the deploy clone $expected_clone — pull and deploy there"
+else
+    # Only the clone pays for the (bounded, read-only) ls-remote probe. It runs
+    # under --from-any-tree too, so the override record says whether it put
+    # unpromoted code into production.
+    ALGO_BRANCH_DIR="$ALGO_DIR"
+    # shellcheck source=deploy/launchd/lib/branch_guard.sh
+    . "$SRC/lib/branch_guard.sh"
+    algo_branch_check
+    [ "$ALGO_BRANCH_STATUS" = "promoted" ] || \
+        guard_reason="the deploy clone is not on promoted code ($ALGO_BRANCH_STATUS): $ALGO_BRANCH_DETAIL"
+fi
+
+if [ "$FROM_ANY_TREE" = "1" ]; then
+    src_branch="$(git -C "$ALGO_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+    src_head="$(git -C "$ALGO_DIR" rev-parse --short HEAD 2>/dev/null || echo '?')"
+    override_line="--from-any-tree: installing from $ALGO_DIR on $src_branch ($src_head)${guard_reason:+ — guard would have refused: $guard_reason}"
+    echo "WARNING: $override_line" >&2
+    if [ "$DRY_RUN" = "0" ]; then
+        mkdir -p "$IBC/logs" 2>/dev/null || true
+        printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$override_line" \
+            >> "$IBC/logs/deploy.log" 2>/dev/null || true
+    fi
+elif [ -n "$guard_reason" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "WARNING: a real deploy would refuse: $guard_reason" >&2
+    else
+        echo "deploy.sh: REFUSED, nothing copied: $guard_reason" >&2
+        echo "  (override, for tests and genuine emergencies only: --from-any-tree)" >&2
+        exit 1
+    fi
+fi
 
 # launchd wiring reconciliation (KAN-64), so the reload hint below can name the
 # jobs that are ACTUALLY unloaded rather than printing a generic list of the
