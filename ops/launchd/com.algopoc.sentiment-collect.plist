@@ -7,10 +7,10 @@
     <string>com.algopoc.sentiment-collect</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/huiliang/GitHub/algo-poc/ops/launchd/run_sentiment_collect.sh</string>
+        <string>/Users/huiliang/algo-poc-deploy/ops/launchd/run_sentiment_collect.sh</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/huiliang/GitHub/algo-poc</string>
+    <string>/Users/huiliang/algo-poc-deploy</string>
     <key>StartInterval</key>
     <integer>3600</integer>
     <key>EnvironmentVariables</key>
@@ -28,8 +28,8 @@
         <string>REPLACE_ME</string>
     </dict>
     <key>StandardOutPath</key>
-    <string>/Users/huiliang/GitHub/algo-poc/output/logs/sentiment-collect.log</string>
+    <string>/Users/huiliang/algo-poc-deploy/output/logs/sentiment-collect.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/huiliang/GitHub/algo-poc/output/logs/sentiment-collect.err.log</string>
+    <string>/Users/huiliang/algo-poc-deploy/output/logs/sentiment-collect.err.log</string>
 </dict>
 </plist>

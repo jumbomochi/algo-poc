@@ -8,7 +8,8 @@
 # "executed" via ${BASH_SOURCE[0]}, which zsh does not define — under zsh the
 # guard collapses to $0 == $0 and the loader would run its CLI instead of
 # defining functions. Nothing here needs zsh.
-ALGO_DIR="/Users/huiliang/GitHub/algo-poc"
+# The deploy clone, not the dev checkout — see deploy/launchd/README.md (KAN-72).
+ALGO_DIR="${ALGO_DIR:-/Users/huiliang/algo-poc-deploy}"
 cd "$ALGO_DIR" || exit 1
 
 # The paper DB is the dockerized postgres on a machine-local port (see
