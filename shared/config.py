@@ -230,6 +230,13 @@ class DivergenceConfig(BaseModel):
     """
 
     baseline_pin: str | None = None
+    #: The Rung-0 baseline of record (KAN-60): momentum only, whole shares,
+    #: the $1 commission floor, USD 3,700 — the book D8 says Rung 0 holds.
+    #: It is the reference for Rung-0 economics and divergence thresholds
+    #: (rung0-economics §9.6), NOT the edge-evidence baseline above and not the
+    #: nightly drift feed, which is the rolling shadow (D19). ``None`` is
+    #: unpinned; it never falls back to ``baseline_pin``.
+    rung0_baseline_pin: str | None = None
     #: Earliest live equity date admissible for grading (KAN-83).
     #:
     #: Live equity from before a re-baseline is not comparable to anything.

@@ -145,6 +145,7 @@ Weekly Telegram evidence digest (rides `run_pipeline_report` + the verified bot)
 | D18 | PIT baseline cannot meet the coverage floor from IB data | **DECIDED 2026-08-26: accept the bias, documented and time-bounded** (KAN-59). No vendor purchase. Coverage floor unchanged at 5.00%; artifacts stay `BLOCKED`. Re-evidence after 3 years of forward capture. See [The accepted PIT coverage bias](#the-accepted-pit-coverage-bias-d18) below |
 | D19 | Divergence graded live against a frozen artifact | **DECIDED 2026-09-04: the daily feed is a rolling shadow, comparability is per sleeve.** A pinned 10-year baseline cannot score sessions past its own last bar, so the window froze at 2026-08-14. The pin remains the baseline of record for edge evidence; it is no longer the operational feed. See [Drift comparability is window-scoped and per-sleeve](#drift-comparability-is-window-scoped-and-per-sleeve-d19) below |
 | D20 | The edge-evidence baseline of record cannot move to a fresher artifact | **DECIDED 2026-09-16: re-accept the same measured bias on the 2026-09-15 refresh.** D18 pinned its acceptance to one sha256 and an acceptance never widens, so a fresher baseline needs its own deliberate entry. Exclusion 11.21% vs D18's 11.28% — the same structural gap, re-measured. Floor still 5.00%, artifact still `BLOCKED`, re-evidence date unchanged. See [Re-accepting the coverage bias on a fresher baseline](#re-accepting-the-coverage-bias-on-a-fresher-baseline-d20) below |
+| D21 | Rung 0 needs a capital-specific baseline, and daily drift moved to the shadow | **DECIDED 2026-09-25: one artifact for evidence, the whole-share shadow for drift** (KAN-60). `output/baselines/rung0_momentum_20260925.json` — `momentum` only, whole shares, the $1.00 floor, USD 3,700 — is the Rung-0 baseline of record, pinned as `divergence.rung0_baseline_pin`, and its coverage bias is accepted under its own entry at the same 11.21% as D20. Floor still 5.00%, artifact still `BLOCKED`. Rung-0 daily drift will be graded against the whole-share momentum shadow under its own `shadow:` id once KAN-33 switches it on (not live today). See [The Rung-0 baseline of record](#the-rung-0-baseline-of-record-d21) below |
 
 ## The accepted PIT coverage bias (D18)
 
@@ -402,6 +403,107 @@ spent against this artifact inherits the same upward survivorship bias D18
 describes, and the bias still runs **against** a passing verdict rather than for
 it. The holdout being spendable in November is not the same as its result being
 clean evidence.
+
+## The Rung-0 baseline of record (D21)
+
+**Decided 2026-09-25 (KAN-60).** Rung 0 gets its own baseline artifact —
+`output/baselines/rung0_momentum_20260925.json` — pinned as
+`divergence.rung0_baseline_pin`, and its coverage bias is accepted under its own
+entry. This is the "one capital-specific divergence baseline" that
+[rung0-economics.md §9.6(2)](../operations/rung0-economics.md) required and D16
+specified: `momentum` only, whole-share sizing, the $1.00 per-order commission
+floor, USD 3,700 of capital.
+
+### How it was generated
+
+From the D20 bars, with no IB time:
+
+```bash
+python scripts/run_backtest.py --years 10 --capital 3700 --whole-shares \
+    --sleeves momentum \
+    --bars-from-json output/backtest_multi_20260915_102125.json \
+    --universe-snapshots data/universe/sp500_membership.json \
+    --output output/baselines/rung0_momentum_20260925.json
+```
+
+`--sleeves momentum` renormalises the allocation over the selection, so
+`momentum` runs at the full 3,700 rather than a sixth of it, and a `--sleeves`
+run always writes the multi-portfolio envelope the monitor reads. The name sits
+outside `backtest_multi_*` on purpose: the 90-day prune, `record_epoch`'s
+newest-baseline lookup and the stale-age check all glob that pattern, and none of
+them should ever see this file (see
+[backtest-baseline.md](../operations/backtest-baseline.md)).
+
+### The number being accepted
+
+Measured on `output/baselines/rung0_momentum_20260925.json`,
+sha256 `f1f3a4ff…e6d3a8`:
+
+```
+total membership-days    : 1,265,371
+excluded membership-days :   141,811
+excluded_pct             :     11.21%
+floor_pct                :      5.00%
+state                    : BLOCKED
+date range               : 2016-09-19 .. 2026-09-14  (2,510 sessions)
+portfolios               : {momentum: 3,700}
+whole_shares             : true
+commission_minimum       : 1.00
+```
+
+The exclusion is **identical** to D20's, day for day. That is expected rather
+than a coincidence: coverage is a property of the membership calendar and the
+bars that could be priced, not of which sleeves ran over them, and this artifact
+was built from D20's bars against the same membership file.
+
+### Why a new acceptance rather than inheriting D20's
+
+Because the rule D20 turned on still holds: an acceptance is pinned to **one
+sha256 and never widens**. The same measured bias on a different file is a
+different artifact, and `resolve_admissibility` refuses any acceptance whose
+`source_sha256` is not the artifact's. D21 is therefore its own entry in
+`research/bias_acceptances.json`; D18 and D20 are untouched, and the edge pin
+(`divergence.baseline_pin`) still names the D20 artifact. The entry also brings
+the file under `protected_artifacts`, so nothing that prunes `output/` may delete
+it.
+
+The floor stays at **5.00**, the artifact stays `BLOCKED` with
+`is_like_for_like` False, and the re-evidence trigger is D18's, unmoved:
+three years of forward capture from the 2026-08-18 start, so **2029-08-18**.
+
+### What it is for, and what it is not
+
+It is the reference for **Rung-0 economics and divergence thresholds** — the
+return figures and thresholds §9.6(3) says may not be quoted before a PIT
+re-run, available with the D18/D20/D21 accepted bias — still survivorship-inflated (§9.7) and must cite D21 — at Rung-0 capital and sizing. It is **not** the edge-evidence baseline
+(`run_sleeve_evaluation.py` still refuses an artifact missing any incumbent
+sleeve, and the D10 verdicts rest on D18/D20), and it is **not** the nightly
+drift feed.
+
+### D19 addendum — Rung-0 daily drift is the whole-share shadow
+
+D19 moved daily drift from the pinned artifact to a rolling shadow. D21 restates
+its Rung-0 acceptance criterion (AC3) in those terms: **the Rung-0 daily-drift
+instrument is the whole-share `momentum` shadow**, filed under its own `shadow:`
+id. Whole-share sizing is part of that id (only when on), so a whole-share shadow
+can never share a `baseline_id` — or an evidence row — with a fractional one, and
+today's fractional ids are byte-identical.
+
+It is switched on **together with paper whole-share sizing, by KAN-33**, and not
+before: the paper book still sizes fractionally, and a whole-share shadow graded
+against it would manufacture drift. The 20-session Rung-0 divergence-OK window
+starts from the first real run on that shadow, not from today. §9.6(4) holds
+unchanged: that window does **not** transfer to a multi-sleeve book at a later
+rung.
+
+### What it does not rescue
+
+A `VALID_WITH_ACCEPTED_BIAS` artifact is still not a `VALID` one. Every Rung-0
+figure quoted from it inherits the same upward survivorship bias D18 and D20
+describe, and the bias runs **against** a Rung-0 result looking good, not for
+it. Nor does a baseline change §9.8: `momentum` failed its edge verdict of
+record, and a clean Rung 0 is evidence the machine works, never that the
+strategy does.
 
 ## Drift comparability is window-scoped and per-sleeve (D19)
 

@@ -27,6 +27,19 @@
       "re_evidence": "3 years of continuous forward-captured daily bars for the whole index, then re-run the baseline over that window -- unchanged from D18, and still dated from the 2026-08-18 capture start (2029-08-18)",
       "doc": "docs/designs/project-direction.md",
       "note": "D18 accepted this bias for ONE artifact by sha256 and an acceptance never widens, so a fresher baseline needs its own deliberate entry rather than inheriting D18's. Nothing about the bias changed: 141,811 of 1,265,371 membership-days unpriceable (11.21%), floor unmoved at 5.00, artifact still BLOCKED, is_like_for_like still False. This entry exists so the EDGE-EVIDENCE baseline of record can move to an artifact whose date index reaches past 2026-08-18 -- which the D18 artifact never can, and which forward_2026h2 (boundary 2026-08-29) requires before it can ever be spent. Per D19 the pin is no longer the operational divergence feed, so this re-pin does not touch nightly drift detection. The 2026-09-10 refresh measured 17.39% and is deliberately NOT accepted: it is an outlier against the ~11.2% structural level, not a trend."
+    },
+    {
+      "decision": "D21",
+      "requirement": "coverage_floor",
+      "source_sha256": "f1f3a4ffec895c22d4baf827ca99c0aac488a0026e68c0b5b301ee8691e6d3a8",
+      "source": "output/baselines/rung0_momentum_20260925.json",
+      "excluded_pct": 11.21,
+      "floor_pct": 5.0,
+      "accepted_at": "2026-09-25",
+      "direction": "survivorship-biased upward by an unmeasured amount -- the same structural gap D18/D20 accepted, measured on the same bars and membership, so the same figure",
+      "re_evidence": "3 years of continuous forward-captured daily bars for the whole index, then re-run the baseline over that window -- unchanged from D18, dated from the 2026-08-18 capture start (2029-08-18)",
+      "doc": "docs/designs/project-direction.md",
+      "note": "The Rung-0 baseline of record (KAN-60): momentum only, whole shares, $1 commission floor, USD 3,700, rebuilt from the D20 bars with no IB time. Coverage is a property of membership and bars, not of which sleeves ran, so it inherits D20's exclusion exactly; a new sha256 still needs its own entry because an acceptance never widens. Pinned as divergence.rung0_baseline_pin. It is the reference for Rung-0 economics and divergence thresholds (rung0-economics 9.6), not the edge-evidence baseline and not the nightly drift feed (D19)."
     }
   ]
 }

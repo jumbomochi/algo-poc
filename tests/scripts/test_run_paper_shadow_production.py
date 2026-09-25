@@ -143,3 +143,35 @@ def test_no_live_history_at_all_writes_an_empty_but_valid_artifact(tmp_path) -> 
 
     assert artifact.series == {}
     assert artifact.shadow_id.startswith("shadow:")
+
+
+# ---------------------------------------------------------------------------
+# whole_shares (KAN-60) — Rung 0's own instrument
+# ---------------------------------------------------------------------------
+
+
+def test_whole_share_sizing_reaches_the_replay(tmp_path, monkeypatch) -> None:
+    import scripts.run_paper as run_paper
+    seen = {}
+    real = run_paper.build_shadow_series
+
+    def spy(**kwargs):
+        seen["whole_shares"] = kwargs.get("whole_shares")
+        return real(**kwargs)
+
+    monkeypatch.setattr(run_paper, "build_shadow_series", spy)
+    _produce(tmp_path, whole_shares=True)
+    assert seen["whole_shares"] is True
+
+
+def test_a_rung0_shadow_is_filed_under_its_own_id(tmp_path) -> None:
+    """Rung 0: momentum is the only sleeve with live history, sized in whole
+    shares. Its evidence must never share an id with the fractional book."""
+    live = {"momentum": _live_equity()["momentum"]}
+    rung0 = load_shadow(_produce(tmp_path, output_path=tmp_path / "r0.json",
+                                 live_equity=live, capital=3_700.0, whole_shares=True))
+    fractional = load_shadow(_produce(tmp_path, output_path=tmp_path / "fr.json",
+                                      live_equity=live, capital=3_700.0))
+
+    assert set(rung0.series) == {"momentum"}
+    assert rung0.shadow_id != fractional.shadow_id

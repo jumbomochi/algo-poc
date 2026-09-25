@@ -179,3 +179,33 @@ def test_a_missing_artifact_raises_rather_than_reading_as_empty(tmp_path) -> Non
     the blind signal, and it must not be laundered into 'no sleeves'."""
     with pytest.raises(FileNotFoundError):
         load_shadow(tmp_path / "absent.json")
+
+
+# ---------------------------------------------------------------------------
+# whole_shares (KAN-60) — sizing is part of the model
+# ---------------------------------------------------------------------------
+
+
+class _ParamsSleeve:
+    """A params-only stand-in, distinct from the file's own ``_Sleeve``
+    (which also carries ``name``) so this class does not rebind that global
+    and break the ``_roster()``-based tests above."""
+
+    def __init__(self, params):
+        self.shadow_params = params
+
+
+def test_fractional_ids_are_unchanged_by_the_whole_shares_flag() -> None:
+    """Every divergence_daily row on file keys on today's id; moving it would
+    orphan the breach streak for a change nobody made."""
+    from backtest.shadow_artifact import shadow_id_for
+    roster = {"momentum": _ParamsSleeve({"top_n": 5})}
+    assert shadow_id_for(roster, whole_shares=False) == shadow_id_for(roster)
+
+
+def test_whole_share_sizing_is_a_different_model() -> None:
+    from backtest.shadow_artifact import shadow_id_for
+    roster = {"momentum": _ParamsSleeve({"top_n": 5})}
+    whole = shadow_id_for(roster, whole_shares=True)
+    assert whole.startswith("shadow:")
+    assert whole != shadow_id_for(roster)

@@ -46,8 +46,11 @@ DEFAULT_CONFIG = "config/default.yaml"
 #: nightly job would then judge against whatever it points at.
 ENV_OVERRIDE = "ALGO_BASELINE_PIN"
 
+#: The rung-0 pin's own override, so redirecting one pin can never move the other.
+RUNG0_ENV_OVERRIDE = "ALGO_RUNG0_BASELINE_PIN"
 
-def resolve_pin(config_path: str = DEFAULT_CONFIG) -> str | None:
+
+def resolve_pin(config_path: str = DEFAULT_CONFIG, *, rung0: bool = False) -> str | None:
     """Return the pinned baseline as an absolute path, or None if unpinned.
 
     Absolute because the callers need it that way: the refresh wrapper compares
@@ -60,17 +63,22 @@ def resolve_pin(config_path: str = DEFAULT_CONFIG) -> str | None:
     Never raises. The refresh wrapper runs this from a scratch tree that may
     carry no config at all, and a traceback on stdout would be substituted into
     ``--backtest`` as though it were a path.
+
+    ``rung0`` selects ``divergence.rung0_baseline_pin`` (KAN-60) and its own
+    override. An unset rung-0 pin is None, never the edge pin.
     """
-    override = os.environ.get(ENV_OVERRIDE)
+    env_name = RUNG0_ENV_OVERRIDE if rung0 else ENV_OVERRIDE
+    override = os.environ.get(env_name)
     if override and override.strip():
         return str(Path(override.strip()).absolute())
 
     try:
-        pin = load_config(config_path).divergence.baseline_pin
+        divergence = load_config(config_path).divergence
     except Exception as exc:  # noqa: BLE001 - stdout must stay a path or empty
         print(f"baseline_pin: could not read {config_path}: {exc}", file=sys.stderr)
         return None
 
+    pin = divergence.rung0_baseline_pin if rung0 else divergence.baseline_pin
     if not pin or not pin.strip():
         return None
     return str(Path(pin.strip()).absolute())
@@ -81,13 +89,16 @@ def main(argv: list[str] | None = None) -> int:
         description="Print the pinned divergence baseline path, if one is configured."
     )
     parser.add_argument("--config", default=DEFAULT_CONFIG)
+    parser.add_argument("--rung0", action="store_true", help="Resolve divergence.rung0_baseline_pin (KAN-60) instead.")
     args = parser.parse_args(argv)
 
-    pin = resolve_pin(args.config)
+    pin = resolve_pin(args.config, rung0=args.rung0)
     if pin is None:
+        key = "divergence.rung0_baseline_pin" if args.rung0 else "divergence.baseline_pin"
+        env = RUNG0_ENV_OVERRIDE if args.rung0 else ENV_OVERRIDE
         print(
-            "baseline_pin: no divergence.baseline_pin configured "
-            f"in {args.config} and no {ENV_OVERRIDE} set",
+            f"baseline_pin: no {key} configured "
+            f"in {args.config} and no {env} set",
             file=sys.stderr,
         )
         return 1
