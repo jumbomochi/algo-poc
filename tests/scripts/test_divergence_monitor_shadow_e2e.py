@@ -53,7 +53,10 @@ def _db(tmp_path: Path, name: str) -> str:
     return url
 
 
-def _shadow(tmp_path: Path, *, session_date=GRADED, drift=1.0, produced_on=None) -> Path:
+def _shadow(
+    tmp_path: Path, *, session_date=GRADED, drift=1.0, produced_on=None,
+    shadow_id: str = "shadow:aaaabbbbccccdddd",
+) -> Path:
     """A model curve that tracks live, scaled by ``drift``."""
     mom, sec = 23080.0, 15380.0
     series: dict[str, dict[date, float]] = {"momentum": {}, "sector_rotation": {}}
@@ -63,7 +66,7 @@ def _shadow(tmp_path: Path, *, session_date=GRADED, drift=1.0, produced_on=None)
         mom *= 1.002 * drift
         sec *= 1.001
     path = tmp_path / "shadow_20260525.json"
-    dump_shadow(path, series=series, shadow_id="shadow:aaaabbbbccccdddd",
+    dump_shadow(path, series=series, shadow_id=shadow_id,
                 window_sessions=5, session_date=session_date,
                 produced_on=produced_on or date.today())
     return path
@@ -280,3 +283,25 @@ def test_the_graded_series_and_the_baseline_id_come_from_one_read(
          shadow=_shadow(tmp_path), output=tmp_path / "divergence.json")
 
     assert len(reads) == 1, f"artifact read {len(reads)} times: {reads}"
+
+
+def test_a_whole_share_shadow_files_verdicts_under_its_own_id(
+    tmp_path, monkeypatch
+) -> None:
+    """KAN-60 AC3 as restated after D19: the Rung-0 instrument is the
+    whole-share shadow, and divergence_daily rows carry ITS baseline_id."""
+    from backtest.shadow_artifact import shadow_id_for
+
+    class _S:
+        shadow_params = {"top_n": 5}
+
+    whole_id = shadow_id_for({"momentum": _S()}, whole_shares=True)
+    frac_id = shadow_id_for({"momentum": _S()})
+    db_url = _db(tmp_path, "rung0")
+    path = _shadow(tmp_path, shadow_id=whole_id)
+
+    _run(monkeypatch, db_url=db_url, shadow=path, output=tmp_path / "divergence.json")
+
+    ids = {r.baseline_id for r in _verdict_rows(db_url)}
+    assert ids == {whole_id}
+    assert frac_id not in ids
