@@ -21,7 +21,7 @@ import os
 import sys
 import time
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -129,6 +129,32 @@ from shared.universe import (  # noqa: F401
     get_union_universe,
     make_stock_contract,
 )
+
+#: Each sleeve's share of --capital. Must agree with
+#: scripts/run_paper.py::CAPITAL_ALLOCATIONS. One table rather than a literal
+#: per call site, so a --sleeves subset can renormalise it.
+SLEEVE_ALLOCATIONS: dict[str, float] = {
+    "momentum": 0.2308,
+    "sector_rotation": 0.1538,
+    "thematic_momentum": 0.1410,
+    "quality_value": 0.1538,
+    "earnings_drift": 0.1923,
+    "tail_risk_hedge": 0.1283,
+}
+
+
+def sleeve_capital_fractions(selected: Sequence[str] | None) -> dict[str, float]:
+    """Capital fractions for the sleeves that will run.
+
+    ``None`` is every sleeve at its live allocation, exactly as before. A subset
+    is renormalised over itself: Rung 0 runs momentum alone at the rung's whole
+    capital (D8), and 23% of USD 3,700 would describe a book nobody holds.
+    """
+    if selected is None:
+        return dict(SLEEVE_ALLOCATIONS)
+    total = sum(SLEEVE_ALLOCATIONS[name] for name in selected)
+    return {name: SLEEVE_ALLOCATIONS[name] / total for name in selected}
+
 
 # Instruments that are tradable on every date because they are not index
 # constituents at all: the sector, thematic, inverse and defensive ETFs the
@@ -2419,12 +2445,17 @@ def save_multi_portfolio_results(
     output_dir: str = "output",
     skipped_signals: dict[str, dict] | None = None,
     entry_signals_sized: dict[str, int] | None = None,
+    path: str | None = None,
 ) -> str:
     """Serialize multi-portfolio backtest output to a timestamped JSON file.
 
     ``skipped_signals`` is written for *every* sleeve, empty block included, so
     a sleeve that skipped nothing reads differently from one that was never
     measured.
+
+    ``path`` overrides the ``output_dir``/timestamp naming with an exact
+    location (parent directories created), for callers such as a Rung 0
+    baseline that must land at a fixed path a weekly refresh's globs never see.
     """
 
     def _json_serializer(obj: Any) -> str:
@@ -2432,10 +2463,12 @@ def save_multi_portfolio_results(
             return obj.isoformat()
         raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
-    os.makedirs(output_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"backtest_multi_{timestamp}.json"
-    path = os.path.join(output_dir, filename)
+    if path is None:
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(output_dir, f"backtest_multi_{timestamp}.json")
+    else:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
 
     portfolios_payload = {}
     for name, result in results.items():
@@ -2535,6 +2568,16 @@ def main():
     parser.add_argument("--ib-port", type=int, default=7497)
     parser.add_argument("--output-dir", default="output",
                         help="Directory for output files (default: output)")
+    parser.add_argument(
+        "--sleeves", nargs="+", choices=list(SLEEVE_ALLOCATIONS), default=None,
+        help="Run only these sleeves, their allocations renormalised over the "
+             "selection (a single sleeve gets the whole --capital). Always "
+             "writes the multi-portfolio envelope. Default: all six.",
+    )
+    parser.add_argument(
+        "--output", default=None,
+        help="Exact results path, parent created. Overrides --output-dir naming.",
+    )
     parser.add_argument("--ml-filter", default=None,
                         help="Path to trained signal quality model (LightGBM .txt file)")
     parser.add_argument("--ml-threshold", type=float, default=0.55,
@@ -2573,6 +2616,7 @@ def main():
         help="Record factor snapshots for every raw sleeve buy candidate",
     )
     args = parser.parse_args()
+    fractions = sleeve_capital_fractions(args.sleeves)
 
     replacement_policy = ReplacementPolicy(args.replacement_policy)
     if args.replacement_score_margin < 0:
@@ -2758,7 +2802,7 @@ def main():
         top_n=5,
         lookback_days=126,
         position_size_pct=0.12,
-        initial_capital=args.capital * 0.2308,
+        initial_capital=args.capital * fractions.get("momentum", SLEEVE_ALLOCATIONS["momentum"]),
         trailing_stop_pct=0.10,
         bear_tickers=BEAR_TICKERS,
         eligible_tickers=momentum_eligible,
@@ -2772,7 +2816,7 @@ def main():
         top_n=3,
         lookback_days=63,
         position_size_pct=0.20,
-        initial_capital=args.capital * 0.1538,
+        initial_capital=args.capital * fractions.get("sector_rotation", SLEEVE_ALLOCATIONS["sector_rotation"]),
         trailing_stop_pct=0.08,
     )
     thematic_signals_fn = make_thematic_momentum_signals_fn(
@@ -2783,7 +2827,7 @@ def main():
         top_n=8,
         lookback_days=63,
         position_size_pct=0.135,
-        initial_capital=args.capital * 0.1410,
+        initial_capital=args.capital * fractions.get("thematic_momentum", SLEEVE_ALLOCATIONS["thematic_momentum"]),
         trailing_stop_pct=0.10,
         regime_by_date=regime_by_date,
         replacement_policy=replacement_policy,
@@ -2798,7 +2842,7 @@ def main():
         eligible_tickers=equity_eligible,
         top_n=15,
         position_size_pct=0.06,
-        initial_capital=args.capital * 0.1538,
+        initial_capital=args.capital * fractions.get("quality_value", SLEEVE_ALLOCATIONS["quality_value"]),
         trailing_stop_pct=0.12,
         regime_by_date=regime_by_date,
         replacement_policy=replacement_policy,
@@ -2812,7 +2856,7 @@ def main():
         surprise_threshold_pct=5.0,
         max_hold_days=20,
         position_size_pct=0.08,
-        initial_capital=args.capital * 0.1923,
+        initial_capital=args.capital * fractions.get("earnings_drift", SLEEVE_ALLOCATIONS["earnings_drift"]),
         trailing_stop_pct=0.06,
         regime_by_date=regime_by_date,
     )
@@ -2821,12 +2865,12 @@ def main():
         skip_ledger=skip_ledgers["tail_risk_hedge"],
         regime_by_date=regime_by_date,
         position_size_pct=0.25,
-        initial_capital=args.capital * 0.1283,
+        initial_capital=args.capital * fractions.get("tail_risk_hedge", SLEEVE_ALLOCATIONS["tail_risk_hedge"]),
     )
     portfolios: dict[str, PortfolioConfig] = {
         "momentum": PortfolioConfig(
             name="momentum",
-            capital=args.capital * 0.2308,
+            capital=args.capital * fractions.get("momentum", SLEEVE_ALLOCATIONS["momentum"]),
             signals_fn=mom_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=12.0,
@@ -2837,7 +2881,7 @@ def main():
         ),
         "sector_rotation": PortfolioConfig(
             name="sector_rotation",
-            capital=args.capital * 0.1538,
+            capital=args.capital * fractions.get("sector_rotation", SLEEVE_ALLOCATIONS["sector_rotation"]),
             signals_fn=sector_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=20.0,
@@ -2848,7 +2892,7 @@ def main():
         ),
         "thematic_momentum": PortfolioConfig(
             name="thematic_momentum",
-            capital=args.capital * 0.1410,
+            capital=args.capital * fractions.get("thematic_momentum", SLEEVE_ALLOCATIONS["thematic_momentum"]),
             signals_fn=thematic_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=15.0,
@@ -2859,7 +2903,7 @@ def main():
         ),
         "quality_value": PortfolioConfig(
             name="quality_value",
-            capital=args.capital * 0.1538,
+            capital=args.capital * fractions.get("quality_value", SLEEVE_ALLOCATIONS["quality_value"]),
             signals_fn=qv_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=10.0,
@@ -2870,7 +2914,7 @@ def main():
         ),
         "earnings_drift": PortfolioConfig(
             name="earnings_drift",
-            capital=args.capital * 0.1923,
+            capital=args.capital * fractions.get("earnings_drift", SLEEVE_ALLOCATIONS["earnings_drift"]),
             signals_fn=ed_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=8.0,
@@ -2881,7 +2925,7 @@ def main():
         ),
         "tail_risk_hedge": PortfolioConfig(
             name="tail_risk_hedge",
-            capital=args.capital * 0.1283,
+            capital=args.capital * fractions.get("tail_risk_hedge", SLEEVE_ALLOCATIONS["tail_risk_hedge"]),
             signals_fn=tail_risk_signals_fn,
             risk_engine=RiskEngine(
                 position_entry_limit_pct=25.0,
@@ -2891,6 +2935,9 @@ def main():
             ),
         ),
     }
+
+    if args.sleeves is not None:
+        portfolios = {name: pc for name, pc in portfolios.items() if name in fractions}
 
     # Level 3: Crash entry freeze — block new buys during crash regime
     for name, pc in list(portfolios.items()):
@@ -2954,7 +3001,8 @@ def main():
         enrich_trades(result.trades, bars_by_ticker, regime_by_date)
 
     # 4. Print results
-    if len(portfolios) == 1:
+    multi = len(portfolios) > 1 or args.sleeves is not None
+    if not multi:
         # Single portfolio: backward-compatible output
         result = next(iter(results.values()))
         print_results(result, elapsed)
@@ -2962,31 +3010,32 @@ def main():
         aggregate = compute_aggregate_metrics(results, portfolios)
         print_multi_portfolio_results(results, portfolios, aggregate, elapsed)
 
-        # Run rebalancer simulation
-        strategy_curves = {name: result.portfolio_values for name, result in results.items()}
-        total_capital = sum(pc.capital for pc in portfolios.values())
-        initial_weights = {name: pc.capital / total_capital for name, pc in portfolios.items()}
-        rebalancer_result = simulate_rebalancer(
-            strategy_curves=strategy_curves,
-            initial_weights=initial_weights,
-            rebalance_interval_days=21,
-            lookback_days=126,
-            max_shift_pct=0.05,
-            floor_pct=0.05,
-            ceiling_pct=0.25,
-            special_floors={"tail_risk_hedge": 0.08},
-        )
+        # Run rebalancer simulation — a one-sleeve book has nothing to rebalance
+        if len(portfolios) > 1:
+            strategy_curves = {name: result.portfolio_values for name, result in results.items()}
+            total_capital = sum(pc.capital for pc in portfolios.values())
+            initial_weights = {name: pc.capital / total_capital for name, pc in portfolios.items()}
+            rebalancer_result = simulate_rebalancer(
+                strategy_curves=strategy_curves,
+                initial_weights=initial_weights,
+                rebalance_interval_days=21,
+                lookback_days=126,
+                max_shift_pct=0.05,
+                floor_pct=0.05,
+                ceiling_pct=0.25,
+                special_floors={"tail_risk_hedge": 0.08},
+            )
 
-        # Print rebalancer comparison
-        if rebalancer_result["weights_history"]:
-            reb_values = rebalancer_result["rebalanced_values"]
-            if len(reb_values) > 1:
-                reb_return = (reb_values[-1] - reb_values[0]) / reb_values[0]
-                print(f"\n  Rebalancer simulation:")
-                print(f"    Static total return:      {aggregate['metrics']['total_return']:>10.2%}")
-                print(f"    Rebalanced total return:  {reb_return:>10.2%}")
-                final_w = rebalancer_result["weights_history"][-1]["weights"]
-                print(f"    Final weights: {', '.join(f'{n}: {w:.1%}' for n, w in sorted(final_w.items()))}")
+            # Print rebalancer comparison
+            if rebalancer_result["weights_history"]:
+                reb_values = rebalancer_result["rebalanced_values"]
+                if len(reb_values) > 1:
+                    reb_return = (reb_values[-1] - reb_values[0]) / reb_values[0]
+                    print(f"\n  Rebalancer simulation:")
+                    print(f"    Static total return:      {aggregate['metrics']['total_return']:>10.2%}")
+                    print(f"    Rebalanced total return:  {reb_return:>10.2%}")
+                    final_w = rebalancer_result["weights_history"][-1]["weights"]
+                    print(f"    Final weights: {', '.join(f'{n}: {w:.1%}' for n, w in sorted(final_w.items()))}")
 
         # Cross-portfolio risk monitoring
         risk_monitor = AggregateRiskMonitor(
@@ -3045,7 +3094,7 @@ def main():
             "threshold": args.ml_threshold,
             "training_window": ml_metadata,
         }
-    if len(portfolios) == 1:
+    if not multi:
         result = next(iter(results.values()))
         save_results(
             config=base_config,
@@ -3073,6 +3122,7 @@ def main():
             entry_signals_sized={
                 name: ledger.sized for name, ledger in skip_ledgers.items()
             },
+            path=args.output,
         )
 
 
