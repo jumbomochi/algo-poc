@@ -403,6 +403,14 @@ regardless. Revisit the threshold when the Rung-0 baseline is pinned for real
 (P2-24); the refresh's own dead-man switch, not this check, is what covers "the
 refresh died".
 
+**Note (2026-09-25, KAN-60):** that trigger has fired — P2-24 is KAN-60, which
+pinned `divergence.rung0_baseline_pin`. The age check deliberately does **not**
+cover the Rung-0 pin: it reads only `divergence.baseline_pin`, and the Rung-0
+artifact is not the nightly drift feed (D19/D21). Any remaining revisit of the
+14-day threshold moves to
+[KAN-33](https://huiliang.atlassian.net/browse/KAN-33), when the whole-share
+shadow goes live.
+
 ### The Rung-0 baseline of record (KAN-60)
 
 Rung 0 has its own artifact, separate from the edge pin above:

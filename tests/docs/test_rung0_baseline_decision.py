@@ -72,12 +72,46 @@ def test_the_rung0_artifact_is_outside_every_refresh_glob() -> None:
     assert not Path(D21_ARTIFACT).name.startswith("backtest_multi_")
 
 
+def _section(text: str, heading: str) -> str:
+    """The body under ``heading``, up to the next heading of the same level."""
+    start = text.index(heading)
+    end = text.find("\n## ", start + len(heading))
+    return text[start:] if end == -1 else text[start:end]
+
+
 def test_the_prose_carries_the_decision() -> None:
-    direction = DIRECTION.read_text()
-    assert "(D21)" in direction and f"{D21_EXCLUDED_PCT}%" in direction
-    assert "KAN-60" in direction
+    # Sliced to the D21 section: 11.21% also appears under D20, so a whole-file
+    # check could never fail on the addendum being gutted.
+    d21 = _section(DIRECTION.read_text(), "## The Rung-0 baseline of record (D21)")
+    for needle in (f"{D21_EXCLUDED_PCT}%", "KAN-33", "shadow:", D21_SHA256[:8],
+                   "2029-08-18"):
+        assert needle in d21, needle
     assert Path(D21_ARTIFACT).name in BASELINE_DOC.read_text()
     assert Path(D21_ARTIFACT).name in ECONOMICS.read_text()
+
+
+def test_the_d21_row_does_not_claim_the_shadow_is_live() -> None:
+    """Nothing produces a whole-share shadow until KAN-33 switches it on."""
+    rows = [ln for ln in DIRECTION.read_text().splitlines() if ln.startswith("| D21 |")]
+    assert len(rows) == 1
+    assert "is graded" not in rows[0]
+    assert "KAN-33" in rows[0]
+
+
+def test_d21_says_its_figures_stay_survivorship_inflated() -> None:
+    d21 = _section(DIRECTION.read_text(), "## The Rung-0 baseline of record (D21)")
+    assert "now available" not in d21
+    assert "available with the D18/D20/D21 accepted bias" in d21
+
+
+def test_the_economics_memo_records_d21_lifting_the_quoting_bar() -> None:
+    """§9.6(3), §1's note and the PIT addendum each said the bar stays in force;
+    D21 lifts it, and the memo must say so at every place it said otherwise."""
+    text = ECONOMICS.read_text()
+    start = text.index("3. **The PIT re-run (§8 step 1) does not block this decision.**")
+    end = text.index("4. **Re-admission is an epoch boundary.**", start)
+    assert "Superseded by D21" in text[start:end]
+    assert text.count("Superseded by D21 (2026-09-25)") >= 3
 
 
 def test_the_on_disk_artifact_resolves_with_the_accepted_bias() -> None:

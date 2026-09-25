@@ -188,4 +188,4 @@ def test_the_committed_config_parses_both_pins():
     from shared.config import load_config
     div = load_config(str(REPO / "config/default.yaml")).divergence
     assert div.baseline_pin
-    assert hasattr(div, "rung0_baseline_pin")
+    assert div.rung0_baseline_pin == "output/baselines/rung0_momentum_20260925.json"

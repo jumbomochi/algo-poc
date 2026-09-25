@@ -67,6 +67,8 @@ fractional reference.
 > them. **§5 returns remain survivorship-inflated and are still indicative
 > only** — the D16 hard bar on quoting a Rung-0 return figure or divergence
 > threshold (§9.6(3)) is **not** lifted by this run and stays in force.
+>
+> **Superseded by D21 (2026-09-25):** lifted with the accepted coverage bias (D18/D20/D21) — any Rung-0 figure quoted from rung0_momentum_20260925.json is survivorship-inflated by an unmeasured amount and must cite D21 (§9.7).
 
 ---
 
@@ -498,12 +500,15 @@ change**, and it carries a second-order effect §7 did not name:
    baseline describing a book that is 100% cash in two of six sleeves.
    **Done 2026-09-25 (KAN-60):** `output/baselines/rung0_momentum_20260925.json`,
    pinned as `divergence.rung0_baseline_pin`, coverage accepted as D21. Daily
-   drift at Rung 0 is the whole-share shadow (D19/D21), switched on by KAN-33.
+   drift at Rung 0 will be graded against the whole-share shadow (D19/D21) once
+   KAN-33 switches it on (not live today).
 3. **The PIT re-run (§8 step 1) does not block this decision.** It was made on
    fill feasibility and commission arithmetic, both functions of a position
    budget and a share price, and therefore independent of index membership. The
    PIT re-run remains **required before any Rung-0 return figure or divergence
    threshold is quoted.**
+
+   **Superseded by D21 (2026-09-25):** lifted with the accepted coverage bias (D18/D20/D21) — any Rung-0 figure quoted from rung0_momentum_20260925.json is survivorship-inflated by an unmeasured amount and must cite D21 (§9.7).
 4. **Re-admission is an epoch boundary.** Suspended sleeves return at a higher
    rung by amendment, and the Rung-0 20-session divergence-OK window does **not**
    transfer to the multi-sleeve book it becomes.
@@ -674,6 +679,8 @@ The D16 hard bar on quoting a Rung-0 return figure or divergence threshold
 therefore **remains in force**, and the capital-specific divergence baseline
 (§9.6(2)) must **not** be built from this artifact. Lifting either needs
 delisted-name history IB does not serve.
+
+**Superseded by D21 (2026-09-25):** lifted with the accepted coverage bias (D18/D20/D21) — any Rung-0 figure quoted from rung0_momentum_20260925.json is survivorship-inflated by an unmeasured amount and must cite D21 (§9.7).
 
 ---
 

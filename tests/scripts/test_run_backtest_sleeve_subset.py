@@ -59,6 +59,18 @@ def test_a_single_sleeve_gets_the_whole_capital() -> None:
     assert run_backtest.sleeve_capital_fractions(["momentum"]) == {"momentum": 1.0}
 
 
+def test_a_repeated_sleeve_is_not_halved() -> None:
+    """``--sleeves momentum momentum`` must not silently run at half capital."""
+    assert run_backtest.sleeve_capital_fractions(["momentum", "momentum"]) == {"momentum": 1.0}
+
+
+def test_the_allocation_table_agrees_with_paper() -> None:
+    """The backtest's table and paper's must agree, or a baseline describes a
+    book paper does not hold."""
+    from scripts import run_paper
+    assert run_backtest.SLEEVE_ALLOCATIONS == run_paper.CAPITAL_ALLOCATIONS
+
+
 def test_a_subset_is_renormalised_over_itself() -> None:
     fractions = run_backtest.sleeve_capital_fractions(["momentum", "sector_rotation"])
     assert sum(fractions.values()) == pytest.approx(1.0)

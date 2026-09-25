@@ -152,6 +152,8 @@ def sleeve_capital_fractions(selected: Sequence[str] | None) -> dict[str, float]
     """
     if selected is None:
         return dict(SLEEVE_ALLOCATIONS)
+    # A repeated name would be counted twice in the total and halve its capital.
+    selected = list(dict.fromkeys(selected))
     total = sum(SLEEVE_ALLOCATIONS[name] for name in selected)
     return {name: SLEEVE_ALLOCATIONS[name] / total for name in selected}
 
