@@ -166,6 +166,12 @@ divergence:
   # "The pinned baseline of record".
   baseline_pin: output/backtest_multi_20260915_102125.json
 
+  # The Rung-0 baseline of record (KAN-60, D21): momentum only, whole shares,
+  # the $1 floor, USD 3,700. Reference for Rung-0 economics and divergence
+  # thresholds — NOT the edge pin above and NOT the nightly drift feed (the
+  # rolling shadow, D19). Resolve with scripts/ops/baseline_pin.py --rung0.
+  rung0_baseline_pin: output/baselines/rung0_momentum_20260925.json
+
   # Earliest live equity date admissible for grading (KAN-83). Live equity from
   # before a re-baseline is not comparable to anything: equity_snapshots carries
   # 2026-07-28..07-31 with negative sleeve equity and a total a third of

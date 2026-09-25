@@ -161,6 +161,7 @@ def produce_shadow_artifact(
     earnings_lookup,
     live_equity: dict[str, dict[date, float]],
     window_sessions: int,
+    whole_shares: bool = False,
 ):
     """Replay every sleeve over its rolling window and write the artifact.
 
@@ -172,6 +173,10 @@ def produce_shadow_artifact(
     The counterfactual is built with **no live portfolio context**. Passing the
     live positions in would re-score the book live actually holds, which is not
     a comparison — it is the same book on both sides of it.
+
+    ``whole_shares``: Truncate the replay's sizing as live execution does. Off
+    until the paper book itself sizes in whole shares (KAN-33): a whole-share
+    shadow graded against a fractional book would manufacture drift.
 
     Returns the path written. Raises on failure: the caller decides whether a
     shadow failure is worth stopping the paper run for, and at 04:15 it is not.
@@ -189,6 +194,7 @@ def produce_shadow_artifact(
         bars_by_ticker=bars_by_ticker,
         live_equity=live_equity,
         window_sessions=window_sessions,
+        whole_shares=whole_shares,
     )
     # The session this shadow speaks for is the last one LIVE recorded, not
     # today's wall-clock date: a Saturday catch-up run scores Friday's session,
@@ -197,7 +203,7 @@ def produce_shadow_artifact(
     dump_shadow(
         output_path,
         series=series,
-        shadow_id=shadow_id_for(shadow_portfolios),
+        shadow_id=shadow_id_for(shadow_portfolios, whole_shares=whole_shares),
         window_sessions=window_sessions,
         session_date=max(graded_sessions) if graded_sessions else date.today(),
         # The wall-clock date of THIS run, not the session it covers. The

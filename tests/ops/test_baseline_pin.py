@@ -140,3 +140,52 @@ def test_the_script_is_runnable_by_path_from_a_launchd_wrapper(
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == str(pinned)
+
+
+def _rung0_config(tmp_path: Path, *, edge: object = None, rung0: object = None) -> Path:
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(
+        {"divergence": {"baseline_pin": edge, "rung0_baseline_pin": rung0}}
+    ))
+    return path
+
+
+def test_rung0_resolves_its_own_key(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ALGO_RUNG0_BASELINE_PIN", raising=False)
+    config = _rung0_config(tmp_path, edge="output/backtest_multi_x.json",
+                           rung0="output/baselines/rung0_momentum_20260925.json")
+
+    assert resolve_pin(str(config), rung0=True) == str(
+        tmp_path / "output" / "baselines" / "rung0_momentum_20260925.json"
+    )
+    assert resolve_pin(str(config)) == str(tmp_path / "output" / "backtest_multi_x.json")
+
+
+def test_an_unset_rung0_pin_never_falls_back_to_the_edge_pin(tmp_path: Path, monkeypatch):
+    """The two pins describe different books. Silently answering with the
+    six-sleeve USD 100k artifact would quote the wrong economics for Rung 0."""
+    monkeypatch.delenv("ALGO_RUNG0_BASELINE_PIN", raising=False)
+    config = _rung0_config(tmp_path, edge="output/backtest_multi_x.json")
+
+    assert resolve_pin(str(config), rung0=True) is None
+    assert main(["--config", str(config), "--rung0"]) == 1
+
+
+def test_each_pin_has_its_own_env_override(tmp_path: Path, monkeypatch):
+    config = _rung0_config(tmp_path, edge="a.json", rung0="b.json")
+    monkeypatch.setenv("ALGO_BASELINE_PIN", str(tmp_path / "edge_override.json"))
+    monkeypatch.delenv("ALGO_RUNG0_BASELINE_PIN", raising=False)
+
+    assert resolve_pin(str(config), rung0=True) == str(Path("b.json").absolute()), (
+        "the edge override must not redirect the rung-0 pin"
+    )
+    monkeypatch.setenv("ALGO_RUNG0_BASELINE_PIN", str(tmp_path / "r0.json"))
+    assert resolve_pin(str(config), rung0=True) == str(tmp_path / "r0.json")
+
+
+def test_the_committed_config_parses_both_pins():
+    from shared.config import load_config
+    div = load_config(str(REPO / "config/default.yaml")).divergence
+    assert div.baseline_pin
+    assert div.rung0_baseline_pin == "output/baselines/rung0_momentum_20260925.json"

@@ -74,12 +74,17 @@ class ShadowArtifact:
     produced_on: date
 
 
-def shadow_id_for(portfolios: Mapping[str, Any]) -> str:
+def shadow_id_for(portfolios: Mapping[str, Any], *, whole_shares: bool = False) -> str:
     """Stable identity for the model that produced a shadow.
 
     Derived from each sleeve's name and its ``shadow_params`` — the parameters
     that determine what the sleeve would do — sorted so that dict ordering,
     which is not a model change, cannot move the id.
+
+    ``whole_shares`` changes what the replay would do — a budget below one
+    share opens nothing — so it is part of the model (KAN-60). It enters the
+    fingerprint only when true, which keeps every fractional id byte-identical
+    to the ones already filed in ``divergence_daily``.
 
     Raises:
         ValueError: A sleeve exposes no ``shadow_params``. Defaulting to an
@@ -105,6 +110,8 @@ def shadow_id_for(portfolios: Mapping[str, Any]) -> str:
         (name, json.dumps(sleeve.shadow_params, sort_keys=True, default=str))
         for name, sleeve in portfolios.items()
     )
+    if whole_shares:
+        fingerprint.append(("__sizing__", "whole_shares"))
     digest = hashlib.sha256(
         json.dumps(fingerprint, sort_keys=True).encode()
     ).hexdigest()[:_DIGEST_CHARS]
