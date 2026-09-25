@@ -496,6 +496,9 @@ change**, and it carries a second-order effect §7 did not name:
    (whole-share, commission floor, Rung-0 capital, `momentum` only) with its own
    monitor pins — cheaper than option (a), which would have required a second
    baseline describing a book that is 100% cash in two of six sleeves.
+   **Done 2026-09-25 (KAN-60):** `output/baselines/rung0_momentum_20260925.json`,
+   pinned as `divergence.rung0_baseline_pin`, coverage accepted as D21. Daily
+   drift at Rung 0 is the whole-share shadow (D19/D21), switched on by KAN-33.
 3. **The PIT re-run (§8 step 1) does not block this decision.** It was made on
    fill feasibility and commission arithmetic, both functions of a position
    budget and a share price, and therefore independent of index membership. The

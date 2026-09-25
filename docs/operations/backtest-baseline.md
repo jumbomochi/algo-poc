@@ -403,6 +403,48 @@ regardless. Revisit the threshold when the Rung-0 baseline is pinned for real
 (P2-24); the refresh's own dead-man switch, not this check, is what covers "the
 refresh died".
 
+### The Rung-0 baseline of record (KAN-60)
+
+Rung 0 has its own artifact, separate from the edge pin above:
+`output/baselines/rung0_momentum_20260925.json` — `momentum` only, whole shares,
+the $1.00 commission floor, USD 3,700 (D16; decided as
+[D21](../designs/project-direction.md#the-rung-0-baseline-of-record-d21)). It is
+the reference for Rung-0 economics and divergence thresholds
+([rung0-economics.md §9.6](rung0-economics.md)); it is not the edge-evidence
+baseline and not the nightly drift feed (the rolling shadow, D19).
+
+```yaml
+# config/default.yaml
+divergence:
+  rung0_baseline_pin: output/baselines/rung0_momentum_20260925.json
+```
+
+Resolve it with `python scripts/ops/baseline_pin.py --rung0` (same rules as the
+edge pin; `ALGO_RUNG0_BASELINE_PIN` overrides it for one run). Regenerate it —
+no IB time — from the bars of the edge baseline of record:
+
+```bash
+python scripts/run_backtest.py --years 10 --capital 3700 --whole-shares \
+    --sleeves momentum \
+    --bars-from-json output/backtest_multi_20260915_102125.json \
+    --universe-snapshots data/universe/sp500_membership.json \
+    --output output/baselines/rung0_momentum_<YYYYMMDD>.json
+```
+
+A regeneration is a re-pin: the new file has a new sha256, so its coverage bias
+needs its own acceptance (see *Re-pinning at a rung change*). Its coverage is
+D20's exactly (11.21%, `BLOCKED`), because coverage follows the membership and
+the bars, not the sleeves run over them.
+
+**Why the name avoids `backtest_multi_*`.** Three things glob that pattern and
+none of them should ever see this file: the weekly refresh's 90-day prune
+(`find` recurses, so `output/baselines/` alone would not hide it),
+`record_epoch._newest_baseline` (an epoch's baseline id), and the stale-age
+check in `deploy/launchd/lib/baseline_age.sh` (which reports the newest refresh).
+The latter two only look at the top of `output/` today; the name keeps that true
+if either ever recurses. The D21 acceptance also lists it in
+`protected_artifacts`, so the prune excludes it by inode regardless of its name.
+
 ---
 
 ## Earliest admissible live history
