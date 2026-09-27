@@ -105,6 +105,13 @@ if ! algo_load_secrets POSTGRES_PASSWORD REDIS_PASSWORD; then
     echo "$(ts): WARNING - docker compose sections will fail: $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
 fi
 
+# Pin the compose project. Unpinned, compose names it after the directory, and
+# since KAN-72 that directory is the deploy clone — so from 2026-09-24 every
+# compose call here looked for algo-poc-deploy-* containers, found none, and the
+# equity section read "service postgres is not running" beside a healthy
+# postgres. Same knob and default as lib/docker_health.sh.
+ALGO_COMPOSE_PROJECT="${ALGO_COMPOSE_PROJECT:-algo-poc}"
+
 # The paper DB is the dockerized postgres on a machine-local port (see
 # docker-compose.override.yml); config/default.yaml's localhost:5432 default
 # points at nothing on this machine. Same DSN run_divergence.sh builds.
@@ -128,7 +135,7 @@ export ALGO_DATABASE_URL="${ALGO_DATABASE_URL:-postgresql://algo:${POSTGRES_PASS
     tail -4 "$LOG_DIR/divergence_${TODAY}.log" 2>/dev/null || echo "MISSING"
 
     echo; echo "===== execution service: last 2h ====="
-    docker compose logs execution --since 2h 2>&1 \
+    docker compose -p "$ALGO_COMPOSE_PROJECT" logs execution --since 2h 2>&1 \
         | grep -iE "skipped|rounded|submitted|error|Cancelled|Fill" | tail -12
 
     echo; echo "===== resting orders at IB ====="
@@ -184,7 +191,7 @@ PYEOF
     printf '%s\n' "$ALGO_RECONCILIATION_DETAIL"
 
     echo; echo "===== equity snapshots (record continuity) ====="
-    docker compose exec -T postgres psql -U algo -d algo_poc -t -c \
+    docker compose -p "$ALGO_COMPOSE_PROJECT" exec -T postgres psql -U algo -d algo_poc -t -c \
       "SELECT date, COUNT(*), ROUND(SUM(equity)::numeric,2) FROM equity_snapshots WHERE portfolio NOT LIKE '\_%' GROUP BY date ORDER BY date DESC LIMIT 7;" 2>&1
 } >> "$LOG_FILE" 2>&1
 
