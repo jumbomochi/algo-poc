@@ -38,10 +38,6 @@ tests:
     input_series:
       - series: 'up{job="data-ingestion"}'
         values: "1+0x576"
-      - series: 'up{job="signal-generation"}'
-        values: "1+0x576"
-      - series: 'up{job="ml-model"}'
-        values: "1+0x576"
       - series: 'up{job="risk-management"}'
         values: "1+0x576"
       - series: 'up{job="execution"}'
@@ -54,7 +50,7 @@ tests:
         values: "1+0x576"
       # Fresh heartbeats everywhere, including the API — which had no series
       # at all before this story.
-      - series: 'algo_heartbeat_age_seconds{job="signal-generation"}'
+      - series: 'algo_heartbeat_age_seconds{job="risk-management"}'
         values: "3+0x576"
       - series: 'algo_heartbeat_age_seconds{job="api"}'
         values: "12+0x576"

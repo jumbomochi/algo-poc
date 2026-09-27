@@ -41,8 +41,8 @@ DOCKER_HEALTH = REPO / "deploy/launchd/lib/docker_health.sh"
 LAUNCHD = REPO / "deploy/launchd"
 
 SERVICES = (
-    "redis postgres migrate data-ingestion signal-generation ml-model "
-    "risk-management api notifications execution portfolio-accounting"
+    "redis postgres migrate data-ingestion risk-management "
+    " api notifications execution portfolio-accounting"
 ).split()
 
 # Long enough that a working call is never mistaken for a hang on a loaded CI

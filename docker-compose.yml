@@ -122,52 +122,6 @@ services:
       retries: 3
       start_period: 3m
 
-  signal-generation:
-    restart: unless-stopped
-    build:
-      context: .
-      dockerfile: services/signal_generation/Dockerfile
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-      data-ingestion:
-        condition: service_started
-    environment:
-      - ALGO_MODE=paper
-      - ALGO_DATABASE_URL=postgresql://algo:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see .env.example) before starting the stack}@postgres:5432/algo_poc
-      - ALGO_REDIS_URL=redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env (see .env.example) before starting the stack}@redis:6379/0
-    # T6: heartbeat-file healthcheck — see the data-ingestion comment above
-    # for the full rationale. This service's Redis-consumer loop iterates
-    # every 1-2s, so a much tighter freshness window than the poller above.
-    healthcheck:
-      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat('/var/algo/heartbeat').st_mtime<120 else 1)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-
-  ml-model:
-    restart: unless-stopped
-    build:
-      context: .
-      dockerfile: services/ml_model/Dockerfile
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-      signal-generation:
-        condition: service_started
-    environment:
-      - ALGO_MODE=paper
-      - ALGO_DATABASE_URL=postgresql://algo:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see .env.example) before starting the stack}@postgres:5432/algo_poc
-      - ALGO_REDIS_URL=redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env (see .env.example) before starting the stack}@redis:6379/0
-    # T6: heartbeat-file healthcheck — see the data-ingestion comment above.
-    healthcheck:
-      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat('/var/algo/heartbeat').st_mtime<120 else 1)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-
   risk-management:
     restart: unless-stopped
     build:
@@ -176,8 +130,6 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-      ml-model:
-        condition: service_started
     environment:
       - ALGO_MODE=paper
       - ALGO_DATABASE_URL=postgresql://algo:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see .env.example) before starting the stack}@postgres:5432/algo_poc
