@@ -51,7 +51,7 @@ RUN_AT = datetime(2026, 8, 25, 4, 15, 0).timestamp()
 # one-shot `migrate`. Used to build the stub's expected-vs-running comparison.
 SERVICES = (
     "redis postgres migrate data-ingestion risk-management "
-    " api notifications execution portfolio-accounting"
+    "api notifications execution portfolio-accounting"
 ).split()
 
 # `migrate` runs `alembic upgrade head` at stack start and then sits at
