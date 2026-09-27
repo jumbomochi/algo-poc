@@ -97,7 +97,6 @@ class SentimentConfig(BaseModel):
 
 
 class MLModelConfig(BaseModel):
-    retrain_cadence_months: int = 6
     target_forward_weeks: int = 8
     target_buckets: dict[str, float] = Field(default_factory=lambda: {"sell": -0.05, "buy": 0.05})
     min_training_samples: int = 200

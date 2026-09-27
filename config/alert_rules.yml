@@ -54,7 +54,7 @@ groups:
       # the service's own main loop) stops responding.
       - alert: ServiceMetricsEndpointDown
         expr: |
-          up{job=~"data-ingestion|signal-generation|ml-model|risk-management|execution|api|notifications|portfolio-accounting"} == 0
+          up{job=~"data-ingestion|risk-management|execution|api|notifications|portfolio-accounting"} == 0
         for: 2m
         labels:
           severity: critical

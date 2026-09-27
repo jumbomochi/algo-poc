@@ -129,20 +129,6 @@ updates:
       day: monday
     labels: [dependencies, docker]
   - package-ecosystem: docker
-    directory: /services/ml_model
-    target-branch: develop
-    schedule:
-      interval: weekly
-      day: monday
-    labels: [dependencies, docker]
-  - package-ecosystem: docker
-    directory: /services/signal_generation
-    target-branch: develop
-    schedule:
-      interval: weekly
-      day: monday
-    labels: [dependencies, docker]
-  - package-ecosystem: docker
     directory: /services/risk_management
     target-branch: develop
     schedule:

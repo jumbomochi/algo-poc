@@ -53,12 +53,17 @@ algo-poc is an automated US equities trading bot built as a set of Python micros
 ### Data flow
 
 ```
-data_ingestion -> signal_generation -> ml_model -> risk_management -> execution
-                                                                         |
-                                                                    notifications
-                                                                         |
-                                                                        api
+scripts/run_paper.py (launchd, 04:15) -> risk_management -> execution
+                                                                 |
+                                                            notifications
+                                                                 |
+                                                                api
 ```
+
+`signal_generation` and `ml_model` are **demoted to offline tools** (KAN-35,
+`docs/decisions/ml-path-2026-09.md`): the code stays for training and
+evaluating models, but compose no longer runs them. `run_paper.py` is the only
+recommendation source.
 
 ### Infrastructure
 
@@ -71,8 +76,8 @@ data_ingestion -> signal_generation -> ml_model -> risk_management -> execution
 | Service | Description | Subscribes | Publishes |
 |---|---|---|---|
 | `data_ingestion` | Fetches market data, fundamentals, and events from IB/external sources | — | `stream:market_data`, `stream:fundamentals`, `stream:events` |
-| `signal_generation` | Computes technical, fundamental, and event signals; detects staleness | `stream:market_data`, `stream:fundamentals`, `stream:events` | `stream:signals` |
-| `ml_model` | Assembles features, trains LightGBM model, generates buy/hold/sell recommendations | `stream:signals` | `stream:recommendations` |
+| `signal_generation` | *Offline only, not in compose.* Computes technical, fundamental, and event signals; detects staleness | `stream:market_data`, `stream:fundamentals`, `stream:events` | `stream:signals` |
+| `ml_model` | *Offline only, not in compose.* Assembles features, trains LightGBM model, generates buy/hold/sell recommendations | `stream:signals` | `stream:recommendations` |
 | `risk_management` | Entry controls, stop-loss, drawdown, kill switch, correlation monitoring | `stream:recommendations`, `stream:kill` | `stream:approved_orders`, `stream:alerts` |
 | `execution` | Manages IB orders, handles fills, repricing, and kill liquidation | `stream:approved_orders`, `stream:kill` | `stream:fills`, `stream:alerts` |
 | `notifications` | Routes alerts to Slack, email, and SMS channels by priority | `stream:alerts` | — |
@@ -98,7 +103,7 @@ Edit `config/default.yaml` to change default settings. Key sections:
 - `universe` — watchlist source and custom tickers
 - `data_ingestion` — polling intervals, rate limits, backfill years
 - `signals` — staleness thresholds
-- `ml_model` — retraining cadence, target buckets, regime detection
+- `ml_model` — target buckets, regime detection (offline training only)
 - `risk` — position limits, stop-loss, drawdown thresholds, margin alerts
 - `execution` — limit order buffers, reprice settings
 - `ib` — Interactive Brokers connection settings

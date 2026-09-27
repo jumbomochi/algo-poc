@@ -121,7 +121,7 @@ Both flags are load-bearing:
   failure. Never run the `up` in this runbook without it.
 - <a id="why---no-deps"></a>**`--no-deps`** stops the force-recreate from
   cascading. Without it, compose brings up each service's dependency chain too
-  — `migrate`, `ml-model`, and through them `postgres` and `redis` — and
+  — `migrate`, and through it `postgres` and `redis` — and
   `--force-recreate` recreates those as well. **Redis has no volume**
   (`docker-compose.yml` declares only `pgdata`): recreating it discards every
   stream, including any unacked entry on `stream:approved_orders` or
@@ -282,8 +282,10 @@ does not.
 1. Reboot the host.
 2. Log in (the login keychain unlocks on login; launchd jobs and Docker Desktop
    both need it) and wait ~3 minutes for the stack to settle.
-3. Check all three layers — expect **10 long-running containers** (all
-   healthy), **7 launchd jobs**, and zero drift:
+3. Check all three layers — expect **8 long-running containers** (all
+   healthy), **7 launchd jobs**, and zero drift. (`ml-model` and
+   `signal-generation` were demoted in KAN-35; if they still appear, they are
+   orphans from before that deploy — see `docs/decisions/ml-path-2026-09.md`.)
 
 ```bash
 docker compose -p algo-poc ps

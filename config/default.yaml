@@ -71,7 +71,6 @@ sentiment:
   zscore_min_baseline_days: 20
 
 ml_model:
-  retrain_cadence_months: 6
   target_forward_weeks: 8
   target_buckets:
     sell: -0.05  # below -5% return

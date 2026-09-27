@@ -606,7 +606,8 @@ def _drive_wrapper(tmp_path, *, paper_log="paper run finished, exit code: 0\n",
     )
 
     stub("osascript", "#!/bin/bash\nexit 0\n")
-    stub("docker", f"#!/bin/bash\necho ' {datetime.now():%Y-%m-%d} | 1 | 1000.00'\nexit 0\n")
+    stub("docker", f"#!/bin/bash\necho \"$*\" >> {tmp_path / 'docker.log'}\n"
+                   f"echo ' {datetime.now():%Y-%m-%d} | 1 | 1000.00'\nexit 0\n")
     stub("security", """#!/bin/bash
 case "${@: -1}" in
   POSTGRES_PASSWORD)  echo "stub-pg" ;;
@@ -701,6 +702,33 @@ def test_the_message_reports_the_documented_facts_in_order(tmp_path):
     assert positions == sorted(positions), msg
     assert "fills:1" in msg
     assert "risk 1" in msg
+
+
+def _compose_calls(tmp_path):
+    log = tmp_path / "docker.log"
+    calls = [l for l in log.read_text().splitlines() if l.startswith("compose")]
+    assert calls, "the report made no docker compose calls"
+    return calls
+
+
+def test_compose_calls_name_the_production_project(tmp_path):
+    """Run from the deploy clone (KAN-72), compose names the project after the
+    directory — ``algo-poc-deploy`` — finds none of the ``algo-poc-*``
+    containers, and the equity and execution sections read "service postgres
+    is not running" every day while postgres is up (2026-09-24 onwards)."""
+    res, _, _ = _drive_wrapper(tmp_path)
+    assert res.returncode == 0
+    for call in _compose_calls(tmp_path):
+        assert call.startswith("compose -p algo-poc "), call
+
+
+def test_the_compose_project_follows_the_shared_override(tmp_path):
+    """Same knob lib/docker_health.sh reads, so one setting moves both."""
+    res, _, _ = _drive_wrapper(
+        tmp_path, env_extra={"ALGO_COMPOSE_PROJECT": "algo-poc-test"})
+    assert res.returncode == 0
+    for call in _compose_calls(tmp_path):
+        assert call.startswith("compose -p algo-poc-test "), call
 
 
 def test_an_active_halt_leads_the_telegram_message(tmp_path):

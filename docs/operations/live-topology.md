@@ -60,8 +60,10 @@ only a warning.
 ## Which decision governs the dormant path
 
 Deleting or wiring `signal_generation` / `ml_model` is the **D17 ML
-architecture decision**, dated end of readiness tranche 3
-(`docs/designs/project-direction.md`). It is deliberately not settled here.
+architecture decision**. **Settled 2026-09-27: demoted** (KAN-35,
+`docs/decisions/ml-path-2026-09.md`). Compose no longer runs either service; the
+code is kept as an offline training and evaluation tool. The measurements above
+are the record of why.
 
 What *was* settled (2026-09-04) is the model loader, which was broken
 independently of that decision:
