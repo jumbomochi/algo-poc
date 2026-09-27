@@ -26,14 +26,6 @@ scrape_configs:
     static_configs:
       - targets: ["data-ingestion:9090"]
 
-  - job_name: "signal-generation"
-    static_configs:
-      - targets: ["signal-generation:9090"]
-
-  - job_name: "ml-model"
-    static_configs:
-      - targets: ["ml-model:9090"]
-
   - job_name: "risk-management"
     static_configs:
       - targets: ["risk-management:9090"]

@@ -20,8 +20,6 @@ services:
       - "--storage.tsdb.retention.time=7d"
     depends_on:
       - data-ingestion
-      - signal-generation
-      - ml-model
       - risk-management
       - execution
       - api

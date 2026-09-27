@@ -28,8 +28,6 @@ ALERT_RULES_PATH = Path("config/alert_rules.yml")
 # file is for a worker loop.
 HEARTBEAT_SERVICES = (
     "data-ingestion",
-    "signal-generation",
-    "ml-model",
     "risk-management",
     "execution",
     "notifications",
@@ -46,8 +44,6 @@ HEARTBEAT_METRIC_SERVICES = HEARTBEAT_SERVICES + ("api",)
 
 RUNNER_FILES_EXPECTING_HEARTBEAT = {
     "data-ingestion": Path("services/data_ingestion/runner.py"),
-    "signal-generation": Path("services/signal_generation/runner.py"),
-    "ml-model": Path("services/ml_model/runner.py"),
     "risk-management": Path("services/risk_management/runner.py"),
     "execution": Path("services/execution/runner.py"),
     "notifications": Path("services/notifications/runner.py"),

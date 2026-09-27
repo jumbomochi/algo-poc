@@ -198,8 +198,8 @@ whichever one is currently active — has `content_hash = NULL`.
 `ModelRegistry.load_active()` fails closed on a NULL `content_hash` by
 design (a missing integrity record is refused, not silently trusted), so
 the very next `load_active()` call after the migration lands raises
-`ModelIntegrityError` and the ml_model service cannot get a model until an
-operator backfills the column.
+`ModelIntegrityError` and nothing — offline training or evaluation included —
+can get a model until an operator backfills the column.
 
 Required sequence, in order:
 
@@ -212,9 +212,10 @@ Required sequence, in order:
    `python -m scripts.ops.backfill_model_hashes --apply` to actually persist
    the computed hashes. `--db-url` overrides the default
    (`AppConfig.database.url` from `config/default.yaml`) if needed.
-3. **Verify** before considering the rollout complete: restart the
-   ml_model service (or call `ModelRegistry.load_active()` directly) and
-   confirm it loads the active model without raising `ModelIntegrityError`.
+3. **Verify** before considering the rollout complete: call
+   `ModelRegistry.load_active()` directly and confirm it loads the active
+   model without raising `ModelIntegrityError`. (The ml_model service no
+   longer runs in compose — KAN-35, `docs/decisions/ml-path-2026-09.md`.)
 
 This is an operator tool — nothing in this repo runs it automatically, and
 it must never be pointed at a real database by an agent. It is tested only

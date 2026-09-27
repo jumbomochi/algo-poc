@@ -22,8 +22,6 @@ GITIGNORE_PATH = Path(".gitignore")
 LOCKED_DOWN_SERVICES_WITH_DB = (
     "migrate",
     "data-ingestion",
-    "signal-generation",
-    "ml-model",
     "risk-management",
     "execution",
     "api",
@@ -32,8 +30,6 @@ LOCKED_DOWN_SERVICES_WITH_DB = (
 )
 LOCKED_DOWN_SERVICES_WITH_REDIS = (
     "data-ingestion",
-    "signal-generation",
-    "ml-model",
     "risk-management",
     "execution",
     "api",
