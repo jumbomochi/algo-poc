@@ -20,10 +20,12 @@ if str(REPO_ROOT) not in sys.path:
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from scripts.paper_state import PaperTradingState
 from scripts.run_paper import dump_paper_state
 from shared.artifact_dir import durable_artifact_dir
 from services.execution.ib_account import IBAccountReader
 from services.execution.reconciliation import (
+    MissedExitRepair,
     PositionReconciler,
     ReconciliationResult,
     RepairAction,
@@ -45,9 +47,24 @@ class RepairRefusedError(RuntimeError):
     """Raised before a repair whenever an operator safety guard fails."""
 
 
+class MissingExitPriceError(RepairRefusedError):
+    """A missed exit has no exit price, and one is never guessed (KAN-85)."""
+
+
+#: Marks a trade the repair tool reconstructed, so a gate reviewer can tell it
+#: from a signal-driven exit. Same prefix as scripts/ops/restore_missed_exit.py.
+MISSED_EXIT_REASON = "reconciliation repair: missed exit booked by reconcile_paper"
+
+#: Share tolerance for "the sale accounts for the whole holding".
+_QUANTITY_TOLERANCE = 1e-6
+
 _PLAN_FIELDS = {"account_id", "created_at", "actions", "unresolved"}
 _ACTION_FIELDS = {
     "action", "account_id", "portfolio", "con_id", "quantity"
+}
+_MISSED_EXIT_FIELDS = _ACTION_FIELDS | {
+    "price", "executed_at", "execution_id", "commission",
+    "classification", "evidence",
 }
 _UNRESOLVED_FIELDS = {"reason", "con_id", "ib_order_id"}
 _ACCOUNT_PATTERN = re.compile(r"^[A-Z0-9]+$")
@@ -136,10 +153,15 @@ def _load_plan(path: Path) -> RepairPlan:
         raise RepairRefusedError(f"invalid repair plan: {exc}") from exc
 
 
-def _parse_repair_action(value: Any, plan_account_id: str) -> RepairAction:
-    if not isinstance(value, dict) or set(value) != _ACTION_FIELDS:
+def _parse_repair_action(
+    value: Any, plan_account_id: str
+) -> RepairAction | MissedExitRepair:
+    if isinstance(value, dict) and value.get("action") == "close_position_with_fill":
+        if set(value) != _MISSED_EXIT_FIELDS:
+            raise ValueError("missed-exit action fields do not match the schema")
+    elif not isinstance(value, dict) or set(value) != _ACTION_FIELDS:
         raise ValueError("repair action fields do not match the schema")
-    if value["action"] != "set_position_quantity":
+    elif value["action"] != "set_position_quantity":
         raise ValueError("unsupported repair action")
     if value["account_id"] != plan_account_id:
         raise ValueError("repair action account does not match plan account")
@@ -160,6 +182,10 @@ def _parse_repair_action(value: Any, plan_account_id: str) -> RepairAction:
         or quantity < 0
     ):
         raise ValueError("quantity must be a finite non-negative number")
+    if value["action"] == "close_position_with_fill":
+        return _parse_missed_exit(
+            value, plan_account_id, portfolio, con_id, float(quantity)
+        )
     return RepairAction(
         action="set_position_quantity",
         account_id=plan_account_id,
@@ -167,6 +193,83 @@ def _parse_repair_action(value: Any, plan_account_id: str) -> RepairAction:
         con_id=con_id,
         quantity=float(quantity),
     )
+
+
+def _is_number(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+    )
+
+
+def _parse_missed_exit(
+    value: dict[str, Any],
+    plan_account_id: str,
+    portfolio: str,
+    con_id: int,
+    quantity: float,
+) -> MissedExitRepair:
+    """Validate shape only. A missing price or date is legal in a plan —
+    it is how the plan asks the operator for it — and is refused at apply."""
+    if quantity <= 0:
+        raise ValueError("missed-exit quantity must be positive")
+    price = value["price"]
+    if price is not None and (not _is_number(price) or price <= 0):
+        raise ValueError("price must be a finite positive number or null")
+    executed_at = value["executed_at"]
+    if executed_at is not None:
+        if not isinstance(executed_at, str):
+            raise ValueError("executed_at must be an ISO-8601 string or null")
+        if datetime.fromisoformat(executed_at).tzinfo is None:
+            raise ValueError("executed_at must include a timezone")
+    execution_id = value["execution_id"]
+    if execution_id is not None and (
+        not isinstance(execution_id, str) or not execution_id.strip()
+    ):
+        raise ValueError("execution_id must be non-empty or null")
+    commission = value["commission"]
+    if not _is_number(commission) or commission < 0:
+        raise ValueError("commission must be a finite non-negative number")
+    if value["classification"] != "missed_exit":
+        raise ValueError("missed-exit classification must be missed_exit")
+    if not isinstance(value["evidence"], dict):
+        raise ValueError("missed-exit evidence must be an object")
+    return MissedExitRepair(
+        action="close_position_with_fill",
+        account_id=plan_account_id,
+        portfolio=portfolio,
+        con_id=con_id,
+        quantity=quantity,
+        price=None if price is None else float(price),
+        executed_at=executed_at,
+        execution_id=execution_id,
+        commission=float(commission),
+        classification="missed_exit",
+        evidence=value["evidence"],
+    )
+
+
+def _require_exit_evidence(plan: RepairPlan) -> None:
+    """Refuse a missed exit the operator has not priced. Never default one:
+    entry price books a plausible-looking zero, and a wrong price is a wrong
+    P&L on the gate record for good."""
+    for action in plan.actions:
+        if not isinstance(action, MissedExitRepair):
+            continue
+        if action.price is None:
+            raise MissingExitPriceError(
+                f"missed exit for con_id {action.con_id} in "
+                f"{action.portfolio!r} has no exit price. Take it from the IB "
+                "statement for the trade date and write it into the plan's "
+                "price field; it is never defaulted."
+            )
+        if action.executed_at is None:
+            raise RepairRefusedError(
+                f"missed exit for con_id {action.con_id} in "
+                f"{action.portfolio!r} has no executed_at. Take the execution "
+                "time from the IB statement; it is never defaulted."
+            )
 
 
 def _parse_unresolved(value: Any) -> UnresolvedRepair:
@@ -207,6 +310,7 @@ def apply_repair_plan(session: Session, *, plan_path: Path) -> None:
         raise RepairRefusedError("repair plan contains unresolved mappings")
     if not plan.account_id.startswith("DU"):
         raise RepairRefusedError("repair plan is not for an IB paper account")
+    _require_exit_evidence(plan)
 
     backup_dir = Path(plan_path).resolve().parent
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -234,9 +338,11 @@ def apply_repair_plan(session: Session, *, plan_path: Path) -> None:
 
 
 def _apply_action(
-    session: Session, plan_account_id: str, action: RepairAction
+    session: Session,
+    plan_account_id: str,
+    action: RepairAction | MissedExitRepair,
 ) -> None:
-    if action.action != "set_position_quantity":
+    if action.action not in {"set_position_quantity", "close_position_with_fill"}:
         raise RepairRefusedError(
             f"unsupported serialized repair action {action.action!r}"
         )
@@ -262,11 +368,86 @@ def _apply_action(
         )
     if action.quantity < 0:
         raise RepairRefusedError("repair quantity cannot be negative")
+    if isinstance(action, MissedExitRepair):
+        _book_missed_exit(session, positions[0], action)
+        return
+    if action.quantity == 0 and _has_unoffset_buy_fills(
+        session, plan_account_id, action.con_id
+    ):
+        raise RepairRefusedError(
+            f"con_id {action.con_id} has fill history (a filled BUY with no "
+            "offsetting SELL), so it was really held: a zero-quantity set "
+            "would write off its exit with no trade and no cash. Regenerate "
+            "the plan with --report, which proposes close_position_with_fill."
+        )
     positions[0].quantity = float(action.quantity)
     if action.quantity == 0:
         positions[0].status = "closed"
         positions[0].closed_at = datetime.now(timezone.utc)
     session.flush()
+
+
+def _has_unoffset_buy_fills(
+    session: Session, account_id: str, con_id: int
+) -> bool:
+    net = 0.0
+    for fill in session.scalars(
+        select(ExecutionFill).where(
+            ExecutionFill.account_id == account_id,
+            ExecutionFill.con_id == con_id,
+        )
+    ):
+        side = fill.side.upper()
+        if side == "BUY":
+            net += float(fill.quantity)
+        elif side == "SELL":
+            net -= float(fill.quantity)
+    return net > _QUANTITY_TOLERANCE
+
+
+def _book_missed_exit(
+    session: Session, position: Position, action: MissedExitRepair
+) -> None:
+    """Write the sell a real exit would have written: trade, P&L, cash."""
+    residue = float(position.quantity) - action.quantity
+    if abs(residue) > _QUANTITY_TOLERANCE:
+        raise RepairRefusedError(
+            f"missed exit of {action.quantity} does not match the holding of "
+            f"{position.quantity}: a residue of {residue:.6f} shares would be "
+            "left open (or oversold), and reconciliation flags it again on "
+            "the next run. Account for every execution on the IB statement."
+        )
+    if action.execution_id is not None and session.scalar(
+        select(ExecutionFill.id).where(
+            ExecutionFill.account_id == position.account_id,
+            ExecutionFill.execution_id == action.execution_id,
+        )
+    ) is not None:
+        raise RepairRefusedError(
+            f"execution {action.execution_id!r} is already recorded; booking "
+            "it again would double-count the P&L."
+        )
+    exit_reason = MISSED_EXIT_REASON
+    if action.execution_id is not None:
+        exit_reason += f" (execution_id {action.execution_id})"
+    try:
+        PaperTradingState(session)._apply_fill_accounting(
+            account_id=position.account_id,
+            portfolio=position.portfolio,
+            ticker=position.ticker,
+            action="sell",
+            quantity=action.quantity,
+            price=float(action.price),
+            fill_datetime=datetime.fromisoformat(action.executed_at),
+            commission=action.commission,
+            con_id=position.con_id,
+            exchange=position.exchange,
+            currency=position.currency,
+            strict_quantity=True,
+            exit_reason=exit_reason,
+        )
+    except ValueError as exc:
+        raise RepairRefusedError(f"missed exit refused: {exc}") from exc
 
 
 def reconcile_snapshot(
@@ -357,7 +538,7 @@ def reconcile_snapshot(
         mode=snapshot.mode,
         result=result,
     )
-    return result, build_repair_plan(result)
+    return result, build_repair_plan(result, fills)
 
 
 async def _read_broker_snapshot(
@@ -447,6 +628,8 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "MissedExitRepair",
+    "MissingExitPriceError",
     "RepairAction",
     "RepairPlan",
     "RepairRefusedError",

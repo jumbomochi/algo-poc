@@ -13,6 +13,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from scripts.reconcile_paper import (
+    MissingExitPriceError,
     RepairAction,
     RepairPlan,
     RepairRefusedError,
@@ -24,7 +25,15 @@ from scripts.reconcile_paper import (
 )
 from services.execution.reconciliation import PositionReconciler
 from shared.broker_state import BrokerPosition
-from shared.models import OrderIntent, OrderStatus, Position, ReconciliationReport
+from shared.models import (
+    ExecutionFill,
+    OrderIntent,
+    OrderStatus,
+    Position,
+    ReconciliationReport,
+)
+from shared.models.portfolio import Trade
+from shared.models.portfolio_config import PortfolioConfig
 from shared.models.base import Base
 
 NOW = datetime(2026, 7, 22, tzinfo=timezone.utc)
@@ -357,3 +366,279 @@ def test_unreadable_plan_path_is_repair_refusal(path_kind, monkeypatch, tmp_path
 
     with pytest.raises(RepairRefusedError, match="repair plan"):
         apply_repair_plan(session, plan_path=plan_path)
+
+
+# --- KAN-85: a missed exit is not a phantom -------------------------------
+
+LLY_CON_ID = 9160
+PAPER = "DUN551088"
+
+
+def _lly_position(quantity=2.0):
+    return Position(
+        account_id=PAPER, ticker="LLY", portfolio="sector_rotation",
+        con_id=LLY_CON_ID, exchange="SMART", currency="USD",
+        quantity=quantity, avg_entry_price=1170.64, current_price=1115.70,
+        peak_price=1170.64, highest_price_since_entry=1170.64,
+        opened_at=datetime(2026, 7, 30, 13, 31, tzinfo=timezone.utc),
+        status="open",
+    )
+
+
+def _fill(side, quantity, execution_id, price=1170.64):
+    return ExecutionFill(
+        account_id=PAPER, execution_id=execution_id, ib_order_id="19",
+        portfolio="sector_rotation", con_id=LLY_CON_ID, symbol="LLY",
+        exchange="SMART", currency="USD", side=side, quantity=quantity,
+        price=price, commission=0.0,
+        executed_at=datetime(2026, 7, 30, 13, 31, tzinfo=timezone.utc),
+        projection_applied=True,
+    )
+
+
+def _sleeve(cash=1000.0):
+    return PortfolioConfig(
+        portfolio="sector_rotation", capital=5000.0, cash=cash,
+        created_at=NOW, updated_at=NOW,
+    )
+
+
+def _empty_broker():
+    return SimpleNamespace(
+        account_id=PAPER, mode="paper", positions={}, open_orders={}
+    )
+
+
+def test_filled_buy_without_offsetting_sell_is_classified_missed_exit(session):
+    session.add_all([
+        _lly_position(),
+        _fill("BUY", 2.0, "0000dc8f.6b2d21b5.01.01"),
+    ])
+    session.commit()
+
+    _, plan = reconcile_snapshot(session, _empty_broker())
+
+    assert plan.unresolved == []
+    [action] = plan.actions
+    assert action.action == "close_position_with_fill"
+    assert action.classification == "missed_exit"
+    assert action.con_id == LLY_CON_ID
+    assert action.portfolio == "sector_rotation"
+    assert action.quantity == 2.0
+    # The exit price is not recoverable from the snapshot; it is left for
+    # the operator, never defaulted.
+    assert action.price is None
+    assert action.executed_at is None
+    assert action.evidence["buy_execution_ids"] == ["0000dc8f.6b2d21b5.01.01"]
+    assert action.evidence["buy_quantity"] == 2.0
+    assert action.evidence["sell_quantity"] == 0.0
+    assert action.evidence["price_source"] == "operator_required"
+
+
+def test_no_fill_history_is_classified_phantom_and_unchanged(session, tmp_path):
+    session.add(_lly_position())
+    session.commit()
+
+    _, plan = reconcile_snapshot(session, _empty_broker())
+
+    assert plan.actions == [RepairAction(
+        action="set_position_quantity", account_id=PAPER,
+        portfolio="sector_rotation", con_id=LLY_CON_ID, quantity=0.0,
+    )]
+    payload = json.loads(write_repair_plan(plan, output_dir=tmp_path).read_text())
+    assert set(payload["actions"][0]) == {
+        "action", "account_id", "portfolio", "con_id", "quantity"
+    }
+
+
+def test_fully_offset_fill_history_is_not_guessed(session):
+    session.add_all([
+        _lly_position(),
+        _fill("BUY", 2.0, "buy-1"),
+        _fill("SELL", 2.0, "sell-1", price=1115.70),
+    ])
+    session.commit()
+
+    _, plan = reconcile_snapshot(session, _empty_broker())
+
+    assert plan.actions == []
+    assert plan.unresolved[0].reason == "recorded_sell_fill_not_projected"
+
+
+def _missed_exit_plan(tmp_path, session, **overrides):
+    session.add_all([
+        _lly_position(), _sleeve(), _fill("BUY", 2.0, "buy-1"),
+    ])
+    session.commit()
+    _, plan = reconcile_snapshot(session, _empty_broker())
+    path = write_repair_plan(plan, output_dir=tmp_path)
+    payload = json.loads(path.read_text())
+    payload["actions"][0].update(overrides)
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def test_applying_missed_exit_writes_one_sell_trade_and_moves_cash(
+    monkeypatch, tmp_path, session
+):
+    path = _missed_exit_plan(
+        tmp_path, session, price=1100.0,
+        executed_at="2026-08-28T13:30:00+00:00", commission=1.05,
+        execution_id="statement-lly-20260828",
+    )
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "APPLY PAPER REPAIR")
+
+    apply_repair_plan(session, plan_path=path)
+
+    [trade] = session.scalars(select(Trade)).all()
+    assert trade.side == "sell"
+    assert trade.ticker == "LLY"
+    assert trade.portfolio == "sector_rotation"
+    assert trade.quantity == 2.0
+    assert trade.price == 1100.0
+    assert trade.pnl == pytest.approx((1100.0 - 1170.64) * 2.0)
+    assert trade.exit_reason.startswith("reconciliation repair")
+    assert "statement-lly-20260828" in trade.exit_reason
+    assert trade.executed_at.replace(tzinfo=timezone.utc) == datetime(
+        2026, 8, 28, 13, 30, tzinfo=timezone.utc
+    )
+    sleeve = session.scalar(select(PortfolioConfig))
+    assert sleeve.cash == pytest.approx(1000.0 + 1100.0 * 2.0 - 1.05)
+    assert session.scalars(
+        select(Position).where(Position.status == "open")
+    ).all() == []
+    assert len(list(tmp_path.glob("paper_state_pre_repair_*.json"))) == 1
+
+
+def test_missed_exit_without_price_is_refused_not_defaulted(
+    monkeypatch, tmp_path, session
+):
+    path = _missed_exit_plan(
+        tmp_path, session, executed_at="2026-08-28T13:30:00+00:00"
+    )
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(
+        "builtins.input", lambda _: pytest.fail("confirmation reached")
+    )
+
+    with pytest.raises(MissingExitPriceError, match="price"):
+        apply_repair_plan(session, plan_path=path)
+
+    assert session.scalars(select(Trade)).all() == []
+    assert session.scalar(select(Position)).quantity == 2.0
+    assert session.scalar(select(PortfolioConfig)).cash == 1000.0
+    assert not list(tmp_path.glob("paper_state_pre_repair_*.json"))
+
+
+def test_missed_exit_without_executed_at_is_refused(
+    monkeypatch, tmp_path, session
+):
+    path = _missed_exit_plan(tmp_path, session, price=1100.0)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    with pytest.raises(RepairRefusedError, match="executed_at"):
+        apply_repair_plan(session, plan_path=path)
+
+    assert session.scalars(select(Trade)).all() == []
+
+
+def test_missed_exit_leaving_a_residue_open_is_refused(
+    monkeypatch, tmp_path, session
+):
+    path = _missed_exit_plan(
+        tmp_path, session, price=1100.0, quantity=1.5,
+        executed_at="2026-08-28T13:30:00+00:00",
+    )
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "APPLY PAPER REPAIR")
+
+    with pytest.raises(RepairRefusedError, match="residue"):
+        apply_repair_plan(session, plan_path=path)
+
+    assert session.scalars(select(Trade)).all() == []
+    assert session.scalar(select(Position)).quantity == 2.0
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"price": 0},
+        {"price": -1.0},
+        {"price": float("nan")},
+        {"price": True},
+        {"executed_at": "2026-08-28T13:30:00"},
+        {"executed_at": "yesterday"},
+        {"commission": -1.0},
+        {"execution_id": ""},
+        {"classification": "phantom"},
+        {"evidence": "trust me"},
+    ],
+)
+def test_malformed_missed_exit_action_is_refused(
+    overrides, monkeypatch, tmp_path, session
+):
+    path = _missed_exit_plan(tmp_path, session, **overrides)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    with pytest.raises(RepairRefusedError, match="invalid repair plan"):
+        apply_repair_plan(session, plan_path=path)
+
+    assert not list(tmp_path.glob("paper_state_pre_repair_*.json"))
+
+
+def test_zero_quantity_set_is_refused_for_a_position_with_fill_history(
+    monkeypatch, tmp_path, session
+):
+    # A plan written before KAN-85 (or hand-edited back to the old action)
+    # must not write off a position that was really bought.
+    session.add_all([_lly_position(), _sleeve(), _fill("BUY", 2.0, "buy-1")])
+    session.commit()
+    plan = RepairPlan(
+        account_id=PAPER, created_at=NOW,
+        actions=[RepairAction(
+            action="set_position_quantity", account_id=PAPER,
+            portfolio="sector_rotation", con_id=LLY_CON_ID, quantity=0.0,
+        )],
+    )
+    path = write_repair_plan(plan, output_dir=tmp_path)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "APPLY PAPER REPAIR")
+
+    with pytest.raises(RepairRefusedError, match="fill history"):
+        apply_repair_plan(session, plan_path=path)
+
+    assert session.scalar(select(Position)).quantity == 2.0
+
+
+@pytest.mark.parametrize(
+    ("guard", "match"),
+    [
+        ("tty", "TTY"),
+        ("unresolved", "unresolved"),
+        ("live", "paper account"),
+        ("confirmation", "confirmation"),
+    ],
+)
+def test_hard_guards_still_refuse_a_missed_exit_plan(
+    guard, match, monkeypatch, tmp_path, session
+):
+    path = _missed_exit_plan(
+        tmp_path, session, price=1100.0,
+        executed_at="2026-08-28T13:30:00+00:00",
+    )
+    payload = json.loads(path.read_text())
+    if guard == "unresolved":
+        payload["unresolved"] = [{"reason": "sleeve_mapping_required"}]
+    if guard == "live":
+        payload["account_id"] = "U17723819"
+        payload["actions"][0]["account_id"] = "U17723819"
+    path.write_text(json.dumps(payload))
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: guard != "tty")
+    monkeypatch.setattr("builtins.input", lambda _: "no")
+
+    with pytest.raises(RepairRefusedError, match=match):
+        apply_repair_plan(session, plan_path=path)
+
+    assert session.scalars(select(Trade)).all() == []
+    assert session.scalar(select(Position)).quantity == 2.0
