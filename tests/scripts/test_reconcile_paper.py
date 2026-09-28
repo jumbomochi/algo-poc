@@ -433,6 +433,8 @@ def test_filled_buy_without_offsetting_sell_is_classified_missed_exit(session):
     assert action.evidence["buy_quantity"] == 2.0
     assert action.evidence["sell_quantity"] == 0.0
     assert action.evidence["price_source"] == "operator_required"
+    assert action.execution_id is None
+    assert action.commission is None
 
 
 def test_no_fill_history_is_classified_phantom_and_unchanged(session, tmp_path):
@@ -451,7 +453,19 @@ def test_no_fill_history_is_classified_phantom_and_unchanged(session, tmp_path):
     }
 
 
-def test_fully_offset_fill_history_is_not_guessed(session):
+def test_unprojected_fill_on_file_is_not_guessed(session):
+    unprojected = _fill("SELL", 2.0, "sell-1", price=1115.70)
+    unprojected.projection_applied = False
+    session.add_all([_lly_position(), _fill("BUY", 2.0, "buy-1"), unprojected])
+    session.commit()
+
+    _, plan = reconcile_snapshot(session, _empty_broker())
+
+    assert plan.actions == []
+    assert plan.unresolved[0].reason == "recorded_fill_not_projected"
+
+
+def test_fill_history_that_nets_flat_is_a_phantom(session):
     session.add_all([
         _lly_position(),
         _fill("BUY", 2.0, "buy-1"),
@@ -461,8 +475,13 @@ def test_fully_offset_fill_history_is_not_guessed(session):
 
     _, plan = reconcile_snapshot(session, _empty_broker())
 
-    assert plan.actions == []
-    assert plan.unresolved[0].reason == "recorded_sell_fill_not_projected"
+    assert [a.action for a in plan.actions] == ["set_position_quantity"]
+
+
+_REST = {"execution_id": "statement-lly-20260828", "commission": 1.05}
+_COMPLETE = {
+    "price": 1100.0, "executed_at": "2026-08-28T13:30:00+00:00", **_REST,
+}
 
 
 def _missed_exit_plan(tmp_path, session, **overrides):
@@ -548,7 +567,7 @@ def test_missed_exit_leaving_a_residue_open_is_refused(
 ):
     path = _missed_exit_plan(
         tmp_path, session, price=1100.0, quantity=1.5,
-        executed_at="2026-08-28T13:30:00+00:00",
+        executed_at="2026-08-28T13:30:00+00:00", **_REST,
     )
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _: "APPLY PAPER REPAIR")
@@ -625,7 +644,7 @@ def test_hard_guards_still_refuse_a_missed_exit_plan(
 ):
     path = _missed_exit_plan(
         tmp_path, session, price=1100.0,
-        executed_at="2026-08-28T13:30:00+00:00",
+        executed_at="2026-08-28T13:30:00+00:00", **_REST,
     )
     payload = json.loads(path.read_text())
     if guard == "unresolved":
@@ -642,3 +661,59 @@ def test_hard_guards_still_refuse_a_missed_exit_plan(
 
     assert session.scalars(select(Trade)).all() == []
     assert session.scalar(select(Position)).quantity == 2.0
+
+
+@pytest.mark.parametrize("missing", ["execution_id", "commission"])
+def test_missed_exit_without_statement_field_is_refused(
+    missing, monkeypatch, tmp_path, session
+):
+    fields = {**_COMPLETE}
+    del fields[missing]
+    path = _missed_exit_plan(tmp_path, session, **fields)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    with pytest.raises(RepairRefusedError, match=missing):
+        apply_repair_plan(session, plan_path=path)
+
+    assert session.scalars(select(Trade)).all() == []
+    assert not list(tmp_path.glob("paper_state_pre_repair_*.json"))
+
+
+def test_missed_exit_already_recorded_execution_is_refused(
+    monkeypatch, tmp_path, session
+):
+    session.add(_fill("SELL", 1.0, "statement-lly-20260828", price=1100.0))
+    session.commit()
+    path = _missed_exit_plan(tmp_path, session, **_COMPLETE)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "APPLY PAPER REPAIR")
+
+    with pytest.raises(RepairRefusedError, match="already recorded"):
+        apply_repair_plan(session, plan_path=path)
+
+    assert session.scalars(select(Trade)).all() == []
+
+
+def test_repaired_exit_leaves_fill_history_flat_for_later_phantoms(
+    monkeypatch, tmp_path, session
+):
+    path = _missed_exit_plan(tmp_path, session, **_COMPLETE)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "APPLY PAPER REPAIR")
+    apply_repair_plan(session, plan_path=path)
+
+    [sell] = session.scalars(
+        select(ExecutionFill).where(ExecutionFill.side == "SELL")
+    ).all()
+    assert sell.execution_id == "statement-lly-20260828"
+    assert sell.quantity == 2.0
+    assert sell.projection_applied is True
+
+    # The book reconciles clean, and a later phantom on the same contract is
+    # still a phantom rather than another "missed exit".
+    result, _ = reconcile_snapshot(session, _empty_broker())
+    assert result.entries_allowed is True
+    session.add(_lly_position(quantity=1.0))
+    session.commit()
+    _, plan = reconcile_snapshot(session, _empty_broker())
+    assert [a.action for a in plan.actions] == ["set_position_quantity"]

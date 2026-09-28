@@ -24,9 +24,10 @@ class MissedExitRepair:
     Distinct from ``set_position_quantity -> 0``, which is right only for a
     phantom: that deletes the position with no trade, no P&L and no cash, so
     applied to a real sale it writes off the proceeds. This action books the
-    sell. ``price`` and ``executed_at`` are ``None`` when the plan cannot
-    recover them, and the apply step refuses until the operator supplies both
-    from the IB statement — they are never defaulted.
+    sell. ``price``, ``executed_at``, ``execution_id`` and ``commission`` are
+    ``None`` when the plan cannot recover them, and the apply step refuses
+    until the operator supplies all four from the IB statement — they are
+    never defaulted.
     """
 
     action: str
@@ -37,7 +38,7 @@ class MissedExitRepair:
     price: float | None
     executed_at: str | None
     execution_id: str | None
-    commission: float
+    commission: float | None
     classification: str
     evidence: dict[str, Any]
 
@@ -333,22 +334,28 @@ def _missing_in_ib_repair(
 ) -> RepairAction | MissedExitRepair | UnresolvedRepair:
     """Say WHY a position IB does not hold vanished, from its fill history.
 
-    A filled BUY with no offsetting SELL proves the position was real, so IB
-    sold it and the fill was missed: book the exit. No fill history at all
-    means it may never have existed: remove it with no trade, as before. A
-    recorded SELL that covers the BUYs means the fill is on file but was never
-    projected — neither repair is right, so it is left to the operator.
+    Only projected fills count. A filled BUY with no offsetting SELL proves
+    the position was real, so IB sold it and the fill was missed: book the
+    exit. Fill history that nets to zero (or none at all) means the fills
+    explain nothing still held, so the row may never have existed: remove it
+    with no trade, as before. A fill on file that was never projected means
+    the book is behind its own ledger — neither repair is right, so it is
+    left to the operator.
     """
     con_id = int(discrepancy["con_id"])
     history = [
         fill for fill in fills
         if fill.account_id == result.account_id and int(fill.con_id) == con_id
     ]
+    if any(not bool(fill.projection_applied) for fill in history):
+        return UnresolvedRepair(
+            reason="recorded_fill_not_projected", con_id=con_id
+        )
     buys = [fill for fill in history if fill.side.upper() == "BUY"]
     sells = [fill for fill in history if fill.side.upper() == "SELL"]
     buy_quantity = sum(float(fill.quantity) for fill in buys)
     sell_quantity = sum(float(fill.quantity) for fill in sells)
-    if not history:
+    if buy_quantity - sell_quantity <= _FILL_QUANTITY_TOLERANCE:
         return RepairAction(
             action="set_position_quantity",
             account_id=result.account_id,
@@ -356,28 +363,24 @@ def _missing_in_ib_repair(
             con_id=con_id,
             quantity=0.0,
         )
-    if buy_quantity - sell_quantity > _FILL_QUANTITY_TOLERANCE:
-        return MissedExitRepair(
-            action="close_position_with_fill",
-            account_id=result.account_id,
-            portfolio=portfolio,
-            con_id=con_id,
-            quantity=float(discrepancy.get("db_quantity") or 0.0),
-            price=None,
-            executed_at=None,
-            execution_id=None,
-            commission=0.0,
-            classification="missed_exit",
-            evidence={
-                "buy_execution_ids": [fill.execution_id for fill in buys],
-                "sell_execution_ids": [fill.execution_id for fill in sells],
-                "buy_quantity": buy_quantity,
-                "sell_quantity": sell_quantity,
-                "price_source": "operator_required",
-            },
-        )
-    return UnresolvedRepair(
-        reason="recorded_sell_fill_not_projected", con_id=con_id
+    return MissedExitRepair(
+        action="close_position_with_fill",
+        account_id=result.account_id,
+        portfolio=portfolio,
+        con_id=con_id,
+        quantity=float(discrepancy.get("db_quantity") or 0.0),
+        price=None,
+        executed_at=None,
+        execution_id=None,
+        commission=None,
+        classification="missed_exit",
+        evidence={
+            "buy_execution_ids": [fill.execution_id for fill in buys],
+            "sell_execution_ids": [fill.execution_id for fill in sells],
+            "buy_quantity": buy_quantity,
+            "sell_quantity": sell_quantity,
+            "price_source": "operator_required",
+        },
     )
 
 

@@ -55,6 +55,11 @@ class MissingExitPriceError(RepairRefusedError):
 #: from a signal-driven exit. Same prefix as scripts/ops/restore_missed_exit.py.
 MISSED_EXIT_REASON = "reconciliation repair: missed exit booked by reconcile_paper"
 
+#: Stamped on the ``execution_fills`` row a missed-exit repair writes, as both
+#: its ``ib_order_id`` (the real order id is not on the statement row) and its
+#: ``recovery_source``.
+REPAIR_SOURCE = "reconcile_paper_repair"
+
 #: Share tolerance for "the sale accounts for the whole holding".
 _QUANTITY_TOLERANCE = 1e-6
 
@@ -229,8 +234,8 @@ def _parse_missed_exit(
     ):
         raise ValueError("execution_id must be non-empty or null")
     commission = value["commission"]
-    if not _is_number(commission) or commission < 0:
-        raise ValueError("commission must be a finite non-negative number")
+    if commission is not None and (not _is_number(commission) or commission < 0):
+        raise ValueError("commission must be a finite non-negative number or null")
     if value["classification"] != "missed_exit":
         raise ValueError("missed-exit classification must be missed_exit")
     if not isinstance(value["evidence"], dict):
@@ -244,31 +249,42 @@ def _parse_missed_exit(
         price=None if price is None else float(price),
         executed_at=executed_at,
         execution_id=execution_id,
-        commission=float(commission),
+        commission=None if commission is None else float(commission),
         classification="missed_exit",
         evidence=value["evidence"],
     )
 
 
 def _require_exit_evidence(plan: RepairPlan) -> None:
-    """Refuse a missed exit the operator has not priced. Never default one:
-    entry price books a plausible-looking zero, and a wrong price is a wrong
-    P&L on the gate record for good."""
+    """Refuse a missed exit the operator has not fully supplied. Never default
+    one: entry price books a plausible-looking zero, and a wrong price is a
+    wrong P&L on the gate record for good."""
     for action in plan.actions:
         if not isinstance(action, MissedExitRepair):
             continue
+        target = f"missed exit for con_id {action.con_id} in {action.portfolio!r}"
         if action.price is None:
             raise MissingExitPriceError(
-                f"missed exit for con_id {action.con_id} in "
-                f"{action.portfolio!r} has no exit price. Take it from the IB "
-                "statement for the trade date and write it into the plan's "
-                "price field; it is never defaulted."
+                f"{target} has no exit price. Take it from the IB statement "
+                "for the trade date and write it into the plan's price "
+                "field; it is never defaulted."
             )
         if action.executed_at is None:
             raise RepairRefusedError(
-                f"missed exit for con_id {action.con_id} in "
-                f"{action.portfolio!r} has no executed_at. Take the execution "
-                "time from the IB statement; it is never defaulted."
+                f"{target} has no executed_at. Take the execution time from "
+                "the IB statement -- statement times are US Eastern with no "
+                "offset, so write e.g. 2026-08-28T09:30:00-04:00, not +00:00."
+            )
+        if action.execution_id is None:
+            raise RepairRefusedError(
+                f"{target} has no execution_id. Take it from the IB "
+                "statement; it is recorded in execution_fills so the same "
+                "execution can never be booked twice."
+            )
+        if action.commission is None:
+            raise RepairRefusedError(
+                f"{target} has no commission. Take it from the IB statement "
+                "(0 only if the statement says 0); it is never defaulted."
             )
 
 
@@ -395,6 +411,7 @@ def _has_unoffset_buy_fills(
         select(ExecutionFill).where(
             ExecutionFill.account_id == account_id,
             ExecutionFill.con_id == con_id,
+            ExecutionFill.projection_applied.is_(True),
         )
     ):
         side = fill.side.upper()
@@ -408,7 +425,13 @@ def _has_unoffset_buy_fills(
 def _book_missed_exit(
     session: Session, position: Position, action: MissedExitRepair
 ) -> None:
-    """Write the sell a real exit would have written: trade, P&L, cash."""
+    """Write what a real exit would have written: the fill, trade, P&L, cash.
+
+    The SELL goes into ``execution_fills`` too. Without it the contract's fill
+    history stays long forever, so the next --report would classify a true
+    phantom on it as a missed exit and the zero-quantity guard would refuse
+    it; and the duplicate-execution check below could never see this repair.
+    """
     residue = float(position.quantity) - action.quantity
     if abs(residue) > _QUANTITY_TOLERANCE:
         raise RepairRefusedError(
@@ -417,7 +440,7 @@ def _book_missed_exit(
             "left open (or oversold), and reconciliation flags it again on "
             "the next run. Account for every execution on the IB statement."
         )
-    if action.execution_id is not None and session.scalar(
+    if session.scalar(
         select(ExecutionFill.id).where(
             ExecutionFill.account_id == position.account_id,
             ExecutionFill.execution_id == action.execution_id,
@@ -427,9 +450,29 @@ def _book_missed_exit(
             f"execution {action.execution_id!r} is already recorded; booking "
             "it again would double-count the P&L."
         )
-    exit_reason = MISSED_EXIT_REASON
-    if action.execution_id is not None:
-        exit_reason += f" (execution_id {action.execution_id})"
+    exit_reason = f"{MISSED_EXIT_REASON} (execution_id {action.execution_id})"
+    executed_at = datetime.fromisoformat(action.executed_at)
+    session.add(ExecutionFill(
+        account_id=position.account_id,
+        execution_id=action.execution_id,
+        ib_order_id=REPAIR_SOURCE,
+        recommendation_id=None,
+        portfolio=position.portfolio,
+        con_id=position.con_id,
+        symbol=position.ticker,
+        exchange=position.exchange,
+        currency=position.currency,
+        side="SELL",
+        quantity=action.quantity,
+        price=float(action.price),
+        commission=float(action.commission),
+        commission_trading=float(action.commission),
+        cumulative_quantity=action.quantity,
+        executed_at=executed_at,
+        projection_applied=True,
+        recovery_source=REPAIR_SOURCE,
+        recovered_at=datetime.now(timezone.utc),
+    ))
     try:
         PaperTradingState(session)._apply_fill_accounting(
             account_id=position.account_id,
@@ -438,8 +481,8 @@ def _book_missed_exit(
             action="sell",
             quantity=action.quantity,
             price=float(action.price),
-            fill_datetime=datetime.fromisoformat(action.executed_at),
-            commission=action.commission,
+            fill_datetime=executed_at,
+            commission=float(action.commission),
             con_id=position.con_id,
             exchange=position.exchange,
             currency=position.currency,
