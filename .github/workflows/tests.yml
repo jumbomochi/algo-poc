@@ -26,6 +26,10 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+          # Keyed on the lockfile, so a pin change is the only thing that
+          # invalidates it (KAN-90).
+          cache: pip
+          cache-dependency-path: requirements-dev.lock
       # No service containers: the suite is self-contained. Migration tests
       # use a throwaway sqlite database in tmp_path, and nothing skips on a
       # missing postgres/redis/docker — so a passing run here means the whole
@@ -40,8 +44,12 @@ jobs:
         run: pip install -r requirements-dev.lock
       - name: Install the project (no deps — the lockfile owns versions)
         run: pip install --no-deps -e .
+      # Parallel across the runner's cores (KAN-90). The suite is
+      # self-contained per test — sqlite in tmp_path, stubs in tmp_path — so
+      # nothing is shared between workers; wall-clock-sensitive tests carry
+      # margins sized for a loaded host rather than an idle one.
       - name: Run the suite
-        run: pytest -q
+        run: pytest -q -n auto
 
   alertmanager-config:
     name: amtool check-config

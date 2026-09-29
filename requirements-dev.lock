@@ -39,6 +39,8 @@ eventkit==1.0.3
     # via ib-insync
 exchange-calendars==4.13.2
     # via algo-poc (pyproject.toml)
+execnet==2.1.2
+    # via pytest-xdist
 factory-boy==3.3.3
     # via algo-poc (pyproject.toml)
 faker==40.36.0
@@ -175,11 +177,14 @@ pytest==9.1.1
     #   pytest-asyncio
     #   pytest-cov
     #   pytest-mock
+    #   pytest-xdist
 pytest-asyncio==1.4.0
     # via algo-poc (pyproject.toml)
 pytest-cov==7.1.0
     # via algo-poc (pyproject.toml)
 pytest-mock==3.15.1
+    # via algo-poc (pyproject.toml)
+pytest-xdist==3.8.0
     # via algo-poc (pyproject.toml)
 python-dateutil==2.9.0.post0
     # via pandas

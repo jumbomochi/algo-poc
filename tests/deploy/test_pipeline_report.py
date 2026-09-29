@@ -686,12 +686,32 @@ def _message(sends):
     return body[0][len("text="):]
 
 
-def test_the_message_reports_the_documented_facts_in_order(tmp_path):
+@pytest.fixture(params=[None, "Etc/GMT-14"], ids=["host-tz", "utc+14"])
+def host_tz(request, monkeypatch):
+    """Run under the host's zone and under one where the local date is ahead
+    of UTC's for most of the day — the frame the wrapper's local-midnight
+    SINCE disagrees with a UTC wall-clock seed in."""
+    if request.param is not None:
+        monkeypatch.setenv("TZ", request.param)
+        time.tzset()
+    yield
+    if request.param is not None:
+        monkeypatch.undo()
+        time.tzset()
+
+
+def test_the_message_reports_the_documented_facts_in_order(tmp_path, host_tz):
     """AC1. Halt, then fills, then rejections split by status, then the run
     status, divergence, resting orders and equity continuity."""
+    # Local, not UTC: SQLite stores the wall-clock time and drops the offset,
+    # and the wrapper's SINCE is LOCAL midnight. Seeded as UTC, the fill reads
+    # as before the window on any host east of UTC until UTC's date catches up
+    # (05:30 SGT is 21:30 UTC the previous day). Postgres compares timestamptz
+    # correctly, so this is a harness frame, not a product defect.
     def seed(s):
-        _fill(s, at=datetime.now(timezone.utc))
-        _intent(s, status=OrderStatus.RISK_REJECTED, at=datetime.now(timezone.utc))
+        now = datetime.now().astimezone()
+        _fill(s, at=now)
+        _intent(s, status=OrderStatus.RISK_REJECTED, at=now)
 
     res, sends, log = _drive_wrapper(tmp_path, seed=seed)
     assert res.returncode == 0

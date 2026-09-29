@@ -41,6 +41,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "pytest-cov>=4.0",
     "pytest-mock>=3.12",
+    "pytest-xdist>=3.5",
     "fakeredis>=2.21",
     "factory-boy>=3.3",
     "testcontainers[postgres,redis]>=3.7",
