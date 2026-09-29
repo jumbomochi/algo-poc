@@ -187,90 +187,69 @@ write one into a file that is not removed in the same command.
 - Stream message schemas live in `shared/schemas/messages.py`
 - Each service Dockerfile builds from Python 3.12-slim and sets `ENTRYPOINT ["python", "-m", "services.<name>.runner"]`
 
-## Branch Flow — develop is the integration branch
+## Branch Flow — trunk-based on `main`
 
 ```
-feature branch  ──PR──>  develop  ──PR──>  main
-                          (verify)         (production)
+feature branch  ──PR (CI required, squash)──>  main  ──pull + deploy.sh──>  deploy clone
+                                               (trunk)   (explicit, human-timed)
 ```
 
-- **Never commit or push directly to `main` or `develop`.** All work lands
-  through a PR. This is a rule you follow, not one the server keeps — see
-  "the protection does not bind you" below. Agents must treat it as absolute:
-  never push to either branch, whatever the API allows.
-- **`main` is production.** The launchd jobs, the paper book, and the live IB
-  account all run from what is on `main`. Only promote to `main` from
-  `develop`, and only after develop's CI is green on the merged tree.
-- **Branch off `develop`, not `main`.** `develop` contains everything `main`
-  has plus whatever is awaiting promotion; branching off `main` reintroduces
-  conflicts that were already resolved.
-- **Promotions to `main` are SQUASH merges, and that has a cost you pay
-  deliberately.** A squash creates a commit that exists only on `main`, so
-  `main` stops being an ancestor of `develop`. The next promotion PR is then
-  unmergeable even when `git diff origin/main origin/develop` is clean, because
-  the 3-way merge cannot tell that the two sides made the same changes. The fix
-  is a **reconciliation PR** merging `origin/main` into `develop`:
+Solo-developer flow since 2026-09-30 (KAN-92). `develop` is retired: its
+history is contained in `main` (final promotion #215 was a merge commit) and
+its tip is preserved as the `archive/develop` tag. It cost 17 promotion PRs,
+15 reconciliation PRs and ~4 full CI runs per change in a single month, and
+both of its jobs are done elsewhere — see the last two bullets.
+
+- **Never commit or push directly to `main`.** All work lands through a PR.
+  This is a rule you follow, not one the server keeps — see "the protection
+  does not bind you" below. Agents must treat it as absolute.
+- **Branch off `origin/main`; PRs target `main`; squash-merge them.** One
+  JIRA issue → one branch → one squash commit whose title carries the key.
+  There is no promotion step and no reconciliation step: a squash into the
+  branch you branched from never breaks ancestry.
+- **Merging is not deploying.** `main` is the trunk, not production.
+  Production runs from the deploy clone (`~/algo-poc-deploy`, KAN-72) and
+  moves only when you release, in that clone and in this order:
 
   ```bash
-  git merge-base --is-ancestor origin/main origin/develop   # fails => reconcile
-  git worktree add .worktrees/reconcile -b chore/reconcile-main-<date> origin/develop
-  cd .worktrees/reconcile && git merge origin/main
-  ```
-
-  Resolve conflicts in favour of `develop` — it already contains everything
-  `main` has, so `main`'s side of any conflict is strictly older, not
-  different. Then **verify the merged tree changes nothing**:
-
-  ```bash
-  git diff --cached origin/develop     # MUST be empty
-  ```
-
-  If it is not empty, stop: something on `main` never reached `develop` and
-  resolving toward `develop` would silently drop it.
-
-  Merge that PR with a **merge commit, never a squash** — squashing it would
-  flatten the very ancestry link that stops the next promotion conflicting for
-  the same reason. Needed twice so far (#157, #164).
-- **CI runs on both PRs and branch pushes.** `.github/workflows/tests.yml` and
-  `security.yml` build every PR and every push to `main`/`develop`. The
-  post-merge build on `develop` is the one that catches two individually-green
-  PRs that conflict semantically once both have landed.
-- **Required checks on `develop`:** `pytest (full suite)`,
-  `pip-audit (dependency vulnerability scan)`,
-  `lockfile matches pyproject.toml`, `amtool check-config`. Renaming a job
-  renames its check and blocks merges until the protection rule is updated to
-  match.
-- **The protection does not bind you.** `develop` is protected with
-  `enforce_admins: false`, and the repo has no non-admin collaborators — so
-  the owner, and any agent holding the owner's token, can still push directly
-  and still merge red. This is deliberate: it preserves the escape hatch used
-  for the 2026-08-14 KAN-16 secrets outage, where merging red was the right
-  call. Treat the rules as binding anyway, and when you do override, record
-  the reason in a PR comment. `main` has no protection at all.
-  Flip with `gh api -X PUT repos/jumbomochi/algo-poc/branches/develop/protection/enforce_admins`.
-- CI depth is unit-level by design (self-contained suite, sqlite in
-  `tmp_path`, no service containers). Real Postgres, `alembic upgrade head`
-  against it, and `docker compose build` are **not** covered — verify those by
-  hand before promoting anything that touches migrations or images.
-- **Merging the promotion PR does not deploy it.** The launchd jobs read a
-  working tree on the host, so promotion has a second half. Run it **in the
-  tree the launchd jobs read** — which `deploy/launchd/README.md` names, and
-  which is not necessarily the tree you are developing in — and in this order:
-
-  ```bash
-  git merge --ff-only origin/main     # FIRST
+  cd ~/algo-poc-deploy
+  git pull --ff-only origin main      # FIRST
   deploy/launchd/deploy.sh --dry-run
   deploy/launchd/deploy.sh
   ```
 
   `deploy.sh` run against a stale tree reports "everything in sync" and copies
-  nothing — true and meaningless (2026-09-08). Note that the two halves of the
-  tree behave differently: `secrets.sh`, `deadman.sh`, everything in
-  `deploy/launchd/lib/`, and all of `scripts/` and `config/` are **sourced by
-  path** and go live the moment the tree is pulled, while `run_*.sh` and
-  `gateway_watchdog.sh` are **copies in `~/ibc`** that only move when
-  `deploy.sh` runs. `deploy/launchd/README.md` carries the file list on each
-  side.
+  nothing — true and meaningless (2026-09-08). It refuses any tree that is not
+  the deploy clone at `origin/main` (KAN-89). The two halves of the tree behave
+  differently: `secrets.sh`, `deadman.sh`, everything in `deploy/launchd/lib/`,
+  and all of `scripts/` and `config/` are **sourced by path** and go live the
+  moment the clone is pulled, while `run_*.sh` and `gateway_watchdog.sh` are
+  **copies in `~/ibc`** that only move when `deploy.sh` runs, and `services/*`
+  only moves when its Docker image is rebuilt. `deploy/launchd/README.md`
+  carries the file list on each side. Between a merge and the next release the
+  daily report's branch line reads "N commit(s) behind origin/main" — that is
+  the undeployed backlog, and it is informational, not a page.
+- **CI runs on every PR and every push to `main`.** `.github/workflows/tests.yml`
+  and `security.yml`. The push build on `main` is the record that the merged
+  tree is green, and it is what catches two individually-green PRs that
+  conflict once both have landed — check it before releasing.
+- **Required checks on `main`:** `pytest (full suite)`,
+  `pip-audit (dependency vulnerability scan)`,
+  `lockfile matches pyproject.toml`, `amtool check-config`. Renaming a job
+  renames its check and blocks merges until the protection rule is updated to
+  match.
+- **The protection does not bind you.** `main` is protected with
+  `enforce_admins: false`, and the repo has no non-admin collaborators — so
+  the owner, and any agent holding the owner's token, can still push directly
+  and still merge red. This is deliberate: it preserves the escape hatch used
+  for the 2026-08-14 KAN-16 secrets outage, where merging red was the right
+  call. Treat the rules as binding anyway, and when you do override, record
+  the reason in a PR comment.
+  Flip with `gh api -X PUT repos/jumbomochi/algo-poc/branches/main/protection/enforce_admins`.
+- CI depth is unit-level by design (self-contained suite, sqlite in
+  `tmp_path`, no service containers). Real Postgres, `alembic upgrade head`
+  against it, and `docker compose build` are **not** covered — verify those by
+  hand before releasing anything that touches migrations or images.
 
 ## Destructive Actions — Human Confirmation Required
 

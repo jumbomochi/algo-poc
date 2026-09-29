@@ -214,11 +214,12 @@ decorative.
 
 ### The deployment procedure
 
-Promotion is the only thing that changes what production runs:
+Releasing is the only thing that changes what production runs. Merging a PR
+to `main` does not (trunk-based since KAN-92; `develop` is retired):
 
 ```bash
-# 1. Promote develop -> main through a PR, as usual.
-# 2. Then, in the DEPLOY CLONE:
+# 1. Merge the PR to main, and check main's push build is green.
+# 2. Then, when you choose to release, in the DEPLOY CLONE:
 cd /Users/huiliang/algo-poc-deploy
 git pull --ff-only origin main      # FIRST. deploy.sh reads this tree.
 deploy/launchd/deploy.sh --dry-run  # show what would change
