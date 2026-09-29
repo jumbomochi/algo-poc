@@ -690,7 +690,11 @@ def _message(sends):
 def host_tz(request, monkeypatch):
     """Run under the host's zone and under one where the local date is ahead
     of UTC's for most of the day — the frame the wrapper's local-midnight
-    SINCE disagrees with a UTC wall-clock seed in."""
+    SINCE disagrees with a UTC wall-clock seed in.
+
+    The UTC+14 case discriminates only while UTC's hour is >= 10 (before that
+    both zones share a date), so it catches a regression ~14h a day rather
+    than always. Making it total needs a controlled clock in the wrapper."""
     if request.param is not None:
         monkeypatch.setenv("TZ", request.param)
         time.tzset()

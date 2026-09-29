@@ -210,7 +210,11 @@ def test_sigkill_follows_for_a_run_that_ignores_sigterm(tmp_path: Path):
 
 def test_a_normal_run_is_untouched_by_the_bound(tmp_path: Path):
     """AC6. The bound must be invisible on the ~7-minute days, which is all of
-    them when the host is behaving."""
+    them when the host is behaving.
+
+    With a deadline no loaded host reaches, this proves non-interference only;
+    a bound that fires too EARLY is pinned by the wedged-run tests, which keep
+    the 2s deadline and assert its exit code and alert text."""
     res = _run_wrapper(
         tmp_path, paper_run="#!/bin/bash\necho 'stub paper run'\nexit 0\n",
         deadline=NORMAL_DEADLINE,
