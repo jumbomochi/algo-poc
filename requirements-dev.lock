@@ -163,7 +163,7 @@ pygments==2.20.0
     # via
     #   pytest
     #   rich
-pyjwt==2.13.0
+pyjwt==2.15.1
     # via redis
 pyluach==2.3.0
     # via exchange-calendars
