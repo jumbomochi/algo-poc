@@ -105,7 +105,7 @@ pydantic-core==2.46.4
     # via pydantic
 pydantic-settings==2.14.2
     # via algo-poc (pyproject.toml)
-pyjwt==2.13.0
+pyjwt==2.15.1
     # via redis
 pyluach==2.3.0
     # via exchange-calendars
