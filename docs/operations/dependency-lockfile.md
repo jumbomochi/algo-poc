@@ -220,22 +220,21 @@ policy asks for, and it is a story of its own.
 
 ### Where dependency PRs are based
 
-Every entry in `.github/dependabot.yml` sets `target-branch: develop`, so no
-dependency PR is based on `main`. Before this, none did: every one of the
-twenty Dependabot PRs this repo has received targeted `main`, which is
-production and carries no branch protection at all (CLAUDE.md, "Branch
-Flow"). It never bit only because nineteen of the twenty were closed
-unmerged — the twentieth, #31, merged straight to production.
+Dependency PRs are based on `main`, the trunk (KAN-92), which carries the
+required checks. No entry in `.github/dependabot.yml` sets `target-branch`:
+the default branch is the right base, and it is also where Dependabot reads
+its configuration from, so a change to that file takes effect once merged.
 
-Two consequences worth knowing:
+History: the entries used to set `target-branch: develop` while `develop` was
+the integration branch, because `main` was then production with no branch
+protection — every one of the first twenty Dependabot PRs had targeted it, and
+#31 merged straight to production. Merging no longer deploys (the deploy
+clone moves only on an explicit release, KAN-72), and `main` is protected, so
+that reason is gone.
 
-- **Dependabot reads `.github/dependabot.yml` from the default branch**
-  (`main`) regardless of `target-branch`. A change to that file therefore has
-  no effect until it is promoted develop → main. The manifests it diffs, and
-  the PRs it opens, do come from `develop`.
-- **Security updates only ever open against the default branch**, so with
-  `target-branch` set these entries handle version updates only. `pip-audit`
-  is the CVE tripwire here, on both lockfiles, on every push/PR and weekly.
+- **Security updates open against the default branch**, which is again the
+  branch everything else targets. `pip-audit` remains the CVE tripwire, on
+  both lockfiles, on every push/PR and weekly.
 
 The docker and github-actions entries carry no `ignore` list at all — only
 the pip entry does. Their update policy is a separate question from the

@@ -1,18 +1,11 @@
 version: 2
 
-# Every entry sets `target-branch: develop`. `develop` is the integration
-# branch (CLAUDE.md, "Branch Flow"); `main` is production and carries no
-# branch protection at all, so a dependency PR must never be based on it.
-#
-# Note the bootstrap asymmetry: Dependabot always reads *this file* from the
-# repository's default branch (`main`), regardless of `target-branch`. A
-# change here therefore does nothing until it is promoted develop -> main.
-# The manifests it diffs, and the PRs it opens, do come from `develop`.
-#
-# Second consequence, deliberate: Dependabot *security* updates are only ever
-# opened against the default branch, so setting `target-branch` means these
-# entries handle version updates only. `pip-audit` (security.yml) is the CVE
-# tripwire here and runs against both lockfiles on every push/PR and weekly.
+# No entry sets `target-branch`: dependency PRs are based on `main`, the trunk
+# (KAN-92), which carries the required checks. Dependabot reads this file from
+# the default branch, so a change here takes effect as soon as it merges.
+# pip-audit (security.yml) is the CVE tripwire and runs against both lockfiles
+# on every push/PR and weekly. History and rationale:
+# docs/operations/dependency-lockfile.md, "Where dependency PRs are based".
 
 updates:
   # pyproject.toml is the source of truth; requirements*.lock are derived
@@ -22,7 +15,6 @@ updates:
   # .github/workflows/security.yml.
   - package-ecosystem: pip
     directory: /
-    target-branch: develop
     schedule:
       interval: weekly
       day: monday
@@ -123,49 +115,42 @@ updates:
   # not glob subdirectories.
   - package-ecosystem: docker
     directory: /
-    target-branch: develop
     schedule:
       interval: weekly
       day: monday
     labels: [dependencies, docker]
   - package-ecosystem: docker
     directory: /services/risk_management
-    target-branch: develop
     schedule:
       interval: weekly
       day: monday
     labels: [dependencies, docker]
   - package-ecosystem: docker
     directory: /services/portfolio_accounting
-    target-branch: develop
     schedule:
       interval: weekly
       day: monday
     labels: [dependencies, docker]
   - package-ecosystem: docker
     directory: /services/execution
-    target-branch: develop
     schedule:
       interval: weekly
       day: monday
     labels: [dependencies, docker]
   - package-ecosystem: docker
     directory: /services/api
-    target-branch: develop
     schedule:
       interval: weekly
       day: monday
     labels: [dependencies, docker]
   - package-ecosystem: docker
     directory: /services/data_ingestion
-    target-branch: develop
     schedule:
       interval: weekly
       day: monday
     labels: [dependencies, docker]
   - package-ecosystem: docker
     directory: /services/notifications
-    target-branch: develop
     schedule:
       interval: weekly
       day: monday
@@ -173,7 +158,6 @@ updates:
 
   - package-ecosystem: github-actions
     directory: /
-    target-branch: develop
     schedule:
       interval: weekly
       day: monday

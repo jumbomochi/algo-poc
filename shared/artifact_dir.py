@@ -1,7 +1,7 @@
 """Where an operator artifact goes so it outlives the tree that wrote it.
 
 Ops tooling is routinely run from a throwaway git worktree — it is how a script
-on ``develop`` gets exercised before the promotion reaches ``main``. Both of the
+on a feature branch gets exercised before it merges to ``main``. Both of the
 artifact writers resolved their default directory in a way that put the file
 *inside* that worktree, and ``git worktree remove`` then deleted it:
 
