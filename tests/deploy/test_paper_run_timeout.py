@@ -79,7 +79,9 @@ _IGNORES_TERM = (
 )
 
 
-def _stub_tree(tmp_path: Path, *, paper_run: str) -> tuple[Path, Path, dict[str, str]]:
+def _stub_tree(
+    tmp_path: Path, *, paper_run: str, deadline: int = 2
+) -> tuple[Path, Path, dict[str, str]]:
     """A throwaway ALGO_DIR the real run_paper.sh can be pointed at.
 
     Same shape as tests/deploy/test_deadman_ping.py's: nothing real is
@@ -124,7 +126,7 @@ def _stub_tree(tmp_path: Path, *, paper_run: str) -> tuple[Path, Path, dict[str,
         ALGO_DEADMAN_PAPER_URL=PING_URL,
         # The injected deadline, and a bound that escalates in seconds rather
         # than the production 20.
-        ALGO_PAPER_TIMEOUT_SECONDS="2",
+        ALGO_PAPER_TIMEOUT_SECONDS=str(deadline),
         ALGO_BOUNDED_POLL_SECONDS="1",
         ALGO_BOUNDED_KILL_GRACE_SECONDS="2",
     )
@@ -144,8 +146,24 @@ class _Result:
         return " ".join(c for c in self.curl if "api.telegram.org" in c or "sendMessage" in c)
 
 
-def _run_wrapper(tmp_path: Path, *, paper_run: str, timeout: int = 120) -> _Result:
-    curl_log, home, env = _stub_tree(tmp_path, paper_run=paper_run)
+#: Wall-clock ceilings. The quantity these tests discriminate is "the bound
+#: fired" (wrapper setup + a few seconds) versus "it did not" (the wedged stub
+#: sleeps 600s), so the ceilings sit far below 600 rather than near the fast
+#: path. Setup alone took ~30s on a loaded host under pytest-xdist (KAN-90),
+#: which is what the old 30s ceiling — and a 2s deadline on the NORMAL run —
+#: kept tripping over.
+WEDGED_CEILING = 300
+#: A normal run gets a deadline no loaded host can reach, so the bound is
+#: genuinely out of the way; the watchdog test's ceiling is half of it, so a
+#: wrapper that waited for its own watchdog still fails.
+NORMAL_DEADLINE = 300
+NORMAL_CEILING = NORMAL_DEADLINE // 2
+
+
+def _run_wrapper(
+    tmp_path: Path, *, paper_run: str, timeout: int = 400, deadline: int = 2
+) -> _Result:
+    curl_log, home, env = _stub_tree(tmp_path, paper_run=paper_run, deadline=deadline)
     start = time.monotonic()
     proc = subprocess.run(
         [str(RUN_PAPER.resolve())],
@@ -177,7 +195,7 @@ def test_a_run_past_its_deadline_is_killed_and_the_wrapper_exits_124(tmp_path: P
     fourteen hours and collided with the next day's slot."""
     res = _run_wrapper(tmp_path, paper_run=_wedged_run())
     assert res.returncode == 124, f"exit {res.returncode}\n{res.log}"
-    assert res.seconds < 30, f"took {res.seconds:.1f}s — the bound did not fire"
+    assert res.seconds < WEDGED_CEILING, f"took {res.seconds:.1f}s — the bound did not fire"
 
 
 def test_sigkill_follows_for_a_run_that_ignores_sigterm(tmp_path: Path):
@@ -186,15 +204,20 @@ def test_sigkill_follows_for_a_run_that_ignores_sigterm(tmp_path: Path):
     so only SIGKILL can end it — if it did not, this would run for 600s."""
     res = _run_wrapper(tmp_path, paper_run=_wedged_run())
     assert res.returncode == 124
-    # 2s deadline + 2s grace, generously bounded.
-    assert res.seconds < 30, f"took {res.seconds:.1f}s — SIGKILL did not follow"
+    # 2s deadline + 2s grace + setup, bounded well short of the 600s sleep.
+    assert res.seconds < WEDGED_CEILING, f"took {res.seconds:.1f}s — SIGKILL did not follow"
 
 
 def test_a_normal_run_is_untouched_by_the_bound(tmp_path: Path):
     """AC6. The bound must be invisible on the ~7-minute days, which is all of
-    them when the host is behaving."""
+    them when the host is behaving.
+
+    With a deadline no loaded host reaches, this proves non-interference only;
+    a bound that fires too EARLY is pinned by the wedged-run tests, which keep
+    the 2s deadline and assert its exit code and alert text."""
     res = _run_wrapper(
-        tmp_path, paper_run="#!/bin/bash\necho 'stub paper run'\nexit 0\n"
+        tmp_path, paper_run="#!/bin/bash\necho 'stub paper run'\nexit 0\n",
+        deadline=NORMAL_DEADLINE,
     )
     assert res.returncode == 0, res.log
     assert "TIMED OUT" not in res.log, res.log
@@ -206,10 +229,11 @@ def test_a_normal_run_leaves_no_watchdog_process_behind(tmp_path: Path):
     wrapper must not return while one is still armed — if it did, this would
     hang until the injected deadline rather than exiting immediately."""
     res = _run_wrapper(
-        tmp_path, paper_run="#!/bin/bash\necho 'stub paper run'\nexit 0\n", timeout=60
+        tmp_path, paper_run="#!/bin/bash\necho 'stub paper run'\nexit 0\n",
+        deadline=NORMAL_DEADLINE,
     )
     assert res.returncode == 0
-    assert res.seconds < 15, (
+    assert res.seconds < NORMAL_CEILING, (
         f"took {res.seconds:.1f}s — the wrapper waited for its own watchdog"
     )
 

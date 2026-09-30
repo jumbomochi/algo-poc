@@ -1,6 +1,8 @@
 """Tests for shared/universe.py — the single source of truth for tickers."""
 from __future__ import annotations
 
+import asyncio
+import importlib.util
 import json
 from datetime import date, timedelta
 from pathlib import Path
@@ -158,6 +160,16 @@ class TestContractConIdOverride:
         c = make_stock_contract("MMC")
         assert c.conId == 9705
         assert c.exchange == "SMART"
+
+    def test_make_stock_contract_survives_a_prior_asyncio_run(self):
+        """KAN-90. asyncio.run() leaves no current loop; ib_insync's first
+        import must not happen after it, or eventkit raises at import."""
+        # find_spec, not importorskip: importing here would load ib_insync
+        # before the asyncio.run() below and prove nothing.
+        if importlib.util.find_spec("ib_insync") is None:
+            pytest.skip("ib_insync not installed")
+        asyncio.run(asyncio.sleep(0))
+        assert make_stock_contract("AAPL").symbol == "AAPL"
 
     def test_make_stock_contract_uses_symbol_for_normal_tickers(self):
         pytest.importorskip("ib_insync")

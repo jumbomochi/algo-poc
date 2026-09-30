@@ -29,8 +29,9 @@ docker compose -f docker-compose.yml -f docker-compose.observability.yml up
 ## Test Commands
 
 ```bash
-# Run the full test suite
-pytest
+# Run the full test suite (parallel; ~3 min vs ~7 serial). Drop -n auto, or
+# pass -n0, when debugging a single test.
+pytest -n auto
 
 # Run tests for a specific service
 pytest tests/services/risk_management/ -v
