@@ -136,43 +136,81 @@ Dependencies: T1 and T7 both touch `execution/runner.py` (sequence or coordinate
 
 ## 12. Findings register
 
-Traceability for every numbered finding → work thread → tracking issue / draft PR → status. **Status as of adoption (2026-08-06): all Open (tracked).** Update the Status column as threads land.
+Traceability for every numbered finding → work thread → evidence → status.
+**Status verified 2026-10-01 against `origin/main` `a3503fb` (KAN-41).** At
+adoption (2026-08-06) every row read "Open".
 
-| ID | Finding | Sev | Thread | Issue | PR | Status |
-|---|---|---|---|:--:|:--:|---|
-| 1.1 | Kill switch fails OPEN on restart | High | T1 | #2 | #12 | Open |
-| 1.2 | 20% circuit breaker never liquidates | High | T1 | #2 | #12 | Open |
-| 1.3 | Kill liquidation not idempotent (can short) | High | T1 | #2 | #12 | Open |
-| 1.4 | Kill uses stale in-memory positions | Med | T1 | #2 | #12 | Open |
-| 1.5 | Kill during IB disconnect aborts, no alert | Med | T1 | #2 | #12 | Open |
-| 2.1 | No independent/intraday stop-loss (dead) | High | T2 | #3 | #13 | Open |
-| 2.2 | No hard-ceiling / margin auto-trim (dead) | Med-High | T2 | #3 | #13 | Open |
-| 2.3 | Drawdown measured on budget, not equity | Med | T2 | #3 | #13 | Open |
-| 2.4 | Reprice / partial-fill loop dead | Med | T7 | #8 | #18 | Open |
-| 3.1 | Risk `process_fill` double-counts on replay | High | T4 | #5 | #15 | Open |
-| 3.2 | `process_fill` mixes commission currency | Med | T4 | #5 | #15 | Open |
-| 3.3 | Poison messages silently parked (no DLQ) | Med | T4 | #5 | #15 | Open |
-| 3.4 | `:dlq` unmonitored; notifications DLQ no-ack | Med | T4 | #5 | #15 | Open |
-| 3.5 | ml/signal no `drain_pending`; ack-on-buffer | Med | T4 | #5 | #15 | Open |
-| 4.1 | Survivorship / winner-preselected universe | High | T5 | #6 | #16 | Open |
-| 4.2 | Same-bar entry fill (look-ahead) | High | T5 | #6 | #16 | Open |
-| 4.3 | Same-bar exit fill at day's open | High | T5 | #6 | #16 | Open |
-| 4.4 | Fundamentals look-ahead (also live path) | High | T5 | #6 | #16 | Open |
-| 4.5 | ML filter in-sample; no purge/embargo | Med | T5 | #6 | #16 | Open |
-| 4.6 | Divergence baseline optimistic | Med | T5 | #6 | #16 | Open |
-| 4.7 | Cost model understated; pop-std Sharpe | Low-Med | T5 | #6 | #16 | Open |
-| 5.1 | Redis/PG open in committed compose | High | T3 | #4 | #14 | Open |
-| 5.2 | No inter-service message authenticity | High | T3 | #4 | #14 | Open |
-| 5.3 | IB Gateway API exposure | High | T9 | #10 | #20 | Open |
-| 5.4 | `joblib.load` untrusted deserialization | Med-High | T9 | #10 | #20 | Open |
-| 5.5 | Live-mode guard drift (raw env var) | Med | T9 | #10 | #20 | Open |
-| 5.6 | `.env` perms; no dependency lockfile | Med-Low | T9 | #10 | #20 | Open |
-| 6.1 | No app-level healthchecks | High | T6 | #7 | #17 | Open |
-| 6.2 | Metrics not wired; no alert rules | High | T6 | #7 | #17 | Open |
-| 6.3 | Unbounded Redis streams (OOM risk) | High | T6 | #7 | #17 | Open |
-| 6.4 | No message `schema_version` | Med | T9 | #10 | #20 | Open |
-| 7.0 | Two parallel implementations + model-loader mismatch | Med | T8 | #9 | #19 | Open |
+How the work actually landed, since the Issue/PR columns alone would mislead:
+T2/T3/T5/T6/T9 merged as PRs #13/#14/#16/#17/#20. **T1, T4 and T7 did not** —
+PRs #12/#15/#18 were closed unmerged because that work landed through the
+Session A integration merge `de7a761` (2026-08-09); cite the per-commit SHAs
+below. **T8's PR #19 was closed unmerged** and its branch never landed; 7.0 was
+resolved by KAN-35 instead. Later readiness stories (KAN-4…KAN-92) reworked
+much of the same code; where they matter, the KAN key is cited.
 
-**Priority rollup:** P0 = T1 (#2/#12), T2 (#3/#13), T3 (#4/#14) · P1 = T4 (#5/#15), T5 (#6/#16), T6 (#7/#17) · P2 = T7 (#8/#18), T8 (#9/#19), T9 (#10/#20).
+Status vocabulary: **Fixed** (code + test), **Partial** (the named residual is
+listed below the table), **Superseded** (replaced by a different mechanism),
+**Deferred** (accepted, with rationale and where it is tracked), **Open**
+(genuinely not done — carries an owner). Test paths are relative to `tests/`.
+
+| ID | Finding | Sev | Thread | Issue | PR | Status | Evidence |
+|---|---|---|---|:--:|:--:|---|---|
+| 1.1 | Kill switch fails OPEN on restart | High | T1 | #2 | #12 | **Fixed** | `2521251`, `7b1d576`, `8894142`; `kill_switch.py` `reload_from_store`/`sync_from_store`; admin-only clear `DELETE /api/v1/kill` (`40c3f3d`); execution halt gate KAN-12. `services/risk_management/test_kill_switch.py::TestKillSwitchPersistence::test_reload_from_store_stays_halted_after_restart` |
+| 1.2 | 20% circuit breaker never liquidates | High | T1 | #2 | #12 | **Fixed** | `40c3f3d`; risk `_emit_drawdown_gauge` → `_liquidate_all(event_type="circuit_breaker_liquidation")`. `services/risk_management/test_runner.py::TestCircuitBreakerLiquidation::test_breaker_liquidates_and_halts` |
+| 1.3 | Kill liquidation not idempotent (can short) | High | T1 | #2 | #12 | **Fixed** | `6af0219` (deterministic ids via ledger); KAN-4, KAN-6, KAN-9; oversell guard KAN-10. `services/risk_management/test_runner.py::TestKillLiquidation::test_replayed_kill_does_not_double_submit` |
+| 1.4 | Kill uses stale in-memory positions | Med | T1 | #2 | #12 | **Fixed** | `6af0219`, KAN-6; risk `_authoritative_open_positions` reads the DB. `services/risk_management/test_runner.py::TestKillLiquidation::test_kill_liquidates_authoritative_db_positions` |
+| 1.5 | Kill during IB disconnect aborts, no alert | Med | T1 | #2 | #12 | **Fixed** | `6af0219`, `1d0d042`; per-ticker try/except + unconditional critical alert. `services/execution/test_runner.py::TestKillHandling::test_kill_per_ticker_failure_continues_and_alerts` |
+| 2.1 | No independent/intraday stop-loss (dead) | High | T2 | #3 | #13 | **Partial** (R1) | `9716eb0` periodic driver `run_periodic_risk_checks`, ledger-routed by KAN-7. `services/risk_management/test_runner.py::TestPeriodicRiskEnforcement::test_periodic_checks_drive_stop_loss` |
+| 2.2 | No hard-ceiling / margin auto-trim (dead) | Med-High | T2 | #3 | #13 | **Partial** (R2) | Hard ceiling: `9716eb0` `run_passive_scan`, KAN-7. `services/risk_management/test_runner.py::TestPeriodicRiskEnforcement::test_hard_ceiling_breach_auto_trims_to_soft`. Margin half deferred |
+| 2.3 | Drawdown measured on budget, not equity | Med | T2 | #3 | #13 | **Fixed** | `9716eb0` `_book_equity_from_db`; USD equity columns KAN-44. `services/risk_management/test_stop_loss.py::TestDrawdownOnBookEquity::test_book_equity_engages_circuit_breaker` |
+| 2.4 | Reprice / partial-fill loop dead | Med | T7 | #8 | #18 | **Partial** (R3) | `847ad47` sweep driven from `run()`; `5f09ec6` sits out outside RTH. `services/execution/test_runner.py::TestUnfilledSweepDriver::test_maybe_run_unfilled_sweep_respects_interval`. Reprice-with-quotes deferred |
+| 3.1 | Risk `process_fill` double-counts on replay | High | T4 | #5 | #15 | **Fixed** | `16efde4` dedup by `execution_id`. `services/risk_management/test_runner.py::TestFillProcessing::test_replayed_fill_does_not_move_book` |
+| 3.2 | `process_fill` mixes commission currency | Med | T4 | #5 | #15 | **Fixed** | `16efde4`, `1d0d042` (uses `commission_trading`). `services/risk_management/test_runner.py::TestFillProcessing::test_process_fill_uses_commission_trading_usd` |
+| 3.3 | Poison messages silently parked (no DLQ) | Med | T4 | #5 | #15 | **Fixed** | `fb0281a`, `1d0d042`, `f1446de`. `services/risk_management/test_runner.py::TestSteadyStatePoisonHandling::test_poison_message_is_dead_lettered_acked_and_alerted`; `services/execution/test_runner.py::TestExecutionPoisonHandling::test_poison_message_dead_lettered_acked_alerted` |
+| 3.4 | `:dlq` unmonitored; notifications DLQ no-ack | Med | T4 | #5 | #15 | **Partial** (R4) | `736c1a0` notifications ack-after-send + risk `_check_dlq_depths` → `dlq_backlog` alert. `services/notifications/test_runner.py::TestNotificationsServiceRunner::test_dlq_path_acks_after_send`; `services/risk_management/test_runner.py::TestDlqDepthMonitor::test_alerts_when_dlq_has_backlog` |
+| 3.5 | ml/signal no `drain_pending`; ack-on-buffer | Med | T4 | #5 | #15 | **Fixed**, then **Superseded** | `f1446de`. `services/ml_model/test_runner.py::TestMLConsumerLoop::test_incomplete_signal_is_not_acked`. Both services left compose in KAN-35 (`12635e1`) |
+| 4.1 | Survivorship / winner-preselected universe | High | T5 | #6 | #16 | **Partial — bias accepted** (R5) | Code: `8666ca3`, `2635674` `MembershipCalendar`; coverage floor KAN-22. `shared/test_universe.py::TestMembershipCalendar::test_contains_is_point_in_time`. Re-run BLOCKED (KAN-52); bias accepted D18 (KAN-59), code path KAN-68 |
+| 4.2 | Same-bar entry fill (look-ahead) | High | T5 | #6 | #16 | **Fixed** | `8666ca3`. `backtest/test_runner_next_bar_fills.py::TestNextBarEntryFill::test_entry_decided_on_close_fills_at_the_next_open` |
+| 4.3 | Same-bar exit fill at day's open | High | T5 | #6 | #16 | **Fixed** | `8666ca3`. `backtest/test_simulator.py::TestMarketExit::test_market_exit_fills_at_open` |
+| 4.4 | Fundamentals look-ahead (also live path) | High | T5 | #6 | #16 | **Fixed** | `8ff56a1` `build_fundamentals_lookup`, shared by `run_paper.py`. `backtest/test_fundamentals_cache.py::TestFilingLag::test_lag_defaults_to_the_10q_filing_deadline` |
+| 4.5 | ML filter in-sample; no purge/embargo | Med | T5 | #6 | #16 | **Fixed** | `8ff56a1` `purged_train_mask`, `assert_ml_filter_out_of_sample`. `backtest/test_signal_model_training.py::TestOutOfSampleGuard::test_rejects_a_backtest_that_overlaps_the_training_window` |
+| 4.6 | Divergence baseline optimistic | Med | T5 | #6 | #16 | **Fixed** | `b809ff0` `is_like_for_like`; KAN-23, KAN-51 (pin), KAN-60 (Rung-0 pin, D21). `backtest/test_divergence.py::TestExecutionModel::test_same_bar_backtest_is_not_comparable`. Pinned baselines inherit 4.1's accepted bias |
+| 4.7 | Cost model understated; pop-std Sharpe | Low-Med | T5 | #6 | #16 | **Fixed** | `8666ca3` commission floor + tiered slippage, `ddof=1`. `backtest/test_metrics.py::TestSharpeRatio::test_sharpe_uses_sample_stdev`; `backtest/test_costs.py::TestCommissionFloor::test_small_order_pays_the_per_order_minimum` |
+| 5.1 | Redis/PG open in committed compose | High | T3 | #4 | #14 | **Fixed** | `c7ba601`. `deploy/test_message_bus_lockdown.py::test_postgres_redis_and_api_ports_are_loopback_bound`, `::test_redis_requires_auth_via_requirepass` |
+| 5.2 | No inter-service message authenticity | High | T3 | #4 | #14 | **Deferred** | T3 deferred it explicitly; one shared Redis credential, no per-service ACL or money-stream integrity check. Tracked in `TODOS.md` ("Per-service Redis ACLs…"). Revisit before live money scales |
+| 5.3 | IB Gateway API exposure | High | T9 | #10 | #20 | **Open** (R6) | Host configuration, not in the repo (§10). KAN-11 (`627c345`) pins the exact account, which narrows wrong-account risk but not API exposure |
+| 5.4 | `joblib.load` untrusted deserialization | Med-High | T9 | #10 | #20 | **Fixed** | `250a9df`, `304a09e` (content hash on the DB row). `services/ml_model/test_model_roundtrip.py::test_a_tampered_native_file_is_refused` |
+| 5.5 | Live-mode guard drift (raw env var) | Med | T9 | #10 | #20 | **Fixed** | `250a9df`; `api/auth.py` `resolve_mode()` reads `AppConfig.mode`. `services/api/test_auth.py` |
+| 5.6 | `.env` perms; no dependency lockfile | Med-Low | T9 | #10 | #20 | **Fixed** | Lockfile `250a9df`; deterministic check + CI KAN-36; guardrail KAN-57; pip-audit (`security.yml`), KAN-91. Secrets moved to the login keychain KAN-16 (`0eee862`); `.env` is not read by any job |
+| 6.1 | No app-level healthchecks | High | T6 | #7 | #17 | **Fixed** | `afeb89e`, `4c63979` heartbeat-file healthchecks; `gateway_watchdog.sh` alerts on an unhealthy stack (KAN-66). `deploy/test_observability_healthchecks.py::test_every_worker_service_has_a_heartbeat_healthcheck`. Detection, not auto-restart (Docker does not restart `unhealthy`) |
+| 6.2 | Metrics not wired; no alert rules | High | T6 | #7 | #17 | **Partial** (R7) | In code: `afeb89e` `setup_metrics()` in every service; `config/alert_rules.yml`; Alertmanager KAN-14; thresholds KAN-15. `deploy/test_observability_healthchecks.py::test_every_backend_service_calls_setup_metrics`. **Not deployed** |
+| 6.3 | Unbounded Redis streams (OOM risk) | High | T6 | #7 | #17 | **Fixed** | `afeb89e`, `4c63979` `XADD MAXLEN ~ 25000` + `maxmemory 512mb noeviction`. `deploy/test_observability_healthchecks.py::test_redis_service_sets_a_maxmemory_ceiling_with_noeviction`. Its memory alert shares R7 |
+| 6.4 | No message `schema_version` | Med | T9 | #10 | #20 | **Fixed** | `250a9df`; additive-only rule in `shared/schemas/messages.py`. `shared/test_schemas.py::TestSchemaVersion::test_future_schema_version_is_rejected` |
+| 7.0 | Two parallel implementations + model-loader mismatch | Med | T8 | #9 | #19 | **Superseded** | Dual path: KAN-35 (`12635e1`, D17, `docs/decisions/ml-path-2026-09.md`) — `run_paper.py` is the only recommendation source; the services remain as offline tools. Loader: `af6ae6d`. `services/ml_model/test_model_roundtrip.py::test_a_native_lightgbm_file_round_trips_through_the_registry` |
+
+**Tally (32):** 22 Fixed · 1 Fixed-then-Superseded · 1 Superseded · 6 Partial · 1
+Deferred · 1 Open.
+
+### Residuals — what is still not done, and who owns it
+
+Every Partial and Open row above resolves to one of R1–R7; R8–R11 are residuals that surfaced in the thread checklists rather than as numbered findings. This table is the complete list. The owner is the
+operator throughout (single-operator system); "where tracked" is where the next
+reader should look.
+
+| Ref | Residual | Disposition | Where tracked |
+|---|---|---|---|
+| R1 | Stop-loss marks are daily closes, so a breach is acted on after the next close. Broker GTC stops (KAN-19/KAN-20) are built but `broker_stops_enabled: false` until epoch v2 | Deferred | `paging-and-accepted-deferrals.md` §2.1; KAN-33 (held) |
+| R2 | Margin utilisation hard-coded `0.0`; the margin-critical trim cannot fire | Deferred | `paging-and-accepted-deferrals.md` §2.2 |
+| R3 | Sweep ages out, does not reprice; calendar set by private attribute. `OrderManager.handle_partial_fill` and `execution.min_viable_fill_pct` still have no caller | Deferred (reprice, calendar) · **Open** (dead partial-fill surface — wire or delete on the next execution-runner touch) | `paging-and-accepted-deferrals.md` §2.3–2.4 |
+| R4 | The live DLQ-depth alert (risk `_check_dlq_depths`) covers `stream:recommendations:dlq`, `stream:kill:dlq` (which is also where execution dead-letters kills) and `stream:fills:dlq`. There is **no aggregate depth alert** for `stream:approved_orders:dlq` — each dead-lettered approved order still raises its own `poison_message` alert — or for `stream:alerts:dlq`; both surface in aggregate only in the weekly evidence digest (KAN-29) and a Prometheus rule with no evaluator | **Open** | `dlq-audit-2026-08.md` findings A–B (KAN-21) |
+| R5 | IB serves no delisted history, so ~11% of membership-days stay excluded and every baseline is `BLOCKED`; accepted as a documented, time-bounded bias. Re-evidence no earlier than 2029-08-18 from forward capture (KAN-58) | Deferred (decision D18, re-accepted D20/D21) | `backtest-baseline.md`; `docs/designs/project-direction.md` D18 |
+| R6 | IB Gateway API bind scope / trusted-IP settings never verified from the repo | **Open** — host check required before live capital | §10 of this review; `go-live-checklist.md` |
+| R7 | The observability overlay (Prometheus, Alertmanager, Grafana, redis-exporter) is not running, so no rule in `config/alert_rules.yml` is evaluated | **Open** — operator decision whether to deploy it | `paging-and-accepted-deferrals.md` §1 |
+| R8 | IPS § 6 still describes pre-KAN-7 enforcement (stop-loss/trim "not yet routed through the ledger", "emit (T2); executes with T1") and omits the broker stops | **Open** — operator; the IPS is a governance document, so this story records the drift rather than editing it | `T2-runtime-risk-enforcement.md`; `investment-policy-statement.md:248,263,267` |
+| R9 | A failed IB callback task is logged (`ib_executor.py` `_spawn`), not alerted | **Open** — low severity; fold into the next execution-runner change | `T7-execution-lifecycle.md` |
+| R10 | A fill that completes while execution is disconnected or restarting is not projected at reconnect; it appears only at the next daily execution sweep (KAN-87, run from `run_paper.py`). No fill is lost, but the book is hours stale in that window | **Open** | `TODOS.md` "Mid-session completed-order reconciliation" |
+| R11 | The API does not enforce TLS itself | **Accepted** — TLS is a deployment concern; the API binds loopback (`docker-compose.yml`) | `api-security.md` |
+
+**Priority rollup (historical):** P0 = T1 (#2/#12), T2 (#3/#13), T3 (#4/#14) · P1 = T4 (#5/#15), T5 (#6/#16), T6 (#7/#17) · P2 = T7 (#8/#18), T8 (#9/#19), T9 (#10/#20).
 
 > The full-detail version of this review — including security exploitation paths and the local IB Gateway settings — is intentionally kept out of this public repo. It lives locally, gitignored, at `output/implementation-review-2026-08-06.FULL-PRIVATE.md`.

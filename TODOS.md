@@ -67,7 +67,8 @@ Deferred work with context. Added by /plan-eng-review and /plan-ceo-review 2026-
 - **Context:** Found by /ship on 2026-09-01 while landing the sleeve-scoping fix; verified pre-existing by stashing the branch changes and reproducing on `develop`. Not caused by that work and left untouched (`REPO_MODE=collaborative`).
 - **Depends on / blocked by:** Nothing.
 
-## Dual signal paths: which one is authoritative (blocked on D17)
+## Dual signal paths: which one is authoritative — RESOLVED by KAN-35 (D17)
+- **Resolved 2026-09-27:** KAN-35 (`12635e1`, `docs/decisions/ml-path-2026-09.md`) demoted `signal_generation`/`ml_model` to offline tools; compose no longer runs them and `run_paper.py` is the only recommendation source. The text below is the original entry, kept for history.
 - **What:** Pick one authoritative path between `scripts/run_paper.py` and the Docker `signal_generation`/`ml_model` services, and delete or clearly demote the dormant one.
 - **Why:** Both docker services are up and healthy while having consumed nothing (`stream:signals` XLEN 0, consumer group `last-delivered-id 0-0`, measured 2026-09-04). `run_paper.py` is the real signal brain. Two systems, one inert, and nothing says which is authoritative.
 - **Pros:** Removes a loader path that cannot work; a new contributor can read one doc and know what actually runs live.

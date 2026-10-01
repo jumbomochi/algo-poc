@@ -5,6 +5,10 @@ Part of the 2026-08-06 implementation review (`docs/operations/implementation-re
 ## Problem
 The backtest that justifies the strategy is optimistic by construction (survivorship + same-bar look-ahead), and the divergence monitor baselines against it — so it cannot distinguish "backtest was never achievable" from "live is degrading." The newer `research/` framework already does this correctly; route through it.
 
+## Status (verified 2026-10-01, KAN-41)
+
+Checked against `origin/main` `a3503fb`. A box is ticked only when shipped code and a test meet it; anything partial stays unticked with the residual named. Finding-level status and the residual register (R1–R7) are in `docs/operations/implementation-review-2026-08-06.md` §12.
+
 ## Checklist
 - [x] **Point-in-time universe** — replace the static `SP500_TOP50` ("as of early 2025") with membership-by-date (the `research/` panel already supports it); include delisted names. `universe.py:13-21`, `run_backtest.py`
 - [x] **Next-bar fills** — a decision on `close[t]` fills at `open[t+1]` for both entries and exits (today entries fill same-bar at close, exits same-bar at open). `simulator.py:31,45-68`, `backtest/runner.py:98-117`
@@ -15,6 +19,7 @@ The backtest that justifies the strategy is optimistic by construction (survivor
 
 ## Acceptance criteria
 - [ ] Headline backtest re-run on a point-in-time universe with next-bar fills; the new numbers become the baseline. **Operator-run** — needs IB bars for the historical members plus a membership-snapshot file, neither of which exists locally. Commands and file format: `docs/operations/backtest-baseline.md`.
+  — *Not met as written; resolved by decision.* Ran 2026-08-19 (KAN-52): coverage `BLOCKED`, 11.28% of membership-days excluded, because IB serves no delisted history. D18 (KAN-59) accepted the survivorship bias as documented and time-bounded; KAN-68 gave it a code path; D20/D21 pinned the resulting baselines. Residual R5.
 - [x] Divergence monitor compares live against a like-for-like execution model.
 - [x] No fundamentals lookup returns data before its filing date (live or backtest).
 
