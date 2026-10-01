@@ -170,7 +170,7 @@ tzdata==2026.3
     #   pandas
 update-checker==1.0.0
     # via praw
-urllib3==2.7.0
+urllib3==2.8.0
     # via requests
 uvicorn==0.52.1
     # via algo-poc (pyproject.toml)
