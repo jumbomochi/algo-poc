@@ -17,7 +17,7 @@ Checked against `origin/main` `a3503fb`. A box is ticked only when shipped code 
   — *Done:* `250a9df`; deterministic lockfile check KAN-36; guardrail KAN-57; pip-audit is a required check.
 - [x] **Message schema versioning** — add a `schema_version` field + an additive-only evolution rule; treat validation failures as DLQ-worthy (see T4). `schemas/messages.py`
 - [ ] **API hardening** — rate-limit / lock out `X-API-Key` failures, enforce TLS, disable interactive docs outside dev. `api/app.py`, `api/auth.py`
-  — *Partial:* key lockout and docs-off-outside-dev done (`250a9df`); TLS is documented as a deployment concern (`api-security.md`), not enforced by the app.
+  — *Partial:* key lockout and docs-off-outside-dev done (`250a9df`); TLS is documented as a deployment concern (`api-security.md`), not enforced by the app — accepted, residual R11.
 
 ## Acceptance criteria
 - [x] Model loads are integrity-checked.

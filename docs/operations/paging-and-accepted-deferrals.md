@@ -1,8 +1,8 @@
 # Paging decision and accepted deferrals
 
 Two things that until KAN-41 lived only in a settings file and in the
-operator-local readiness design (`~/.gstack/.../huiliang-main-design-20260811-145715.md`,
-tranche 1 item 3 and tranche 3 item 12): **how this system pages a human**, and
+operator-local readiness design (2026-08-11, tranche 1 item 3 and
+tranche 3 item 12): **how this system pages a human**, and
 **which known gaps were deliberately left open, and why**. If you are debugging
 a page that never arrived, or wondering whether a dead monitor is a bug, start
 here.
@@ -11,10 +11,11 @@ State verified 2026-10-01 against `origin/main` `a3503fb` and the running host.
 
 ---
 
-## 1. The pager is Telegram, on both layers
+## 1. The pager is Telegram, on every layer
 
-There are two independent alert sources, and both deliver to the same Telegram
-bot and chat.
+The design decision is "Telegram on both layers" — the application layer and
+the Prometheus layer. A third, the launchd wrappers, sits outside both. All
+three deliver to the same Telegram bot and chat.
 
 | Layer | Source | Delivery path | Config |
 |---|---|---|---|
@@ -51,7 +52,7 @@ deployment is:
   has no evaluator. The config is correct and tested (`amtool check-config` is a
   required CI check); it is not deployed. Until it is, the independent path for
   "the notifications service is wedged" is the external dead-man switches, not
-  HeartbeatStale. See also `dlq-audit-2026-08.md:241`.
+  HeartbeatStale. See also `dlq-audit-2026-08.md` finding B.
 
 Bringing the overlay up is the command in `CLAUDE.md` ("Start with
 observability stack") plus the credentials listed there; the delivery drill is
@@ -150,10 +151,11 @@ that touches the execution runner's constructor.
 
 ## 3. Stale-documentation corrections
 
-Two claims this backlog found wrong, recorded so the next reader is not misled
-the same way. Both are already corrected in place:
+Claims this backlog found wrong, recorded so the next reader is not misled
+the same way. The first two were already corrected in place; the third is corrected by KAN-41:
 
 | Where | Was | Now | Corrected in |
 |---|---|---|---|
 | `TODOS.md` (mid-session reconciliation entry) | orderRef stamping (D12) listed as pending | Records that D12 has shipped: `ib_executor.py` sets `order.orderRef` on both submission paths and reads it back via `find_order_by_ref` / `restore_order_by_ref` | `627c345` (KAN-11) |
 | `backtest-baseline.md` | Pointed at `scripts/fetch_fundamentals.py` for `SECTOR_MAP` | Points at `shared/universe.py`, noting `fetch_fundamentals.py` only re-exports it | `d86a6f6` (KAN-23) |
+| `TODOS.md` ("Dual signal paths") | Listed the authoritative-path call as open, blocked on D17, with both services "up and healthy" | Marked resolved: KAN-35 (D17) demoted both services to offline tools; `run_paper.py` is the only recommendation source | KAN-41 |

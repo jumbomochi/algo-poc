@@ -17,7 +17,7 @@ Checked against `origin/main` `a3503fb`. A box is ticked only when shipped code 
 - [x] **Measure drawdown on marked book equity** (cash + MTM positions), not `deployable_capital` (pinned at the USD cap, so it reads ~0%). `risk/runner.py:674,684-693`, `capital.py:74-82`
   — *Done:* `9716eb0`, USD equity columns KAN-44; `TestDrawdownOnBookEquity::test_book_equity_engages_circuit_breaker`.
 - [ ] **Reconcile IPS § 6 with reality** — either wire the remaining limits or amend the IPS to state what is actually enforced.
-  — *Open (owner: operator — the IPS is a governance document).* § 6 was amended once, but `investment-policy-statement.md:248` still says stop-loss/trim exits are "not yet routed through the ledger" (KAN-7 did that), `:263,:267` still read "emit (T2); executes with T1", and it does not mention the broker stops (KAN-19/20) or that they are off.
+  — *Open, residual R8 (owner: operator — the IPS is a governance document).* § 6 was amended once, but `investment-policy-statement.md:248` still says stop-loss/trim exits are "not yet routed through the ledger" (KAN-7 did that), `:263,:267` still read "emit (T2); executes with T1", and it does not mention the broker stops (KAN-19/20) or that they are off.
 
 ## Acceptance criteria
 - [ ] An intraday stop fires without waiting for the daily run. — *Not met in production:* marks are daily closes and `broker_stops_enabled: false` until KAN-33 (R1).

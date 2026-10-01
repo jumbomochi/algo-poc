@@ -193,7 +193,7 @@ Deferred · 1 Open.
 
 ### Residuals — what is still not done, and who owns it
 
-Every Partial and Open row above resolves to one of these. The owner is the
+Every Partial and Open row above resolves to one of R1–R7; R8–R11 are residuals that surfaced in the thread checklists rather than as numbered findings. This table is the complete list. The owner is the
 operator throughout (single-operator system); "where tracked" is where the next
 reader should look.
 
@@ -202,10 +202,14 @@ reader should look.
 | R1 | Stop-loss marks are daily closes, so a breach is acted on after the next close. Broker GTC stops (KAN-19/KAN-20) are built but `broker_stops_enabled: false` until epoch v2 | Deferred | `paging-and-accepted-deferrals.md` §2.1; KAN-33 (held) |
 | R2 | Margin utilisation hard-coded `0.0`; the margin-critical trim cannot fire | Deferred | `paging-and-accepted-deferrals.md` §2.2 |
 | R3 | Sweep ages out, does not reprice; calendar set by private attribute. `OrderManager.handle_partial_fill` and `execution.min_viable_fill_pct` still have no caller | Deferred (reprice, calendar) · **Open** (dead partial-fill surface — wire or delete on the next execution-runner touch) | `paging-and-accepted-deferrals.md` §2.3–2.4 |
-| R4 | Live DLQ-depth alert covers only risk's three input DLQs. `stream:approved_orders:dlq`, `stream:alerts:dlq` and execution's kill DLQ surface only in the weekly evidence digest (KAN-29) and a Prometheus rule with no evaluator | **Open** | `dlq-audit-2026-08.md` (KAN-21) |
+| R4 | The live DLQ-depth alert (risk `_check_dlq_depths`) covers `stream:recommendations:dlq`, `stream:kill:dlq` (which is also where execution dead-letters kills) and `stream:fills:dlq`. There is **no aggregate depth alert** for `stream:approved_orders:dlq` — each dead-lettered approved order still raises its own `poison_message` alert — or for `stream:alerts:dlq`; both surface in aggregate only in the weekly evidence digest (KAN-29) and a Prometheus rule with no evaluator | **Open** | `dlq-audit-2026-08.md` findings A–B (KAN-21) |
 | R5 | IB serves no delisted history, so ~11% of membership-days stay excluded and every baseline is `BLOCKED`; accepted as a documented, time-bounded bias. Re-evidence no earlier than 2029-08-18 from forward capture (KAN-58) | Deferred (decision D18, re-accepted D20/D21) | `backtest-baseline.md`; `docs/designs/project-direction.md` D18 |
 | R6 | IB Gateway API bind scope / trusted-IP settings never verified from the repo | **Open** — host check required before live capital | §10 of this review; `go-live-checklist.md` |
 | R7 | The observability overlay (Prometheus, Alertmanager, Grafana, redis-exporter) is not running, so no rule in `config/alert_rules.yml` is evaluated | **Open** — operator decision whether to deploy it | `paging-and-accepted-deferrals.md` §1 |
+| R8 | IPS § 6 still describes pre-KAN-7 enforcement (stop-loss/trim "not yet routed through the ledger", "emit (T2); executes with T1") and omits the broker stops | **Open** — operator; the IPS is a governance document, so this story records the drift rather than editing it | `T2-runtime-risk-enforcement.md`; `investment-policy-statement.md:248,263,267` |
+| R9 | A failed IB callback task is logged (`ib_executor.py` `_spawn`), not alerted | **Open** — low severity; fold into the next execution-runner change | `T7-execution-lifecycle.md` |
+| R10 | A fill that completes while execution is disconnected or restarting is not projected at reconnect; it appears only at the next daily execution sweep (KAN-87, run from `run_paper.py`). No fill is lost, but the book is hours stale in that window | **Open** | `TODOS.md` "Mid-session completed-order reconciliation" |
+| R11 | The API does not enforce TLS itself | **Accepted** — TLS is a deployment concern; the API binds loopback (`docker-compose.yml`) | `api-security.md` |
 
 **Priority rollup (historical):** P0 = T1 (#2/#12), T2 (#3/#13), T3 (#4/#14) · P1 = T4 (#5/#15), T5 (#6/#16), T6 (#7/#17) · P2 = T7 (#8/#18), T8 (#9/#19), T9 (#10/#20).
 

@@ -12,9 +12,9 @@ Checked against `origin/main` `a3503fb`. A box is ticked only when shipped code 
 ## Checklist
 - [ ] **Wire metrics** — call `setup_metrics()` / `start_http_server()` in each service `main`; verify Prometheus scrapes real targets. `observability.py:21,31`, `config/prometheus.yml`
   — *Partial:* wired in every service (`afeb89e`, `test_every_backend_service_calls_setup_metrics`), but nothing scrapes them — the observability overlay is not deployed (R7).
-- [x] **Container healthchecks** — a liveness endpoint or heartbeat file so Docker restarts a deadlocked-but-alive process (the known stuck-modal class), which `restart: unless-stopped` alone misses. `docker-compose.yml`
+- [x] **Container healthchecks** (*detection + alert; no auto-restart*) — a liveness endpoint or heartbeat file so Docker restarts a deadlocked-but-alive process (the known stuck-modal class), which `restart: unless-stopped` alone misses. `docker-compose.yml`
   — *Done:* heartbeat-file healthchecks (`afeb89e`, `4c63979`). Docker marks a wedged container unhealthy but does not restart it; `gateway_watchdog.sh` alerts on it (KAN-66).
-- [x] **Alert rules** — stream-idle / no-fills-in-N-min / dlq-depth / redis-memory.
+- [x] **Alert rules** (*written, not evaluated*) — stream-idle / no-fills-in-N-min / dlq-depth / redis-memory.
   — *Written:* `config/alert_rules.yml`, retuned by KAN-15, routed by KAN-14. No evaluator in production (R7).
 - [x] **Bound Redis** — set `maxmemory` + policy; cap streams with `XADD MAXLEN ~` or periodic `XTRIM` (streams currently grow forever → eventual OOM takes down the whole bus). `redis_client.py:31,126`
 

@@ -17,7 +17,7 @@ Checked against `origin/main` `a3503fb`. A box is ticked only when shipped code 
   — *Done:* `fb0281a`, `1d0d042`, `f1446de` (ml/signal dead-letter + ack without an alert; both left compose in KAN-35).
 - [x] **Add `drain_pending` on startup** for `ml_model` + `signal_generation`; in `ml_model`, ack only after signals are durably aggregated. `ml_model/runner.py:136,159`
 - [ ] **Monitor `:dlq` depth** (> 0 → alert) and fix the notifications DLQ path to **ack after send**. `redis_client.py:118-126`, `notifications/runner.py:84-86`
-  — *Partial:* ack-after-send fixed (`736c1a0`); the live depth alert covers only risk's three input DLQs. `approved_orders`, `alerts` and execution's kill DLQ are unalerted — residual R4, open.
+  — *Partial:* ack-after-send fixed (`736c1a0`); the live depth alert covers risk's three input DLQs (`stream:kill:dlq` included, which is also where execution dead-letters kills). `stream:approved_orders:dlq` has per-message `poison_message` alerts but no aggregate depth alert, and `stream:alerts:dlq` has neither — residual R4, open.
 
 ## Acceptance criteria
 - [x] Replaying a fill does not move NAV/cash/positions.
