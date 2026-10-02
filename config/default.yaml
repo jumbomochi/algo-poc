@@ -118,6 +118,9 @@ execution:
   # so a Gateway restart before the open cannot lose that day's fills.
   ib_liveness_interval_seconds: 60
   ib_disconnect_alert_seconds: 600  # one high page after 10 min disconnected
+  # KAN-95: execution re-reads its own IB executions this often (and after any
+  # reconnect) and books fills the live callback missed.
+  execution_sweep_interval_minutes: 60
 
 ib:
   host: "127.0.0.1"

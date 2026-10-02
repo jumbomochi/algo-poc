@@ -65,6 +65,10 @@ class ExecutionConfig(BaseModel):
     # ib_disconnect_alert_seconds pages once.
     ib_liveness_interval_seconds: int = Field(default=60, ge=1)
     ib_disconnect_alert_seconds: int = Field(default=600, ge=1)
+    # In-service execution sweep (KAN-95): how often execution re-reads its
+    # own IB executions to book any fill the live callback missed. Also runs
+    # right after every reconnect.
+    execution_sweep_interval_minutes: int = Field(default=60, ge=1)
 
 
 class SignalStalenessConfig(BaseModel):

@@ -195,6 +195,15 @@ class ExecutionServiceRunner:
         self._ib_disconnected_since: float | None = None
         self._ib_disconnect_alerted = False
 
+        # In-service execution sweep (KAN-95). Replaces the 04:15 sweep in
+        # run_paper.py, which read executions on another client id hours
+        # after IB's execution day had rolled and never recovered a fill.
+        self._execution_sweep_interval_seconds = (
+            int(config.execution.execution_sweep_interval_minutes) * 60
+        )
+        self._last_execution_sweep_at: float | None = None
+        self._last_execution_sweep_generation: int | None = None
+
         # Post-halt reconcile sweep (KAN-13). Its own timer, and deliberately
         # NOT sharing the unfilled sweep's calendar gate: that sweep returns
         # False whenever `_market_calendar` is unset, and a halt-safety path
@@ -1770,6 +1779,81 @@ class ExecutionServiceRunner:
                 "Could not publish alert", event_type=alert.get("event_type")
             )
 
+    async def maybe_run_execution_sweep(self, now: float) -> bool:
+        """Book fills the live callback missed, from IB's own record (KAN-95).
+
+        ``now`` is a monotonic timestamp (seconds). Runs every
+        ``execution_sweep_interval_minutes`` and immediately after any
+        reconnect (the executor's connection generation changed), so a fill
+        that landed while the socket was dead is read back the same evening.
+        Inert without a ledger: there is nothing to attribute a fill to.
+
+        The decision is ``plan_sweep``'s, unchanged. Executions this process
+        already handled are skipped and recovered ones are marked handled,
+        under the same lock as the live callback, so the two paths never
+        publish one execution twice. Best-effort: a failure is logged and
+        retried next interval. Returns True when a sweep ran.
+        """
+        from services.execution.execution_sweep import plan_sweep
+
+        if self._order_ledger is None:
+            return False
+        try:
+            generation = await self._order_manager.broker_connection_generation()
+        except Exception:
+            generation = None
+        reconnected = (
+            generation is not None
+            and self._last_execution_sweep_generation is not None
+            and generation != self._last_execution_sweep_generation
+        )
+        last = self._last_execution_sweep_at
+        if (
+            not reconnected
+            and last is not None
+            and (now - last) < self._execution_sweep_interval_seconds
+        ):
+            return False
+        self._last_execution_sweep_at = now
+        self._last_execution_sweep_generation = generation
+
+        try:
+            executions = await self._order_manager.recent_broker_executions()
+            async with self._fill_lock:
+                fresh = [
+                    execution for execution in executions
+                    if (execution.account_id, execution.execution_id)
+                    not in self._handled_executions
+                ]
+                outcome = plan_sweep(fresh, self._order_ledger)
+                self._commit_ledger()
+                for fill in outcome.recovered:
+                    await self._redis.publish(FILLS_STREAM, fill.to_stream_dict())
+                    self._handled_executions.add(
+                        (str(fill.account_id), str(fill.execution_id))
+                    )
+        except Exception:
+            try:
+                self._order_ledger.session.rollback()
+            except Exception:
+                self._logger.exception("Rollback after a failed execution sweep")
+            self._logger.exception("Execution sweep failed; retrying next interval")
+            return True
+
+        log = self._logger.warning if outcome.recovered else self._logger.info
+        log(
+            "Execution sweep",
+            fetched=len(executions),
+            recovered=len(outcome.recovered),
+            already_recorded=outcome.already_recorded
+            + (len(executions) - len(fresh)),
+            untracked=len(outcome.untracked),
+            corrected=len(outcome.corrected),
+            deferred=len(outcome.deferred),
+            after_reconnect=reconnected,
+        )
+        return True
+
     async def maybe_run_unfilled_sweep(self, now: float) -> bool:
         """Run the unfilled-order sweep when the reprice interval has elapsed.
 
@@ -2041,6 +2125,14 @@ class ExecutionServiceRunner:
                 await self.maybe_check_ib_connection(
                     asyncio.get_running_loop().time()
                 )
+                # In-service execution sweep (KAN-95). Already best-effort
+                # inside; guarded here too so nothing in it can end the loop.
+                try:
+                    await self.maybe_run_execution_sweep(
+                        asyncio.get_running_loop().time()
+                    )
+                except Exception:
+                    self._logger.exception("Execution sweep failed; continuing")
                 # Periodic unfilled-order sweep (best-effort — never tear down
                 # the loop on a sweep failure).
                 try:

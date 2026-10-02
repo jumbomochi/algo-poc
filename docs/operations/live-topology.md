@@ -106,18 +106,19 @@ they are the machine shutting down from heat during dark wake. Residual sleeps
 of that kind after this change are an airflow or hardware problem, not evidence
 that the setting failed to apply.
 
-## Host prerequisite: the Gateway's Master API client ID
+## Missed fills are swept inside execution (KAN-95)
 
-`Configure > API > Settings > Master API client ID` must be **58**, or the
-daily run's execution sweep silently recovers nothing — `reqExecutions` only
-serves the calling client's own executions, and the orders are placed by the
-execution service under `ib.client_id`. Full reasoning, and the
-`execution_sweep_blind` alert that fires if the setting is lost, are in
-[deploy/launchd/README.md](../../deploy/launchd/README.md#ib-gateway-api-settings-master-api-client-id-kan-87).
+The execution service re-reads its own IB executions every
+`execution.execution_sweep_interval_minutes` (60) and right after every
+reconnect, and books any fill the live callback missed through the normal
+`stream:fills` path (`recovery_source = ib_execution_sweep`). It reads on the
+client that placed the orders, so the Gateway's Master API client ID no longer
+matters — the old 04:15 sweep that needed it never recovered a fill; see
+[deploy/launchd/README.md](../../deploy/launchd/README.md#ib-gateway-api-settings-master-api-client-id-kan-87-superseded-by-kan-95).
 
 ## Recovering fills the executor never saw
 
-The sweep above covers the previous session. Anything older is beyond
+The sweep above covers IB's current execution day. Anything older is beyond
 `reqExecutions` and has to come from an IB Account Management statement:
 
 - a position the book does not know it **owns** →
