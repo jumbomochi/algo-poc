@@ -138,7 +138,7 @@ MISSING_IN_DB_REMEDY = (
 )
 
 
-def _remedy(facts: "ReconciliationFacts") -> str:
+def _remedy(facts: ReconciliationFacts) -> str:
     """The command that can actually clear what this reading found."""
     if any(d.get("type") == "missing_in_db" for d in facts.discrepancies):
         return MISSING_IN_DB_REMEDY

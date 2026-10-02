@@ -390,6 +390,14 @@ def _missing_in_ib_repair(
     )
 
 
+def _single_absent_candidate(absent: list[Any], con_id: Any) -> Any | None:
+    """The one absent-expired intent on ``con_id``, or None for zero or many."""
+    if con_id is None:
+        return None
+    matches = [intent for intent in absent if int(intent.con_id) == int(con_id)]
+    return matches[0] if len(matches) == 1 else None
+
+
 def build_repair_plan(
     result: ReconciliationResult,
     execution_fills: Iterable[ExecutionFill] = (),
@@ -413,12 +421,8 @@ def build_repair_plan(
         kind = discrepancy["type"]
         con_id = discrepancy.get("con_id")
         portfolio = discrepancy.get("portfolio")
+        candidate = _single_absent_candidate(absent, con_id)
         if kind == "missing_in_db":
-            candidates = [
-                intent for intent in absent
-                if con_id is not None and int(intent.con_id) == int(con_id)
-            ]
-            candidate = candidates[0] if len(candidates) == 1 else None
             unresolved.append(UnresolvedRepair(
                 reason="sleeve_mapping_required",
                 con_id=con_id,
@@ -426,6 +430,22 @@ def build_repair_plan(
                     candidate.recommendation_id if candidate else None
                 ),
                 candidate_portfolio=candidate.portfolio if candidate else None,
+            ))
+        elif (
+            kind == "quantity_mismatch"
+            and candidate is not None
+            and float(discrepancy.get("ib_quantity") or 0.0)
+            > float(discrepancy.get("db_quantity") or 0.0)
+        ):
+            # IB holds more than the book on a contract another sleeve
+            # already holds, and an absent BUY explains it. set_position_
+            # quantity would hand the missed shares to the holder at no cost
+            # basis; leave it for the statement restore instead (KAN-96).
+            unresolved.append(UnresolvedRepair(
+                reason="probable_missed_fill",
+                con_id=con_id,
+                candidate_recommendation_id=candidate.recommendation_id,
+                candidate_portfolio=candidate.portfolio,
             ))
         elif kind in {"missing_in_ib", "quantity_mismatch"}:
             if not portfolio:

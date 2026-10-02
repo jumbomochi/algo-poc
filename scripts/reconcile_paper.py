@@ -345,6 +345,8 @@ def recent_absent_intents(
             OrderIntent.account_id == account_id,
             OrderIntent.status == OrderStatus.EXPIRED.value,
             OrderIntent.reason == ABSENT_AT_IB_REASON,
+            # Only a BUY can explain shares IB holds that the book does not.
+            func.upper(OrderIntent.action) == "BUY",
             OrderIntent.terminal_at >= since,
         ).order_by(OrderIntent.terminal_at)
     ))
@@ -714,6 +716,17 @@ def main() -> int:
                     "because IB no longer knew the order. --apply-plan cannot "
                     "repair it; rebuild the fill from an IB Flex Trades "
                     "statement with scripts/ops/restore_missed_entries.py."
+                )
+            elif entry.reason == "sleeve_mapping_required" and any(
+                d.get("type") == "missing_in_db" and d.get("con_id") == entry.con_id
+                for d in result.discrepancies
+            ):
+                print(
+                    f"IB holds con_id {entry.con_id} and the book has no "
+                    "record of it, and no recently expired order explains "
+                    "it. --apply-plan cannot repair it; find the fill on an "
+                    "IB Flex Trades statement and rebuild it with "
+                    "scripts/ops/restore_missed_entries.py."
                 )
         return 0 if result.entries_allowed else 1
 

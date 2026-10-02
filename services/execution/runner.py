@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from types import SimpleNamespace
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from services.execution.broker_stops import BrokerStopManager
@@ -1565,30 +1565,38 @@ class ExecutionServiceRunner:
             return
         if broker_qty - book_qty < 1.0:
             return
-        await self._publish_alert(
-            event_type="probable_missed_fill",
-            priority="high",
-            message=(
-                f"Probable missed fill: {intent.recommendation_id} "
-                f"({intent.symbol}, {intent.portfolio}, IB order "
-                f"{intent.ib_order_id}) was expired because IB no longer knew "
-                f"the order, but IB holds {broker_qty:g} {intent.symbol} and "
-                f"the book holds {book_qty:g}. Reconciliation will block "
-                "entries. Rebuild the fill from an IB Flex Trades statement: "
-                "python scripts/ops/restore_missed_entries.py --statement "
-                f"<csv> --account {intent.account_id} --statement-tz "
-                "America/New_York"
-            ),
-            context={
-                "recommendation_id": str(intent.recommendation_id),
-                "symbol": str(intent.symbol),
-                "portfolio": str(intent.portfolio),
-                "ib_order_id": str(intent.ib_order_id),
-                "con_id": str(intent.con_id),
-                "broker_qty": str(broker_qty),
-                "book_qty": str(book_qty),
-            },
-        )
+        try:
+            await self._publish_alert(
+                event_type="probable_missed_fill",
+                priority="high",
+                message=(
+                    f"Probable missed fill: {intent.recommendation_id} "
+                    f"({intent.symbol}, {intent.portfolio}, IB order "
+                    f"{intent.ib_order_id}) was expired because IB no longer knew "
+                    f"the order, but IB holds {broker_qty:g} {intent.symbol} and "
+                    f"the book holds {book_qty:g}. Reconciliation will block "
+                    "entries. Rebuild the fill from an IB Flex Trades statement: "
+                    "python scripts/ops/restore_missed_entries.py --statement "
+                    f"<csv> --account {intent.account_id} --statement-tz "
+                    "America/New_York"
+                ),
+                context={
+                    "recommendation_id": str(intent.recommendation_id),
+                    "symbol": str(intent.symbol),
+                    "portfolio": str(intent.portfolio),
+                    "ib_order_id": str(intent.ib_order_id),
+                    "con_id": str(intent.con_id),
+                    "broker_qty": str(broker_qty),
+                    "book_qty": str(book_qty),
+                },
+            )
+        except Exception:
+            # The expiry stands either way, and nothing on this path may fail
+            # execution startup (it runs inside restore_broker_tracking).
+            self._logger.exception(
+                "Could not publish probable_missed_fill",
+                recommendation_id=intent.recommendation_id,
+            )
 
     async def process_kill(self, kill_msg: KillMessage) -> None:
         """Process a kill event: cancel all open orders and liquidate positions.

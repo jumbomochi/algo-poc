@@ -261,3 +261,60 @@ class TestRecentAbsentIntents:
         found = recent_absent_intents(session, account_id=ACCOUNT, now=NOW)
 
         assert [i.recommendation_id for i in found] == [XLC_REC]
+
+
+class TestReviewHardening:
+    async def test_a_redis_failure_while_paging_cannot_fail_startup(self, session):
+        runner, ledger, redis, _ = _runner(session, broker_qty=26.0)
+        redis.publish = AsyncMock(side_effect=ConnectionError("redis down"))
+        _seed_submitted(ledger)
+
+        await _expire_on_absence(runner)  # must not raise
+
+        assert ledger.get(XLC_REC).status == OrderStatus.EXPIRED.value
+
+    def test_a_held_contract_with_a_missed_fill_is_not_handed_to_the_holder(self):
+        """Another sleeve already holds XLC, so reconciliation reports a
+        quantity_mismatch, not missing_in_db. set_position_quantity would give
+        the missed shares to the holder at no cost basis — the harm this
+        ticket exists to prevent."""
+        result = PositionReconciler(account_id=ACCOUNT).reconcile(
+            broker_positions={XLC_CON_ID: 56.0},
+            db_positions={XLC_CON_ID: SimpleNamespace(
+                account_id=ACCOUNT, quantity=30.0, portfolio="momentum"
+            )},
+            broker_orders={},
+            db_orders={},
+        )
+
+        plan = build_repair_plan(result, absent_intents=[_absent()])
+
+        assert plan.actions == []
+        (entry,) = plan.unresolved
+        assert entry.reason == "probable_missed_fill"
+        assert entry.candidate_recommendation_id == XLC_REC
+        assert entry.candidate_portfolio == "sector_rotation"
+
+    def test_a_held_contract_without_a_candidate_keeps_its_repair_action(self):
+        result = PositionReconciler(account_id=ACCOUNT).reconcile(
+            broker_positions={XLC_CON_ID: 56.0},
+            db_positions={XLC_CON_ID: SimpleNamespace(
+                account_id=ACCOUNT, quantity=30.0, portfolio="momentum"
+            )},
+            broker_orders={},
+            db_orders={},
+        )
+
+        plan = build_repair_plan(result)
+
+        assert [a.action for a in plan.actions] == ["set_position_quantity"]
+        assert plan.unresolved == []
+
+    def test_an_absent_sell_is_never_a_candidate(self, session):
+        ledger = OrderLedger(session)
+        _seed_submitted(ledger, action="SELL")
+        ledger.transition(XLC_REC, OrderStatus.EXPIRED, reason=ABSENT_AT_IB_REASON)
+        ledger.get(XLC_REC).terminal_at = NOW - timedelta(days=1)
+        session.commit()
+
+        assert recent_absent_intents(session, account_id=ACCOUNT, now=NOW) == []
