@@ -209,6 +209,16 @@ class OrderLedger:
             )
         ) is not None
 
+    def open_position_quantity(self, *, account_id: str, con_id: int) -> float:
+        """Shares the book holds open for one contract, across every sleeve."""
+        return float(self.session.scalar(
+            select(func.coalesce(func.sum(Position.quantity), 0.0)).where(
+                Position.status == "open",
+                Position.account_id == account_id,
+                Position.con_id == int(con_id),
+            )
+        ) or 0.0)
+
     def managed_position_snapshot(
         self, execution_keys: Iterable[tuple[str, str]]
     ) -> tuple[list[tuple[str, float]], set[tuple[str, str]]]:

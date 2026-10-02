@@ -8,7 +8,7 @@ import json
 import math
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -41,6 +41,7 @@ from shared.models import (
     Position,
     ReconciliationReport,
 )
+from shared.order_ledger import ABSENT_AT_IB_REASON
 
 
 class RepairRefusedError(RuntimeError):
@@ -71,7 +72,16 @@ _MISSED_EXIT_FIELDS = _ACTION_FIELDS | {
     "price", "executed_at", "execution_id", "commission",
     "classification", "evidence",
 }
-_UNRESOLVED_FIELDS = {"reason", "con_id", "ib_order_id"}
+_UNRESOLVED_FIELDS = {
+    "reason", "con_id", "ib_order_id",
+    "candidate_recommendation_id", "candidate_portfolio",
+}
+
+#: How far back an intent expired on absence still counts as the candidate
+#: owner of a ``missing_in_db`` position (KAN-96). The XLC case took 5 days
+#: from fill to expiry; ten covers a long weekend on top with room to spare,
+#: and is still short enough that an old, unrelated expiry is not named.
+ABSENT_INTENT_LOOKBACK_DAYS = 10
 _ACCOUNT_PATTERN = re.compile(r"^[A-Z0-9]+$")
 _PORTFOLIO_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,49}$")
 
@@ -308,9 +318,36 @@ def _parse_unresolved(value: Any) -> UnresolvedRepair:
         not isinstance(ib_order_id, str) or not ib_order_id
     ):
         raise ValueError("unresolved ib_order_id must be non-empty")
+    candidate = {}
+    for key in ("candidate_recommendation_id", "candidate_portfolio"):
+        text = value.get(key)
+        if text is not None and (not isinstance(text, str) or not text):
+            raise ValueError(f"unresolved {key} must be non-empty")
+        candidate[key] = text
     return UnresolvedRepair(
-        reason=reason, con_id=con_id, ib_order_id=ib_order_id
+        reason=reason, con_id=con_id, ib_order_id=ib_order_id, **candidate
     )
+
+
+def recent_absent_intents(
+    session: Session, *, account_id: str, now: datetime
+) -> list[OrderIntent]:
+    """Intents expired because IB had no record of their order (KAN-96).
+
+    The only evidence of who owned a fill the book missed: the startup
+    restore expires a filled-but-unseen order with ``ABSENT_AT_IB_REASON``,
+    and the repair plan names it as the candidate for the matching
+    ``missing_in_db`` position.
+    """
+    since = now - timedelta(days=ABSENT_INTENT_LOOKBACK_DAYS)
+    return list(session.scalars(
+        select(OrderIntent).where(
+            OrderIntent.account_id == account_id,
+            OrderIntent.status == OrderStatus.EXPIRED.value,
+            OrderIntent.reason == ABSENT_AT_IB_REASON,
+            OrderIntent.terminal_at >= since,
+        ).order_by(OrderIntent.terminal_at)
+    ))
 
 
 def apply_repair_plan(session: Session, *, plan_path: Path) -> None:
@@ -581,7 +618,12 @@ def reconcile_snapshot(
         mode=snapshot.mode,
         result=result,
     )
-    return result, build_repair_plan(result, fills)
+    absent = recent_absent_intents(
+        session,
+        account_id=snapshot.account_id,
+        now=datetime.now(timezone.utc),
+    )
+    return result, build_repair_plan(result, fills, absent_intents=absent)
 
 
 async def _read_broker_snapshot(
@@ -663,6 +705,16 @@ def main() -> int:
         session.commit()
         print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         print(f"Repair plan: {plan_path}")
+        for entry in plan.unresolved:
+            candidate = getattr(entry, "candidate_recommendation_id", None)
+            if candidate:
+                print(
+                    f"Probable missed fill: con_id {entry.con_id} matches "
+                    f"{candidate} ({entry.candidate_portfolio}), expired "
+                    "because IB no longer knew the order. --apply-plan cannot "
+                    "repair it; rebuild the fill from an IB Flex Trades "
+                    "statement with scripts/ops/restore_missed_entries.py."
+                )
         return 0 if result.entries_allowed else 1
 
 

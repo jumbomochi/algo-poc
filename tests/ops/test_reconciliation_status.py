@@ -481,3 +481,49 @@ def test_an_overlong_body_is_capped_so_the_send_is_not_dropped(session):
 
     assert len(body) <= 3500
     assert body.endswith("…")
+
+
+# ---------------------------------------------------------------------------
+# KAN-96. The remedy matches the discrepancy: --apply-plan cannot repair a
+# position IB holds that the book never recorded, so naming it sent the
+# operator to a command that refuses outright.
+# ---------------------------------------------------------------------------
+
+XLC_MISSING_IN_DB = {
+    "type": "missing_in_db",
+    "con_id": 322317077,
+    "symbol": "XLC",
+    "ib_quantity": 26.0,
+    "db_quantity": None,
+    "auto_correct": False,
+}
+
+
+def test_a_missing_in_db_escalation_points_at_the_statement_restore(session):
+    _report(session, at=NOW - timedelta(days=1), allowed=False,
+            discrepancies=[XLC_MISSING_IN_DB])
+    _report(session, at=NOW - timedelta(minutes=37), allowed=False,
+            discrepancies=[XLC_MISSING_IN_DB])
+    body = alert_body(_facts(session))
+
+    assert "--apply-plan" not in body
+    assert "restore_missed_entries.py" in body
+    assert "scripts/reconcile_paper.py --report" in body
+
+
+def test_a_missing_in_db_section_names_the_statement_restore(session):
+    _report(session, at=NOW - timedelta(minutes=37), allowed=False,
+            discrepancies=[XLC_MISSING_IN_DB])
+    section = render_section(_facts(session))
+
+    assert "--apply-plan" not in section
+    assert "restore_missed_entries.py" in section
+
+
+def test_a_repairable_discrepancy_keeps_apply_plan(session):
+    _report(session, at=NOW - timedelta(days=1), allowed=False,
+            discrepancies=[LLY])
+    _report(session, at=NOW - timedelta(minutes=37), allowed=False,
+            discrepancies=[LLY])
+
+    assert "--apply-plan" in alert_body(_facts(session))

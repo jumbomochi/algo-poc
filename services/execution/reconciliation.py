@@ -48,6 +48,12 @@ class UnresolvedRepair:
     reason: str
     con_id: int | None = None
     ib_order_id: str | None = None
+    # KAN-96: for a ``missing_in_db`` position, the one intent on that contract
+    # that was expired because IB no longer knew the order — the likeliest
+    # owner of a fill the book missed. A pointer for the operator, never a
+    # repair: the price has to come from IB, not from the intent's limit.
+    candidate_recommendation_id: str | None = None
+    candidate_portfolio: str | None = None
 
 
 @dataclass(frozen=True)
@@ -387,9 +393,20 @@ def _missing_in_ib_repair(
 def build_repair_plan(
     result: ReconciliationResult,
     execution_fills: Iterable[ExecutionFill] = (),
+    absent_intents: Iterable[Any] = (),
 ) -> RepairPlan:
-    """Construct a reviewable plan without guessing sleeve attribution."""
+    """Construct a reviewable plan without guessing sleeve attribution.
+
+    ``absent_intents`` are intents recently expired because IB had no record
+    of their order (``ABSENT_AT_IB_REASON``). A ``missing_in_db`` position with
+    exactly one of them on the same contract names it as the candidate owner;
+    the entry stays unresolved either way (KAN-96).
+    """
     fills = list(execution_fills)
+    absent = [
+        intent for intent in absent_intents
+        if getattr(intent, "account_id", result.account_id) == result.account_id
+    ]
     actions: list[RepairAction | MissedExitRepair] = []
     unresolved: list[UnresolvedRepair] = []
     for discrepancy in result.discrepancies:
@@ -397,8 +414,18 @@ def build_repair_plan(
         con_id = discrepancy.get("con_id")
         portfolio = discrepancy.get("portfolio")
         if kind == "missing_in_db":
+            candidates = [
+                intent for intent in absent
+                if con_id is not None and int(intent.con_id) == int(con_id)
+            ]
+            candidate = candidates[0] if len(candidates) == 1 else None
             unresolved.append(UnresolvedRepair(
-                reason="sleeve_mapping_required", con_id=con_id
+                reason="sleeve_mapping_required",
+                con_id=con_id,
+                candidate_recommendation_id=(
+                    candidate.recommendation_id if candidate else None
+                ),
+                candidate_portfolio=candidate.portfolio if candidate else None,
             ))
         elif kind in {"missing_in_ib", "quantity_mismatch"}:
             if not portfolio:
