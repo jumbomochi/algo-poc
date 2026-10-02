@@ -645,43 +645,26 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.algo-gateway-watch
 launchctl list | grep local.algo-gateway-watchdog
 ```
 
-## IB Gateway API settings: Master API client ID (KAN-87)
+## IB Gateway API settings: Master API client ID (KAN-87, superseded by KAN-95)
 
-**`Configure > API > Settings > Master API client ID` must be `58`** — the
-same id the 04:15 paper run connects with (`run_paper.py --ib-client-id`,
-default 58). Like `AutoRestartTime` above this is host state in the Gateway's
-own settings, not a repo file, so it is recorded here: nothing in a commit
-carries it, and a Gateway reinstall, a settings reset or a new machine drops
-it without a word.
+**Nothing depends on this setting any more.** The 04:15 run used to end with an
+execution sweep that connected as client 58 and needed
+`Configure > API > Settings > Master API client ID` set to `58` to see the
+execution service's orders. It logged `IB returned 0 execution(s)` on every
+night it ran (2026-09-23 → 10-02), most likely because IB serves executions
+"since midnight" in the Gateway's time zone (`Asia/Singapore`) and a 21:30 SGT
+fill is already "yesterday" by 04:15. It never recovered a fill, and its
+`execution_sweep_blind` alert fired nightly.
 
-Why it is required: the daily run ends with an **execution sweep** that calls
-`reqExecutions` to recover fills the live `execDetails` callback never
-received (the order is placed ~21 min after the close, fills at the next open,
-and the process that placed it is long gone — KAN-85). `reqExecutions` is
-**clientId-scoped**: a client is served its own executions and nothing else,
-*unless* it holds the Master API client ID. The orders are not placed by the
-sweep — the execution service places them under `ib.client_id`
-(`config/default.yaml:123`, currently `1`). So without this setting the sweep
-connecting as 58 is served an empty list every night. An `ExecutionFilter`
-does not help: a filter narrows what a client can already see, it cannot grant
-visibility.
-
-**IBC cannot set this.** `~/ibc/config.ini` has no key for it (unlike
-`AutoRestartTime`); it is stored in the Gateway's own settings, so it has to
-be set in the UI once per install and re-checked after one.
-
-**If it is ever lost**, the failure is silent by construction — an empty
-result is exactly what a healthy night with nothing to recover looks like. The
-guard against that is a self-check in the sweep: when IB returns **zero**
-executions while the order ledger still holds intents that were working at the
-broker (or were terminalized because IB could not find them) inside the last 5
-days, `run_paper.py` raises a **high**-priority `execution_sweep_blind` alert
-on `stream:alerts` naming this setting. It is best-effort and never changes
-the run's exit code, so the alert is the whole signal — and the daily
-`IB returned N (M readable)` line in the paper-run log is how to confirm it by
-hand. Two known false positives, both harmless: yesterday's limit order simply
-never filled and expired at IB, and a stale intent inside the window. Either
-way the check to run is the same one.
+KAN-95 moved the sweep into the execution service: it reads `reqExecutions`
+on its own session (`ib.client_id`, the client that placed the orders, so no
+master id is needed) every `execution.execution_sweep_interval_minutes` (15)
+and right after every reconnect or 1101. A fill missed in the last interval
+before midnight SGT can still fall out of IB's window; that one needs an IB
+statement (`scripts/ops/restore_missed_entries.py`). Look
+for `Execution sweep` lines in the execution container's log; a non-zero
+`recovered` means the live callback missed a fill. Leaving `58` set in the
+Gateway is harmless.
 
 ## Weekly backtest refresh
 

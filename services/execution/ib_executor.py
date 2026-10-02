@@ -8,6 +8,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
 
+from services.execution.execution_sweep import (
+    SweptExecution,
+    executions_from_ib_fills,
+)
 from shared.broker_state import commission_in_usd, optional_float, optional_str
 from shared.logging import get_logger
 from shared.order_ledger import ABSENT_AT_IB_REASON
@@ -27,6 +31,11 @@ IB_CONNECTIVITY_RESTORED_DATA_MAINTAINED = 1102
 # stays open during a connectivity loss, so the watchdog's port check is blind
 # to it. Written under ALGO_GATEWAY_STATE_DIR (a host-bind-mounted dir).
 CONNECTIVITY_MARKER_NAME = "gateway_connectivity_lost"
+
+# Bound on one ``reqExecutions`` round trip for the in-service sweep (KAN-95).
+# A Gateway that accepts the request and never answers must cost the loop one
+# failed pass, not the loop.
+REQ_EXECUTIONS_TIMEOUT_SECONDS = 30
 
 # Payload passed to the fill handler on every real IB fill (partial or full).
 FillHandler = Callable[[dict[str, Any]], Awaitable[None]]
@@ -138,6 +147,15 @@ class IBExecutorProtocol(Protocol):
         """Reconnect if the session dropped; True when a reconnect happened."""
         ...
 
+    async def recent_executions(self) -> list[SweptExecution]:
+        """This session's executions IB still serves, normalized for the sweep."""
+        ...
+
+    @property
+    def connection_generation(self) -> int:
+        """Count of successful connects; changes on every reconnect."""
+        ...
+
 
 class NotConnectedError(RuntimeError):
     """Raised when an order operation is attempted without an IB connection."""
@@ -189,6 +207,9 @@ class IBExecutor:
         self._ib = None  # Will hold ib_insync.IB instance
         self._trades: dict[str, Any] = {}  # order_id -> ib_insync.Trade
         self._trade_meta: dict[str, tuple[str, str]] = {}  # order_id -> (ticker, side)
+        # Bumped on every successful connect, so the runner can tell a
+        # reconnect happened — through any path — and sweep at once (KAN-95).
+        self._connection_generation = 0
         # Retain references to fire-and-forget callback tasks so they are not
         # garbage-collected mid-flight and their exceptions are surfaced.
         self._pending_tasks: set[Any] = set()
@@ -239,6 +260,10 @@ class IBExecutor:
     @property
     def is_connected(self) -> bool:
         return self._ib is not None and self._ib.isConnected()
+
+    @property
+    def connection_generation(self) -> int:
+        return self._connection_generation
 
     def _on_ib_error(
         self, reqId: int, errorCode: int, errorString: str, contract: Any = None
@@ -330,6 +355,9 @@ class IBExecutor:
             )
             return
         self._reregister_open_trades(open_trades=open_trades)
+        # A 1101 is the blind-fill case (2026-09-18): treat it as a reconnect
+        # so the execution sweep runs on the next loop iteration (KAN-95).
+        self._connection_generation += 1
 
     async def _page_connectivity_data_lost(self, error_code: int) -> None:
         """Best-effort operator page; a dead alert path must not stop recovery."""
@@ -482,6 +510,7 @@ class IBExecutor:
             # no-op. Orders that completed during the outage are logged for
             # reconciliation — see _reregister_open_trades.)
             self._reregister_open_trades()
+            self._connection_generation += 1
 
             # A healthy session proves server connectivity: clear any stale
             # lost-marker left by a socket that dropped without a 1102.
@@ -645,25 +674,9 @@ class IBExecutor:
             commission_currency = str(
                 getattr(commission_report, "currency", "") or ""
             )
-            commission_fx_base_per_trading = None
-            if commission_currency == "SGD" and self._ib is not None:
-                rows = [
-                    row
-                    for row in (self._ib.accountValues() or ())
-                    if getattr(row, "tag", None) == "ExchangeRate"
-                    and getattr(row, "currency", None) == "USD"
-                ]
-                if len(rows) == 1:
-                    try:
-                        candidate = float(rows[0].value)
-                    except (TypeError, ValueError):
-                        candidate = None
-                    if (
-                        candidate is not None
-                        and math.isfinite(candidate)
-                        and candidate > 0
-                    ):
-                        commission_fx_base_per_trading = candidate
+            commission_fx_base_per_trading = (
+                self._usd_exchange_rate() if commission_currency == "SGD" else None
+            )
             payload = {
                 "execution_id": str(fill.execution.execId),
                 "account_id": str(fill.execution.acctNumber),
@@ -854,6 +867,63 @@ class IBExecutor:
         self._ib.cancelOrder(trade.order)
         self._logger.info("Order cancel requested", order_id=order_id)
         return True
+
+    def _usd_exchange_rate(self) -> float | None:
+        """IB's ``ExchangeRate`` account value for USD, or None when unusable.
+
+        Exactly one USD row, parseable, finite and positive. None means
+        "absent", never "one": a commission that cannot be translated is
+        deferred by the sweep rather than booked wrong.
+        """
+        if self._ib is None:
+            return None
+        rows = [
+            row
+            for row in (self._ib.accountValues() or ())
+            if getattr(row, "tag", None) == "ExchangeRate"
+            and getattr(row, "currency", None) == "USD"
+        ]
+        if len(rows) != 1:
+            return None
+        try:
+            candidate = float(rows[0].value)
+        except (TypeError, ValueError):
+            return None
+        return candidate if math.isfinite(candidate) and candidate > 0 else None
+
+    async def recent_executions(self) -> list[SweptExecution]:
+        """The executions IB still serves to this session (KAN-95).
+
+        ``reqExecutions`` is clientId-scoped, and this is the client that
+        placed the orders, so — unlike the old 04:15 sweep on client 58 — it
+        needs no Master API client ID. IB serves only the current day's
+        executions; the runner calls this hourly and after every reconnect,
+        so a fill is read the same evening it happens.
+        """
+        from ib_insync import ExecutionFilter
+
+        await self._ensure_connected()
+        fills = await asyncio.wait_for(
+            self._ib.reqExecutionsAsync(ExecutionFilter()),
+            REQ_EXECUTIONS_TIMEOUT_SECONDS,
+        )
+        # ib_insync returns a FRESH Fill with an empty CommissionReport for an
+        # execution its wrapper already stored (connect's own startup sync
+        # stores every one); IB's commissionReport only ever updates the
+        # stored Fill. Read the stored one, and leave any execution whose
+        # report has not arrived for the next pass — booking it now would
+        # write commission 0 into the immutable execution_fills row.
+        stored = getattr(getattr(self._ib, "wrapper", None), "fills", None) or {}
+        settled = []
+        for fill in fills:
+            fill = stored.get(fill.execution.execId, fill)
+            report = getattr(fill, "commissionReport", None)
+            if not getattr(report, "execId", ""):
+                continue
+            settled.append(fill)
+        return executions_from_ib_fills(
+            settled, fx_base_per_trading=self._usd_exchange_rate()
+        )
 
     async def broker_position(self, con_id: int) -> float:
         """Net quantity IB reports held for ``con_id`` on this account.

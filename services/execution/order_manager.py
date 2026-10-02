@@ -582,6 +582,14 @@ class OrderManager:
         """
         return await self._executor.ensure_connected()
 
+    async def recent_broker_executions(self) -> list[Any]:
+        """Executions IB still serves to this session, for the sweep (KAN-95)."""
+        return list(await self._executor.recent_executions())
+
+    async def broker_connection_generation(self) -> int:
+        """Changes whenever the executor reconnects (KAN-95)."""
+        return int(self._executor.connection_generation)
+
     async def completed_order_states(self) -> dict[str, str]:
         """Terminal status per ``orderRef`` from IB's completed-order history.
 

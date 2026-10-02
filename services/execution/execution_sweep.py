@@ -9,7 +9,10 @@ buy, and the repair tool writes its value off (KAN-85).
 
 IB's own execution record survives the session boundary that the order
 state does not. That asymmetry is what this module exploits. It decides
-only; fetching and publishing live at the edges (Task 4).
+only; fetching and publishing live at the edges — since KAN-95 the
+execution service (``IBExecutor.recent_executions`` and
+``ExecutionServiceRunner.maybe_run_execution_sweep``), on the session that
+placed the orders, every 15 minutes and after each reconnect.
 """
 
 from __future__ import annotations
@@ -237,8 +240,8 @@ def executions_from_ib_fills(
     Mirrors the payload the live callback builds (``ib_executor``'s
     ``_on_commission_report``) so a recovered fill is indistinguishable from
     the one that should have arrived. Duck-typed and import-free by design:
-    the caller (Task 4, in ``scripts/run_paper.py``) is the only place that
-    touches ``ib_insync``.
+    the caller (``IBExecutor.recent_executions``, KAN-95) is the only place
+    that touches ``ib_insync``.
 
     ``fx_base_per_trading`` is IB's ``ExchangeRate`` account value, read by
     that caller, and is attached only to a non-USD commission — recording a
