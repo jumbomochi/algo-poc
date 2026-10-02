@@ -63,8 +63,8 @@ class ExecutionConfig(BaseModel):
     # reconnects when it dropped, so a Gateway restart before the open cannot
     # leave fills going to a dead socket. A disconnect lasting
     # ib_disconnect_alert_seconds pages once.
-    ib_liveness_interval_seconds: int = 60
-    ib_disconnect_alert_seconds: int = 600
+    ib_liveness_interval_seconds: int = Field(default=60, ge=1)
+    ib_disconnect_alert_seconds: int = Field(default=600, ge=1)
 
 
 class SignalStalenessConfig(BaseModel):

@@ -280,3 +280,108 @@ class TestTheOrderManagerForwards:
 
         assert await manager.ensure_broker_connection() is True
         executor.ensure_connected.assert_awaited_once()
+
+
+class TestReviewHardening:
+    """Post-review: the check must never be quieter than what it replaced."""
+
+    async def test_a_wrong_account_session_pages_before_it_stops_the_service(self):
+        runner, order_manager, redis = _runner()
+        order_manager.ensure_broker_connection = AsyncMock(
+            side_effect=WrongAccountTypeError("LIVE account U123 on port 7497")
+        )
+
+        with pytest.raises(WrongAccountTypeError):
+            await runner.maybe_check_ib_connection(0.0)
+
+        (alert,) = _alerts(redis)
+        assert alert.event_type == "ib_wrong_account"
+        assert alert.priority == "critical"
+        assert "U123" in alert.message
+
+    async def test_a_redis_failure_while_paging_cannot_hide_a_wrong_account(self):
+        runner, order_manager, redis = _runner()
+        order_manager.ensure_broker_connection = AsyncMock(
+            side_effect=WrongAccountTypeError("LIVE account U123")
+        )
+        redis.publish = AsyncMock(side_effect=ConnectionError("redis down"))
+
+        with pytest.raises(WrongAccountTypeError):
+            await runner.maybe_check_ib_connection(0.0)
+
+    async def test_a_redis_failure_while_paging_never_escapes_the_check(self):
+        runner, order_manager, redis = _runner(ib_disconnect_alert_seconds=60)
+        order_manager.ensure_broker_connection = AsyncMock(
+            side_effect=NotConnectedError("down")
+        )
+        redis.publish = AsyncMock(side_effect=ConnectionError("redis down"))
+        await runner.maybe_check_ib_connection(0.0)
+
+        assert await runner.maybe_check_ib_connection(60.0) is True
+
+        order_manager.ensure_broker_connection = AsyncMock(return_value=True)
+        assert await runner.maybe_check_ib_connection(120.0) is True
+
+    async def test_a_liveness_reconnect_is_logged_for_the_operator(self):
+        runner, order_manager, _ = _runner()
+        order_manager.ensure_broker_connection = AsyncMock(return_value=True)
+        runner._logger = MagicMock()
+
+        await runner.maybe_check_ib_connection(0.0)
+
+        messages = [c.args[0] for c in runner._logger.info.call_args_list]
+        assert "IB session restored by the liveness check" in messages
+
+    def test_a_zero_interval_is_refused_not_silently_clamped(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            ExecutionConfig(ib_liveness_interval_seconds=0)
+        with pytest.raises(ValidationError):
+            ExecutionConfig(ib_disconnect_alert_seconds=0)
+
+
+class TestTheLoopSurvivesAndStops:
+    def _looping_runner(self, iterations: int):
+        runner, order_manager, redis = _runner(ib_liveness_interval_seconds=1)
+        runner.setup = AsyncMock()
+        runner.shutdown = AsyncMock()
+        reads = {"n": 0}
+
+        async def read_group(*args, **kwargs):
+            reads["n"] += 1
+            if reads["n"] >= iterations * 2:  # two stream reads per iteration
+                runner._running = False
+            await asyncio.sleep(0)
+            return []
+
+        redis.read_group = read_group
+        return runner, order_manager, redis, reads
+
+    async def test_a_reconnect_failing_every_time_keeps_the_loop_running(self):
+        runner, order_manager, _, reads = self._looping_runner(iterations=3)
+        order_manager.ensure_broker_connection = AsyncMock(
+            side_effect=NotConnectedError("down")
+        )
+        # Every iteration checks; config refuses 0, so set the runner directly.
+        runner._ib_liveness_interval_seconds = 0
+
+        with patch("services.execution.runner.write_heartbeat") as heartbeat:
+            await asyncio.wait_for(runner.run(), timeout=5)
+
+        assert heartbeat.call_count == 3
+        assert reads["n"] == 6
+        assert order_manager.ensure_broker_connection.await_count == 3
+
+    async def test_a_wrong_account_stop_is_logged_with_its_cause(self):
+        runner, order_manager, _, _ = self._looping_runner(iterations=5)
+        order_manager.ensure_broker_connection = AsyncMock(
+            side_effect=WrongAccountTypeError("LIVE account U123")
+        )
+        runner._logger = MagicMock()
+
+        with patch("services.execution.runner.write_heartbeat"):
+            await asyncio.wait_for(runner.run(), timeout=5)
+
+        runner._logger.exception.assert_called()
+        runner.shutdown.assert_awaited_once()

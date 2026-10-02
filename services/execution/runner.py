@@ -185,11 +185,11 @@ class ExecutionServiceRunner:
         # IB liveness (KAN-94). Reconnecting used to be lazy — only an executor
         # call healed a dropped session — so a Gateway restart with no order in
         # flight left fills going to a dead socket until the next order.
-        self._ib_liveness_interval_seconds = max(
-            1, int(config.execution.ib_liveness_interval_seconds)
+        self._ib_liveness_interval_seconds = int(
+            config.execution.ib_liveness_interval_seconds
         )
-        self._ib_disconnect_alert_seconds = max(
-            1, int(config.execution.ib_disconnect_alert_seconds)
+        self._ib_disconnect_alert_seconds = int(
+            config.execution.ib_disconnect_alert_seconds
         )
         self._last_ib_liveness_at: float | None = None
         self._ib_disconnected_since: float | None = None
@@ -1666,9 +1666,12 @@ class ExecutionServiceRunner:
 
         A failed reconnect is logged and retried next interval; a disconnect
         lasting ``ib_disconnect_alert_seconds`` pages once, and the reconnect
-        after that page says so. ``WrongAccountTypeError`` propagates — a
-        session on the wrong account must stop the service, exactly as it does
-        on every other reconnect path. Returns True when the check ran.
+        after that page says so. A session on the wrong account pages
+        ``ib_wrong_account`` (critical) and then propagates, stopping the
+        service the way startup refuses it — it must never be quieter than
+        the per-order poison alerts it pre-empts. Paging is best-effort: a
+        Redis failure is logged, never raised in place of the real outcome.
+        Returns True when the check ran.
         """
         from services.execution.ib_executor import WrongAccountTypeError
 
@@ -1677,8 +1680,19 @@ class ExecutionServiceRunner:
             return False
         self._last_ib_liveness_at = now
         try:
-            await self._order_manager.ensure_broker_connection()
-        except WrongAccountTypeError:
+            reconnected = await self._order_manager.ensure_broker_connection()
+        except WrongAccountTypeError as exc:
+            await self._publish_alert_best_effort(
+                event_type="ib_wrong_account",
+                priority="critical",
+                message=(
+                    f"Execution is STOPPING: the IB session on "
+                    f"{self._config.ib.host}:{self.ib_port} is the wrong "
+                    f"account — {exc}"
+                ),
+                context={"host": str(self._config.ib.host),
+                         "port": str(self.ib_port)},
+            )
             raise
         except Exception as exc:
             if self._ib_disconnected_since is None:
@@ -1697,13 +1711,19 @@ class ExecutionServiceRunner:
                 await self._publish_ib_disconnected(down_for, exc)
             return True
 
+        if reconnected is True:
+            self._logger.info(
+                "IB session restored by the liveness check",
+                host=self._config.ib.host,
+                port=self.ib_port,
+            )
         if self._ib_disconnect_alerted:
-            await self._publish_alert(
+            await self._publish_alert_best_effort(
                 event_type="ib_reconnected",
                 priority="low",
                 message=(
                     f"Execution reconnected to IB on {self._config.ib.host}:"
-                    f"{self.ib_port} after "
+                    f"{self.ib_port} after at least "
                     f"{round((now - self._ib_disconnected_since) / 60)} min. "
                     "Fills that completed while it was down are not replayed "
                     "by callbacks — check reconciliation."
@@ -1717,12 +1737,12 @@ class ExecutionServiceRunner:
         self, down_for: float, exc: Exception
     ) -> None:
         tracked = len(getattr(self._order_manager, "open_orders", {}) or {})
-        await self._publish_alert(
+        await self._publish_alert_best_effort(
             event_type="ib_disconnected",
             priority="high",
             message=(
                 f"Execution has been disconnected from IB on "
-                f"{self._config.ib.host}:{self.ib_port} for "
+                f"{self._config.ib.host}:{self.ib_port} for at least "
                 f"{round(down_for / 60)} min and cannot reconnect ({exc}). "
                 f"{tracked} tracked open order(s): any fill IB reports now "
                 "is not reaching the book."
@@ -1734,6 +1754,21 @@ class ExecutionServiceRunner:
                 "tracked_open_orders": str(tracked),
             },
         )
+
+    async def _publish_alert_best_effort(self, **alert: Any) -> None:
+        """Publish an alert, logging instead of raising when Redis fails.
+
+        For paths where a failed page must not replace the outcome it reports
+        — above all a reconnect that has just succeeded, where an escaped
+        error would run ``shutdown()`` and cancel the resting orders the
+        reconnect exists to protect.
+        """
+        try:
+            await self._publish_alert(**alert)
+        except Exception:
+            self._logger.exception(
+                "Could not publish alert", event_type=alert.get("event_type")
+            )
 
     async def maybe_run_unfilled_sweep(self, now: float) -> bool:
         """Run the unfilled-order sweep when the reprice interval has elapsed.
@@ -2054,8 +2089,12 @@ class ExecutionServiceRunner:
                     block_ms=500,
                 )
 
-        except (KeyboardInterrupt, Exception):
+        except KeyboardInterrupt:
             self._logger.info("Execution service interrupted")
+        except Exception:
+            # Anything reaching here stops the service (a wrong-account IB
+            # session, by design): say why, with the cause, not "interrupted".
+            self._logger.exception("Execution service stopped on an error")
         finally:
             await self.shutdown()
 
