@@ -134,6 +134,10 @@ class IBExecutorProtocol(Protocol):
         """Net quantity the broker reports held for one contract."""
         ...
 
+    async def ensure_connected(self) -> bool:
+        """Reconnect if the session dropped; True when a reconnect happened."""
+        ...
+
 
 class NotConnectedError(RuntimeError):
     """Raised when an order operation is attempted without an IB connection."""
@@ -578,6 +582,24 @@ class IBExecutor:
 
         task.add_done_callback(_done)
         return task
+
+    async def ensure_connected(self) -> bool:
+        """Reconnect now if the Gateway dropped the session (KAN-94).
+
+        The execution loop calls this on a timer so a Gateway restart is
+        healed before the open, not at the next order. Every other caller
+        reconnects lazily through :meth:`_ensure_connected`, which is why a
+        restart between the 04:21 placement and the 21:30 SGT open on
+        2026-09-25 left IB's fill for XLC talking to a dead socket.
+
+        Returns True when a reconnect happened and False when the session was
+        already up; a connected session costs one ``isConnected()`` read and
+        no IB request. Raises what :meth:`_ensure_connected` raises.
+        """
+        if self.is_connected:
+            return False
+        await self._ensure_connected()
+        return True
 
     async def _ensure_connected(self) -> None:
         """Reconnect on demand when the Gateway dropped the session.
