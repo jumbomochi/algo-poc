@@ -48,6 +48,12 @@ class UnresolvedRepair:
     reason: str
     con_id: int | None = None
     ib_order_id: str | None = None
+    # KAN-96: for a ``missing_in_db`` position, the one intent on that contract
+    # that was expired because IB no longer knew the order — the likeliest
+    # owner of a fill the book missed. A pointer for the operator, never a
+    # repair: the price has to come from IB, not from the intent's limit.
+    candidate_recommendation_id: str | None = None
+    candidate_portfolio: str | None = None
 
 
 @dataclass(frozen=True)
@@ -384,21 +390,62 @@ def _missing_in_ib_repair(
     )
 
 
+def _single_absent_candidate(absent: list[Any], con_id: Any) -> Any | None:
+    """The one absent-expired intent on ``con_id``, or None for zero or many."""
+    if con_id is None:
+        return None
+    matches = [intent for intent in absent if int(intent.con_id) == int(con_id)]
+    return matches[0] if len(matches) == 1 else None
+
+
 def build_repair_plan(
     result: ReconciliationResult,
     execution_fills: Iterable[ExecutionFill] = (),
+    absent_intents: Iterable[Any] = (),
 ) -> RepairPlan:
-    """Construct a reviewable plan without guessing sleeve attribution."""
+    """Construct a reviewable plan without guessing sleeve attribution.
+
+    ``absent_intents`` are intents recently expired because IB had no record
+    of their order (``ABSENT_AT_IB_REASON``). A ``missing_in_db`` position with
+    exactly one of them on the same contract names it as the candidate owner;
+    the entry stays unresolved either way (KAN-96).
+    """
     fills = list(execution_fills)
+    absent = [
+        intent for intent in absent_intents
+        if getattr(intent, "account_id", result.account_id) == result.account_id
+    ]
     actions: list[RepairAction | MissedExitRepair] = []
     unresolved: list[UnresolvedRepair] = []
     for discrepancy in result.discrepancies:
         kind = discrepancy["type"]
         con_id = discrepancy.get("con_id")
         portfolio = discrepancy.get("portfolio")
+        candidate = _single_absent_candidate(absent, con_id)
         if kind == "missing_in_db":
             unresolved.append(UnresolvedRepair(
-                reason="sleeve_mapping_required", con_id=con_id
+                reason="sleeve_mapping_required",
+                con_id=con_id,
+                candidate_recommendation_id=(
+                    candidate.recommendation_id if candidate else None
+                ),
+                candidate_portfolio=candidate.portfolio if candidate else None,
+            ))
+        elif (
+            kind == "quantity_mismatch"
+            and candidate is not None
+            and float(discrepancy.get("ib_quantity") or 0.0)
+            > float(discrepancy.get("db_quantity") or 0.0)
+        ):
+            # IB holds more than the book on a contract another sleeve
+            # already holds, and an absent BUY explains it. set_position_
+            # quantity would hand the missed shares to the holder at no cost
+            # basis; leave it for the statement restore instead (KAN-96).
+            unresolved.append(UnresolvedRepair(
+                reason="probable_missed_fill",
+                con_id=con_id,
+                candidate_recommendation_id=candidate.recommendation_id,
+                candidate_portfolio=candidate.portfolio,
             ))
         elif kind in {"missing_in_ib", "quantity_mismatch"}:
             if not portfolio:

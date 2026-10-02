@@ -126,6 +126,24 @@ MAX_BODY_CHARS = 3500
 
 REMEDY = "python scripts/reconcile_paper.py --report"
 
+#: ``missing_in_db`` is the one class ``--apply-plan`` can never repair: the
+#: plan has no sleeve for a position the book never saw, and apply refuses any
+#: plan with unresolved entries. Naming it sent the operator to a command that
+#: refuses outright (XLC, 2026-10-02). The report names the candidate intent;
+#: the fill itself comes from the IB statement (KAN-96).
+MISSING_IN_DB_REMEDY = (
+    f"{REMEDY} (it names the probable order), then rebuild the fill from an "
+    "IB Flex Trades statement with scripts/ops/restore_missed_entries.py — "
+    "applying the repair plan cannot fix a position the book never recorded"
+)
+
+
+def _remedy(facts: ReconciliationFacts) -> str:
+    """The command that can actually clear what this reading found."""
+    if any(d.get("type") == "missing_in_db" for d in facts.discrepancies):
+        return MISSING_IN_DB_REMEDY
+    return f"{REMEDY} (then --apply-plan)"
+
 # A bad DSN surfaces verbatim in SQLAlchemy's ArgumentError, and the DSN carries
 # the live Postgres password. Runs to the LAST '@' on purpose: the password may
 # itself contain '@' or whitespace, and over-redacting is the safe direction.
@@ -391,7 +409,7 @@ def render_section(facts: ReconciliationFacts) -> str:
     if remaining > 0:
         lines.append(f"  +{remaining} more")
     if facts.status == "disabled":
-        lines.append(f"  remedy: {REMEDY}")
+        lines.append(f"  remedy: {_remedy(facts)}")
     return "\n".join(lines)
 
 
@@ -442,7 +460,7 @@ def _alert_body(facts: ReconciliationFacts) -> str:
             f"every sleeve is blocked, and a book that places no buys looks "
             f"exactly like a book whose signals said hold. "
             f"status={facts.severity}, {_discrepancy_phrase(facts)}. "
-            f"Remedy: {REMEDY} (then --apply-plan). "
+            f"Remedy: {_remedy(facts)}. "
             f"Escalates at {facts.escalate_after_sessions} consecutive sessions."
         )
     return ""

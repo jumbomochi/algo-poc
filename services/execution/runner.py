@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from services.execution.broker_stops import BrokerStopManager
@@ -1519,6 +1520,18 @@ class ExecutionServiceRunner:
         if target is None:
             self._order_ledger.session.rollback()
             return
+        expired_on_absence = status_info.get("order_absent_at_ib") is True
+        # Read before the commit expires the row: the missed-fill check below
+        # needs these after the transition (KAN-96).
+        absent_identity = SimpleNamespace(
+            recommendation_id=intent.recommendation_id,
+            account_id=intent.account_id,
+            portfolio=intent.portfolio,
+            con_id=intent.con_id,
+            symbol=intent.symbol,
+            action=str(intent.action).upper(),
+            ib_order_id=order_id,
+        )
         try:
             self._order_ledger.transition(
                 intent.recommendation_id, target, reason=reason
@@ -1546,6 +1559,74 @@ class ExecutionServiceRunner:
             return
         self._pending_orders.pop(order_id, None)
         self._order_manager.open_orders.pop(order_id, None)
+        if expired_on_absence and absent_identity.action == "BUY":
+            await self._alert_if_absent_buy_filled(absent_identity)
+
+    async def _alert_if_absent_buy_filled(self, intent: SimpleNamespace) -> None:
+        """Page when IB holds shares the book does not, after an absent expiry.
+
+        Expiring an order IB no longer knows assumes "any filled shares are
+        already recorded". When a fill was missed while disconnected that is
+        false, and the expiry removes the only record of which sleeve owned it
+        (XLC, 2026-09-25 → 2026-09-30). Comparing broker and book for the
+        contract right here turns that into a page naming the intent and the
+        repair, instead of an anonymous ``missing_in_db`` days later (KAN-96).
+
+        Best-effort: the expiry is already committed and must stand whatever
+        this check does.
+        """
+        try:
+            broker_qty = float(
+                await self._order_manager.broker_position(int(intent.con_id))
+            )
+            book_qty = self._order_ledger.open_position_quantity(
+                account_id=intent.account_id, con_id=int(intent.con_id)
+            )
+            self._order_ledger.session.rollback()
+        except Exception:
+            try:
+                self._order_ledger.session.rollback()
+            except Exception:
+                self._logger.exception("Rollback after a failed missed-fill check")
+            self._logger.exception(
+                "Could not compare broker and book after an absent expiry",
+                recommendation_id=intent.recommendation_id,
+            )
+            return
+        if broker_qty - book_qty < 1.0:
+            return
+        try:
+            await self._publish_alert(
+                event_type="probable_missed_fill",
+                priority="high",
+                message=(
+                    f"Probable missed fill: {intent.recommendation_id} "
+                    f"({intent.symbol}, {intent.portfolio}, IB order "
+                    f"{intent.ib_order_id}) was expired because IB no longer knew "
+                    f"the order, but IB holds {broker_qty:g} {intent.symbol} and "
+                    f"the book holds {book_qty:g}. Reconciliation will block "
+                    "entries. Rebuild the fill from an IB Flex Trades statement: "
+                    "python scripts/ops/restore_missed_entries.py --statement "
+                    f"<csv> --account {intent.account_id} --statement-tz "
+                    "America/New_York"
+                ),
+                context={
+                    "recommendation_id": str(intent.recommendation_id),
+                    "symbol": str(intent.symbol),
+                    "portfolio": str(intent.portfolio),
+                    "ib_order_id": str(intent.ib_order_id),
+                    "con_id": str(intent.con_id),
+                    "broker_qty": str(broker_qty),
+                    "book_qty": str(book_qty),
+                },
+            )
+        except Exception:
+            # The expiry stands either way, and nothing on this path may fail
+            # execution startup (it runs inside restore_broker_tracking).
+            self._logger.exception(
+                "Could not publish probable_missed_fill",
+                recommendation_id=intent.recommendation_id,
+            )
 
     async def process_kill(self, kill_msg: KillMessage) -> None:
         """Process a kill event: cancel all open orders and liquidate positions.
