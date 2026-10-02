@@ -114,6 +114,10 @@ execution:
   broker_stops_enabled: false
   broker_stops_tif: GTC           # survives a Gateway restart (KAN-18 spike)
   broker_stops_outside_rth: false # false = dormant outside RTH; gaps uncovered
+  # KAN-94: reconnect a dropped IB session on a timer, not at the next order,
+  # so a Gateway restart before the open cannot lose that day's fills.
+  ib_liveness_interval_seconds: 60
+  ib_disconnect_alert_seconds: 600  # one high page after 10 min disconnected
 
 ib:
   host: "127.0.0.1"

@@ -59,6 +59,12 @@ class ExecutionConfig(BaseModel):
     # the cost of triggering on thin extended-hours prints. Set deliberately —
     # the spike found this is the one property "resting at IB" does not buy.
     broker_stops_outside_rth: bool = False
+    # IB liveness (KAN-94). The loop checks the session this often and
+    # reconnects when it dropped, so a Gateway restart before the open cannot
+    # leave fills going to a dead socket. A disconnect lasting
+    # ib_disconnect_alert_seconds pages once.
+    ib_liveness_interval_seconds: int = Field(default=60, ge=1)
+    ib_disconnect_alert_seconds: int = Field(default=600, ge=1)
 
 
 class SignalStalenessConfig(BaseModel):

@@ -574,6 +574,14 @@ class OrderManager:
         """
         return list(await self._executor.list_open_orders())
 
+    async def ensure_broker_connection(self) -> bool:
+        """Reconnect to IB if the session dropped; True when it reconnected.
+
+        Driven by the execution loop's liveness check (KAN-94) so fills keep
+        arriving after a Gateway restart even when no order is in flight.
+        """
+        return await self._executor.ensure_connected()
+
     async def completed_order_states(self) -> dict[str, str]:
         """Terminal status per ``orderRef`` from IB's completed-order history.
 
