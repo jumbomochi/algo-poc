@@ -20,7 +20,8 @@ that stops the next one and cannot reach back to these.
 
 WHY THE ORDINARY RECOVERY PATHS CANNOT DO IT
 --------------------------------------------
-* **KAN-87's execution sweep** re-reads executions from IB, but
+* **The execution sweep** (KAN-87; in execution since KAN-95) re-reads
+  executions from IB, but
   ``reqExecutions`` serves only about the current trading day. That window
   shut on 2026-09-19: it now returns 0 rows for these, and
   ``reqCompletedOrders`` no longer lists the orders either.

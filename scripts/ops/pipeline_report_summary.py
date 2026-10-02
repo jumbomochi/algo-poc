@@ -91,7 +91,7 @@ class RunFacts:
     # when capture is disabled.
     capture_written: int = 0
     capture_expected: int = 0
-    # KAN-87. Recovered by the daily IB execution sweep. Counted the same way
+    # KAN-87. Recovered by the IB execution sweep (in execution since KAN-95). Counted the same way
     # as `fills` (unscoped by mode; see the comment on `fills` in
     # collect_facts) but over a window one day wider, and therefore NOT a
     # subset of it — see RECOVERED_LOOKBACK. Reported whether zero or not: a

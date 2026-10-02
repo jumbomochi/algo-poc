@@ -658,8 +658,10 @@ fill is already "yesterday" by 04:15. It never recovered a fill, and its
 
 KAN-95 moved the sweep into the execution service: it reads `reqExecutions`
 on its own session (`ib.client_id`, the client that placed the orders, so no
-master id is needed) every `execution.execution_sweep_interval_minutes` (60)
-and right after every reconnect — always inside IB's execution window. Look
+master id is needed) every `execution.execution_sweep_interval_minutes` (15)
+and right after every reconnect or 1101. A fill missed in the last interval
+before midnight SGT can still fall out of IB's window; that one needs an IB
+statement (`scripts/ops/restore_missed_entries.py`). Look
 for `Execution sweep` lines in the execution container's log; a non-zero
 `recovered` means the live callback missed a fill. Leaving `58` set in the
 Gateway is harmless.

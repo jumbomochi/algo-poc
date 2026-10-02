@@ -109,7 +109,7 @@ that the setting failed to apply.
 ## Missed fills are swept inside execution (KAN-95)
 
 The execution service re-reads its own IB executions every
-`execution.execution_sweep_interval_minutes` (60) and right after every
+`execution.execution_sweep_interval_minutes` (15) and right after every
 reconnect, and books any fill the live callback missed through the normal
 `stream:fills` path (`recovery_source = ib_execution_sweep`). It reads on the
 client that placed the orders, so the Gateway's Master API client ID no longer

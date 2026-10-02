@@ -119,8 +119,9 @@ execution:
   ib_liveness_interval_seconds: 60
   ib_disconnect_alert_seconds: 600  # one high page after 10 min disconnected
   # KAN-95: execution re-reads its own IB executions this often (and after any
-  # reconnect) and books fills the live callback missed.
-  execution_sweep_interval_minutes: 60
+  # reconnect) and books fills the live callback missed. IB serves executions
+  # only since midnight SGT, so this also bounds what a pre-midnight miss loses.
+  execution_sweep_interval_minutes: 15
 
 ib:
   host: "127.0.0.1"

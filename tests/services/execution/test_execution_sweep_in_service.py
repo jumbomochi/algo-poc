@@ -53,8 +53,10 @@ def _ib_fill(*, exec_id="0001f4e8.xlc.01", order_id=219, side="BOT",
         contract=SimpleNamespace(
             conId=322317077, symbol="XLC", exchange="ARCA", currency="USD"
         ),
+        # A report that has arrived carries its execId (ib_insync's
+        # CommissionReport); recent_executions skips ones that have not.
         commissionReport=SimpleNamespace(
-            commission=1.000078, currency=commission_currency
+            execId=exec_id, commission=1.000078, currency=commission_currency
         ),
     )
 
@@ -82,6 +84,7 @@ class TestTheExecutorReadsItsOwnExecutions:
         executor._ib.isConnected.return_value = True
         executor._ib.reqExecutionsAsync = AsyncMock(return_value=[_ib_fill()])
         executor._ib.accountValues.return_value = []
+        executor._ib.wrapper.fills = {}
 
         [swept] = await executor.recent_executions()
 
@@ -102,6 +105,7 @@ class TestTheExecutorReadsItsOwnExecutions:
         executor._ib.accountValues.return_value = [
             SimpleNamespace(tag="ExchangeRate", currency="USD", value="1.2775")
         ]
+        executor._ib.wrapper.fills = {}
 
         [swept] = await executor.recent_executions()
 
@@ -319,6 +323,12 @@ class TestWhenTheSweepRuns:
         with pytest.raises(ValidationError):
             ExecutionConfig(execution_sweep_interval_minutes=0)
 
+    def test_the_default_interval_keeps_the_pre_midnight_gap_short(self):
+        """IB serves executions since midnight Gateway time (Asia/Singapore):
+        a missed fill in the last interval before 00:00 SGT is unreadable
+        after it, so the interval bounds that loss."""
+        assert ExecutionConfig().execution_sweep_interval_minutes == 15
+
     async def test_the_main_loop_runs_the_sweep(self, session):
         runner, _, redis = _runner(session)
         runner.setup = AsyncMock()
@@ -357,3 +367,158 @@ class TestTheNightlySweepIsRetired:
         assert "reqExecutions" not in source
         assert not hasattr(run_paper, "sweep_executions_best_effort")
         assert not hasattr(run_paper, "alert_sweep_blindness_best_effort")
+
+
+# --------------------------------------------------------------------------
+# Review follow-up — commission integrity, alerts, 1101
+# --------------------------------------------------------------------------
+
+
+def _ib_contract_and_execution(exec_id="0001f4e8.xlc.01"):
+    from ib_insync import Contract, Execution
+
+    contract = Contract(conId=322317077, symbol="XLC", exchange="ARCA",
+                        currency="USD", secType="STK")
+    execution = Execution(
+        execId=exec_id, time=FILLED_AT, acctNumber=ACCOUNT, exchange="ARCA",
+        side="BOT", shares=26.0, price=113.35, permId=753926985, clientId=1,
+        orderId=219, cumQty=26.0, avgPrice=113.35,
+    )
+    return contract, execution
+
+
+def _commission_report(exec_id="0001f4e8.xlc.01", commission=1.000078,
+                       currency="USD"):
+    from ib_insync import CommissionReport
+
+    return CommissionReport(execId=exec_id, commission=commission,
+                            currency=currency)
+
+
+class TestCommissionIntegrity:
+    """ib_insync's reqExecutions returns a *fresh* Fill with an empty
+    CommissionReport for an execution its wrapper already stored; the report
+    only ever updates the stored Fill. Reading the returned one booked every
+    recovered fill at commission 0 into the immutable execution_fills row."""
+
+    def _executor_on_a_real_wrapper(self, replay):
+        from ib_insync import IB
+
+        executor = IBExecutor("h", 7497, 1)
+        executor._ib = IB()
+        executor._ensure_connected = AsyncMock()
+        wrapper = executor._ib.wrapper
+
+        async def req_executions(_filter):
+            future = wrapper.startReq(77)
+            replay(wrapper)
+            return await future
+
+        executor._ib.reqExecutionsAsync = req_executions
+        return executor, wrapper
+
+    async def test_a_known_execution_keeps_its_real_commission(self):
+        contract, execution = _ib_contract_and_execution()
+
+        def replay(wrapper):
+            wrapper.execDetails(77, contract, execution)
+            wrapper.execDetailsEnd(77)
+
+        executor, wrapper = self._executor_on_a_real_wrapper(replay)
+        # Seen live earlier (connect's startup sync does the same), with its
+        # commission report applied to the stored Fill.
+        wrapper.execDetails(-1, contract, execution)
+        wrapper.commissionReport(_commission_report())
+
+        [swept] = await executor.recent_executions()
+
+        assert swept.commission == pytest.approx(1.000078)
+        assert swept.commission_currency == "USD"
+
+    async def test_a_fill_whose_commission_has_not_arrived_is_left_for_next_pass(self):
+        contract, execution = _ib_contract_and_execution()
+
+        def replay(wrapper):
+            wrapper.execDetails(77, contract, execution)  # first sight
+            wrapper.execDetailsEnd(77)  # ends before its commissionReport
+
+        executor, _ = self._executor_on_a_real_wrapper(replay)
+
+        assert await executor.recent_executions() == []
+
+    async def test_a_data_lost_reconnect_bumps_the_generation(self):
+        executor = IBExecutor("h", 7497, 1)
+        executor._ib = MagicMock()
+        executor._ib.reqOpenOrdersAsync = AsyncMock(return_value=[])
+        before = executor.connection_generation
+
+        await executor._resubscribe_after_data_loss(1101)
+
+        assert executor.connection_generation == before + 1
+
+
+class TestTheSweepPagesWhatItFinds:
+    def _alerts(self, redis):
+        from shared.schemas.messages import AlertMessage
+
+        return [
+            AlertMessage.from_stream_dict(c.args[1])
+            for c in redis.publish.await_args_list
+            if c.args[0] == "stream:alerts"
+        ]
+
+    async def test_a_recovered_fill_is_paged(self, session):
+        _seed_xlc_submitted(session)
+        runner, _, redis = _runner(session, executions=[_swept()])
+
+        await runner.maybe_run_execution_sweep(0.0)
+
+        [alert] = self._alerts(redis)
+        assert alert.event_type == "execution_sweep_recovered"
+        assert alert.priority == "medium"
+        assert XLC_REC in alert.message
+
+    async def test_an_untracked_execution_pages_once(self, session):
+        _seed_xlc_submitted(session)
+        runner, _, redis = _runner(
+            session, execution_sweep_interval_minutes=1,
+            executions=[_swept(ib_order_id="999", execution_id="manual-1")],
+        )
+
+        await runner.maybe_run_execution_sweep(0.0)
+        await runner.maybe_run_execution_sweep(60.0)
+
+        alerts = self._alerts(redis)
+        assert [a.event_type for a in alerts] == ["execution_sweep_untracked"]
+        assert alerts[0].priority == "high"
+        assert "999" in alerts[0].message
+
+    async def test_three_failed_passes_in_a_row_page_once(self, session):
+        runner, _, redis = _runner(
+            session, execution_sweep_interval_minutes=1,
+            error=asyncio.TimeoutError(),
+        )
+
+        for now in (0.0, 60.0):
+            await runner.maybe_run_execution_sweep(now)
+        assert self._alerts(redis) == []
+
+        for now in (120.0, 180.0):
+            await runner.maybe_run_execution_sweep(now)
+
+        alerts = self._alerts(redis)
+        assert [a.event_type for a in alerts] == ["execution_sweep_failed"]
+        assert alerts[0].priority == "high"
+
+    async def test_a_redis_failure_while_paging_never_escapes(self, session):
+        _seed_xlc_submitted(session)
+        runner, _, redis = _runner(session, executions=[_swept()])
+
+        async def publish(stream, payload):
+            if stream == "stream:alerts":
+                raise ConnectionError("redis down")
+            return "id"
+
+        redis.publish = AsyncMock(side_effect=publish)
+
+        assert await runner.maybe_run_execution_sweep(0.0) is True

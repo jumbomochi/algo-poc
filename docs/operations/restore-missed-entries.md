@@ -15,9 +15,10 @@ All of the following:
 
 1. `python scripts/reconcile_paper.py --report` shows `missing_in_db`
    discrepancies — IB holds shares the book has no position for.
-2. The daily execution sweep cannot reach them. `reqExecutions` serves only
-   about the current trading day, so anything older than the previous
-   session is gone from the API and the sweep will report nothing.
+2. The execution sweep cannot reach them. It runs inside execution every
+   15 minutes (KAN-95), but `reqExecutions` serves only executions since
+   midnight Gateway time (SGT), so anything older is gone from the API and
+   the sweep will report nothing.
 3. `reconcile_paper.py --apply-plan` refuses: its only repair action is
    `set_position_quantity`, and a `missing_in_db` divergence generates 0
    actions with every entry `unresolved / sleeve_mapping_required`.

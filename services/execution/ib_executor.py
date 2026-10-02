@@ -355,6 +355,9 @@ class IBExecutor:
             )
             return
         self._reregister_open_trades(open_trades=open_trades)
+        # A 1101 is the blind-fill case (2026-09-18): treat it as a reconnect
+        # so the execution sweep runs on the next loop iteration (KAN-95).
+        self._connection_generation += 1
 
     async def _page_connectivity_data_lost(self, error_code: int) -> None:
         """Best-effort operator page; a dead alert path must not stop recovery."""
@@ -904,8 +907,22 @@ class IBExecutor:
             self._ib.reqExecutionsAsync(ExecutionFilter()),
             REQ_EXECUTIONS_TIMEOUT_SECONDS,
         )
+        # ib_insync returns a FRESH Fill with an empty CommissionReport for an
+        # execution its wrapper already stored (connect's own startup sync
+        # stores every one); IB's commissionReport only ever updates the
+        # stored Fill. Read the stored one, and leave any execution whose
+        # report has not arrived for the next pass — booking it now would
+        # write commission 0 into the immutable execution_fills row.
+        stored = getattr(getattr(self._ib, "wrapper", None), "fills", None) or {}
+        settled = []
+        for fill in fills:
+            fill = stored.get(fill.execution.execId, fill)
+            report = getattr(fill, "commissionReport", None)
+            if not getattr(report, "execId", ""):
+                continue
+            settled.append(fill)
         return executions_from_ib_fills(
-            fills, fx_base_per_trading=self._usd_exchange_rate()
+            settled, fx_base_per_trading=self._usd_exchange_rate()
         )
 
     async def broker_position(self, con_id: int) -> float:
