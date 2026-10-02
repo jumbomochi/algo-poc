@@ -1927,15 +1927,6 @@ class ExecutionServiceRunner:
                 context={"ib_order_ids": ",".join(new_untracked)},
             )
 
-    async def _publish_alert_best_effort(self, **alert: Any) -> None:
-        """Publish an alert, logging instead of raising when Redis fails."""
-        try:
-            await self._publish_alert(**alert)
-        except Exception:
-            self._logger.exception(
-                "Could not publish alert", event_type=alert.get("event_type")
-            )
-
     async def maybe_run_unfilled_sweep(self, now: float) -> bool:
         """Run the unfilled-order sweep when the reprice interval has elapsed.
 
