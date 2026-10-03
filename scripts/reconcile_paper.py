@@ -707,9 +707,14 @@ def report_hints(result: Any, plan: RepairPlan) -> list[str]:
                 "scripts/ops/restore_missed_entries.py."
             )
         else:
+            order_id = (
+                None if entry.ib_order_id in (None, "", "None")
+                else entry.ib_order_id
+            )
             subject = (
-                f"IB order {entry.ib_order_id}" if entry.ib_order_id
-                else f"con_id {entry.con_id}"
+                f"IB order {order_id}" if order_id
+                else f"con_id {entry.con_id}" if entry.con_id
+                else "(no contract or order id — see the discrepancy list above)"
             )
             lines.append(
                 f"Unresolved ({entry.reason}): {subject}. --apply-plan will "

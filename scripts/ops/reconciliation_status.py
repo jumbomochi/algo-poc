@@ -126,22 +126,25 @@ MAX_BODY_CHARS = 3500
 
 REMEDY = "python scripts/reconcile_paper.py --report"
 
-#: ``missing_in_db`` is the one class ``--apply-plan`` can never repair: the
-#: plan has no sleeve for a position the book never saw, and apply refuses any
-#: plan with unresolved entries. Naming it sent the operator to a command that
-#: refuses outright (XLC, 2026-10-02). The report names the candidate intent;
-#: the fill itself comes from the IB statement (KAN-96).
-MISSING_IN_DB_REMEDY = (
-    f"{REMEDY} (it names the probable order), then rebuild the fill from an "
-    "IB Flex Trades statement with scripts/ops/restore_missed_entries.py — "
-    "applying the repair plan cannot fix a position the book never recorded"
-)
-
-
 #: The only classes ``build_repair_plan`` emits an action for, and only when
 #: the discrepancy names a sleeve. Everything else is left unresolved, and
 #: ``apply_repair_plan`` refuses any plan carrying an unresolved entry (KAN-97).
+#: Holds while ``reconcile_snapshot`` hands the reconciler and the plan the
+#: same fill list: an unprojected fill then always also surfaces as an
+#: ``unapplied_execution_fill`` (unrepairable), which covers the one case
+#: (``recorded_fill_not_projected``) where a sleeved ``missing_in_ib`` is left
+#: unresolved too.
 APPLY_PLAN_REPAIRABLE = frozenset({"missing_in_ib", "quantity_mismatch"})
+
+#: ``missing_in_db`` is the one class --apply-plan can never repair: the plan
+#: has no sleeve for a position the book never saw. The report names the
+#: candidate intent; the fill itself comes from the IB statement (KAN-96).
+STATEMENT_RESTORE = (
+    "rebuild the missing fill from an IB Flex Trades statement with "
+    "scripts/ops/restore_missed_entries.py (the report names the probable "
+    "order; applying the repair plan cannot fix a position the book never "
+    "recorded)"
+)
 
 
 def _repairable(discrepancy: dict) -> bool:
@@ -151,31 +154,62 @@ def _repairable(discrepancy: dict) -> bool:
     )
 
 
+def _unrepairable_label(discrepancy: dict) -> str:
+    kind = str(discrepancy.get("type") or "unknown")
+    if kind in APPLY_PLAN_REPAIRABLE:
+        return f"{kind} (no sleeve)"
+    return kind
+
+
+def _ib_holds_more(discrepancy: dict) -> bool:
+    try:
+        return float(discrepancy.get("ib_quantity") or 0.0) > float(
+            discrepancy.get("db_quantity") or 0.0
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 def _remedy(facts: ReconciliationFacts) -> str:
-    """The command that can actually clear what this reading found."""
+    """The commands that can actually clear this reading, in the order that
+    works: ``--apply-plan`` refuses while any unresolved entry stands, so the
+    statement restore and the hand-resolution come before it (KAN-97)."""
     discrepancies = facts.discrepancies
-    missing = [d for d in discrepancies if d.get("type") == "missing_in_db"]
+    missing = any(d.get("type") == "missing_in_db" for d in discrepancies)
     repairable = [d for d in discrepancies if _repairable(d)]
     unrepairable = sorted({
-        str(d.get("type") or "unknown") for d in discrepancies
+        _unrepairable_label(d) for d in discrepancies
         if d.get("type") != "missing_in_db" and not _repairable(d)
     })
+    # KAN-96 leaves a quantity_mismatch where IB holds more unresolved when
+    # an absent BUY explains it; this text cannot see that, so it hedges.
+    maybe_missed = any(
+        d.get("type") == "quantity_mismatch" and _ib_holds_more(d)
+        for d in repairable
+    )
+
+    steps: list[str] = []
     if missing:
-        remedy = MISSING_IN_DB_REMEDY
-        if repairable:
-            remedy += "; then --report again and --apply-plan for what remains"
-        if unrepairable:
-            remedy += (
-                f"; --apply-plan cannot repair {', '.join(unrepairable)} — "
-                "resolve each by hand as the report describes"
-            )
-        return remedy
+        steps.append(STATEMENT_RESTORE)
     if unrepairable:
-        return (
-            f"{REMEDY} — --apply-plan cannot repair {', '.join(unrepairable)}; "
-            "resolve each by hand as the report describes"
+        steps.append(
+            f"resolve {', '.join(unrepairable)} by hand as the report "
+            "describes (--apply-plan cannot repair them)"
         )
-    return f"{REMEDY} (then --apply-plan)"
+    if maybe_missed:
+        steps.append(
+            "restore any probable missed fill the report names from an IB "
+            "Flex Trades statement with scripts/ops/restore_missed_entries.py"
+        )
+    if not steps:
+        return f"{REMEDY} (then --apply-plan)"
+    if repairable:
+        if missing or unrepairable:
+            steps.append("--report again and --apply-plan for what remains")
+        else:
+            steps.append("--apply-plan")
+    return f"{REMEDY}, then " + "; then ".join(steps)
+
 
 # A bad DSN surfaces verbatim in SQLAlchemy's ArgumentError, and the DSN carries
 # the live Postgres password. Runs to the LAST '@' on purpose: the password may

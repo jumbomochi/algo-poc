@@ -49,3 +49,16 @@ def test_any_other_unresolved_entry_names_its_reason():
 
 def test_a_plan_with_nothing_unresolved_prints_nothing():
     assert report_hints(_result(), _plan()) == []
+
+
+def test_an_entry_with_no_usable_id_does_not_print_none():
+    plan = _plan(
+        UnresolvedRepair(reason="manual_order_or_fill_resolution_required",
+                         ib_order_id="None"),
+        UnresolvedRepair(reason="manual_order_or_fill_resolution_required"),
+    )
+    lines = report_hints(_result({"type": "fill_quantity_mismatch"}), plan)
+
+    assert len(lines) == 2
+    assert all("None" not in line for line in lines)
+    assert all("no contract or order id" in line for line in lines)
