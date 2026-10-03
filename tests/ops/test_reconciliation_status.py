@@ -527,3 +527,78 @@ def test_a_repairable_discrepancy_keeps_apply_plan(session):
             discrepancies=[LLY])
 
     assert "--apply-plan" in alert_body(_facts(session))
+
+
+# ---------------------------------------------------------------------------
+# KAN-97. The remedy follows what --apply-plan can actually repair: only
+# missing_in_ib and quantity_mismatch that name a sleeve get an action; every
+# other class is left unresolved and apply refuses the whole plan.
+# ---------------------------------------------------------------------------
+
+REPAIRABLE_MISMATCH = {
+    "type": "quantity_mismatch", "con_id": 4391, "symbol": "AMD",
+    "ib_quantity": 5.0, "db_quantity": 4.0, "portfolio": "momentum",
+    "auto_correct": False,
+}
+UNREPAIRABLE = [
+    {"type": "order_missing_at_ib", "ib_order_id": "219", "auto_correct": False},
+    {"type": "unapplied_execution_fill", "con_id": 4391, "auto_correct": False},
+    {"type": "fill_quantity_mismatch", "con_id": 4391, "auto_correct": False},
+    {"type": "open_order_mismatch", "ib_order_id": "240", "auto_correct": False},
+    {"type": "order_missing_in_db", "ib_order_id": "241", "auto_correct": False},
+    {"type": "account_mismatch", "con_id": 4391, "auto_correct": False},
+    {"type": "db_position_missing_contract_id", "count": 1, "auto_correct": False},
+    {"type": "db_position_missing_account_id", "count": 1, "auto_correct": False},
+    {"type": "duplicate_contract_key", "con_id": 4391, "auto_correct": False},
+    {"type": "invalid_contract_key", "con_id": 4391, "auto_correct": False},
+    {"type": "missing_in_ib", "con_id": 9160, "symbol": "LLY",
+     "db_quantity": 12.0, "portfolio": None, "auto_correct": False},
+]
+
+
+def _escalate(session, discrepancies):
+    _report(session, at=NOW - timedelta(days=1), allowed=False,
+            discrepancies=discrepancies)
+    _report(session, at=NOW - timedelta(minutes=37), allowed=False,
+            discrepancies=discrepancies)
+    return alert_body(_facts(session))
+
+
+def test_only_repairable_classes_keep_apply_plan(session):
+    body = _escalate(session, [LLY, REPAIRABLE_MISMATCH])
+
+    assert "then --apply-plan" in body
+
+
+@pytest.mark.parametrize("discrepancy", UNREPAIRABLE,
+                         ids=[d["type"] for d in UNREPAIRABLE])
+def test_an_unrepairable_class_is_not_sent_to_apply_plan(session, discrepancy):
+    body = _escalate(session, [discrepancy])
+
+    assert "then --apply-plan" not in body
+    assert discrepancy["type"] in body
+    assert "cannot repair" in body
+
+
+def test_a_mixed_reading_restores_first_then_applies_the_rest(session):
+    body = _escalate(session, [XLC_MISSING_IN_DB, LLY])
+
+    assert "restore_missed_entries.py" in body
+    assert "--apply-plan for what remains" in body
+
+
+def test_an_unrepairable_section_names_the_types(session):
+    _report(session, at=NOW - timedelta(minutes=37), allowed=False,
+            discrepancies=[UNREPAIRABLE[0]])
+    section = render_section(_facts(session))
+
+    assert "then --apply-plan" not in section
+    assert "order_missing_at_ib" in section
+
+
+def test_the_widest_remedy_still_fits_the_body_cap(session):
+    from scripts.ops.reconciliation_status import MAX_BODY_CHARS
+
+    body = _escalate(session, [XLC_MISSING_IN_DB, LLY, *UNREPAIRABLE])
+
+    assert len(body) <= MAX_BODY_CHARS

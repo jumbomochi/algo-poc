@@ -138,10 +138,43 @@ MISSING_IN_DB_REMEDY = (
 )
 
 
+#: The only classes ``build_repair_plan`` emits an action for, and only when
+#: the discrepancy names a sleeve. Everything else is left unresolved, and
+#: ``apply_repair_plan`` refuses any plan carrying an unresolved entry (KAN-97).
+APPLY_PLAN_REPAIRABLE = frozenset({"missing_in_ib", "quantity_mismatch"})
+
+
+def _repairable(discrepancy: dict) -> bool:
+    return (
+        discrepancy.get("type") in APPLY_PLAN_REPAIRABLE
+        and bool(discrepancy.get("portfolio"))
+    )
+
+
 def _remedy(facts: ReconciliationFacts) -> str:
     """The command that can actually clear what this reading found."""
-    if any(d.get("type") == "missing_in_db" for d in facts.discrepancies):
-        return MISSING_IN_DB_REMEDY
+    discrepancies = facts.discrepancies
+    missing = [d for d in discrepancies if d.get("type") == "missing_in_db"]
+    repairable = [d for d in discrepancies if _repairable(d)]
+    unrepairable = sorted({
+        str(d.get("type") or "unknown") for d in discrepancies
+        if d.get("type") != "missing_in_db" and not _repairable(d)
+    })
+    if missing:
+        remedy = MISSING_IN_DB_REMEDY
+        if repairable:
+            remedy += "; then --report again and --apply-plan for what remains"
+        if unrepairable:
+            remedy += (
+                f"; --apply-plan cannot repair {', '.join(unrepairable)} — "
+                "resolve each by hand as the report describes"
+            )
+        return remedy
+    if unrepairable:
+        return (
+            f"{REMEDY} — --apply-plan cannot repair {', '.join(unrepairable)}; "
+            "resolve each by hand as the report describes"
+        )
     return f"{REMEDY} (then --apply-plan)"
 
 # A bad DSN surfaces verbatim in SQLAlchemy's ArgumentError, and the DSN carries
