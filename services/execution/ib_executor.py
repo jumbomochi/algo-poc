@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
 
 from services.execution.execution_sweep import (
+    RECOVERY_SOURCE_SWEEP,
     SweptExecution,
     executions_from_ib_fills,
 )
@@ -210,6 +211,14 @@ class IBExecutor:
         # Bumped on every successful connect, so the runner can tell a
         # reconnect happened — through any path — and sweep at once (KAN-95).
         self._connection_generation = 0
+        # KAN-98. IB answers reqExecutions with a commissionReport per
+        # execution, and ib_insync emits it into the tracked trade's
+        # commissionReportEvent — the live fill callback. Executions the fill
+        # handler already booked are not handed over again, and one that
+        # never arrived through fillEvent (only fired for a live execution)
+        # is stamped as recovered, whichever path books it.
+        self._reported_exec_ids: set[str] = set()
+        self._live_exec_ids: set[str] = set()
         # Retain references to fire-and-forget callback tasks so they are not
         # garbage-collected mid-flight and their exceptions are surfaced.
         self._pending_tasks: set[Any] = set()
@@ -665,9 +674,19 @@ class IBExecutor:
         # Trade object after a reconnect recreates the IB client.
         self._trade_meta[order_id] = (ticker, side)
 
+        def _on_live_fill(trade: Any, fill: Any) -> None:
+            self._live_exec_ids.add(str(fill.execution.execId))
+
+        fill_event = getattr(trade, "fillEvent", None)
+        if fill_event is not None:
+            fill_event += _on_live_fill
+
         def _on_commission_report(
             trade: Any, fill: Any, commission_report: Any
         ) -> None:
+            exec_id = str(fill.execution.execId)
+            if exec_id in self._reported_exec_ids:
+                return  # a reqExecutions replay of one already handed over
             commission = float(
                 getattr(commission_report, "commission", 0.0) or 0.0
             )
@@ -702,10 +721,21 @@ class IBExecutor:
                 ),
                 "order_done": trade.isDone(),
             }
+            if exec_id not in self._live_exec_ids:
+                payload["recovery_source"] = RECOVERY_SOURCE_SWEEP
             if self._fill_handler is None:
                 self._logger.warning("IB fill received but no handler set", **payload)
                 return
-            self._spawn(self._fill_handler(payload))
+            handler = self._fill_handler
+
+            async def _deliver() -> None:
+                await handler(payload)
+                # Marked only once the handler succeeded: a duplicate delivery
+                # after a failed publish must still get through, because it is
+                # that fill's retry.
+                self._reported_exec_ids.add(exec_id)
+
+            self._spawn(_deliver())
 
         trade.commissionReportEvent += _on_commission_report
 
