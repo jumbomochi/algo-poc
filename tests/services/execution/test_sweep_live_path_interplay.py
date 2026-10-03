@@ -234,6 +234,7 @@ class TestAHungSweepNeverHoldsAKill:
             await asyncio.wait_for(runner.run(), timeout=1)
 
         assert kill_reads == ["stream:kill"]
+        runner._execution_sweep_task.cancel()  # shutdown() is mocked here
 
     async def test_only_one_sweep_runs_at_a_time(self):
         runner, _, _ = _runner()
@@ -267,3 +268,30 @@ class TestAHungSweepNeverHoldsAKill:
         await runner.shutdown()
 
         assert task.cancelled()
+
+
+class TestReconnectsNeverRace:
+    """The sweep now runs beside the main loop, so two callers can find the
+    session down at once. Unlocked, both connect: one attempt's failure path
+    sets ``_ib = None`` under the other, stranding a live IB client on
+    clientId 1 that every later reconnect then collides with."""
+
+    async def test_two_concurrent_reconnects_connect_once(self):
+        executor = IBExecutor("h", 7497, 1)
+        executor._ib = MagicMock()
+        executor._ib.isConnected.return_value = False
+        connects = []
+
+        async def slow_connect(expect_paper=None):
+            connects.append(expect_paper)
+            await asyncio.sleep(0.01)
+            executor._ib = MagicMock()
+            executor._ib.isConnected.return_value = True
+
+        executor.connect = slow_connect
+
+        await asyncio.gather(
+            executor._ensure_connected(), executor._ensure_connected()
+        )
+
+        assert len(connects) == 1

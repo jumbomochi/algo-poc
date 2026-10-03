@@ -1139,11 +1139,11 @@ class ExecutionServiceRunner:
                 event_type="execution_sweep_recovered",
                 priority="medium",
                 message=(
-                    f"A fill the live callback missed was booked from IB's "
-                    f"execution record: {fill.recommendation_id} "
-                    f"({fill.quantity:g} {fill.ticker}). The book is now "
-                    "right; a recurrence means execution is losing its IB "
-                    "session."
+                    f"A fill first seen in IB's execution record rather "
+                    f"than live was booked: {fill.recommendation_id} "
+                    f"({fill.quantity:g} {fill.ticker}). Probably missed "
+                    "while execution's IB session was down; the book is now "
+                    "right. Recurring pages mean the session keeps dropping."
                 ),
                 context={"execution_id": str(fill.execution_id)},
             )
@@ -2032,7 +2032,13 @@ class ExecutionServiceRunner:
 
         Returns True when a task was started. The sweep decides for itself
         whether it is due, so a started task usually returns at once; only a
-        due pass talks to IB.
+        due pass talks to IB. This takes only the sweep off the kill path
+        (KAN-98): the loop's other IB steps still run inline.
+
+        Running beside the loop, the sweep shares the ledger session. That is
+        safe only under the runner's rule that no coroutine holds a
+        transaction open across an await — the sweep's commit or rollback
+        would otherwise land on another coroutine's pending work.
         """
         task = self._execution_sweep_task
         if task is not None and not task.done():
@@ -2329,8 +2335,8 @@ class ExecutionServiceRunner:
                     asyncio.get_running_loop().time()
                 )
                 # In-service execution sweep (KAN-95), started in the
-                # background so a hung IB request cannot delay the kill
-                # stream below (KAN-98).
+                # background so a hung reqExecutions cannot delay the kill
+                # stream below (KAN-98). The other IB steps stay inline.
                 self._start_execution_sweep(asyncio.get_running_loop().time())
                 # Periodic unfilled-order sweep (best-effort — never tear down
                 # the loop on a sweep failure).
