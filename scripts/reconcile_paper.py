@@ -674,6 +674,55 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def report_hints(result: Any, plan: RepairPlan) -> list[str]:
+    """One line per unresolved plan entry, saying what will clear it.
+
+    ``--apply-plan`` refuses any plan with an unresolved entry, so each one
+    needs its own instruction (KAN-96, KAN-97): a probable missed fill or an
+    unexplained ``missing_in_db`` comes from an IB statement; anything else
+    names its reason so the operator knows why apply will refuse.
+    """
+    lines: list[str] = []
+    for entry in plan.unresolved:
+        if isinstance(entry, dict):
+            entry = _parse_unresolved(entry)
+        candidate = entry.candidate_recommendation_id
+        if candidate:
+            lines.append(
+                f"Probable missed fill: con_id {entry.con_id} matches "
+                f"{candidate} ({entry.candidate_portfolio}), expired "
+                "because IB no longer knew the order. --apply-plan cannot "
+                "repair it; rebuild the fill from an IB Flex Trades "
+                "statement with scripts/ops/restore_missed_entries.py."
+            )
+        elif entry.reason == "sleeve_mapping_required" and any(
+            d.get("type") == "missing_in_db" and d.get("con_id") == entry.con_id
+            for d in result.discrepancies
+        ):
+            lines.append(
+                f"IB holds con_id {entry.con_id} and the book has no "
+                "record of it, and no recently expired order explains "
+                "it. --apply-plan cannot repair it; find the fill on an "
+                "IB Flex Trades statement and rebuild it with "
+                "scripts/ops/restore_missed_entries.py."
+            )
+        else:
+            order_id = (
+                None if entry.ib_order_id in (None, "", "None")
+                else entry.ib_order_id
+            )
+            subject = (
+                f"IB order {order_id}" if order_id
+                else f"con_id {entry.con_id}" if entry.con_id
+                else "(no contract or order id — see the discrepancy list above)"
+            )
+            lines.append(
+                f"Unresolved ({entry.reason}): {subject}. --apply-plan will "
+                "refuse the whole plan while this stands; resolve it by hand."
+            )
+    return lines
+
+
 def main() -> int:
     args = _parser().parse_args()
     config = load_config("config/default.yaml")
@@ -707,27 +756,8 @@ def main() -> int:
         session.commit()
         print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         print(f"Repair plan: {plan_path}")
-        for entry in plan.unresolved:
-            candidate = getattr(entry, "candidate_recommendation_id", None)
-            if candidate:
-                print(
-                    f"Probable missed fill: con_id {entry.con_id} matches "
-                    f"{candidate} ({entry.candidate_portfolio}), expired "
-                    "because IB no longer knew the order. --apply-plan cannot "
-                    "repair it; rebuild the fill from an IB Flex Trades "
-                    "statement with scripts/ops/restore_missed_entries.py."
-                )
-            elif entry.reason == "sleeve_mapping_required" and any(
-                d.get("type") == "missing_in_db" and d.get("con_id") == entry.con_id
-                for d in result.discrepancies
-            ):
-                print(
-                    f"IB holds con_id {entry.con_id} and the book has no "
-                    "record of it, and no recently expired order explains "
-                    "it. --apply-plan cannot repair it; find the fill on an "
-                    "IB Flex Trades statement and rebuild it with "
-                    "scripts/ops/restore_missed_entries.py."
-                )
+        for line in report_hints(result, plan):
+            print(line)
         return 0 if result.entries_allowed else 1
 
 
