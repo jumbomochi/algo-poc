@@ -895,6 +895,9 @@ class TestDurableExecutionIdentity:
         )
         report = SimpleNamespace(commission=0.25, currency="USD")
 
+        # Live sequence: fillEvent, then the commission report (KAN-98 tells
+        # a live fill from a reqExecutions replay by the fillEvent).
+        trade.fillEvent.emit(trade, fill)
         trade.commissionReportEvent.emit(trade, fill, report)
         trade.commissionReportEvent.emit(trade, fill, report)
         await asyncio.sleep(0)

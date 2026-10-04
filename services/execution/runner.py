@@ -208,6 +208,9 @@ class ExecutionServiceRunner:
         )
         self._last_execution_sweep_at: float | None = None
         self._last_execution_sweep_generation: int | None = None
+        # The sweep runs as a background task (KAN-98): a hung reqExecutions
+        # must never hold stream:kill unread for its 30 s timeout.
+        self._execution_sweep_task: asyncio.Task | None = None
         # Paging state: a run of failed passes pages once at the threshold,
         # and an untracked broker order pages once per order id.
         self._execution_sweep_failures = 0
@@ -1110,6 +1113,7 @@ class ExecutionServiceRunner:
             exchange=fill_info.get("exchange"),
             currency=fill_info.get("currency"),
             order_done=bool(fill_info.get("order_done", False)),
+            recovery_source=fill_info.get("recovery_source"),
         )
         local_effect = None
         if fill.account_id and fill.portfolio:
@@ -1128,6 +1132,21 @@ class ExecutionServiceRunner:
             # transaction while this coroutine is suspended.
             self._order_ledger.session.rollback()
         await self._redis.publish(FILLS_STREAM, fill.to_stream_dict())
+        if fill.recovery_source:
+            # The live callback first saw this execution in a reqExecutions
+            # replay: it was missed live. Same page as the sweep's (KAN-98).
+            await self._publish_alert_best_effort(
+                event_type="execution_sweep_recovered",
+                priority="medium",
+                message=(
+                    f"A fill first seen in IB's execution record rather "
+                    f"than live was booked: {fill.recommendation_id} "
+                    f"({fill.quantity:g} {fill.ticker}). Probably missed "
+                    "while execution's IB session was down; the book is now "
+                    "right. Recurring pages mean the session keeps dropping."
+                ),
+                context={"execution_id": str(fill.execution_id)},
+            )
 
         self._logger.info(
             "Fill published",
@@ -2008,6 +2027,35 @@ class ExecutionServiceRunner:
                 context={"ib_order_ids": ",".join(new_untracked)},
             )
 
+    def _start_execution_sweep(self, now: float) -> bool:
+        """Start the execution sweep as a task unless one is still running.
+
+        Returns True when a task was started. The sweep decides for itself
+        whether it is due, so a started task usually returns at once; only a
+        due pass talks to IB. This takes only the sweep off the kill path
+        (KAN-98): the loop's other IB steps still run inline.
+
+        Running beside the loop, the sweep shares the ledger session. That is
+        safe only under the runner's rule that no coroutine holds a
+        transaction open across an await — the sweep's commit or rollback
+        would otherwise land on another coroutine's pending work.
+        """
+        task = self._execution_sweep_task
+        if task is not None and not task.done():
+            return False
+        self._execution_sweep_task = asyncio.create_task(
+            self._execution_sweep_guarded(now)
+        )
+        return True
+
+    async def _execution_sweep_guarded(self, now: float) -> None:
+        try:
+            await self.maybe_run_execution_sweep(now)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._logger.exception("Execution sweep failed; continuing")
+
     async def maybe_run_unfilled_sweep(self, now: float) -> bool:
         """Run the unfilled-order sweep when the reprice interval has elapsed.
 
@@ -2250,6 +2298,13 @@ class ExecutionServiceRunner:
         """
         self._logger.info("Execution service shutting down")
         self._running = False
+        task = self._execution_sweep_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
         await self._order_manager.cancel_all_orders(include_stops=False)
         self._logger.info("Execution service shutdown complete — no orphaned orders")
 
@@ -2279,14 +2334,10 @@ class ExecutionServiceRunner:
                 await self.maybe_check_ib_connection(
                     asyncio.get_running_loop().time()
                 )
-                # In-service execution sweep (KAN-95). Already best-effort
-                # inside; guarded here too so nothing in it can end the loop.
-                try:
-                    await self.maybe_run_execution_sweep(
-                        asyncio.get_running_loop().time()
-                    )
-                except Exception:
-                    self._logger.exception("Execution sweep failed; continuing")
+                # In-service execution sweep (KAN-95), started in the
+                # background so a hung reqExecutions cannot delay the kill
+                # stream below (KAN-98). The other IB steps stay inline.
+                self._start_execution_sweep(asyncio.get_running_loop().time())
                 # Periodic unfilled-order sweep (best-effort — never tear down
                 # the loop on a sweep failure).
                 try:

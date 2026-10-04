@@ -133,20 +133,22 @@ class TestIBExecutionIdentity:
         executor.set_fill_handler(handler)
         trade = MagicMock()
         trade.isDone.return_value = False
-        commission_callback = None
+        callbacks = {}
 
         class Event:
+            def __init__(self, name):
+                self.name = name
+
             def __iadd__(self, callback):
-                nonlocal commission_callback
-                commission_callback = callback
+                callbacks[self.name] = callback
                 return self
 
         class StatusEvent:
             def __iadd__(self, callback):
                 return self
 
-        trade.fillEvent = Event()
-        trade.commissionReportEvent = Event()
+        trade.fillEvent = Event("fill")
+        trade.commissionReportEvent = Event("commission")
         trade.statusEvent = StatusEvent()
         fill = MagicMock()
         fill.execution.execId = "exec-1"
@@ -166,7 +168,10 @@ class TestIBExecutionIdentity:
         report = SimpleNamespace(commission=0.2, currency="USD")
 
         executor._register_trade("9", trade, ticker="AAPL", side="buy")
-        commission_callback(trade, fill, report)
+        # ib_insync's live sequence: execDetails fires fillEvent, then the
+        # commission report arrives (KAN-98 tells a live fill apart by it).
+        callbacks["fill"](trade, fill)
+        callbacks["commission"](trade, fill, report)
         await asyncio.sleep(0)
 
         payload = handler.call_args.args[0]
