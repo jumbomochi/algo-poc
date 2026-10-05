@@ -38,6 +38,12 @@ CONNECTIVITY_MARKER_NAME = "gateway_connectivity_lost"
 # failed pass, not the loop.
 REQ_EXECUTIONS_TIMEOUT_SECONDS = 30
 
+# How long the sweep waits, after IB's reply, for the fill deliveries that
+# reply set off through the live callback (KAN-102). Deliveries that finish
+# first are booked unstamped by the live path instead of being raced by the
+# sweep's own booking. Bounded: a stuck delivery must not hold the sweep.
+DELIVERY_DRAIN_TIMEOUT_SECONDS = 5.0
+
 # Payload passed to the fill handler on every real IB fill (partial or full).
 FillHandler = Callable[[dict[str, Any]], Awaitable[None]]
 OrderStatusHandler = Callable[[dict[str, Any]], Awaitable[None]]
@@ -152,6 +158,10 @@ class IBExecutorProtocol(Protocol):
         """This session's executions IB still serves, normalized for the sweep."""
         ...
 
+    def mark_executions_booked(self, execution_ids: Any) -> None:
+        """Never hand these already booked executions to the fill handler."""
+        ...
+
     @property
     def connection_generation(self) -> int:
         """Count of successful connects; changes on every reconnect."""
@@ -215,20 +225,43 @@ class IBExecutor:
         # execution, and ib_insync emits it into the tracked trade's
         # commissionReportEvent — the live fill callback. Executions the fill
         # handler already booked are not handed over again, and one that
-        # never arrived through fillEvent (only fired for a live execution)
-        # is stamped as recovered, whichever path books it.
+        # never arrived live is stamped as recovered, whichever path books it.
         #
-        # Known windows where a live fill is still stamped (KAN-98 review):
-        # (a) a live execution arriving while a sweep's reqExecutions is in
-        # flight, when the reply's execDetails reaches ib_insync first — it
-        # then knows the execId and fires no fillEvent for the live one;
-        # (b) a live execDetails processed inside connectAsync before the
-        # callbacks are re-bound, with its commissionReport after; (c) after a
-        # process restart, earlier executions of a restored, partly filled
-        # order replayed by the first sweep (normally dropped as duplicates by
-        # the runner). All are narrow; the page says "probably", not "did".
+        # KAN-102 closed the three windows where a live fill was still
+        # stamped:
+        # (a) a live execution answered first by an in-flight sweep's reply
+        #     (ib_insync then fires no fillEvent for the live copy) — see
+        #     _seen_live and _sweep_window;
+        # (b) a live execDetails processed inside connectAsync, before the
+        #     trade callbacks are re-bound — the client-wide execDetailsEvent
+        #     is bound before connectAsync, so it is recorded anyway;
+        # (c) a restored order's earlier, already booked executions replayed
+        #     by the first sweep after a restart — the runner seeds them
+        #     through mark_executions_booked.
+        # What remains is narrower still: a live execDetails inside
+        # connectAsync for an order the wrapper does not know yet, and a fill
+        # the previous process published that the projector had not applied
+        # by the restart. The page keeps saying "probably", not "did".
         self._reported_exec_ids: set[str] = set()
         self._live_exec_ids: set[str] = set()
+        # Window (a). Bumped on every connectivity event (1100/1101/1102):
+        # after one, IB may hold executions this session never heard of.
+        # _exec_record_epoch is the epoch at which the wrapper last held
+        # every execution IB serves (connect's own sync, or a full sweep
+        # read). While the two match, an execution the wrapper did not know
+        # when a sweep request went out happened during that request on a
+        # healthy session: it was live, whichever message arrived first.
+        self._connectivity_epoch = 0
+        self._exec_record_epoch: int | None = None
+        # (IB client, epoch, execIds the wrapper knew) for the in-flight sweep
+        # request; set only when the record was complete at its start.
+        self._sweep_window: tuple[Any, int, frozenset[str]] | None = None
+        # A replay arriving while the first delivery of the same execution is
+        # still in flight is held, not handed over: it becomes that delivery's
+        # retry if it fails, and is dropped if it succeeds (KAN-102).
+        self._delivering_exec_ids: set[str] = set()
+        self._held_replays: dict[str, dict[str, Any]] = {}
+        self._delivery_tasks: set[Any] = set()
         # Serializes reconnects (KAN-98): the execution sweep runs as a
         # background task beside the main loop, so two callers can find the
         # session down at once. Unserialized, one attempt's failure path sets
@@ -308,6 +341,13 @@ class IBExecutor:
         which is what happened on 2026-09-18. So a 1101 re-requests open orders
         off the event loop; nothing here may raise into ib_insync's dispatch.
         """
+        if errorCode in (
+            IB_CONNECTIVITY_LOST,
+            IB_CONNECTIVITY_RESTORED_DATA_LOST,
+            IB_CONNECTIVITY_RESTORED_DATA_MAINTAINED,
+        ):
+            # IB may have executed while the Gateway was cut off (KAN-102).
+            self._connectivity_epoch += 1
         if errorCode == IB_CONNECTIVITY_LOST:
             self._mark_connectivity_lost()
         elif errorCode == IB_CONNECTIVITY_RESTORED_DATA_MAINTAINED:
@@ -481,6 +521,13 @@ class IBExecutor:
             from ib_insync import IB
 
             self._ib = IB()
+            # Bound before connectAsync (KAN-102, window b): a live execution
+            # processed during connect's own sync fires the fresh Trade's
+            # fillEvent before our callbacks are re-bound to it, but always
+            # fires this client-wide event.
+            exec_details_event = getattr(self._ib, "execDetailsEvent", None)
+            if exec_details_event is not None:
+                exec_details_event += self._on_live_exec_details
             await self._ib.connectAsync(
                 self._host, self._port, clientId=self._client_id
             )
@@ -536,6 +583,9 @@ class IBExecutor:
             # reconciliation — see _reregister_open_trades.)
             self._reregister_open_trades()
             self._connection_generation += 1
+            # connectAsync returns only after its own reqExecutions, so the
+            # wrapper now holds every execution IB serves (window a).
+            self._exec_record_epoch = self._connectivity_epoch
 
             # A healthy session proves server connectivity: clear any stale
             # lost-marker left by a socket that dropped without a 1102.
@@ -741,21 +791,18 @@ class IBExecutor:
                 ),
                 "order_done": trade.isDone(),
             }
-            if exec_id not in self._live_exec_ids:
+            if not self._seen_live(exec_id):
                 payload["recovery_source"] = RECOVERY_SOURCE_SWEEP
             if self._fill_handler is None:
                 self._logger.warning("IB fill received but no handler set", **payload)
                 return
-            handler = self._fill_handler
-
-            async def _deliver() -> None:
-                await handler(payload)
-                # Marked only once the handler succeeded: a duplicate delivery
-                # after a failed publish must still get through, because it is
-                # that fill's retry.
-                self._reported_exec_ids.add(exec_id)
-
-            self._spawn(_deliver())
+            if exec_id in self._delivering_exec_ids:
+                # The first delivery is still in flight. Handing this copy
+                # over too only reaches the runner's dedupe; hold it as that
+                # delivery's retry instead (latest copy wins).
+                self._held_replays[exec_id] = payload
+                return
+            self._deliver_fill(exec_id, payload, self._fill_handler)
 
         trade.commissionReportEvent += _on_commission_report
 
@@ -774,6 +821,81 @@ class IBExecutor:
             )
 
         trade.statusEvent += _on_status
+
+    def _on_live_exec_details(self, trade: Any, fill: Any) -> None:
+        """ib_insync ``execDetailsEvent``: fired only for a live execution."""
+        self._live_exec_ids.add(str(fill.execution.execId))
+
+    def _seen_live(self, exec_id: str) -> bool:
+        """Whether this execution reached the session live (KAN-98/102).
+
+        Besides the execIds recorded live, an execution the wrapper first
+        heard of during the in-flight sweep request counts as live, provided
+        the wrapper's record was complete when the request went out, no
+        connectivity event has happened since, and the callback comes from
+        the same IB client. Any condition failing errs towards the stamp: a
+        false "probably" page is the safe side, a silent miss is not.
+        """
+        if exec_id in self._live_exec_ids:
+            return True
+        window = self._sweep_window
+        if window is None:
+            return False
+        ib, epoch, known = window
+        return (
+            ib is self._ib
+            and epoch == self._connectivity_epoch
+            and exec_id not in known
+        )
+
+    def _deliver_fill(
+        self, exec_id: str, payload: dict[str, Any], handler: FillHandler
+    ) -> None:
+        """Hand one execution to the fill handler as a tracked task."""
+        self._delivering_exec_ids.add(exec_id)
+
+        async def _deliver() -> None:
+            try:
+                await handler(payload)
+                # Marked only once the handler succeeded: a duplicate delivery
+                # after a failed publish must still get through, because it is
+                # that fill's retry.
+                self._reported_exec_ids.add(exec_id)
+            finally:
+                self._delivering_exec_ids.discard(exec_id)
+                retry = self._held_replays.pop(exec_id, None)
+                if retry is not None and exec_id not in self._reported_exec_ids:
+                    self._deliver_fill(exec_id, retry, handler)
+
+        task = self._spawn(_deliver())
+        self._delivery_tasks.add(task)
+        task.add_done_callback(self._delivery_tasks.discard)
+
+    async def _drain_fill_deliveries(self) -> None:
+        """Wait, bounded, for fill deliveries already under way (KAN-102)."""
+        pending = [task for task in self._delivery_tasks if not task.done()]
+        if not pending:
+            return
+        _, still_running = await asyncio.wait(
+            pending, timeout=DELIVERY_DRAIN_TIMEOUT_SECONDS
+        )
+        if still_running:
+            self._logger.warning(
+                "Fill deliveries still running after the execution sweep's "
+                "reply; the sweep proceeds without them",
+                still_running=len(still_running),
+            )
+
+    def mark_executions_booked(self, execution_ids: Any) -> None:
+        """Treat these executions as already handed over (KAN-102, window c).
+
+        For a restarted process: the runner seeds the execIds the book
+        already holds for the orders it restores, so the first sweep's replay
+        of a partly filled order's earlier executions is dropped here instead
+        of being handed over stamped, only to be dropped by the runner's
+        dedupe. Only durably booked executions may be passed.
+        """
+        self._reported_exec_ids.update(str(e) for e in execution_ids)
 
     async def _emit_order_status(
         self,
@@ -953,10 +1075,37 @@ class IBExecutor:
         from ib_insync import ExecutionFilter
 
         await self._ensure_connected()
-        fills = await asyncio.wait_for(
-            self._ib.reqExecutionsAsync(ExecutionFilter()),
-            REQ_EXECUTIONS_TIMEOUT_SECONDS,
-        )
+        ib = self._ib
+        epoch = self._connectivity_epoch
+        known = self._known_exec_ids(ib)
+        window = None
+        if self._exec_record_epoch == epoch:
+            # Window (a): see _seen_live.
+            window = (ib, epoch, known)
+            self._sweep_window = window
+        try:
+            fills = await asyncio.wait_for(
+                ib.reqExecutionsAsync(ExecutionFilter()),
+                REQ_EXECUTIONS_TIMEOUT_SECONDS,
+            )
+        finally:
+            if window is not None and self._sweep_window is window:
+                self._sweep_window = None
+        if self._ib is ib and self._connectivity_epoch == epoch:
+            if window is not None:
+                # New during the request on a healthy session, so live; their
+                # commission reports may still be on the way.
+                self._live_exec_ids.update(
+                    str(fill.execution.execId)
+                    for fill in fills
+                    if str(fill.execution.execId) not in known
+                )
+            # The wrapper now holds IB's whole record, read after the last
+            # connectivity event.
+            self._exec_record_epoch = epoch
+        # The reply's commission reports went to the live callback first; let
+        # those deliveries finish so the live path, not the sweep, books them.
+        await self._drain_fill_deliveries()
         # ib_insync returns a FRESH Fill with an empty CommissionReport for an
         # execution its wrapper already stored (connect's own startup sync
         # stores every one); IB's commissionReport only ever updates the
@@ -974,6 +1123,13 @@ class IBExecutor:
         return executions_from_ib_fills(
             settled, fx_base_per_trading=self._usd_exchange_rate()
         )
+
+    @staticmethod
+    def _known_exec_ids(ib: Any) -> frozenset[str]:
+        fills = getattr(getattr(ib, "wrapper", None), "fills", None)
+        if not isinstance(fills, dict):
+            return frozenset()
+        return frozenset(str(exec_id) for exec_id in fills)
 
     async def broker_position(self, con_id: int) -> float:
         """Net quantity IB reports held for ``con_id`` on this account.

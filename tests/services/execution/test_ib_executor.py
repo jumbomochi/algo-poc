@@ -156,10 +156,14 @@ async def test_unsupported_commission_currency_is_not_translated():
 
 @pytest.mark.asyncio
 async def test_duplicate_authoritative_commission_delivery_replays_same_fill():
+    """A second report arriving while the first delivery is in flight is held
+    rather than handed over at once (KAN-102); when the first delivery fails
+    it is replayed as the retry, carrying the same fill."""
     executor = IBExecutor("h", 7497, 1)
     executor._ib = MagicMock()
     executor._ib.accountValues.return_value = []
-    handler = AsyncMock()
+    executor._logger = MagicMock()
+    handler = AsyncMock(side_effect=[RuntimeError("transient Redis failure"), None])
     executor.set_fill_handler(handler)
     trade = MagicMock()
     trade.fillEvent = Event()
@@ -188,7 +192,8 @@ async def test_duplicate_authoritative_commission_delivery_replays_same_fill():
     trade.fillEvent.emit(trade, fill)
     trade.commissionReportEvent.emit(trade, fill, report)
     trade.commissionReportEvent.emit(trade, fill, report)
-    await asyncio.sleep(0)
+    for _ in range(5):
+        await asyncio.sleep(0)
 
     assert handler.await_count == 2
     first, second = [call.args[0] for call in handler.await_args_list]

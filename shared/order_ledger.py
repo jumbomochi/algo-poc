@@ -209,6 +209,22 @@ class OrderLedger:
             )
         ) is not None
 
+    def booked_execution_ids(self, ib_order_ids: Iterable[str]) -> set[str]:
+        """Execution ids durably recorded against these broker orders.
+
+        The same record :meth:`execution_fill_exists` reads, per order: what a
+        restarted execution service already booked for the orders it restores
+        (KAN-102).
+        """
+        order_ids = [str(order_id) for order_id in ib_order_ids]
+        if not order_ids:
+            return set()
+        return set(self.session.scalars(
+            select(ExecutionFill.execution_id).where(
+                ExecutionFill.ib_order_id.in_(order_ids)
+            )
+        ))
+
     def open_position_quantity(self, *, account_id: str, con_id: int) -> float:
         """Shares the book holds open for one contract, across every sleeve."""
         return float(self.session.scalar(
