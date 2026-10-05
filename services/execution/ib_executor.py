@@ -402,9 +402,13 @@ class IBExecutor:
 
         Orders absent from that answer are logged by
         :meth:`_reregister_open_trades` and left tracked. They are NOT
-        terminalized: an order that vanished across a 1101 may well have
+        terminalized here: an order that vanished across a 1101 may well have
         filled, and guessing "cancelled" is exactly how 15 filled positions
-        became phantoms on 2026-09-18.
+        became phantoms on 2026-09-18. The generation bump below makes the
+        runner sweep executions first and only then resolve them through
+        :meth:`restore_order_by_ref` (KAN-106), which reads the local
+        ``openTrades()`` cache — an order that filled unobserved still sits
+        there as open, so it is left alone, never expired.
         """
         await self._page_connectivity_data_lost(error_code)
         if self._ib is None:
@@ -671,12 +675,18 @@ class IBExecutor:
                 "Re-registered IB callbacks after reconnect", count=reattached
             )
         # Tracked orders that vanished across the reconnect may have completed
-        # during the outage; their fills cannot be replayed via callbacks.
+        # during the outage; their fills cannot be replayed via callbacks. The
+        # runner resolves them through restore_order_by_ref once the
+        # post-reconnect execution sweep has booked any fill IB still serves
+        # (KAN-106) — not here, where neither the sweep nor the
+        # recommendation_id each order needs has been seen.
         missing = [oid for oid in self._trade_meta if oid not in open_ids]
         if missing:
             self._logger.warning(
                 "Tracked orders absent after reconnect — verify via broker "
-                "reconciliation (fills may have completed during the outage)",
+                "reconciliation (fills may have completed during the outage); "
+                "the ones the book still holds working are resolved against "
+                "IB's order history after the execution sweep",
                 order_ids=missing,
             )
 
@@ -1190,7 +1200,15 @@ class IBExecutor:
     async def restore_order_by_ref(
         self, recommendation_id: str, expected_order_id: str
     ) -> bool | None:
-        """Reattach callbacks, or reconcile a terminal completed order."""
+        """Reattach callbacks, or reconcile a terminal completed order.
+
+        The one resolution path for a tracked order, run at startup
+        (``OrderManager.restore_broker_tracking``) and after every reconnect
+        (``OrderManager.resolve_tracked_orders``, KAN-106): still open →
+        callbacks attached, never twice; in completed-order history → its
+        true terminal status; in neither → expired with
+        ``ABSENT_AT_IB_REASON`` (KAN-96). Each outcome is logged.
+        """
         await self._ensure_connected()
         for trade in self._ib.openTrades():
             if str(getattr(trade.order, "orderRef", "")) != recommendation_id:
@@ -1202,13 +1220,20 @@ class IBExecutor:
                     f"{order_id}, expected {expected_order_id}"
                 )
             action = str(getattr(trade.order, "action", "")).lower()
-            if order_id not in self._trades:
+            reattached = order_id not in self._trades
+            if reattached:
                 self._register_trade(
                     order_id,
                     trade,
                     ticker=str(trade.contract.symbol),
                     side="buy" if action == "buy" else "sell",
                 )
+            self._logger.info(
+                "Tracked order still open at IB",
+                order_id=order_id,
+                recommendation_id=recommendation_id,
+                outcome="reattached" if reattached else "still_open",
+            )
             return True
 
         completed = await self._ib.reqCompletedOrdersAsync(apiOnly=False)
@@ -1223,6 +1248,13 @@ class IBExecutor:
             reason = self._status_reason(trade)
             if status == "Inactive" and not reason:
                 reason = "IB completed order is Inactive"
+            self._logger.info(
+                "Tracked order resolved from IB completed-order history",
+                order_id=str(expected_order_id),
+                recommendation_id=recommendation_id,
+                status=status,
+                outcome="terminal_from_history",
+            )
             if self._order_status_handler is not None:
                 await self._order_status_handler({
                     "order_id": str(expected_order_id),
@@ -1245,6 +1277,14 @@ class IBExecutor:
         # Without a handler there is no safe terminalization path, so preserve
         # the fail-closed None (the caller raises).
         if self._order_status_handler is not None:
+            self._logger.warning(
+                "Tracked order absent from IB open trades and completed-order "
+                "history — expiring it",
+                order_id=str(expected_order_id),
+                recommendation_id=recommendation_id,
+                reason=ABSENT_AT_IB_REASON,
+                outcome="expired_absent",
+            )
             await self._order_status_handler({
                 "order_id": str(expected_order_id),
                 "status": "Expired",

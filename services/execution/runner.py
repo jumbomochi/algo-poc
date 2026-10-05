@@ -225,6 +225,19 @@ class ExecutionServiceRunner:
         # burst no pass picks up is paged once it settles.
         self._unpaged_recoveries: list[FillMessage] = []
         self._last_recovery_queued_at: float | None = None
+        # Resolving orders IB no longer knows after a reconnect (KAN-106).
+        # A reconnect makes it pending; a sweep pass that started after the
+        # reconnect and succeeded makes it ready, so a fill IB still serves
+        # is booked before any expiry. One attempt per successful pass: a
+        # failure waits for the next interval or reconnect, not the next loop.
+        self._absent_resolution_pending = False
+        self._absent_resolution_ready = False
+        # Highest cumulative quantity per broker order id in the executions
+        # the last successful sweep pass read. An order whose served fills the
+        # book has not applied yet (the projector is another service) is not
+        # resolved until it has — expiring it first would leave the intent
+        # EXPIRED holding a fill.
+        self._served_cumulative: dict[str, float] = {}
 
         # Post-halt reconcile sweep (KAN-13). Its own timer, and deliberately
         # NOT sharing the unfilled sweep's calendar gate: that sweep returns
@@ -1976,6 +1989,11 @@ class ExecutionServiceRunner:
             return False
         self._last_execution_sweep_at = now
         self._last_execution_sweep_generation = generation
+        if reconnected:
+            # Resolved once this pass (or a later one) has read IB's
+            # executions on the new session (KAN-106).
+            self._absent_resolution_pending = True
+            self._absent_resolution_ready = False
 
         try:
             executions = await self._order_manager.recent_broker_executions()
@@ -2017,6 +2035,15 @@ class ExecutionServiceRunner:
             return True
 
         self._execution_sweep_failures = 0
+        served: dict[str, float] = {}
+        for execution in executions:
+            order_id = str(execution.ib_order_id)
+            served[order_id] = max(
+                served.get(order_id, 0.0), float(execution.cumulative_quantity)
+            )
+        self._served_cumulative = served
+        if self._absent_resolution_pending:
+            self._absent_resolution_ready = True
         await self._page_execution_sweep_outcome(outcome)
         log = self._logger.warning if outcome.recovered else self._logger.info
         log(
@@ -2166,6 +2193,103 @@ class ExecutionServiceRunner:
             raise
         except Exception:
             self._logger.exception("Execution sweep failed; continuing")
+        # In the same task, strictly after the sweep (KAN-106): a fill IB
+        # still serves is booked before the order could be expired, and like
+        # the sweep it runs off the kill path.
+        try:
+            await self.maybe_resolve_absent_orders()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._logger.exception(
+                "Resolving orders absent after a reconnect failed; retrying "
+                "after the next execution sweep"
+            )
+
+    async def maybe_resolve_absent_orders(self) -> bool:
+        """Resolve tracked orders IB may have dropped while disconnected.
+
+        KAN-106. On 2026-10-06 ARKW DAY order 241 expired while the Gateway
+        was down; execution reconnected on its own but only warned, so the
+        intent stayed SUBMITTED, reconciliation read ``order_missing_at_ib``
+        and entries were disabled until execution was restarted. Its startup
+        restore is what healed it, so this runs the same resolution — through
+        ``OrderManager.resolve_tracked_orders`` and
+        ``IBExecutor.restore_order_by_ref`` — for every order the book still
+        holds working: re-attached if open, its true status if IB's
+        completed-order history has it, otherwise EXPIRED with
+        ``ABSENT_AT_IB_REASON`` (KAN-96, which also pages a probable missed
+        fill when IB holds shares the book does not).
+
+        Runs only once a sweep pass that started after the reconnect has
+        succeeded (see ``_absent_resolution_ready``), and defers any order
+        whose served executions the book has not applied yet. A failure is
+        logged and retried after the next successful pass — the next interval
+        or the next reconnect. Returns True when a resolution pass ran.
+        """
+        if not (self._absent_resolution_pending and self._absent_resolution_ready):
+            return False
+        self._absent_resolution_ready = False
+        resolve = getattr(
+            type(self._order_manager), "resolve_tracked_orders", None
+        )
+        if resolve is None or self._order_ledger is None:
+            self._absent_resolution_pending = False
+            return False
+
+        candidates, deferred = self._absent_resolution_candidates()
+        outcomes: dict[str, str] = {}
+        if candidates:
+            outcomes = dict(await resolve(self._order_manager, candidates))
+        failed = sorted(
+            order_id for order_id, outcome in outcomes.items()
+            if outcome == "failed"
+        )
+        unresolved = sorted(
+            order_id for order_id, outcome in outcomes.items()
+            if outcome == "unresolved"
+        )
+        self._absent_resolution_pending = bool(failed or deferred)
+        if outcomes or deferred:
+            log = (
+                self._logger.warning
+                if failed or deferred or unresolved
+                else self._logger.info
+            )
+            log(
+                "Resolved tracked orders after reconnect",
+                outcomes=outcomes,
+                failed=failed,
+                deferred_unapplied_fills=deferred,
+                unresolved=unresolved,
+                retrying=self._absent_resolution_pending,
+            )
+        return True
+
+    def _absent_resolution_candidates(self) -> tuple[set[str], list[str]]:
+        """Working intents to resolve, and broker order ids held back.
+
+        Only intents the book still holds working are candidates: an order
+        that is already terminal needs nothing from IB, and asking would cost
+        a completed-order request each. Held back are orders IB served
+        executions for that the book has not applied yet. Reads and releases
+        the shared session before any await.
+        """
+        candidates: set[str] = set()
+        deferred: list[str] = []
+        try:
+            for intent in self._order_ledger.load_pending_orders():
+                if intent.ib_order_id is None:
+                    continue
+                order_id = str(intent.ib_order_id)
+                served = self._served_cumulative.get(order_id, 0.0)
+                if served - float(intent.filled_quantity or 0.0) > 1e-9:
+                    deferred.append(order_id)
+                    continue
+                candidates.add(str(intent.recommendation_id))
+        finally:
+            self._order_ledger.session.rollback()
+        return candidates, sorted(deferred)
 
     async def maybe_run_unfilled_sweep(self, now: float) -> bool:
         """Run the unfilled-order sweep when the reprice interval has elapsed.
