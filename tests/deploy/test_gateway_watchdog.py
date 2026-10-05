@@ -310,6 +310,78 @@ def _helper(name: str, *args: str) -> subprocess.CompletedProcess:
     )
 
 
+def _lift(*names: str) -> str:
+    """The shipped definitions of `names`, plus the schedule constants, as one
+    bash prelude. One-line functions (`ts() { ...; }`) and block functions are
+    both handled."""
+    body = WATCHDOG.read_text()
+    parts = re.findall(
+        r"^(?:PAPER_RUN_\w+|REALERT_MAX_SECS)=.*$", body, re.MULTILINE
+    )
+    for name in names:
+        start = body.index(f"\n{name}() {{") + 1
+        line_end = body.index("\n", start)
+        if body[start:line_end].rstrip().endswith("}"):
+            parts.append(body[start:line_end])
+        else:
+            end = body.index("\n}\n", start) + len("\n}\n")
+            parts.append(body[start:end])
+    return "\n".join(parts) + "\n"
+
+
+COUNTDOWN_FNS = ("now_epoch", "ts", "algo_local_wday_hms", "paper_run_countdown",
+                 "secs_to_paper_run")
+
+
+def _countdown(now: float | str, tmp_path: Path) -> tuple[int, str]:
+    """secs_to_paper_run at a faked `now`, plus whatever it logged."""
+    log = tmp_path / "countdown.log"
+    res = subprocess.run(
+        ["bash", "-c", _lift(*COUNTDOWN_FNS) + "secs_to_paper_run\n"],
+        capture_output=True, text=True, timeout=60,
+        env=dict(os.environ, ALGO_NOW_EPOCH=now if isinstance(now, str) else str(int(now)),
+                 LOG_FILE=str(log)),
+    )
+    assert res.returncode == 0, res.stderr
+    return int(res.stdout.strip()), (log.read_text() if log.exists() else "")
+
+
+def _cadence(start: float, end: float, tmp_path: Path) -> list[tuple[int, int, bool]]:
+    """Drive the shipped throttle over every 300s cycle in [start, end] inside
+    ONE bash process: (epoch, re-alert interval, paged?) per cycle.
+
+    A paged cycle stamps the marker at the *faked* now. The real watchdog's
+    `touch` stamps wall time, which equals now in production; the end-to-end
+    Host cannot model that without one subprocess per cycle (~700 for a
+    weekend, ~2 min), so the multi-day schedule is asserted here and the
+    wording end to end further down.
+    """
+    marker = tmp_path / "auth_marker"
+    script = _lift(*COUNTDOWN_FNS, "need_alert", "auth_realert_secs") + f"""
+LOG_FILE="{tmp_path}/cadence.log"
+MARKER="{marker}"
+MARKER_AT=0
+algo_mtime() {{ echo "$MARKER_AT"; }}
+for (( t={int(start)}; t<={int(end)}; t+=300 )); do
+    export ALGO_NOW_EPOCH=$t
+    iv="$(auth_realert_secs)"
+    if need_alert "$MARKER" "$iv"; then
+        touch "$MARKER"; MARKER_AT=$t; echo "$t $iv 1"
+    else
+        echo "$t $iv 0"
+    fi
+done
+"""
+    res = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                         timeout=120)
+    assert res.returncode == 0, res.stderr
+    rows = []
+    for line in res.stdout.splitlines():
+        t, iv, paged = line.split()
+        rows.append((int(t), int(iv), paged == "1"))
+    return rows
+
+
 def test_the_mtime_helper_returns_a_bare_epoch(tmp_path):
     target = tmp_path / "marker"
     target.touch()
@@ -349,6 +421,30 @@ def test_the_local_time_helper_returns_hh_mm_ss():
     assert re.fullmatch(r"\d{2} \d{2} \d{2}", res.stdout.strip()), res.stdout
     # It is the paper-run instant, so it must read back as the run time.
     assert res.stdout.split()[:2] == ["05", "15"], res.stdout
+
+
+def test_the_weekday_helper_returns_w_hh_mm_ss():
+    """KAN-99. %w numbering (0 = Sunday) is launchd's, so no translation sits
+    between the plist and the countdown."""
+    res = _helper("algo_local_wday_hms", str(int(RUN_AT)))
+
+    assert res.returncode == 0, res.stderr
+    assert re.fullmatch(r"[0-6] \d{2} \d{2} \d{2}", res.stdout.strip()), res.stdout
+    # RUN_AT is Tuesday 05:15:00.
+    assert res.stdout.split() == ["2", "05", "15", "00"], res.stdout
+
+
+def test_an_unreadable_clock_still_falls_back_to_twelve_hours(tmp_path):
+    """Neither date(1) spelling can read this, so the helper fails loudly
+    (non-zero, nothing on stdout) and the countdown takes the slowest cadence
+    rather than inventing an urgency, and says so in the log."""
+    res = _helper("algo_local_wday_hms", "not-an-epoch")
+    assert res.returncode != 0
+    assert res.stdout == "", res.stdout
+
+    out, log = _countdown("not-an-epoch", tmp_path)
+    assert out == 12 * 3600, out
+    assert "WARNING - could not read the local time of day" in log, log
 
 
 # ---------------------------------------------------------------------------
@@ -885,6 +981,140 @@ def test_recovery_from_the_auth_failure_still_alerts(host):
 
 
 # ---------------------------------------------------------------------------
+# KAN-99 — count down to a run that exists
+# ---------------------------------------------------------------------------
+# The paper job fires Tue–Sat SGT only. On 2026-10-03 (Sat) IB rejected the
+# 16:38 re-login and the watchdog paged "356 min to the 4:15 run" at 22:18,
+# toward a Sunday 04:15 that never runs. Left alone it would have sent about
+# twenty "will abort" pages across the weekend for two non-runs. (The run has
+# been at 05:15 since KAN-104; the times below are measured from that slot.)
+
+SAT_RUN = datetime(2026, 10, 3, 5, 15, 0).timestamp()    # a real (Sat) run
+NEXT_RUN = datetime(2026, 10, 6, 5, 15, 0).timestamp()   # the Tue after it
+MON_2315 = datetime(2026, 10, 5, 23, 15, 0).timestamp()  # six hours before it
+INCIDENT = datetime(2026, 10, 3, 16, 57, 0).timestamp()  # the first real page
+
+
+@pytest.mark.parametrize(
+    "now, run_at",
+    [
+        (datetime(2026, 10, 3, 5, 14), SAT_RUN),    # Sat's own run is still ahead
+        (datetime(2026, 10, 3, 5, 16), NEXT_RUN),   # ...and once it has passed: Tue
+        (datetime(2026, 10, 3, 16, 57), NEXT_RUN),  # the 2026-10-03 incident
+        (datetime(2026, 10, 4, 12, 0), NEXT_RUN),   # Sunday: no Sun or Mon run
+        (datetime(2026, 10, 5, 5, 15), NEXT_RUN),   # Mon 05:15 is not a run
+        (datetime(2026, 10, 5, 23, 15), NEXT_RUN),  # 6h out: escalation begins
+        (datetime(2026, 10, 6, 5, 14), NEXT_RUN),   # Tue, one minute out
+    ],
+    ids=["sat-0514", "sat-0516", "sat-1657", "sun-1200", "mon-0515",
+         "mon-2315", "tue-0514"],
+)
+def test_the_countdown_skips_days_with_no_paper_run(tmp_path, now, run_at):
+    out, log = _countdown(now.timestamp(), tmp_path)
+    assert out == int(run_at - now.timestamp()), (
+        f"at {now:%a %H:%M} the countdown is {out}s; the next scheduled run is "
+        f"{int(run_at - now.timestamp())}s away"
+    )
+    assert "WARNING" not in log, log
+
+
+def test_a_weekend_holds_the_twelve_hour_cadence_until_six_hours_out(tmp_path):
+    """AC2: every cycle from Sat 05:16 through Mon 23:14 re-alerts at 12h."""
+    rows = _cadence(datetime(2026, 10, 3, 5, 16).timestamp(), MON_2315 - 60, tmp_path)
+    assert rows and rows[-1][0] > MON_2315 - 360
+    wrong = [(datetime.fromtimestamp(t), iv) for t, iv, _ in rows if iv != 12 * 3600]
+    assert not wrong, f"{len(wrong)} weekend cycles tightened, e.g. {wrong[:3]}"
+
+
+def _threshold(remaining: float) -> int:
+    """KAN-62's cadence, restated: the thresholds KAN-99 must leave alone."""
+    if remaining <= 3600:
+        return 900
+    if remaining <= 10800:
+        return 1800
+    if remaining <= 21600:
+        return 3600
+    return 12 * 3600
+
+
+def test_the_2026_10_03_weekend_pages_every_twelve_hours_then_tightens(tmp_path):
+    """The incident, simulated: 300s cycles from Sat 16:57 to Tue 05:15."""
+    rows = _cadence(INCIDENT, NEXT_RUN, tmp_path)
+    pages = [t for t, _, paged in rows if paged]
+
+    weekend = [t for t in pages if t < MON_2315]
+    assert [datetime.fromtimestamp(t).strftime("%a %H:%M") for t in weekend] == [
+        "Sat 16:57", "Sun 04:57", "Sun 16:57", "Mon 04:57", "Mon 16:57",
+    ], "the weekend was not paged on a flat 12h cadence"
+
+    # From Mon 23:15 on, every cycle's interval is exactly KAN-62's threshold
+    # for the time left before the Tue run.
+    for t, iv, _ in rows:
+        if t >= MON_2315:
+            assert iv == _threshold(NEXT_RUN - t), (datetime.fromtimestamp(t), iv)
+
+    stale_minutes = (NEXT_RUN - pages[-1]) / 60
+    assert stale_minutes <= 60, (
+        f"the last warning before the Tue run was {stale_minutes:.0f} min old"
+    )
+
+
+def test_the_run_up_to_tuesday_matches_the_run_up_to_a_weekday_run(tmp_path):
+    """AC3: Mon 23:15 -> Tue 05:15 is the same schedule as Wed 23:15 -> Thu
+    05:15, cycle for cycle, starting from the same (absent) marker."""
+    def run_up(run_at: float, sub: str) -> list[tuple[int, int, bool]]:
+        d = tmp_path / sub
+        d.mkdir()
+        rows = _cadence(run_at - 7 * 3600, run_at, d)
+        return [(int(run_at - t), iv, paged) for t, iv, paged in rows]
+
+    weekday = run_up(datetime(2026, 10, 8, 5, 15).timestamp(), "thu")
+    tuesday = run_up(NEXT_RUN, "tue")
+    assert tuesday == weekday
+
+
+def _weekend_auth_page(host: Host, when: datetime) -> str:
+    host.port_up = False
+    host.ibc_log_text = AUTH_LOG
+    host.now = when.timestamp()
+    host.auth_marker.unlink(missing_ok=True)
+    host.clear_messages()
+    host.run()
+    sent = host.messages()
+    assert len(sent) == 1, sent
+    return sent[0]
+
+
+def test_the_incident_page_names_tuesday_in_days_and_hours(host):
+    """AC1, end to end: the page the operator got at 16:57 on Sat 2026-10-03."""
+    page = _weekend_auth_page(host, datetime(2026, 10, 3, 16, 57))
+    assert "The next paper run (Tue 05:15) is in 2d 12h" in page, page
+    assert not re.search(r"\bin \d+ min\b", page), page
+    assert "2d 12h to the next paper run (Tue 05:15)" in host.watchdog_log()
+
+
+@pytest.mark.parametrize(
+    "when", [datetime(2026, 10, 3, 5, 16), datetime(2026, 10, 4, 12, 0),
+             datetime(2026, 10, 5, 5, 14)],
+    ids=["sat-0516", "sun-1200", "mon-0514"],
+)
+def test_no_weekend_page_counts_minutes_to_a_run_that_does_not_exist(host, when):
+    """Every page while the real run is a day or more away. Mon 05:14 is the
+    last of them (1d 0h); from Mon 05:15 the run is under 24h out and the page
+    counts minutes again, to Tuesday's run, which does exist."""
+    page = _weekend_auth_page(host, when)
+    assert not re.search(r"\bin \d+ min\b", page), page
+    assert re.search(r"The next paper run \(Tue 05:15\) is in \d+d \d+h", page), page
+
+
+def test_under_a_day_the_page_keeps_counting_minutes(host):
+    """Mon 23:15 is 6h out: the existing "in N min" wording, unchanged."""
+    page = _weekend_auth_page(host, datetime(2026, 10, 5, 23, 15))
+    assert "5:15 paper run is in 360 min" in page, page
+    assert "next paper run" not in page, page
+
+
+# ---------------------------------------------------------------------------
 # KAN-62 — the config half, pinned so it cannot silently move back
 # ---------------------------------------------------------------------------
 
@@ -974,3 +1204,23 @@ def test_the_watchdogs_run_time_constants_match_the_paper_plist():
     text = WATCHDOG.read_text()
     assert f"PAPER_RUN_HOUR={hours.pop()}" in text
     assert f"PAPER_RUN_MIN={minutes.pop()}" in text
+
+    # KAN-99: and on which days. The countdown that ignored this escalated
+    # toward a Sunday and a Monday 04:15 that launchd never fires.
+    # launchd numbers Sunday as both 0 and 7, so both sides are normalised.
+    plist_days = {e["Weekday"] % 7 for e in entries if "Weekday" in e}
+    assert all("Weekday" in e for e in entries), (
+        "an entry in the paper plist has no Weekday, so the job runs daily and "
+        "PAPER_RUN_WEEKDAYS no longer describes it"
+    )
+    assert plist_days == _paper_run_weekdays(), (
+        f"local.algo-paper-trading.plist runs on launchd weekdays "
+        f"{sorted(plist_days)} but gateway_watchdog.sh counts down to "
+        f"{sorted(_paper_run_weekdays())} (PAPER_RUN_WEEKDAYS)"
+    )
+
+
+def _paper_run_weekdays() -> set[int]:
+    m = re.search(r'^PAPER_RUN_WEEKDAYS="([0-7 ]+)"$', WATCHDOG.read_text(), re.MULTILINE)
+    assert m, 'gateway_watchdog.sh has no PAPER_RUN_WEEKDAYS="..." constant'
+    return {int(d) % 7 for d in m.group(1).split()}

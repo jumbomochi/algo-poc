@@ -595,6 +595,16 @@ path's two-strike counter and this branch does not own it. Clearing it meant
 that when the auth condition cleared on 2026-08-21 at 08:19 the watchdog
 restarted counting from zero, adding a whole extra cycle of downtime.
 
+**"The run" is the next *scheduled* run (KAN-99).** The paper job fires Tue–Sat
+SGT only, but the countdown used to target the next 04:15 on any day, so a
+weekend login failure (2026-10-03, Sat 16:38) escalated toward Sunday and Monday
+04:15 runs that do not exist, and every page said they "will abort". The
+countdown now steps to the first day in `PAPER_RUN_WEEKDAYS` (launchd numbering,
+pinned to the plist by a drift test), so a weekend failure pages every 12h until
+Mon 22:15 and then tightens only before the real Tue 04:15 run. While that run
+is a day or more away the page names it — "The next paper run (Tue 04:15) is in
+2d 11h"; under 24h it keeps the "in N min" wording.
+
 ### `AutoRestartTime` — why it is 2:00 PM, not 11:55 PM
 
 `~/ibc/config.ini:52` is **`AutoRestartTime=2:00 PM`** (SGT). This is the other
