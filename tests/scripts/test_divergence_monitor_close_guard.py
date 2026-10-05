@@ -39,7 +39,7 @@ def _db(tmp_path: Path) -> str:
     now = datetime.now(timezone.utc)
     equity = 23080.0
     for d in SESSIONS:
-        s.add(EquitySnapshot(portfolio="momentum", date=d, equity=equity,
+        s.add(EquitySnapshot(portfolio="momentum", date=d, session_date=d, equity=equity,
                              cash=equity, market_value=0.0, created_at=now))
         equity *= 1.002
     s.commit()
