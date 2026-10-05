@@ -399,8 +399,16 @@ class PaperTradingState:
         trading_currency: str | None = None,
         fx_base_per_trading: float | None = None,
         valuation_at: datetime | None = None,
+        session_date: date | None = None,
     ) -> None:
         """Record (or update) an equity snapshot for a portfolio on a date.
+
+        ``snap_date`` is the run date (SGT wall clock) and stays the upsert
+        key. ``session_date`` is the US session whose closes marked the book
+        (KAN-103), or None when the run could not name one. Like the currency
+        columns it is rewritten on every update, including back to NULL: a
+        re-run that priced a partial session must not keep the earlier run's
+        claim to a closed one.
 
         ``equity``/``cash``/``market_value`` are denominated in the trading
         currency (USD): sleeve budgets and bar prices are both USD. Supplying
@@ -438,6 +446,7 @@ class PaperTradingState:
             existing.cash = cash
             existing.market_value = market_value
             existing.created_at = now
+            existing.session_date = session_date
             for column, value in currency.items():
                 setattr(existing, column, value)
         else:
@@ -448,6 +457,7 @@ class PaperTradingState:
                 cash=cash,
                 market_value=market_value,
                 created_at=now,
+                session_date=session_date,
                 **currency,
             )
             self._session.add(snap)
@@ -601,6 +611,11 @@ class PaperTradingState:
         return [
             {
                 "date": str(s.date),
+                # The US session the row valued (KAN-103); None until stamped
+                # or backfilled. ``date`` is the SGT run date.
+                "session_date": (
+                    str(s.session_date) if s.session_date is not None else None
+                ),
                 "equity": s.equity,
                 "cash": s.cash,
                 "market_value": s.market_value,
