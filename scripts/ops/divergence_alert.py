@@ -274,7 +274,7 @@ def _render(
             "⚠️ Divergence baseline is STALE (exit 4): the numbers below were "
             "scored against expectations that stopped being refreshed.\n"
             f"{_staleness_line(report)}\n"
-            "The weekly backtest refresh (Tue 05:00 SGT) has not produced a "
+            "The weekly backtest refresh (Tue 06:30 SGT) has not produced a "
             "newer baseline — check ~/ibc/logs/backtest_refresh_*.log and the "
             "refresh dead-man check."
         )

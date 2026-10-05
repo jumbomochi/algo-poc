@@ -530,9 +530,9 @@ verdict — worse than the honest blindness it replaced.
 
 ### What replaces it
 
-Each night the 04:15 paper run replays every sleeve's own signal function over
+Each night the 05:15 paper run replays every sleeve's own signal function over
 the bars it just fetched, seeded at live's NAV `--window` sessions back, and
-writes `output/shadow_<date>.json`. The 04:45 monitor grades against that, so
+writes `output/shadow_<date>.json`. The 05:45 monitor grades against that, so
 `window_end` is the current session.
 
 The shadow needs no execution model: every requirement of one is satisfied by

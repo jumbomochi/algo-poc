@@ -22,7 +22,7 @@ book that places no buys for 17 days looks exactly like a book whose signals
 said hold. Nothing in the equity curve, the exit code or the dead-man switch
 separates the two.
 
-So this module produces two things for the 04:52 report:
+So this module produces two things for the 05:52 report:
 
 * a **section**, rendered whether the book is healthy or not, so a quiet
   section is evidence rather than absence; and
@@ -75,18 +75,18 @@ from shared.models.order_ledger import ReconciliationReport  # noqa: E402
 #: be read once.
 SENTINEL = "===RECONCILIATION-ALERT==="
 
-#: The clock the trading day is named by. Both the 04:15 paper run and this
-#: 04:52 report are scheduled in SGT, so the SGT date is what "session" means
+#: The clock the trading day is named by. Both the 05:15 paper run and this
+#: 05:52 report are scheduled in SGT, so the SGT date is what "session" means
 #: here. Grouping on the UTC date instead would be wrong in both directions:
 #: the UTC date rolls at 08:00 SGT, so a catch-up reconcile at 09:00 SGT would
-#: land in a *different* session from that morning's 04:15 run — escalating on
+#: land in a *different* session from that morning's 05:15 run — escalating on
 #: one bad day plus the operator's own investigation re-run — while a manual
 #: run at 23:30 SGT would merge into the NEXT morning's session.
 SESSION_TZ = ZoneInfo("Asia/Singapore")
 
 #: How old a reading may be before it stops being evidence about this morning.
-#: The only legitimate age at 04:52 is ~37 minutes: the paper run writes at
-#: 04:15 the same morning, and the report shares its Tue–Sat schedule, so there
+#: The only legitimate age at 05:52 is ~37 minutes: the paper run writes at
+#: 05:15 the same morning, and the report shares its Tue–Sat schedule, so there
 #: is no weekend gap to accommodate — a Tuesday whose own run wrote nothing
 #: leaves Saturday's reading at 72h and SHOULD say unknown.
 #:

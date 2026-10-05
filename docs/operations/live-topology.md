@@ -10,7 +10,7 @@ Measured 2026-09-04 against the running stack, not inferred from the code.
 ## The authoritative path
 
 ```
-  04:15 launchd  ->  scripts/run_paper.py
+  05:15 launchd  ->  scripts/run_paper.py
                        computes every sleeve's signals in-process
                        (make_*_signals_fn from scripts/run_backtest.py)
                        |

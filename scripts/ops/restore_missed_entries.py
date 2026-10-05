@@ -1124,7 +1124,7 @@ def _run(args) -> int:
         print(
             "\nNow run:  python scripts/reconcile_paper.py --report\n"
             "and confirm severity: ok / entries_allowed: true before the "
-            "next 04:15."
+            "next 05:15 paper run."
         )
         return 0
 

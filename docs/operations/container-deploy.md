@@ -22,7 +22,7 @@ the names — but recreating `redis` has a consequence of its own (see
 |---|---|---|
 | 1 | Run the whole runbook in **bash**, not zsh (`bash` then proceed) | `deploy/launchd/secrets.sh` is bash-only, and the exports it sets must survive into the `docker compose` calls |
 | 2 | The login keychain unlocked | Secrets come from the keychain via `secrets.sh --export` (KAN-16). The deploy clone has no `.env` — which also means nothing supplies the non-secret `ALGO_IB_ACCOUNT_ID` unless you export it (below) |
-| 3 | Deploy outside the scheduled window and outside NYSE hours | The launchd block runs 04:15–05:15 local (paper run 04:15 Tue–Sat, divergence 04:45, pipeline report 04:52, backtest refresh Tue 05:00, backup 05:15; the evidence digest sits apart at Mon 08:00). Recreating `execution` mid-session drops the IB connection |
+| 3 | Deploy outside the scheduled window and outside NYSE hours | The launchd block runs 05:15–06:30 local (paper run 05:15 Tue–Sat, divergence 05:45, pipeline report 05:52, backup 06:15, backtest refresh Tue 06:30 for up to 6h; the evidence digest sits apart at Mon 08:00). Recreating `execution` mid-session drops the IB connection |
 | 4 | Stack already up: `docker compose -p algo-poc ps` shows every service healthy | These steps recreate two containers in place; they do not bring up a cold stack |
 | 5 | You are in the **deploy clone**, `/Users/huiliang/algo-poc-deploy`, freshly `git pull --ff-only`ed to a promoted `main` (`git log -1`, `git status` clean) | The image is built from the working tree, not from a ref — so it must be the tree production runs, never the dev checkout on whatever branch it was left on (KAN-72, `deploy/launchd/README.md`) |
 | 6 | Every compose call carries **`-p algo-poc`** | Compose names the project after the directory. Bare `docker compose` in `algo-poc-deploy` addresses a new, empty project — `ps` shows nothing, and `up` starts a second stack on fresh volumes |
@@ -251,7 +251,7 @@ nothing about a container that is already running.
 ## Step 7 — Next scheduled paper run
 
 The deploy is not finished until one full run has gone through the new code.
-The morning after (04:15 local, Tue–Sat):
+The morning after (05:15 local, Tue–Sat):
 
 ```bash
 tail -50 ~/ibc/logs/paper_trading_$(date +%Y%m%d).log

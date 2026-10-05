@@ -1,6 +1,6 @@
 #!/bin/bash
-# Daily pipeline report — 04:52 SGT Tue-Sat, after the 04:15 paper run and the
-# 04:45 divergence monitor. Collects the whole pipeline's state (paper run,
+# Daily pipeline report — 05:52 SGT Tue-Sat, after the 05:15 paper run and the
+# 05:45 divergence monitor. Collects the whole pipeline's state (paper run,
 # risk-gate activity, divergence, execution service, resting IB orders, equity
 # snapshot continuity) into one log and sends a compact Telegram summary.
 #
@@ -40,9 +40,9 @@ VENV="${ALGO_PYTHON:-$ALGO_DIR/.venv/bin/python}"
 LOG_DIR="$HOME/ibc/logs"
 TODAY=$(date +%Y%m%d)
 # Lower bound for "this run's" fills and rejections. Local midnight, stamped
-# with its offset so the summariser does no timezone guessing: at 04:52 SGT it
-# brackets the 04:15 paper run and excludes yesterday's. A UTC calendar date
-# would be wrong here — 04:52 SGT is 20:52 UTC the *previous* day, so the
+# with its offset so the summariser does no timezone guessing: at 05:52 SGT it
+# brackets the 05:15 paper run and excludes yesterday's. A UTC calendar date
+# would be wrong here — 05:52 SGT is 21:52 UTC the *previous* day, so the
 # headline would read zero fills on a day that traded.
 SINCE=$(date +%Y-%m-%dT00:00:00%z)
 LOG_FILE="$LOG_DIR/pipeline_report_${TODAY}.log"

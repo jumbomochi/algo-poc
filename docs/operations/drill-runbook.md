@@ -161,8 +161,13 @@ broker *before* the halt exists.
 > true race was not reproduced.**
 
 Run the tagged entry **pre-open** so the limit buy rests at IB instead of filling
-immediately. `run_paper.py` has no market-calendar gate — it runs whenever
-invoked.
+immediately. A `--portfolio-tag` run is exempt from `run_paper.py`'s
+market-calendar gate (KAN-104) — it runs whenever invoked, and prints a NOTE
+saying so. The graded (untagged) run refuses with exit 4 inside a session, and
+there is deliberately no flag to override that. Do not try to "catch up" a
+missed graded run during a drill: a missed 05:15 run can only be caught up
+before the next open, and after that the session is a gap. The rule is in
+[`deploy/launchd/README.md`, "Catch-up runs"](../../deploy/launchd/README.md#catch-up-runs--the-window-closes-at-the-next-open-kan-104).
 
 ```bash
 python scripts/run_paper.py --portfolio-tag __drill__ --portfolio-tag-capital 500

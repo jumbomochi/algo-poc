@@ -37,7 +37,7 @@
 #
 # The split, and the sentinel between them, exist so the database is read once:
 # the section and the alert are two renderings of one reading, and two
-# invocations could disagree with each other across the 04:15 run's write.
+# invocations could disagree with each other across the 05:15 run's write.
 
 # Bounded execution lives in one place (KAN-75). Resolved relative to THIS
 # file, not $ALGO_DIR, for the reason branch_guard.sh records: a lib knows

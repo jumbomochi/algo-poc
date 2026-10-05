@@ -9,15 +9,17 @@ trading state via `run_paper.py --reset` with no backup to restore from.
 
 | | |
 |---|---|
-| Job | `local.algo-db-backup` (launchd), 05:15 SGT daily |
+| Job | `local.algo-db-backup` (launchd), 06:15 SGT daily |
 | Script | `~/ibc/run_db_backup.sh` (repo copy: `deploy/launchd/run_db_backup.sh`) |
 | Dumps | `~/ibc/backups/algo_poc_<YYYYmmdd_HHMMSS>.dump` (pg_dump custom format, compressed) |
 | Retention | 30 days for local dumps and job logs, pruned by the job itself |
 | Logs | `~/ibc/logs/db_backup_<YYYYmmdd>.log`, launchd stdout to `db-backup-launchd.log` |
 | Alerts | Telegram on ANY failure (container down, dump error, unreadable archive). Success is logged only. |
 
-The 05:15 slot is deliberately after the 04:15 paper run and 04:45 divergence
-monitor, so each dump contains that trading day's snapshots and positions.
+The 06:15 slot is deliberately after the 05:15 paper run, 05:45 divergence
+monitor and 05:52 report, so each dump contains that trading day's snapshots
+and positions. (It was 05:15 until KAN-104 moved the paper run onto that
+minute: SGT has no DST, and 04:15 fell before the NYSE close every EST winter.)
 
 Every dump is verified with `pg_restore --list` before the job reports
 success — an unreadable archive counts as a failed backup.
@@ -52,9 +54,9 @@ To restore a single table (e.g. only `equity_snapshots`), add
 
 ## Limitations / future work
 
-- RPO is 1 day: intra-day writes since 05:15 are not covered (no WAL
+- RPO is 1 day: intra-day writes since 06:15 are not covered (no WAL
   archiving). Acceptable while the paper book is rebuilt nightly from the
-  04:15 run.
+  05:15 run.
 - Backups are local to this Mac. No offsite copy is currently configured, so
   machine loss can remove both the database and its backups. This is accepted
   temporarily; the backup job must not be granted Full Disk Access merely to

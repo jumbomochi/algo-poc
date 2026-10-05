@@ -114,7 +114,7 @@ def build_shadow_series(
             ``risk_engine`` (``PortfolioConfig`` in production). Built with no
             live ``portfolio_context``, so the replay is the model's own
             counterfactual rather than a re-scoring of live's positions.
-        bars_by_ticker: The union of bars the 04:15 run already fetched. Each
+        bars_by_ticker: The union of bars the 05:15 run already fetched. Each
             sleeve's ``signals_fn`` scopes itself to its own universe.
         live_equity: Sleeve name -> live NAV by session, from
             ``equity_snapshots``.
@@ -127,7 +127,7 @@ def build_shadow_series(
         loss instead of as an ungradeable sleeve.
 
     The window is derived per sleeve from *live's* sessions, never from the
-    bars. Bars can run ahead of the book — a session prints but the 04:15 job
+    bars. Bars can run ahead of the book — a session prints but the 05:15 job
     aborted before writing a snapshot — and grading a session live has no NAV
     for would compare a real number against nothing.
     """

@@ -1,7 +1,8 @@
 #!/bin/bash
 # Daily backup of the dockerized paper DB (RPO <= 1 day).
-# Runs at 05:15 SGT every day — after the 04:15 paper run and 04:45 divergence
-# monitor have written the day's rows, so each dump contains that day's state.
+# Runs at 06:15 SGT every day — after the 05:15 paper run, 05:45 divergence
+# monitor and 05:52 report have written the day's rows, so each dump contains
+# that day's state. (05:15 until KAN-104 moved the paper run onto that minute.)
 #
 # Dumps pg_dump custom format (compressed, pg_restore-able) via docker exec,
 # verifies the archive is readable, prunes dumps older than 30 days, and
@@ -13,11 +14,11 @@
 # ------------------------
 # The RPO promise is "at most one day of paper history lost", and every failure
 # path below reports through Telegram — but only when this script runs. A job
-# that never starts (host asleep at 05:15, launchd not loaded, a missed
+# that never starts (host asleep at 06:15, launchd not loaded, a missed
 # calendar slot after a boot) cannot report its own absence, and a backup that
 # silently stopped is discovered at restore time, which is the worst possible
 # moment. So a *successful* dump pings $ALGO_DEADMAN_BACKUP_URL and an external
-# checker pages when the pings stop. Configure its cron at `15 5 * * *` (daily).
+# checker pages when the pings stop. Configure its cron at `15 6 * * *` (daily).
 # See docs/operations/dead-man-switches.md.
 
 set -uo pipefail

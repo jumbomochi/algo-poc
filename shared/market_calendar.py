@@ -41,6 +41,17 @@ class MarketCalendar:
         close = self._cal.session_close(session)
         return close.to_pydatetime().astimezone(ET)
 
+    def session_bounds(self, d: date) -> tuple[datetime, datetime] | None:
+        """``(open, close)`` of session ``d`` in ET, or None if ``d`` is not a
+        session. The close is the real one, so a half day (the day after
+        Thanksgiving, Christmas Eve) closes at 13:00 ET, not 16:00."""
+        if not self._cal.is_session(d):
+            return None
+        return (
+            self._cal.session_open(d).to_pydatetime().astimezone(ET),
+            self._cal.session_close(d).to_pydatetime().astimezone(ET),
+        )
+
     def trading_sessions(self, start: date, end: date) -> list[date]:
         """Trading session dates in [start, end], ascending. Used to build a
         zero-filled baseline (sentiment/aggregate.py) that includes quiet

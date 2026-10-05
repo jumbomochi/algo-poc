@@ -1,7 +1,12 @@
 #!/bin/bash
 # Daily paper trading runner for algo-poc
-# Runs after US market close (4:15 AM SGT / 4:15 PM ET)
-# Signals are computed on finalized daily bars to avoid intraday noise
+# Runs at 05:15 SGT Tue-Sat, after the US close in BOTH seasons (KAN-104):
+#   EDT (Mar-Nov): close 04:00 SGT, so 05:15 SGT = 17:15 ET
+#   EST (Nov-Mar): close 05:00 SGT, so 05:15 SGT = 16:15 ET
+# SGT has no DST and ET does, so the old 04:15 slot was 45 min BEFORE the close
+# for the EST half of the year. Signals are computed on finalized daily bars;
+# scripts/run_paper.py refuses (exit 4) if the session it would price has not
+# closed, so this slot is a convenience and not the only defence.
 #
 # EXIT CODES
 #   0   = the run committed the day's book
@@ -9,7 +14,14 @@
 #         paper DB, alembic head unreadable, schema behind the code)
 #   124 = the run exceeded ALGO_PAPER_TIMEOUT_SECONDS and was killed (KAN-78)
 #   *   = whatever scripts/run_paper.py returned (see its own contract; 3 is
-#         insufficient bar coverage, KAN-80)
+#         insufficient bar coverage, KAN-80; 4 is "the NYSE session had not
+#         closed", KAN-104)
+#
+# The close guard lives in run_paper.py, not here, deliberately: it needs the
+# exchange calendar (holidays, 13:00 ET half days, DST), which bash would have
+# to re-implement and could then disagree with. Nothing this wrapper does before
+# the run prices anything — it only waits for ports — and run_paper.py checks
+# before it reads the broker. This wrapper's job is to name exit 4 accurately.
 # Only 0 pings the dead-man switch.
 
 # Overridable only so tests/deploy/test_deadman_ping.py can drive this wrapper
@@ -91,7 +103,7 @@ if [ -f "$CANON" ] && ! cmp -s "$0" "$CANON"; then
 fi
 
 # Bounded wait for a TCP port to accept connections. On a cold boot the docker
-# stack and IB Gateway can lag the 04:15 trigger; the old behaviour hard-failed
+# stack and IB Gateway can lag the 05:15 trigger; the old behaviour hard-failed
 # on the first probe and forced a manual rerun. Retries let it self-heal.
 # $1=host $2=port $3=label $4=timeout_sec
 wait_for_port() {
@@ -125,7 +137,7 @@ if ! algo_load_secrets POSTGRES_PASSWORD REDIS_PASSWORD; then
     # Telegram needs a credential we may not have; alert through the
     # secret-free channel too, so a locked keychain is still noticed today
     # rather than in two days.
-    algo_alert_local "paper run aborted 04:15 — $ALGO_SECRETS_ERROR"
+    algo_alert_local "paper run aborted 05:15 — $ALGO_SECRETS_ERROR"
     telegram "🚨 Paper trading run ABORTED: $ALGO_SECRETS_ERROR"
     paper_exit 1
 fi
@@ -133,7 +145,7 @@ export ALGO_DATABASE_URL="postgresql://algo:${POSTGRES_PASSWORD}@localhost:55432
 export ALGO_REDIS_URL="redis://:${REDIS_PASSWORD}@localhost:56379/0"
 
 # Wait up to 10 min for IB Gateway. The watchdog kickstarts it within ~10 min
-# of a cold boot, and the 04:45 divergence job leaves 30 min of headroom.
+# of a cold boot, and the 05:45 divergence job leaves 30 min of headroom.
 if ! wait_for_port 127.0.0.1 7497 "IB Gateway" 600; then
     algo_alert_local "paper run aborted — IB Gateway never came up on 7497"
     telegram "🚨 Paper trading run ABORTED: IB Gateway not reachable on 7497 after 10 min."
@@ -186,7 +198,7 @@ LOG_LINES_BEFORE_RUN=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
 
 # Bound the run (KAN-78). The 2026-09-09 run was still going at 19:00 — 14h45m,
 # stalled at ticker 88 of 140 with 87 consecutive zero-bar fetches, holding IB
-# clientId 58 — and nothing would have stopped it before the next 04:15 slot,
+# clientId 58 — and nothing would have stopped it before the next day's slot,
 # where two paper runs would have contended for that clientId.
 #
 # WHERE 3h COMES FROM: measured start-to-completion over the last fourteen
@@ -196,7 +208,7 @@ LOG_LINES_BEFORE_RUN=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
 # complete: a merely slow run should finish and give the book its day, while the
 # 8-to-15-hour pathologies end less than three hours in.
 #
-# Its consumer is the 04:45 divergence monitor, which a run over ~30 minutes has
+# Its consumer is the 05:45 divergence monitor, which a run over ~30 minutes has
 # already failed. This bound is not there to protect that; it is there so a run
 # that cannot finish stops before it collides with tomorrow's.
 PAPER_TIMEOUT="${ALGO_PAPER_TIMEOUT_SECONDS:-10800}"   # 3h
@@ -208,7 +220,7 @@ EXIT_CODE=$?
 echo "$(date): Paper trading run completed (exit code: $EXIT_CODE)" >> "$LOG_FILE"
 
 # A non-zero exit means no signals were committed for the day. Say so out loud:
-# the 2026-08-13/14 aborts were written to this log and to the 04:52 pipeline
+# the 2026-08-13/14 aborts were written to this log and to the daily pipeline
 # report, and still went unnoticed for two days because nothing pushed.
 if [ "$EXIT_CODE" != "0" ]; then
     # KAN-31 gave a nonzero exit a second meaning: the book committed but the
@@ -227,6 +239,16 @@ if [ "$EXIT_CODE" != "0" ]; then
         ICON="⏱️"
         DETAIL="TIMED OUT after ${PAPER_TIMEOUT:-?}s and was killed; no signals committed today."
         echo "$(date): paper run TIMED OUT after ${PAPER_TIMEOUT:-?}s and was killed" >> "$LOG_FILE"
+    elif [ "$EXIT_CODE" = "4" ]; then
+        # KAN-104: run_paper.py refused before pricing anything, because the
+        # NYSE session it would have priced had not closed. Not "no signals
+        # committed today" in the sense of a fault to chase. Usually this is a
+        # hand-started catch-up that landed inside the next session: say that
+        # retrying is pointless until the close and that the missed session is
+        # gone, or the operator retries in a loop. The rule is in README.md,
+        # "Catch-up runs"; the log line names the exact earliest re-run time.
+        ICON="⏰"
+        DETAIL="REFUSED: the NYSE session had not closed yet, so nothing was priced (KAN-104). Do not retry before the close — let the next scheduled 05:15 SGT run do it. A missed session cannot be caught up once the next session has opened; record it as a gap (deploy/launchd/README.md, Catch-up runs)."
     elif tail -n "+$((LOG_LINES_BEFORE_RUN + 1))" "$LOG_FILE" 2>/dev/null \
         | grep -q "WARNING: publish to pipeline failed"; then
         DETAIL="Book committed, but no orders reached risk/execution; intents replay next run."

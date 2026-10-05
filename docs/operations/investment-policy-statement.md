@@ -305,7 +305,7 @@ deployed system capital reaches −25%.**
 ## 8. Monitoring & review cadence
 
 - **Daily (automated):** the [divergence monitor](divergence-monitor.md) runs after
-  the paper/live signal job (launchd job `local.algo-divergence-monitor`, 04:45 SGT
+  the paper/live signal job (launchd job `local.algo-divergence-monitor`, 05:45 SGT
   Tue–Sat; see `deploy/launchd/`). Two-axis OK/WARNING/BREACH classification; exits
   non-zero on breach for alerting. A `local.algo-gateway-watchdog` job keeps the IB
   Gateway connection self-healing.

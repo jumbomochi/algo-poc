@@ -14,12 +14,13 @@
 	<string>/Users/huiliang/ibc/logs/divergence-launchd.log</string>
 	<key>StandardOutPath</key>
 	<string>/Users/huiliang/ibc/logs/divergence-launchd.log</string>
-	<!-- Run at 4:45 AM SGT Tue-Sat, ~30 min after the 4:15 paper-trading run -->
+	<!-- Run at 05:45 SGT Tue-Sat, ~30 min after the 05:15 paper-trading run
+	     (KAN-104 moved both an hour later, year-round). -->
 	<key>StartCalendarInterval</key>
 	<array>
 		<dict>
 			<key>Hour</key>
-			<integer>4</integer>
+			<integer>5</integer>
 			<key>Minute</key>
 			<integer>45</integer>
 			<key>Weekday</key>
@@ -27,7 +28,7 @@
 		</dict>
 		<dict>
 			<key>Hour</key>
-			<integer>4</integer>
+			<integer>5</integer>
 			<key>Minute</key>
 			<integer>45</integer>
 			<key>Weekday</key>
@@ -35,7 +36,7 @@
 		</dict>
 		<dict>
 			<key>Hour</key>
-			<integer>4</integer>
+			<integer>5</integer>
 			<key>Minute</key>
 			<integer>45</integer>
 			<key>Weekday</key>
@@ -43,7 +44,7 @@
 		</dict>
 		<dict>
 			<key>Hour</key>
-			<integer>4</integer>
+			<integer>5</integer>
 			<key>Minute</key>
 			<integer>45</integer>
 			<key>Weekday</key>
@@ -51,7 +52,7 @@
 		</dict>
 		<dict>
 			<key>Hour</key>
-			<integer>4</integer>
+			<integer>5</integer>
 			<key>Minute</key>
 			<integer>45</integer>
 			<key>Weekday</key>

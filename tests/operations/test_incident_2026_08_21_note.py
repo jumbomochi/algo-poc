@@ -10,7 +10,8 @@ Four ways this record rots:
 * the note says the paper run is at **04:15** and that the auto-restart lands
   4h20m before it. Move the run and the arithmetic in the note is wrong while
   reading plausibly, so the run time is read out of the plist rather than
-  hardcoded here;
+  hardcoded here, and the note must state the current slot (KAN-104 moved it
+  to 05:15 and added an addendum saying so);
 
 * the note argues at length that ``Weekday`` 2-6 is **Tuesday-Saturday and
   correct by design**, because the 04:15 SGT run covers the US session that
@@ -94,7 +95,14 @@ def test_note_is_listed_in_the_operations_index() -> None:
 
 
 def test_note_states_the_paper_run_time_the_plist_actually_schedules() -> None:
-    """The note's 04:15 and its 4h20m arithmetic must match the live schedule."""
+    """The note must say when the paper run is scheduled NOW.
+
+    Its timeline (04:15, the 4h20m gap) is the schedule during the incident and
+    stays as written. KAN-104 moved the run to 05:15, so the note carries a
+    dated addendum stating the current slot in bold; a substring match on the
+    bare time would pass on any unrelated "05:15" in the timeline (the old
+    backup slot), which is why the bold form is required.
+    """
     entries = _calendar_entries(PAPER_PLIST)
     hours = {e["Hour"] for e in entries}
     minutes = {e["Minute"] for e in entries}
@@ -104,7 +112,7 @@ def test_note_states_the_paper_run_time_the_plist_actually_schedules() -> None:
     )
     stamp = f"{hours.pop():02d}:{minutes.pop():02d}"
 
-    assert stamp in NOTE.read_text(), (
+    assert f"**{stamp}**" in NOTE.read_text(), (
         f"the note must state the scheduled run time as {stamp!r}; if the run "
         "moved, its timeline and the 4h20m gap to AutoRestartTime are both stale"
     )

@@ -1,7 +1,7 @@
 """KAN-23 AC5: the Tuesday refresh must not silently un-rebaseline the monitor.
 
 ``deploy/launchd/run_backtest_refresh.sh`` re-runs the 10-year backtest every
-Tuesday 05:00 SGT, and ``scripts/divergence_monitor.py`` auto-selects the
+Tuesday 06:30 SGT, and ``scripts/divergence_monitor.py`` auto-selects the
 *newest* ``output/backtest_multi_*.json``. So a refresh that omits
 ``--universe-snapshots`` writes a survivorship-biased artifact that supersedes
 the rebaselined one, and the monitor reverts to exit 3 (BLIND) within a week —
@@ -235,7 +235,7 @@ def test_a_missing_snapshot_sends_a_telegram_naming_the_file(tmp_path):
 
 def test_a_missing_snapshot_is_reported_before_the_gateway_check(tmp_path):
     """A local, deterministic misconfiguration must not be masked by whatever
-    IB happens to be doing at 05:00 — otherwise the operator chases the wrong
+    IB happens to be doing at 06:30 — otherwise the operator chases the wrong
     failure for a week."""
     _, sends, _, _, _ = _drive(tmp_path, snapshot=False, gateway=False)
 
@@ -288,8 +288,8 @@ def test_wrappers_still_source_the_shared_telegram_helper(wrapper):
 
 def test_a_runaway_backtest_is_killed_and_reported(tmp_path):
     """The point-in-time universe takes run_backtest from 140 tickers to ~830,
-    so the IB pull is hours. An unbounded 05:00 job could still be holding the
-    gateway at the next day's 04:15 paper run."""
+    so the IB pull is hours. An unbounded 06:30 job could still be holding the
+    gateway at the next day's 05:15 paper run."""
     result, sends, _, log, _ = _drive(tmp_path, backtest_sleep=30, timeout_seconds=1)
 
     assert result.returncode == 124, result.returncode

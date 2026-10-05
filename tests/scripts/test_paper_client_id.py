@@ -7,9 +7,9 @@ its historical-data connection, while ``--ib-client-id`` (58) covered only the
 broker snapshot and the order path.
 
 IB refuses a second connection presenting a client id already in use, and the
-weekly backtest refresh is Tuesday 05:00 SGT with a six-hour bound, so it can
-hold id 10 until ~11:00. A paper run started in that window — which is exactly a
-catch-up after a missed 04:15 slot — fails to fetch bars and exits with
+weekly backtest refresh is Tuesday 06:30 SGT with a six-hour bound, so it can
+hold id 10 until ~12:30. A paper run started in that window — which is exactly a
+catch-up after a missed 05:15 slot — fails to fetch bars and exits with
 "ERROR: No data fetched. Is IB Gateway running?", naming the wrong cause.
 
 ``deploy/launchd/run_backtest_refresh.sh`` asserted the opposite as settled fact,
@@ -130,7 +130,7 @@ def test_the_paper_and_backtest_client_ids_are_disjoint():
     paper_ids = {paper_id, paper_id + 1}
     assert backtest_id not in paper_ids, (
         f"backtest client id {backtest_id} collides with run_paper's {sorted(paper_ids)}; "
-        f"the Tuesday 05:00-11:00 refresh window would block a paper catch-up"
+        f"the Tuesday 06:30-12:30 refresh window would block a paper catch-up"
     )
 
 

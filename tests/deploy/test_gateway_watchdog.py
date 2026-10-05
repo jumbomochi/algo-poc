@@ -42,9 +42,10 @@ DOCKER_HEALTH = REPO / "deploy/launchd/lib/docker_health.sh"
 PAPER_PLIST = REPO / "deploy/launchd/local.algo-paper-trading.plist"
 README = REPO / "deploy/launchd/README.md"
 
-# A Tuesday, so 04:15 is a real scheduled run. Naive .timestamp() is local time,
-# which is the same clock the shell derives its hour-of-day from.
-RUN_AT = datetime(2026, 8, 25, 4, 15, 0).timestamp()
+# A Tuesday, so 05:15 is a real scheduled run (04:15 until KAN-104). Naive
+# .timestamp() is local time, which is the same clock the shell derives its
+# hour-of-day from.
+RUN_AT = datetime(2026, 8, 25, 5, 15, 0).timestamp()
 
 # Every algo-poc compose service, verbatim from `docker compose config
 # --services` on the operator host — hyphens, not underscores, and including the
@@ -347,7 +348,7 @@ def test_the_local_time_helper_returns_hh_mm_ss():
     assert res.returncode == 0, res.stderr
     assert re.fullmatch(r"\d{2} \d{2} \d{2}", res.stdout.strip()), res.stdout
     # It is the paper-run instant, so it must read back as the run time.
-    assert res.stdout.split()[:2] == ["04", "15"], res.stdout
+    assert res.stdout.split()[:2] == ["05", "15"], res.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -866,7 +867,7 @@ def test_the_auth_alert_names_how_long_is_left_before_the_run(host):
     rejected" is not — the operator has to decide whether to get up."""
     sent = _auth_cycle(host, minutes_before_run=42, alerted_ago=None)
     assert sent
-    assert re.search(r"4:15 paper run is in 4[12] min", sent[0]), sent
+    assert re.search(r"5:15 paper run is in 4[12] min", sent[0]), sent
 
 
 def test_recovery_from_the_auth_failure_still_alerts(host):
@@ -887,10 +888,10 @@ def test_recovery_from_the_auth_failure_still_alerts(host):
 # KAN-62 — the config half, pinned so it cannot silently move back
 # ---------------------------------------------------------------------------
 
-# The four SGT jobs in the daily chain. AutoRestartTime must not land in here,
-# nor in the hours immediately before the first of them.
-JOB_WINDOW_START = 4 * 60       # 04:00, ahead of the 04:15 paper run
-JOB_WINDOW_END = 5 * 60 + 30    # 05:30, after the 05:15 DB backup
+# The SGT jobs in the daily chain (KAN-104 schedule). AutoRestartTime must not
+# land in here, nor in the hours immediately before the first of them.
+JOB_WINDOW_START = 5 * 60       # 05:00, ahead of the 05:15 paper run
+JOB_WINDOW_END = 6 * 60 + 45    # 06:45, after the 06:15 backup and 06:30 refresh start
 
 CONFIG_INI = Path.home() / "ibc" / "config.ini"
 
@@ -930,13 +931,13 @@ def test_auto_restart_time_is_outside_the_scheduled_job_window():
     minutes = _parse_ibc_time(_readme_auto_restart_time())
     assert not (JOB_WINDOW_START <= minutes <= JOB_WINDOW_END), (
         f"AutoRestartTime is {_readme_auto_restart_time()}, inside the "
-        f"04:00-05:30 job window"
+        f"05:00-06:45 job window"
     )
     # And it must not sit in the run-up either: a failure at 23:55 is only
     # "outside the window" in the narrowest sense.
     hours_of_slack = ((JOB_WINDOW_START - minutes) % (24 * 60)) / 60
     assert hours_of_slack >= 8, (
-        f"AutoRestartTime leaves only {hours_of_slack:.1f}h before the 04:15 "
+        f"AutoRestartTime leaves only {hours_of_slack:.1f}h before the 05:15 "
         "run. The 23:55 value left 4h20m, all of it overnight, and a rejected "
         "re-login ate two NYSE sessions of gate evidence."
     )
@@ -957,7 +958,7 @@ def test_the_live_ibc_config_agrees_with_the_recorded_value():
 
 
 def test_the_watchdogs_run_time_constants_match_the_paper_plist():
-    """The escalating cadence is computed against a hardcoded 04:15. If the run
+    """The escalating cadence is computed against a hardcoded 05:15. If the run
     moves, every threshold above is measured from the wrong instant."""
     with PAPER_PLIST.open("rb") as fh:
         parsed = plistlib.load(fh)

@@ -41,7 +41,7 @@
 # is a StartInterval job, not a calendar one, so it has no slot to miss — after
 # a boot launchd starts it within 300s. And its failure is not silent by
 # nature: if the watchdog stops running, the Gateway it guards eventually goes
-# unreachable, and *that* is what the 04:15 paper run and the Tuesday refresh
+# unreachable, and *that* is what the 05:15 paper run and the Tuesday refresh
 # report (both alert on an unreachable 7497 and both hold their own dead-man
 # check). A ping every 5 minutes would also be the noisiest check in the
 # account while adding a signal that arrives strictly later than the ones
@@ -108,7 +108,7 @@ ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
 # Injectable clock. Only the tests set $ALGO_NOW_EPOCH; the escalating re-alert
 # schedule below has to be asserted by driving the clock rather than by waiting
-# four hours for 04:15 to come round.
+# four hours for the paper run's slot to come round.
 now_epoch() { echo "${ALGO_NOW_EPOCH:-$(date +%s)}"; }
 
 # stat(1) and date(1) diverge between BSD and GNU, and the test suite runs on
@@ -169,11 +169,12 @@ need_alert() {
 # The daily paper run this watchdog exists to protect. Kept as constants rather
 # than parsed out of the plist (this is a 300s job; it should not be reading
 # and parsing XML 288 times a day) — tests/deploy/test_gateway_watchdog.py
-# asserts they still match local.algo-paper-trading.plist.
-PAPER_RUN_HOUR=4
+# asserts they still match local.algo-paper-trading.plist. 05:15 since KAN-104
+# (04:15 fell before the NYSE close every EST winter).
+PAPER_RUN_HOUR=5
 PAPER_RUN_MIN=15
 
-# Seconds from now until the next local 04:15. Computed from the local
+# Seconds from now until the next local paper-run slot. Computed from the local
 # time-of-day rather than by parsing a date string, because `date -j -f` is
 # BSD-only and this has to run under the Linux CI that tests it.
 secs_to_paper_run() {

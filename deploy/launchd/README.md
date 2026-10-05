@@ -5,17 +5,78 @@ host. The **live** copies are deployed outside the repo:
 
 | Repo copy | Deployed to |
 |---|---|
-| `run_paper.sh` | `~/ibc/run_paper.sh` (chmod +x) — 04:15 SGT daily paper run |
+| `run_paper.sh` | `~/ibc/run_paper.sh` (chmod +x) — 05:15 SGT Tue–Sat paper run |
 | `run_divergence.sh` | `~/ibc/run_divergence.sh` (chmod +x) |
 | `local.algo-divergence-monitor.plist` | `~/Library/LaunchAgents/local.algo-divergence-monitor.plist` |
 | `gateway_watchdog.sh` | `~/ibc/gateway_watchdog.sh` (chmod +x) |
 | `local.algo-gateway-watchdog.plist` | `~/Library/LaunchAgents/local.algo-gateway-watchdog.plist` |
-| `run_backtest_refresh.sh` | `~/ibc/run_backtest_refresh.sh` (chmod +x) — Tue 05:00 SGT weekly baseline refresh |
+| `run_backtest_refresh.sh` | `~/ibc/run_backtest_refresh.sh` (chmod +x) — Tue 06:30 SGT weekly baseline refresh |
 | `local.algo-backtest-refresh.plist` | `~/Library/LaunchAgents/local.algo-backtest-refresh.plist` |
-| `run_db_backup.sh` | `~/ibc/run_db_backup.sh` (chmod +x) — 05:15 SGT daily paper-DB pg_dump (RPO ≤ 1 day) |
+| `run_db_backup.sh` | `~/ibc/run_db_backup.sh` (chmod +x) — 06:15 SGT daily paper-DB pg_dump (RPO ≤ 1 day) |
 | `local.algo-db-backup.plist` | `~/Library/LaunchAgents/local.algo-db-backup.plist` |
-| `run_pipeline_report.sh` | `~/ibc/run_pipeline_report.sh` (chmod +x) — 04:52 SGT Tue–Sat pipeline report + Telegram heartbeat |
+| `run_pipeline_report.sh` | `~/ibc/run_pipeline_report.sh` (chmod +x) — 05:52 SGT Tue–Sat pipeline report + Telegram heartbeat |
 | `local.algo-pipeline-report.plist` | `~/Library/LaunchAgents/local.algo-pipeline-report.plist` |
+
+### The schedule, and why it is 05:15 (KAN-104)
+
+Every slot is **SGT, which has no daylight saving time**; the NYSE close is
+16:00 **ET, which does**. So the close lands at 04:00 SGT under EDT
+(mid-March → early November) and at 05:00 SGT under EST (early November →
+mid-March). The paper run used to fire at 04:15, which is 15 min after the
+close in summer and **45 min before it in winter** — from Tue 2026-11-03 it
+would have priced an in-progress session every run until Sat 2027-03-13. The
+chain now starts at 05:15, after the close in both seasons:
+
+| Job | Slot (SGT) | Days | ET under EDT / EST | Healthy duration |
+|---|---|---|---|---|
+| `local.algo-paper-trading` | 05:15 | Tue–Sat | 17:15 / 16:15 | 6–9 min (bounded at 3h) |
+| `local.algo-divergence-monitor` | 05:45 | Tue–Sat | 17:45 / 16:45 | seconds |
+| `local.algo-pipeline-report` | 05:52 | Tue–Sat | 17:52 / 16:52 | seconds |
+| `local.algo-db-backup` | 06:15 | daily | — | ~1 s |
+| `local.algo-backtest-refresh` | 06:30 | Tue | 18:30 / 17:30 (Mon) | 5–6 h (bounded at 6h → ends by 12:30) |
+| `local.algo-evidence-digest` | 08:00 | Mon | — | seconds |
+| `local.algo-gateway-watchdog` | every 5 min | — | — | — |
+| IBC `AutoRestartTime` (host config) | 14:00 | daily | — | — |
+
+The slot is a convenience, not the guard: `scripts/run_paper.py` refuses
+(exit 4, Telegram, no dead-man ping) when the session it would price has not
+closed per `shared/market_calendar.py`, including 13:00 ET half days, and the
+divergence monitor refuses a shadow priced before its session closed. See
+`shared/session_close.py`.
+
+### Catch-up runs — the window closes at the next open (KAN-104)
+
+When the 05:15 run is missed (host asleep, Gateway down, a fixed abort), a
+hand-started `~/ibc/run_paper.sh` can still book the missed session, but **only
+until the next NYSE open**. Every run prices the newest *closed* session, and
+`run_paper.py` has no as-of mode (KAN-67), so there is a window for each missed
+session and no way back once it shuts:
+
+| Missed slot | Catch-up window (SGT, same day) | Next open |
+|---|---|---|
+| 05:15 under EDT | from the failure to ~21:00 | 21:30 SGT |
+| 05:15 under EST | from the failure to ~22:00 | 22:30 SGT |
+
+- **Start the catch-up at least 30 minutes before the open.** The fetch takes
+  6–9 min, and a fetch that runs past 09:30 ET gets today's forming bar. The
+  guard's second half then refuses it (exit 4) *after* it has written a
+  capital snapshot and a reconciliation reading. Both are true pre-open broker
+  readings and the next good run supersedes them
+  (`tests/scripts/test_run_paper_close_guard.py::test_a_late_refusal_then_a_good_run_leaves_a_clean_book`),
+  but the session is still lost.
+- **Then catch up the divergence monitor too** (`~/ibc/run_divergence.sh`). The
+  shadow it grades is the one the catch-up just wrote; same SGT date, so it is
+  fresh.
+- **Inside a session, a catch-up is refused, and that is final for the missed
+  session.** Exit 4, with a Telegram ⏰ naming the earliest re-run time
+  (close + 5 min). Do not retry in a loop, and do not run by hand after the
+  close: the next scheduled 05:15 run is at most 15 minutes after the earliest
+  allowed time and books the newest closed session. The missed one is a
+  permanent gap. Accept it the sanctioned way: a PR adding it to
+  `shared/absent_sessions.py` with its cause (KAN-67).
+- **There is no override flag, by design.** The guard exists so that nothing
+  ever trades on a partial bar. A drill (`--portfolio-tag`) is the only exempt
+  run, and it is excluded from the graded evidence.
 
 `run_paper.sh` and `run_divergence.sh` export
 `ALGO_DATABASE_URL=postgresql://algo:<pw>@localhost:55432/algo_poc` (plus the
@@ -117,8 +178,8 @@ enforces it: a new wrapper with neither reddens the suite.
 | `gateway_watchdog.sh` | — | `StartInterval`, so it has no slot to miss; a dead watchdog surfaces as an unreachable Gateway in the paper run and the refresh, both of which alert and both of which ping. The host-wide case belongs to `DEADMAN_WATCHDOG_URL`. |
 
 Give each check a cron matching its plist rather than a flat period, in
-**Asia/Singapore**: `15 4 * * 2-6` (paper), `45 4 * * 2-6` (divergence),
-`15 5 * * *` (backup), `0 5 * * 2` (refresh), `0 8 * * 1` (digest). The paper
+**Asia/Singapore**: `15 5 * * 2-6` (paper), `45 5 * * 2-6` (divergence),
+`15 6 * * *` (backup), `30 6 * * 2` (refresh), `0 8 * * 1` (digest). The paper
 run and the divergence monitor are Tue–Sat, so a flat ~26 h period pages every
 Sunday and stays red all Monday. A check that has **never been pinged** does not
 alert at all — it needs one successful check-in to arm.
@@ -131,7 +192,7 @@ Full setup, cadence guidance and the delivery drill:
 **launchd does not re-fire a `StartCalendarInterval` job whose slot passed
 while the host was down.** It runs the job at the next matching time. For the
 weekly refresh that means a full week; on 2026-08-11 the Mac booted at 07:59,
-two hours after the 05:00 slot, and the Tuesday refresh simply did not happen
+two hours after the then-05:00 slot, and the Tuesday refresh simply did not happen
 until 08-18 — silently, because a script that never starts cannot alert.
 
 (`StartInterval` jobs behave differently: launchd starts them shortly after
@@ -141,7 +202,7 @@ boot, so `gateway_watchdog.sh` self-heals across a downtime.)
 adding a catch-up guard. A catch-up run is worse than the gap it closes: the
 refresh holds IB's historical-data pacing budget for up to six hours, so a job
 that fires at an arbitrary post-boot time could still be running into the next
-04:15 paper run and starve it of data. The failure the catch-up would prevent
+05:15 paper run and starve it of data. The failure the catch-up would prevent
 is one late baseline; the failure it would introduce is a missed trading day.
 
 What covers it instead, in order of how fast it speaks:
@@ -315,12 +376,12 @@ canonical` line if it was launched from a drifted copy.
 | file | job |
 |---|---|
 | `gateway_watchdog.sh` | IB Gateway watchdog, every 5 min |
-| `run_backtest_refresh.sh` | weekly backtest refresh, Tue 05:00 |
+| `run_backtest_refresh.sh` | weekly backtest refresh, Tue 06:30 |
 | `run_db_backup.sh` | daily paper-DB backup |
-| `run_divergence.sh` | daily divergence monitor, 04:45 |
+| `run_divergence.sh` | daily divergence monitor, 05:45 |
 | `run_evidence_digest.sh` | evidence digest |
-| `run_paper.sh` | daily paper trading run, 04:15 |
-| `run_pipeline_report.sh` | daily pipeline report, 04:52 |
+| `run_paper.sh` | daily paper trading run, 05:15 |
+| `run_pipeline_report.sh` | daily pipeline report, 05:52 |
 
 `deploy.sh` itself is not deployed — it is the deployer.
 
@@ -361,7 +422,7 @@ which adds the before/after image and environment evidence and `--no-deps`.
   "no pin" — leaving only the `DU`/`U` prefix guard. The `:?` line refuses.
 - The clone needs its own copy of the gitignored `docker-compose.override.yml`
   (the machine-local ports 55432/56379 the wrappers wait on). Without it the
-  stack comes up on the default ports and the 04:15 run times out waiting for
+  stack comes up on the default ports and the 05:15 run times out waiting for
   the paper DB.
 
 ## Deploying / syncing
@@ -382,7 +443,7 @@ touched — prints the `launchctl bootout/bootstrap` reload commands for you to
 run (launchctl is a human step, CLAUDE.md). Each wrapper also self-checks at
 startup and logs a loud `WARNING - … differs from repo canonical` line if it
 was launched from a drifted copy, so drift surfaces the same morning instead of
-failing silently at 04:15.
+failing silently at 05:15.
 
 ### A copied plist is not a loaded job (KAN-64)
 
@@ -411,7 +472,7 @@ and reports both directions:
 It is called from two places. `deploy.sh` calls it so its reload hint names the
 labels that are *actually* outstanding rather than only the ones whose file
 happened to change — it still only ever reads `launchctl list`, and still only
-prints bootout/bootstrap. And the **04:52 pipeline report** calls it every day,
+prints bootout/bootstrap. And the **05:52 pipeline report** calls it every day,
 because the check has to live in a job that is verifiably running: it cannot
 live in pytest (CI has no launchd, and a test that shelled out to `launchctl`
 would fail there or be skipped — the same blind spot in a new costume), and it
@@ -421,12 +482,12 @@ loaded.
 Scope is `local.algo-*`. `local.ibc-gateway` is deliberately excluded: its plist
 belongs to IBC rather than this repo, and its failure mode is not silent — an
 unloaded Gateway job means port 7497 goes unreachable, which the watchdog, the
-04:15 run and the Tuesday refresh all already alert on.
+05:15 run and the Tuesday refresh all already alert on.
 
 ## Daily divergence monitor
 
-Runs `scripts/divergence_monitor.py` at **04:45 SGT, Tue–Sat** — ~30 min after
-the 04:15 `local.algo-paper-trading` job has written that day's
+Runs `scripts/divergence_monitor.py` at **05:45 SGT, Tue–Sat** — ~30 min after
+the 05:15 `local.algo-paper-trading` job has written that day's
 `equity_snapshots` row. See [divergence-monitor.md](../../docs/operations/divergence-monitor.md).
 
 - **Logs:** `~/ibc/logs/divergence_YYYYMMDD.log` (auto-pruned after 30 days),
@@ -515,9 +576,10 @@ re-login was rejected at 23:55, the watchdog alerted once at 23:59:56, and the
 next message was not due until roughly noon the following day — so the
 operator's last warning arrived **4h16m before the 04:15 run**, which aborted at
 04:25 and cost a session of gate evidence. The same sequence had already cost
-2026-08-18. The interval now tightens as the run approaches:
+2026-08-18. The interval now tightens as the run approaches (the run has been
+at 05:15 since KAN-104; `PAPER_RUN_HOUR`/`PAPER_RUN_MIN` follow the plist):
 
-| Time until the 04:15 paper run | Re-alert every |
+| Time until the 05:15 paper run | Re-alert every |
 |---|---|
 | more than 6h | 12h |
 | 6h–3h | 1h |
@@ -541,14 +603,16 @@ being guarded against, and
 `tests/deploy/test_gateway_watchdog.py::test_auto_restart_time_is_outside_the_scheduled_job_window`
 pins it.
 
-The daily chain is 04:15 (paper run), 04:45 (divergence), 04:52 (pipeline
-report), 05:15 (DB backup), all SGT. At 23:55 a rejected re-login had 4h20m to
+The daily chain is 05:15 (paper run), 05:45 (divergence), 05:52 (pipeline
+report), 06:15 (DB backup), plus the Tuesday refresh at 06:30, all SGT
+(KAN-104; it was 04:15–05:15 when this was decided). At 23:55 a rejected
+re-login had 4h20m to
 be noticed by a human who was asleep, and no automated path at all — the
 watchdog is forbidden from kickstarting into an auth failure, and
 `ColdRestartTime=08:00` is **weekly, not daily** (the 08-21 session logged "cold
 restarted at 2026/08/23 08:00", a Sunday), so on a weekday there is no automatic
 backstop. 2:00 PM SGT puts a failed re-login in the middle of the operator's
-working day and roughly **14 hours** ahead of the next run that depends on it,
+working day and roughly **15 hours** ahead of the next run that depends on it,
 and it is clear of both the job window and IB's own overnight reset.
 
 **Telegram alerts** (best-effort) are sent on: auth-failure refusal, kickstart
@@ -647,7 +711,7 @@ launchctl list | grep local.algo-gateway-watchdog
 
 ## IB Gateway API settings: Master API client ID (KAN-87, superseded by KAN-95)
 
-**Nothing depends on this setting any more.** The 04:15 run used to end with an
+**Nothing depends on this setting any more.** The paper run used to end with an
 execution sweep that connected as client 58 and needed
 `Configure > API > Settings > Master API client ID` set to `58` to see the
 execution service's orders. It logged `IB returned 0 execution(s)` on every
@@ -668,7 +732,7 @@ Gateway is harmless.
 
 ## Weekly backtest refresh
 
-Runs `run_backtest_refresh.sh` every **Tuesday 05:00 SGT** — full 10yr
+Runs `run_backtest_refresh.sh` every **Tuesday 06:30 SGT** — full 10yr
 backtest so the [divergence monitor](../../docs/operations/divergence-monitor.md)
 baseline stays current (the monitor scores against the artifact named by
 `divergence.baseline_pin`, not the newest one — re-pinning is deliberate, see
@@ -678,14 +742,21 @@ portfolio reads `NO_DATA`).
 
 **Why Tuesday, not Monday:** IBKR's historical-data farm is routinely dead
 from Saturday night until the US Monday open (observed 2026-07-05/06 — 26
-consecutive failed probes across the weekend). By Tuesday 05:00 SGT the US
-Monday session has closed and the farms are warm. The job also runs safely
-alongside the 04:15/04:45 jobs (backtest uses IB clientId 10).
+consecutive failed probes across the weekend). By Tuesday 06:30 SGT the US
+Monday session has closed in both seasons and the farms are warm.
+
+**Why 06:30, after the whole chain (KAN-104):** the old 05:00 slot was exactly
+the NYSE close under EST, and with the paper run moved to 05:15 it would have
+been an hour into a 5–6h IB historical pull when the paper run needed the same
+gateway. Distinct client ids (refresh 10, paper 58/59) avoid a collision, not
+contention for the pacing budget. Starting after the backup keeps the daily
+chain strictly sequential, and the 6h bound ends by 12:30, ahead of the
+2:00 PM `AutoRestartTime`.
 
 - **Telegram**: ✅ with the headline metrics on success, ❌ on failure or when
   the Gateway is unreachable (baseline going stale is a silent risk otherwise).
 - **Dead-man**: pings `$ALGO_DEADMAN_REFRESH_URL` on success only. A missed
-  Tuesday — the host down at 05:00, which is not re-fired; see [Missed calendar
+  Tuesday — the host down at 06:30, which is not re-fired; see [Missed calendar
   slots](#missed-calendar-slots--what-launchd-does-and-what-covers-it) —
   produces no alert from this job at all, so the external check is the only
   thing that can report it.
@@ -699,9 +770,11 @@ alongside the 04:15/04:45 jobs (backtest uses IB clientId 10).
 
 ## Daily paper-DB backup
 
-Runs `run_db_backup.sh` at **05:15 SGT every day** — a `pg_dump` (custom
-format) of the dockerized `algo_poc` DB, taken after the 04:15 paper run and
-04:45 divergence monitor so each dump contains that day's rows. RPO ≤ 1 day.
+Runs `run_db_backup.sh` at **06:15 SGT every day** — a `pg_dump` (custom
+format) of the dockerized `algo_poc` DB, taken after the 05:15 paper run,
+05:45 divergence monitor and 05:52 report so each dump contains that day's
+rows. RPO ≤ 1 day. (05:15 until KAN-104 put the paper run on that minute; a
+dump taken while the run is writing would capture a half-written day.)
 Added after the 2026-07-10 incident where an agent wiped the paper book via
 `run_paper.py --reset` with nothing to restore from.
 
@@ -716,8 +789,8 @@ Added after the 2026-07-10 incident where an agent wiped the paper book via
 
 ## Daily pipeline report
 
-Runs `run_pipeline_report.sh` at **04:52 SGT, Tue–Sat** — after the 04:15
-paper run and 04:45 divergence monitor. One log per day with the whole
+Runs `run_pipeline_report.sh` at **05:52 SGT, Tue–Sat** — after the 05:15
+paper run and 05:45 divergence monitor. One log per day with the whole
 pipeline's state: paper-run tail, risk-gate BUY/SELL/SKIP counts, divergence
 result, execution-service activity (last 2h), resting IB orders (clientId 54),
 the four standing-fact sections below, and the last 7 days of equity snapshots.
