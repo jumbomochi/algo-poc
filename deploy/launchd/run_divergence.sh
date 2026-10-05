@@ -231,6 +231,18 @@ if ! wait_for_port 127.0.0.1 55432 "paper DB (docker compose up?)" 300; then
     exit 2
 fi
 
+# Refuse a schema behind the code (KAN-103): a pull without `alembic upgrade
+# head` would otherwise die mid-run on a raw UndefinedColumn. Exit 2 = page.
+# shellcheck source=deploy/launchd/lib/schema_guard.sh
+. "$ALGO_DIR/deploy/launchd/lib/schema_guard.sh"
+if ! algo_schema_guard "$ALGO_DIR"; then
+    SCHEMA_MSG="${ALGO_SCHEMA_ERROR:-schema guard unavailable (lib/schema_guard.sh not sourced)}"
+    echo "$(date): ERROR - $SCHEMA_MSG" >> "$LOG_FILE"
+    algo_alert_local "divergence monitor aborted — $SCHEMA_MSG"
+    telegram "🚨 Divergence monitor ABORTED: $SCHEMA_MSG"
+    exit 2
+fi
+
 cd "$ALGO_DIR"
 
 # The rolling shadow the 05:15 run wrote. Named explicitly rather than

@@ -10,7 +10,8 @@ import math
 from datetime import date, datetime, timezone
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import inspect, select, update
+from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy.orm import Session
 
 from backtest.portfolio_context import HeldPosition, PendingOrder, PortfolioContext
@@ -73,6 +74,41 @@ def _currency_context(
     }
 
 
+class SchemaOutOfDateError(RuntimeError):
+    """The database is behind the code's alembic migrations."""
+
+
+#: Columns the code reads on every equity history load. Each was added by a
+#: migration; a database missing one has not been upgraded.
+_REQUIRED_EQUITY_COLUMNS = ("session_date",)  # KAN-103, b3d5f7a9c1e2
+
+
+def require_current_schema(session: Session) -> None:
+    """Refuse a database whose ``equity_snapshots`` predates the code.
+
+    The launchd wrappers compare alembic revisions before running
+    (``deploy/launchd/lib/schema_guard.sh``); this is the same refusal for a
+    script started by hand, which no wrapper guards.
+    """
+    try:
+        columns = {
+            c["name"]
+            for c in inspect(session.connection()).get_columns("equity_snapshots")
+        }
+    except NoSuchTableError as exc:
+        raise SchemaOutOfDateError(
+            "equity_snapshots does not exist: run `alembic upgrade head` "
+            "against this database first"
+        ) from exc
+    missing = [c for c in _REQUIRED_EQUITY_COLUMNS if c not in columns]
+    if missing:
+        raise SchemaOutOfDateError(
+            f"equity_snapshots is missing {', '.join(missing)}: the database "
+            "is behind the code's migrations. Run `alembic upgrade head` "
+            "against it first (ALGO_DATABASE_URL set)."
+        )
+
+
 class PaperTradingState:
     """Manages paper trading state across multiple portfolios in the DB."""
 
@@ -101,7 +137,13 @@ class PaperTradingState:
 
     @classmethod
     def load(cls, session: Session) -> PaperTradingState:
-        """Load state from DB. Raises ValueError if no state exists."""
+        """Load state from DB. Raises ValueError if no state exists.
+
+        Raises :class:`SchemaOutOfDateError` first when the database predates
+        the code's migrations, so a manual ops script fails with the fix in
+        its message rather than on a raw UndefinedColumn mid-run.
+        """
+        require_current_schema(session)
         count = session.execute(
             select(PortfolioConfig.id).limit(1)
         ).scalar()
@@ -399,8 +441,16 @@ class PaperTradingState:
         trading_currency: str | None = None,
         fx_base_per_trading: float | None = None,
         valuation_at: datetime | None = None,
+        session_date: date | None = None,
     ) -> None:
         """Record (or update) an equity snapshot for a portfolio on a date.
+
+        ``snap_date`` is the run date (SGT wall clock) and stays the upsert
+        key. ``session_date`` is the US session whose closes marked the book
+        (KAN-103), or None when the run could not name one. Like the currency
+        columns it is rewritten on every update, including back to NULL: a
+        re-run that priced a partial session must not keep the earlier run's
+        claim to a closed one.
 
         ``equity``/``cash``/``market_value`` are denominated in the trading
         currency (USD): sleeve budgets and bar prices are both USD. Supplying
@@ -438,6 +488,7 @@ class PaperTradingState:
             existing.cash = cash
             existing.market_value = market_value
             existing.created_at = now
+            existing.session_date = session_date
             for column, value in currency.items():
                 setattr(existing, column, value)
         else:
@@ -448,6 +499,7 @@ class PaperTradingState:
                 cash=cash,
                 market_value=market_value,
                 created_at=now,
+                session_date=session_date,
                 **currency,
             )
             self._session.add(snap)
@@ -601,6 +653,11 @@ class PaperTradingState:
         return [
             {
                 "date": str(s.date),
+                # The US session the row valued (KAN-103); None until stamped
+                # or backfilled. ``date`` is the SGT run date.
+                "session_date": (
+                    str(s.session_date) if s.session_date is not None else None
+                ),
                 "equity": s.equity,
                 "cash": s.cash,
                 "market_value": s.market_value,

@@ -93,6 +93,7 @@ from shared.observability import DEFAULT_TRADING_METRICS
 from services.execution.ib_account import IBAccountReader
 from services.execution.reconciliation import ReconciliationResult
 from shared.logging import get_logger
+from shared.session_dating import stamp_session
 from shared.universe import DRILL_PORTFOLIO, is_excluded_portfolio
 from shared.session_close import (
     UnclosedSession,
@@ -869,6 +870,11 @@ def run_daily(
     for ticker, bars in bars_by_ticker.items():
         if bars:
             current_prices[ticker] = bars[-1]["close"]
+    # KAN-103: ``today`` is the SGT run date; this is the US session those
+    # closes are from, or None if it had not closed by valuation.
+    marks_session = _marks_session(
+        bars_by_ticker, currency_context.get("valuation_at")
+    )
 
     for name, pc in portfolios.items():
         universe = list(bars_by_ticker.keys())
@@ -1041,7 +1047,8 @@ def run_daily(
         cash = state.get_cash(name)
         market_value = equity - cash
         state.record_equity_snapshot(
-            name, today, equity, cash, market_value, **currency_context
+            name, today, equity, cash, market_value,
+            session_date=marks_session, **currency_context,
         )
 
     # Record aggregate equity snapshot. Synthetic portfolios (the "__drill__"
@@ -1062,6 +1069,7 @@ def run_daily(
             total_equity,
             total_cash,
             total_market_value,
+            session_date=marks_session,
             **currency_context,
         )
 
@@ -1077,6 +1085,24 @@ def _contract_by_symbol(
     }
     result.update(contract_details or {})
     return result
+
+
+def _marks_session(
+    bars_by_ticker: Mapping[str, list[dict]],
+    valuation_at: datetime | None,
+) -> date | None:
+    """The US session whose closes ``current_prices`` holds (KAN-103).
+
+    Taken from the bars actually priced, cross-checked against the valuation
+    instant (``valuation_at``, or now for a harness run without a budget):
+    a session that had not closed by then is a partial bar and yields None.
+    """
+    sessions = [_bar_date(bars[-1]["date"]) for bars in bars_by_ticker.values() if bars]
+    if not sessions:
+        return None
+    return stamp_session(
+        max(sessions), valuation_at or datetime.now(timezone.utc)
+    )
 
 
 def _bar_date(value: object) -> date:
