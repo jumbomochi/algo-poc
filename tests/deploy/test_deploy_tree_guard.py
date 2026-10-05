@@ -31,12 +31,77 @@ LAUNCHD = REPO / "deploy/launchd"
 _DEFAULT_RE = re.compile(r'^ALGO_DIR="\$\{ALGO_DIR:-[^}]*\}"$', re.MULTILINE)
 
 
+GIT_TIMEOUT = 60
+
+# Passed as GIT_CONFIG_COUNT/KEY/VALUE, so the git that deploy.sh runs sees
+# them too. Auto-maintenance is off because it detaches: every commit, fetch
+# and push used to leave a background `git maintenance run --auto` in the repo
+# it touched, still running when the test's next git command arrived (KAN-101).
+# Not a confirmed cause of the flake, but it is the only concurrency these
+# throwaway repos have, and nothing here needs it.
+#
+# Git drops GIT_CONFIG_* (and GIT_CONFIG_PARAMETERS, i.e. `-c`) before spawning
+# the receive-pack/upload-pack of a local-path push or fetch, so none of this
+# reaches origin's side — _ORIGIN_CONFIG is written into origin itself.
+_GIT_CONFIG = {
+    "user.name": "t",
+    "user.email": "t@t",
+    "init.defaultBranch": "main",
+    "commit.gpgsign": "false",
+    "maintenance.auto": "false",
+    "gc.auto": "0",
+}
+_ORIGIN_CONFIG = {"maintenance.auto": "false", "gc.auto": "0", "receive.autogc": "false"}
+
+
+def _git_env() -> dict[str, str]:
+    """The environment for every git these tests run, directly or via deploy.sh.
+
+    Isolated from the host (KAN-101): no system or global git config (hooks,
+    signing, templateDir, insteadOf, safe.directory), and no inherited GIT_*
+    variable — a GIT_DIR or GIT_INDEX_FILE from a parent hook or shell would
+    point these commands at a different repository entirely.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+               GIT_TERMINAL_PROMPT="0", GIT_CONFIG_COUNT=str(len(_GIT_CONFIG)))
+    for i, (key, value) in enumerate(_GIT_CONFIG.items()):
+        env[f"GIT_CONFIG_KEY_{i}"] = key
+        env[f"GIT_CONFIG_VALUE_{i}"] = value
+    return env
+
+
+def _text(stream: str | bytes | None) -> str:
+    # TimeoutExpired carries bytes even under text=True.
+    if isinstance(stream, bytes):
+        return stream.decode(errors="replace")
+    return stream or ""
+
+
 def _git(cwd: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main",
-         *args],
-        cwd=cwd, check=True, capture_output=True, text=True, timeout=60,
-    ).stdout.strip()
+    """Run git, and on failure say which command, where, and what git said.
+
+    check=True used to raise a CalledProcessError naming only the exit status,
+    which is all the 2026-10-02 CI failure of this file left behind (KAN-101).
+    """
+    cmd = ["git", *args]
+    env = _git_env()
+    try:
+        res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                             timeout=GIT_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(
+            f"{' '.join(cmd)} timed out after {GIT_TIMEOUT}s in {cwd}\n"
+            f"--- stdout ---\n{_text(exc.stdout)}\n--- stderr ---\n{_text(exc.stderr)}"
+        )
+    if res.returncode != 0:
+        version = subprocess.run(["git", "--version"], capture_output=True, text=True,
+                                 env=env).stdout.strip()
+        pytest.fail(
+            f"{' '.join(cmd)} exited {res.returncode} in {cwd} ({version})\n"
+            f"--- stdout ---\n{res.stdout}\n--- stderr ---\n{res.stderr}"
+        )
+    return res.stdout.strip()
 
 
 def _make_tree(root: Path, clone_path: Path) -> None:
@@ -56,6 +121,8 @@ def host(tmp_path):
     tmp_path = tmp_path.resolve()
     origin = tmp_path / "origin.git"
     _git(tmp_path, "init", "-q", "--bare", str(origin))
+    for key, value in _ORIGIN_CONFIG.items():
+        _git(origin, "config", key, value)
 
     clone = tmp_path / "algo-poc-deploy"
     clone.mkdir()
@@ -76,7 +143,7 @@ def host(tmp_path):
 
 
 def _deploy(tree: Path, home: Path, stub: Path, *args: str) -> subprocess.CompletedProcess:
-    env = dict(os.environ, HOME=str(home), ALGO_LAUNCHCTL_BIN=str(stub),
+    env = dict(_git_env(), HOME=str(home), ALGO_LAUNCHCTL_BIN=str(stub),
                ALGO_BRANCH_PROBE_TIMEOUT="5")
     # An operator's exported ALGO_DIR / ALGO_BRANCH_DIR must not decide which
     # tree counts as the clone.
@@ -274,3 +341,28 @@ def test_override_with_dry_run_writes_no_record(host, tmp_path):
 
     assert res.returncode == 0, res.stdout + res.stderr
     assert list(home.iterdir()) == []
+
+
+def test_a_failing_git_call_reports_the_command_and_gits_stderr(tmp_path):
+    """KAN-101: the 2026-10-02 CI failure said only 'exit status 1'."""
+    with pytest.raises(pytest.fail.Exception) as exc:
+        _git(tmp_path, "rev-parse", "--verify", "no-such-ref")
+    msg = str(exc.value)
+    assert "git rev-parse --verify no-such-ref exited 128" in msg
+    assert str(tmp_path) in msg
+    assert "fatal:" in msg, "git's own stderr must be in the failure"
+
+
+def test_git_ignores_a_leaked_git_dir_and_the_host_config(tmp_path, monkeypatch):
+    """KAN-101 hardening: a GIT_DIR exported by a parent hook or shell must not
+    redirect these commands into another repository, and the host's global
+    config must not reach them."""
+    elsewhere = tmp_path / "elsewhere.git"
+    monkeypatch.setenv("GIT_DIR", str(elsewhere))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    assert (repo / ".git").is_dir()
+    assert not elsewhere.exists()
+    assert _git(repo, "config", "--show-origin", "user.email") == "command line:\tt@t"
+    assert _git(repo, "config", "--global", "--list") == ""
