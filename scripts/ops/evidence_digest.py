@@ -972,9 +972,20 @@ def _ping_deadman() -> None:
     The URL is exported by the launchd wrapper, which resolves it through
     KAN-15's keychain loader — the lookup stays in one place rather than being
     reimplemented here.
+
+    The TLS context is built from certifi's bundle on purpose. The production
+    venv's Python has no default CA file (``ssl.get_default_verify_paths()``
+    reports ``cafile=None``), so a bare ``urlopen`` failed every https ping
+    with CERTIFICATE_VERIFY_FAILED — the check was never pinged, and a
+    healthchecks.io check that has never been pinged never alerts. The bash
+    wrappers ping with curl, which uses the system trust store, so only this
+    path was affected. ``certifi`` is installed via ``httpx``.
     """
     import os
+    import ssl
     import urllib.request
+
+    import certifi
 
     url = os.environ.get(DEADMAN_URL_VAR, "")
     if not url.startswith(("http://", "https://")):
@@ -984,7 +995,8 @@ def _ping_deadman() -> None:
             file=sys.stderr,
         )
         return
-    urllib.request.urlopen(url, timeout=10).close()
+    context = ssl.create_default_context(cafile=certifi.where())
+    urllib.request.urlopen(url, timeout=10, context=context).close()
 
 
 def main(argv: list[str] | None = None) -> int:
