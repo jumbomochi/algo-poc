@@ -523,6 +523,54 @@ def test_a_failing_dead_man_ping_does_not_fail_the_digest():
     assert exit_code == 0
 
 
+def test_the_dead_man_ping_verifies_tls_against_certifis_bundle(monkeypatch):
+    """The deploy venv's Python has no default CA file.
+
+    A bare ``urlopen`` there failed every https ping with
+    CERTIFICATE_VERIFY_FAILED (evidence_digest_20260928.log and
+    evidence_digest_20261005.log), so the healthchecks.io check was never
+    pinged — and a never-pinged check never alerts. The ping must carry a
+    verifying context built from certifi, not fall back to the interpreter's
+    (absent) defaults, and not skip verification to get around them.
+    """
+    import ssl
+    import urllib.request
+
+    import certifi
+
+    built: list[dict] = []
+    real_create_default_context = ssl.create_default_context
+
+    def _spy_create_default_context(*args, **kwargs):
+        built.append(kwargs)
+        return real_create_default_context(*args, **kwargs)
+
+    calls: list[tuple[str, dict]] = []
+
+    class _Response:
+        def close(self) -> None:
+            pass
+
+    def _fake_urlopen(url, **kwargs):
+        calls.append((url, kwargs))
+        return _Response()
+
+    monkeypatch.setattr(ssl, "create_default_context", _spy_create_default_context)
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setenv(evidence_digest.DEADMAN_URL_VAR, "https://hc-ping.example/abc")
+
+    evidence_digest._ping_deadman()
+
+    assert built == [{"cafile": certifi.where()}]
+    [(url, kwargs)] = calls
+    assert url == "https://hc-ping.example/abc"
+    context = kwargs["context"]
+    assert isinstance(context, ssl.SSLContext)
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname is True
+    assert context.get_ca_certs(), "certifi's bundle loaded no CA certificates"
+
+
 # ---------------------------------------------------------------------------
 # The real collectors, against sqlite and a fake Redis
 # ---------------------------------------------------------------------------
