@@ -414,7 +414,14 @@ class ExecutionServiceRunner:
             )
             return
         finally:
-            self._order_ledger.session.rollback()
+            # Its own guard: a rollback failure must not escape setup() and
+            # turn a best-effort seed into a startup failure.
+            try:
+                self._order_ledger.session.rollback()
+            except Exception:
+                self._logger.exception(
+                    "Rollback after seeding booked executions failed"
+                )
         if booked:
             self._logger.info(
                 "Seeded booked executions of restored orders",
@@ -1179,8 +1186,14 @@ class ExecutionServiceRunner:
         if fill.recovery_source:
             # The live callback first saw this execution in IB's execution
             # record: it was probably missed live (KAN-98). Paged in a batch
-            # with the rest of its sweep pass or burst (KAN-102).
-            self._unpaged_recoveries.append(fill)
+            # with the rest of its sweep pass or burst (KAN-102). Queued once:
+            # if a later step here raises, the executor's retry runs this
+            # again for the same execution.
+            if fill.execution_id is None or all(
+                queued.execution_id != fill.execution_id
+                for queued in self._unpaged_recoveries
+            ):
+                self._unpaged_recoveries.append(fill)
             self._last_recovery_queued_at = asyncio.get_running_loop().time()
 
         self._logger.info(

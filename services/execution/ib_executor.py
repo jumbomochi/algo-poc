@@ -520,20 +520,29 @@ class IBExecutor:
         try:
             from ib_insync import IB
 
+            # The wrapper about to be built holds nothing yet: no sweep may
+            # treat it as a complete record until this connect proves it
+            # (window a). The epoch at the start tells whether a connectivity
+            # event landed during the handshake.
+            self._exec_record_epoch = None
+            epoch_at_start = self._connectivity_epoch
             self._ib = IB()
-            # Bound before connectAsync (KAN-102, window b): a live execution
-            # processed during connect's own sync fires the fresh Trade's
-            # fillEvent before our callbacks are re-bound to it, but always
-            # fires this client-wide event.
+            # Both bound before connectAsync, once per IB instance (each connect
+            # builds a fresh one):
+            # - server-connectivity events (Error 1100/1101/1102), so one
+            #   during the handshake is counted and the execution record is not
+            #   wrongly marked complete (KAN-102);
+            # - the client-wide execDetailsEvent (KAN-102, window b): a live
+            #   execution processed during connect's own sync fires the fresh
+            #   Trade's fillEvent before our callbacks are re-bound to it, but
+            #   always fires this one.
+            self._ib.errorEvent += self._on_ib_error
             exec_details_event = getattr(self._ib, "execDetailsEvent", None)
             if exec_details_event is not None:
                 exec_details_event += self._on_live_exec_details
             await self._ib.connectAsync(
                 self._host, self._port, clientId=self._client_id
             )
-            # Observe server-connectivity events (Error 1100/1101/1102). The IB
-            # instance is recreated per connect, so re-attach every time.
-            self._ib.errorEvent += self._on_ib_error
             accounts = self._ib.managedAccounts()
 
             if expect_paper:
@@ -584,8 +593,11 @@ class IBExecutor:
             self._reregister_open_trades()
             self._connection_generation += 1
             # connectAsync returns only after its own reqExecutions, so the
-            # wrapper now holds every execution IB serves (window a).
-            self._exec_record_epoch = self._connectivity_epoch
+            # wrapper now holds every execution IB serves (window a) — unless
+            # a connectivity event arrived during the handshake, in which case
+            # the record stays incomplete until a full sweep read.
+            if self._connectivity_epoch == epoch_at_start:
+                self._exec_record_epoch = epoch_at_start
 
             # A healthy session proves server connectivity: clear any stale
             # lost-marker left by a socket that dropped without a 1102.
@@ -857,15 +869,27 @@ class IBExecutor:
         async def _deliver() -> None:
             try:
                 await handler(payload)
-                # Marked only once the handler succeeded: a duplicate delivery
-                # after a failed publish must still get through, because it is
-                # that fill's retry.
-                self._reported_exec_ids.add(exec_id)
-            finally:
+            except asyncio.CancelledError:
+                # Teardown: never respawn a delivery into a shutdown. The held
+                # copy goes too; IB keeps the execution, and the next process's
+                # sweep reads it back.
+                self._delivering_exec_ids.discard(exec_id)
+                self._held_replays.pop(exec_id, None)
+                raise
+            except Exception:
+                # A failed delivery: a copy held meanwhile is its retry. Only
+                # one retry per held copy; a later replay gets through as usual.
                 self._delivering_exec_ids.discard(exec_id)
                 retry = self._held_replays.pop(exec_id, None)
-                if retry is not None and exec_id not in self._reported_exec_ids:
+                if retry is not None:
                     self._deliver_fill(exec_id, retry, handler)
+                raise
+            # Marked only once the handler succeeded: a duplicate delivery
+            # after a failed publish must still get through, because it is
+            # that fill's retry.
+            self._reported_exec_ids.add(exec_id)
+            self._delivering_exec_ids.discard(exec_id)
+            self._held_replays.pop(exec_id, None)
 
         task = self._spawn(_deliver())
         self._delivery_tasks.add(task)

@@ -723,3 +723,183 @@ class TestTheSweepPassPagesOnceForBothPaths:
 
         assert await runner.maybe_page_recovered_fills(_later()) is True
         assert [a.event_type for a in _alerts(redis)] == ["execution_sweep_recovered"]
+
+
+# --------------------------------------------------------------------------
+# PR #227 review follow-ups
+# --------------------------------------------------------------------------
+
+
+class TestDeliveryFailureAndTeardown:
+    async def test_when_the_retry_fails_too_a_later_replay_still_gets_through(self):
+        calls = []
+        gate = asyncio.Event()
+
+        async def failing(payload):
+            calls.append(payload)
+            if len(calls) == 1:
+                await gate.wait()
+            if len(calls) <= 2:
+                raise RuntimeError("transient Redis failure")
+
+        executor, ib, _ = await _connected_executor(handler=failing)
+        executor._logger = MagicMock()
+        _live(ib.wrapper, "x.live")
+        await _settle()
+        ib.wrapper.commissionReport(_report("x.live"))  # held as the retry
+        gate.set()
+        await _settle()
+
+        # The first delivery and its one retry both failed; nothing is held
+        # and nothing is marked reported, so the next replay is a delivery.
+        assert len(calls) == 2
+        assert "x.live" not in executor._reported_exec_ids
+        assert executor._held_replays == {}
+        assert executor._delivering_exec_ids == set()
+
+        ib.wrapper.commissionReport(_report("x.live"))
+        await _settle()
+
+        assert len(calls) == 3
+        assert "x.live" in executor._reported_exec_ids
+
+    async def test_a_cancelled_delivery_never_respawns_its_held_replay(self):
+        calls = []
+
+        async def hung(payload):
+            calls.append(payload)
+            await asyncio.sleep(3600)
+
+        executor, ib, _ = await _connected_executor(handler=hung)
+        _live(ib.wrapper, "x.live")
+        await _settle()
+        ib.wrapper.commissionReport(_report("x.live"))  # held
+        await _settle()
+        assert "x.live" in executor._held_replays
+
+        for task in list(executor._delivery_tasks):
+            task.cancel()
+        await _settle()
+
+        assert len(calls) == 1
+        assert executor._delivery_tasks == set()
+        assert executor._held_replays == {}
+        assert executor._delivering_exec_ids == set()
+
+
+class TestConnectivityDuringTheHandshake:
+    @pytest.mark.parametrize("code", [1100, 1102])
+    async def test_an_event_inside_connect_async_leaves_the_record_incomplete(
+        self, code
+    ):
+        executor, ib, delivered = await _connected_executor(
+            during_connect=lambda wrapper: wrapper.ib.errorEvent.emit(
+                -1, code, "connectivity event", None
+            )
+        )
+        assert executor._connectivity_epoch == 1
+
+        def replay(wrapper):
+            wrapper.execDetails(SWEEP_REQ_ID, _contract(), _execution("x.new"))
+            wrapper.commissionReport(_report("x.new"))
+            wrapper.execDetailsEnd(SWEEP_REQ_ID)
+
+        _sweep_replies(ib, replay)
+        await executor.recent_executions()
+        await _settle()
+
+        # Could have been missed while the Gateway was cut off: stamped.
+        [payload] = delivered
+        assert payload["recovery_source"] == RECOVERY_SOURCE_SWEEP
+
+    async def test_the_error_handler_is_bound_once_per_connect(self):
+        executor, ib, _ = await _connected_executor()
+
+        ib.errorEvent.emit(-1, 1100, "connectivity lost", None)
+
+        assert executor._connectivity_epoch == 1
+
+
+class TestACommissionReportAfterTheDrain:
+    async def test_a_late_report_is_booked_once_whichever_path_wins(self, session):
+        """The drain only waits for deliveries already spawned. A report that
+        lands while it waits — a later socket chunk — spawns a delivery it
+        never saw, so the sweep may book that fill itself; the runner's dedupe
+        still lets exactly one booking through."""
+        _seed_xlc_submitted(session)
+        order_manager = AsyncMock()
+        order_manager.open_orders = {}
+        order_manager.broker_connection_generation = AsyncMock(return_value=1)
+        runner, redis = _runner(session, order_manager=order_manager)
+        executor, ib, _ = await _connected_executor(handler=runner.handle_ib_fill)
+        order_manager.recent_broker_executions = executor.recent_executions
+
+        def replay(wrapper):
+            # x.first is delivered inside the reply, so the drain has a task
+            # to wait on; x.late's report comes in the next chunk, during it.
+            wrapper.execDetails(SWEEP_REQ_ID, _contract(), _execution("x.first"))
+            wrapper.commissionReport(_report("x.first"))
+            wrapper.execDetails(
+                SWEEP_REQ_ID, _contract(),
+                _execution("x.late", shares=10.0, cum_qty=20.0),
+            )
+            wrapper.execDetailsEnd(SWEEP_REQ_ID)
+            asyncio.get_running_loop().call_soon(
+                wrapper.commissionReport, _report("x.late")
+            )
+
+        _sweep_replies(ib, replay)
+        await runner.maybe_run_execution_sweep(0.0)
+        await _settle()
+
+        published = [
+            FillMessage.from_stream_dict(c.args[1]).execution_id
+            for c in redis.publish.await_args_list
+            if c.args[0] == "stream:fills"
+        ]
+        assert sorted(published) == ["x.first", "x.late"]
+
+
+class TestReviewFollowUpsInTheRunner:
+    async def test_a_retried_fill_is_queued_for_its_page_once(self):
+        runner, redis = _runner()
+        runner._cover_position_with_stop = AsyncMock(
+            side_effect=[RuntimeError("stop placement blew up"), None]
+        )
+
+        with pytest.raises(RuntimeError):
+            await runner.handle_ib_fill(_fill_info("x.1"))
+        await runner.handle_ib_fill(_fill_info("x.1"))  # the executor's retry
+        await runner.maybe_page_recovered_fills(_later())
+
+        [alert] = _alerts(redis)
+        assert alert.context["recovered"] == "1"
+        assert alert.context["execution_ids"] == "x.1"
+
+    async def test_a_failed_rollback_after_the_seed_never_blocks_startup(
+        self, session
+    ):
+        await TestARestartSeedsWhatIsAlreadyBooked()._book_partial_fill(session)
+        manager = _RestartedManager()
+        runner, _ = _runner(session, order_manager=manager)
+        real_booked = runner._order_ledger.booked_execution_ids
+        real_rollback = session.rollback
+        failures = ["connection reset"]
+
+        def flaky_rollback():
+            if failures:
+                raise RuntimeError(failures.pop())
+            real_rollback()
+
+        def booked_then_break_rollback(order_ids):
+            booked = real_booked(order_ids)
+            session.rollback = flaky_rollback  # the seed's own rollback fails
+            return booked
+
+        runner._order_ledger.booked_execution_ids = booked_then_break_rollback
+
+        await runner.setup()
+
+        assert failures == []  # the failing rollback did run
+        assert manager.seeded == {"x.booked"}
+        assert manager.events == ["seed", "restore"]
