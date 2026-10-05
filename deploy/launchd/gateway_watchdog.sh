@@ -145,6 +145,21 @@ algo_local_hms() {
     return 1
 }
 
+# Local "W HH MM SS" for an epoch, W from %w (0 = Sunday … 6 = Saturday, which
+# is launchd's Weekday numbering), or non-zero if it cannot be read. Same two
+# spellings and the same shape check as algo_local_hms, for the same reason
+# (KAN-99).
+algo_local_wday_hms() {
+    local out
+    for out in "$(date -r "$1" '+%w %H %M %S' 2>/dev/null)" \
+               "$(date -d "@$1" '+%w %H %M %S' 2>/dev/null)"; do
+        case "$out" in
+            [0-6]" "[0-9][0-9]" "[0-9][0-9]" "[0-9][0-9]) printf '%s\n' "$out"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
 # Drift guard: warn loudly if this deployed copy has fallen behind the repo
 # canonical. The 2026-08-11 cold-boot auth failure was a stale ~/ibc copy still
 # using the pre-T3 default DB password. Warn-only — a legitimately newer
@@ -173,24 +188,54 @@ need_alert() {
 # (04:15 fell before the NYSE close every EST winter).
 PAPER_RUN_HOUR=5
 PAPER_RUN_MIN=15
+# launchd Weekday numbering: 0 or 7 = Sunday, 1 = Monday … 6 = Saturday. The
+# job runs Tue–Sat SGT, i.e. after each US Mon–Fri session (KAN-99).
+PAPER_RUN_WEEKDAYS="2 3 4 5 6"
 
-# Seconds from now until the next local paper-run slot. Computed from the local
-# time-of-day rather than by parsing a date string, because `date -j -f` is
-# BSD-only and this has to run under the Linux CI that tests it.
-secs_to_paper_run() {
-    local hms h m s sod run delta
+# "SECS W": seconds from now until the next scheduled paper run, and that run's
+# weekday (0-6), or "SECS -" on the fallback below. Computed from the local
+# weekday and time of day rather than by parsing a date string, because
+# `date -j -f` is BSD-only and this has to run under the Linux CI that tests it.
+#
+# KAN-99: the countdown used to target the next 04:15 on ANY day, so a weekend
+# login failure escalated toward a Sunday and a Monday 04:15 that launchd never
+# fires, and every page said that run "will abort". It now steps forward a day
+# at a time to the first weekday in PAPER_RUN_WEEKDAYS. Each step is a flat
+# 86400s: the host is SGT, which has no daylight saving.
+paper_run_countdown() {
+    local whms w h m s sod run delta off cand day rd
     # Cannot read the clock → fall back to the slowest cadence rather than
     # inventing an urgency, and say so in the log.
-    if ! hms="$(algo_local_hms "$(now_epoch)")"; then
+    if ! whms="$(algo_local_wday_hms "$(now_epoch)")"; then
         echo "$(ts): WARNING - could not read the local time of day; re-alert cadence falls back to ${REALERT_MAX_SECS}s" >> "$LOG_FILE"
-        echo "$REALERT_MAX_SECS"; return 0
+        echo "$REALERT_MAX_SECS -"; return 0
     fi
-    read -r h m s <<< "$hms"
+    read -r w h m s <<< "$whms"
     sod=$(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
     run=$(( PAPER_RUN_HOUR * 3600 + PAPER_RUN_MIN * 60 ))
     delta=$(( run - sod ))
-    [ "$delta" -lt 0 ] && delta=$(( delta + 86400 ))
-    echo "$delta"
+    # Offset 7 is today's weekday again, for when today is the only run day
+    # and its run has already passed.
+    for off in 0 1 2 3 4 5 6 7; do
+        cand=$(( delta + off * 86400 ))
+        [ "$cand" -ge 0 ] || continue
+        day=$(( (w + off) % 7 ))
+        for rd in $PAPER_RUN_WEEKDAYS; do
+            if [ $(( rd % 7 )) -eq "$day" ]; then
+                echo "$cand $day"; return 0
+            fi
+        done
+    done
+    # Unreachable unless PAPER_RUN_WEEKDAYS is empty or garbage.
+    echo "$(ts): WARNING - PAPER_RUN_WEEKDAYS='${PAPER_RUN_WEEKDAYS}' names no weekday; re-alert cadence falls back to ${REALERT_MAX_SECS}s" >> "$LOG_FILE"
+    echo "$REALERT_MAX_SECS -"
+}
+
+# Seconds from now until the next scheduled paper run.
+secs_to_paper_run() {
+    local secs _day
+    read -r secs _day <<< "$(paper_run_countdown)"
+    echo "$secs"
 }
 
 # KAN-62 part 2: while the Gateway is unusable, how often to re-alert. A flat
@@ -408,9 +453,24 @@ if [ -n "$LATEST_GW_LOG" ] && tail -80 "$LATEST_GW_LOG" 2>/dev/null \
     # (2026-07-07..09), and a flat 12h cadence cost the 2026-08-21 session.
     REALERT_SECS="$(auth_realert_secs)"
     if need_alert "$AUTH_MARKER" "$REALERT_SECS"; then
-        MINS_TO_RUN=$(( $(secs_to_paper_run) / 60 ))
-        echo "$(ts): AUTH FAILURE in $LATEST_GW_LOG — refusing to kickstart; alerted operator (re-alert ${REALERT_SECS}s, ${MINS_TO_RUN} min to the ${PAPER_RUN_HOUR}:$(printf '%02d' "$PAPER_RUN_MIN") run)" >> "$LOG_FILE"
-        telegram "🚨 IB Gateway login is being REJECTED (port $PORT down). Watchdog will NOT restart it — repeated failed logins risk an IB lockout. Manual re-login needed. The ${PAPER_RUN_HOUR}:$(printf '%02d' "$PAPER_RUN_MIN") paper run is in ${MINS_TO_RUN} min and will abort unless this is fixed."
+        read -r SECS_TO_RUN RUN_WDAY <<< "$(paper_run_countdown)"
+        RUN_HHMM="$(printf '%02d:%02d' "$PAPER_RUN_HOUR" "$PAPER_RUN_MIN")"
+        if [ "$SECS_TO_RUN" -ge 86400 ] && [ "$RUN_WDAY" != "-" ]; then
+            # KAN-99: a day or more out, say WHICH run and how far in days —
+            # "in 3438 min" to an unnamed 4:15 is how a weekend page came to
+            # point at a Sunday run that does not exist.
+            RUN_DAY_NAMES=(Sun Mon Tue Wed Thu Fri Sat)
+            RUN_NAME="${RUN_DAY_NAMES[$RUN_WDAY]} ${RUN_HHMM}"
+            RUN_IN="$(( SECS_TO_RUN / 86400 ))d $(( SECS_TO_RUN % 86400 / 3600 ))h"
+            LOG_RUN="${RUN_IN} to the next paper run (${RUN_NAME})"
+            MSG_RUN="The next paper run (${RUN_NAME}) is in ${RUN_IN}"
+        else
+            MINS_TO_RUN=$(( SECS_TO_RUN / 60 ))
+            LOG_RUN="${MINS_TO_RUN} min to the ${PAPER_RUN_HOUR}:$(printf '%02d' "$PAPER_RUN_MIN") run"
+            MSG_RUN="The ${PAPER_RUN_HOUR}:$(printf '%02d' "$PAPER_RUN_MIN") paper run is in ${MINS_TO_RUN} min"
+        fi
+        echo "$(ts): AUTH FAILURE in $LATEST_GW_LOG — refusing to kickstart; alerted operator (re-alert ${REALERT_SECS}s, ${LOG_RUN})" >> "$LOG_FILE"
+        telegram "🚨 IB Gateway login is being REJECTED (port $PORT down). Watchdog will NOT restart it — repeated failed logins risk an IB lockout. Manual re-login needed. ${MSG_RUN} and will abort unless this is fixed."
         touch "$AUTH_MARKER"
     fi
     # NOTE (KAN-62): $MARKER is deliberately NOT removed here. It is the
