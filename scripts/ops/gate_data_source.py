@@ -200,7 +200,26 @@ class PostgresGateDataSource:
         report's are the same number, computed once. That module speaks
         percent; the gate's threshold is a fraction.
         """
-        start = self.get_paper_start_date().date()
+        # The paper clock is a run date (gate 1 is a calendar span), but
+        # equity_series is keyed by the US session each row valued (KAN-103),
+        # which is the day before. Bounding the series by the run date would
+        # drop the first mark — the peak, when the clock restarts on a funded
+        # book. So the series starts at the session the first in-window run
+        # valued.
+        start_run = self.get_paper_start_date().date()
+        start = self._session.scalar(
+            select(func.min(EquitySnapshot.session_date)).where(
+                self._real_equity(),
+                EquitySnapshot.date >= start_run,
+                EquitySnapshot.session_date.is_not(None),
+            )
+        )
+        if start is None:
+            raise GateDataUnavailable(
+                "no session-dated equity snapshots in the paper window, so "
+                "drawdown is unmeasured rather than zero (has "
+                "scripts/ops/backfill_snapshot_sessions.py --apply run?)"
+            )
         rows = equity_series(
             self._session,
             start=start,

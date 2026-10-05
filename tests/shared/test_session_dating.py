@@ -10,11 +10,12 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 
 from shared import session_dating
+from shared.session_close import CLOSE_SETTLE, newest_bar_session
 from shared.session_dating import (
     infer_session,
+    is_closed,
     last_closed_session,
     last_session_before,
-    session_in_progress,
     stamp_session,
 )
 
@@ -128,13 +129,14 @@ def test_a_calendar_failure_stamps_none_instead_of_raising(log):
 # ---------------------------------------------------------------- helpers
 
 
-def test_last_closed_session_honours_the_close_instant():
-    # 16:00 EDT on 09-28 is 20:00 UTC.
+def test_last_closed_session_honours_the_close_plus_its_settle_margin():
+    # 16:00 EDT on 09-28 is 20:00 UTC; KAN-104 trusts the bar from 16:05.
+    assert CLOSE_SETTLE == timedelta(minutes=5)
     assert last_closed_session(
-        datetime(2026, 9, 28, 19, 59, tzinfo=timezone.utc)
+        datetime(2026, 9, 28, 20, 4, tzinfo=timezone.utc)
     ) == date(2026, 9, 25)
     assert last_closed_session(
-        datetime(2026, 9, 28, 20, 0, tzinfo=timezone.utc)
+        datetime(2026, 9, 28, 20, 5, tzinfo=timezone.utc)
     ) == date(2026, 9, 28)
 
 
@@ -144,12 +146,42 @@ def test_last_session_before_skips_weekends_and_holidays():
     assert last_session_before(date(2026, 8, 9)) == date(2026, 8, 7)
 
 
-def test_session_in_progress_is_rth_only():
-    assert session_in_progress(sgt(2026, 9, 29, 22, 0)) == date(2026, 9, 29)
-    assert session_in_progress(sgt(2026, 9, 29, 4, 15)) is None
-    assert session_in_progress(sgt(2026, 9, 8, 0, 30)) is None  # Labor Day
-    # Winter: 04:15 SGT is 15:15 EST, inside the 11-02 session.
-    assert session_in_progress(sgt(2026, 11, 3, 4, 15)) == date(2026, 11, 2)
+def test_closed_means_what_the_kan104_close_guard_means():
+    """One notion of "closed": the stamp cannot pass what the guard refuses."""
+    from shared.session_close import unclosed_session
+
+    for session, at in [
+        (date(2026, 9, 28), datetime(2026, 9, 28, 20, 4, tzinfo=timezone.utc)),
+        (date(2026, 9, 28), datetime(2026, 9, 28, 20, 5, tzinfo=timezone.utc)),
+        (date(2026, 11, 27), datetime(2026, 11, 27, 18, 3, tzinfo=timezone.utc)),
+        (date(2026, 11, 2), sgt(2026, 11, 3, 4, 15)),
+        (date(2026, 11, 2), sgt(2026, 11, 3, 5, 15)),
+    ]:
+        guard_passes = unclosed_session(session, at) is None
+        assert is_closed(session, at) is guard_passes
+        assert (stamp_session(session, at) == session) is guard_passes
+
+
+def test_the_stamp_takes_the_session_the_close_guard_checks(log):
+    """run_paper stamps newest_bar_session, the guard's own reading of the bars."""
+    from scripts.run_paper import _marks_session
+
+    bars = {
+        "AAPL": [{"date": "2026-09-25"}, {"date": "2026-09-28"}],
+        "LAG": [{"date": "2026-09-25"}],
+        "EMPTY": [],
+    }
+    at = sgt(2026, 9, 29, 5, 15)
+    assert newest_bar_session(bars) == date(2026, 9, 28)
+    assert _marks_session(bars, at) == date(2026, 9, 28)
+    # Without valuation_at, the fetch start is the instant checked.
+    assert _marks_session(bars, None, priced_at=at) == date(2026, 9, 28)
+    assert _marks_session(bars, None, priced_at=sgt(2026, 9, 29, 4, 0)) is None
+
+
+def test_a_naive_priced_instant_is_utc_not_refused(log):
+    """session_close refuses naive datetimes; sqlite hands them back."""
+    assert is_closed(date(2026, 9, 28), datetime(2026, 9, 28, 20, 15))
 
 
 # ---------------------------------------------------------------- infer_session

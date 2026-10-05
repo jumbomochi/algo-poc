@@ -55,12 +55,12 @@ if str(_REPO_ROOT) not in sys.path:
 from shared.artifact_dir import durable_artifact_dir  # noqa: E402
 from shared.config import load_config  # noqa: E402
 from shared.models.equity_snapshot import EquitySnapshot  # noqa: E402
+from shared.session_close import session_in_progress  # noqa: E402
 from shared.session_dating import (  # noqa: E402
     as_utc,
     infer_session,
     last_closed_session,
     last_session_before,
-    session_in_progress,
 )
 
 CONFIRMATION = "BACKFILL SNAPSHOT SESSIONS"
@@ -143,12 +143,14 @@ def _resolve(
 ) -> tuple[date | None, str | None, str]:
     """(session, rule, reason-if-unresolved) for one recorded row."""
     instant = as_utc(valuation_at if valuation_at is not None else created_at)
+    # KAN-104's notion of "in progress": opened, and not yet past its close
+    # plus the settle margin. One definition for the guard and the backfill.
     trading = session_in_progress(instant)
     if trading is not None:
         which = "valuation_at" if valuation_at is not None else "created_at"
         return None, None, (
-            f"{which} {instant.isoformat()} falls inside the {trading} session; "
-            f"its bars may be partial"
+            f"{which} {instant.isoformat()} falls inside the "
+            f"{trading.session} session; its bars may be partial"
         )
     by_run_date = last_session_before(run_date)
     if valuation_at is not None:

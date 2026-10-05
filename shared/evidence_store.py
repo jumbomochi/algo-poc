@@ -62,6 +62,7 @@ from shared.models.evidence import (
     validate_manifest,
 )
 from shared.models.portfolio import Trade
+from shared.session_dating import last_closed_session
 from shared.universe import EXCLUDED_PORTFOLIO_PREFIX
 
 __all__ = [
@@ -570,6 +571,100 @@ def _round_trips(
     )
 
 
+#: Above this share of unstamped rows, the cause is not a stray partial-bar
+#: run (one NULL row per sleeve) but history the operator backfill has not
+#: filled — and every session-keyed reader is about to read NO_DATA or empty.
+UNSTAMPED_ALARM_SHARE = 0.5
+
+BACKFILL_HINT = (
+    "backfill not applied? Run scripts/ops/backfill_snapshot_sessions.py "
+    "(dry-run, then --apply)"
+)
+
+
+@dataclass(frozen=True)
+class UnstampedSnapshots:
+    """How many real-sleeve snapshots in a run-date span carry no session."""
+
+    unstamped: int
+    total: int
+
+    @property
+    def share(self) -> float:
+        return self.unstamped / self.total if self.total else 0.0
+
+    @property
+    def alarming(self) -> bool:
+        return self.total > 0 and self.share >= UNSTAMPED_ALARM_SHARE
+
+    def describe(self, span: str) -> str:
+        return (
+            f"{self.unstamped} of {self.total} equity snapshots {span} carry "
+            f"no session_date (KAN-103) — {BACKFILL_HINT}. Until then those "
+            "sessions are excluded, so they read as NO_DATA or empty, not as "
+            "a clean record"
+        )
+
+
+def unstamped_snapshots(
+    session: Session,
+    *,
+    start: date | None,
+    end: date | None = None,
+    excluded_prefix: str = EXCLUDED_PORTFOLIO_PREFIX,
+) -> UnstampedSnapshots:
+    """Count unstamped rows by RUN date (``date``), the only date they have.
+
+    The pre-flight for every session-keyed reader: a quiet NO_DATA after a
+    deploy that skipped the backfill would look exactly like a dead monitor.
+    """
+    filters = [~EquitySnapshot.portfolio.startswith(excluded_prefix, autoescape=True)]
+    if start is not None:
+        filters.append(EquitySnapshot.date >= start)
+    if end is not None:
+        filters.append(EquitySnapshot.date <= end)
+    total, unstamped = session.execute(
+        select(
+            func.count(),
+            func.count().filter(EquitySnapshot.session_date.is_(None)),
+        ).where(*filters)
+    ).one()
+    return UnstampedSnapshots(unstamped=int(unstamped or 0), total=int(total or 0))
+
+
+def session_snapshots(
+    session: Session,
+    *,
+    start: date,
+    end: date,
+    excluded_prefix: str = EXCLUDED_PORTFOLIO_PREFIX,
+) -> dict[date, dict[str, EquitySnapshot]]:
+    """The snapshot of record for each (US session, portfolio) in the window.
+
+    Keyed by ``session_date``, the session the row valued (KAN-103), never by
+    ``date``, the SGT run date. Unstamped rows are excluded: a partial-bar
+    run, or history the operator backfill has not filled, has no session to
+    file under. Where two run dates valued one session (the Tuesday after a US
+    Monday holiday, a weekend catch-up) the later run's row is the one of
+    record, so a sum across portfolios can never count a session twice.
+    """
+    rows = session.execute(
+        select(EquitySnapshot)
+        .where(
+            EquitySnapshot.session_date.is_not(None),
+            EquitySnapshot.session_date >= start,
+            EquitySnapshot.session_date <= end,
+            ~EquitySnapshot.portfolio.startswith(excluded_prefix, autoescape=True),
+        )
+        .order_by(EquitySnapshot.session_date, EquitySnapshot.date)
+    ).scalars().all()
+    out: dict[date, dict[str, EquitySnapshot]] = {}
+    for row in rows:
+        # Ascending by run date, so a later run overwrites an earlier one.
+        out.setdefault(row.session_date, {})[row.portfolio] = row
+    return out
+
+
 def equity_series(
     session: Session,
     *,
@@ -577,30 +672,29 @@ def equity_series(
     end: date,
     excluded_prefix: str = EXCLUDED_PORTFOLIO_PREFIX,
 ) -> list[tuple[date, float, float]]:
-    """Per-date ``(date, summed equity, summed market value)``, ascending.
+    """Per-session ``(session, summed equity, summed market value)``, ascending.
 
     Summed across sleeves and excluding synthetic portfolios — the same shape
     ``shared/position_loader.py`` already uses for ``peak_nav``, so the two
-    readers cannot disagree about what the account was worth.
+    readers cannot disagree about what the account was worth. Dated by the US
+    session valued, one row of record per portfolio per session
+    (:func:`session_snapshots`), so exposure is credited to the session it
+    was held over and a re-valued session is not counted twice.
 
     Public because the go-live gate's drawdown check reads the same series
     (KAN-42): two callers, one definition of what the account was worth.
     """
-    rows = session.execute(
-        select(
-            EquitySnapshot.date,
-            func.sum(EquitySnapshot.equity),
-            func.sum(EquitySnapshot.market_value),
+    by_session = session_snapshots(
+        session, start=start, end=end, excluded_prefix=excluded_prefix
+    )
+    return [
+        (
+            day,
+            sum(float(row.equity or 0.0) for row in rows.values()),
+            sum(float(row.market_value or 0.0) for row in rows.values()),
         )
-        .where(
-            EquitySnapshot.date >= start,
-            EquitySnapshot.date <= end,
-            ~EquitySnapshot.portfolio.startswith(excluded_prefix, autoescape=True),
-        )
-        .group_by(EquitySnapshot.date)
-        .order_by(EquitySnapshot.date)
-    ).all()
-    return [(row[0], float(row[1] or 0.0), float(row[2] or 0.0)) for row in rows]
+        for day, rows in sorted(by_session.items())
+    ]
 
 
 def max_drawdown_pct(rows: Sequence[tuple[date, float, float]]) -> float:
@@ -651,6 +745,7 @@ def epoch_progress(
     as_of: date,
     excluded_prefix: str = EXCLUDED_PORTFOLIO_PREFIX,
     calendar: object | None = None,
+    now: datetime | None = None,
 ) -> EpochProgress:
     """Score one epoch against the ladder's five criteria.
 
@@ -663,6 +758,10 @@ def epoch_progress(
     ``divergence``, ``drawdown`` and ``safety`` are never amber; ``drills`` and
     ``evidence_quantum`` are never red. That asymmetry is D12 made structural:
     a shortfall extends an epoch, a breach fails it.
+
+    ``now`` (default: the wall clock) bounds the scored span at the last NYSE
+    session closed by then (KAN-103), so a session still trading, or not yet
+    opened, is never counted as unobserved.
     """
     calendar = _resolve_calendar(calendar)
     epoch = _load_epoch(session, epoch_id)
@@ -688,6 +787,12 @@ def epoch_progress(
         as_of = today
 
     effective_as_of = _session_on_or_before(calendar, as_of) or as_of
+    # A session that has not closed has no verdict to have written (KAN-103):
+    # on an SGT Monday morning ``today`` is a US Monday that has not opened.
+    # Counting it would pause the clock, and call it blind, every week.
+    closed = last_closed_session(now or datetime.now(timezone.utc))
+    if closed is not None and effective_as_of > closed:
+        effective_as_of = _session_on_or_before(calendar, closed) or closed
     sessions = (
         calendar.trading_sessions(start, effective_as_of)
         if effective_as_of >= start

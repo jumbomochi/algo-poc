@@ -41,12 +41,19 @@ def state(session: Session) -> PaperTradingState:
     )
 
 
-def _legacy_row(session: Session, day: date, equity: float, portfolio="momentum"):
-    """A row exactly as written before KAN-44: all eight columns NULL."""
+def _legacy_row(
+    session: Session, day: date, equity: float, portfolio="momentum",
+    session_date: date | None = None,
+):
+    """A row exactly as written before KAN-44: all eight columns NULL.
+
+    ``session_date`` is what the KAN-103 backfill later fills in.
+    """
     session.add(
         EquitySnapshot(
             portfolio=portfolio,
             date=day,
+            session_date=session_date,
             equity=equity,
             cash=equity,
             market_value=0.0,
@@ -97,10 +104,13 @@ def test_get_equity_history_reads_legacy_rows(
 def test_divergence_monitor_series_unaffected_by_null_columns(
     session: Session, state: PaperTradingState
 ):
-    _legacy_row(session, date(2026, 6, 1), 12_000.0)
+    # Keyed by the session each row valued (KAN-103), here the day before.
+    _legacy_row(
+        session, date(2026, 6, 2), 12_000.0, session_date=date(2026, 6, 1)
+    )
     state.record_equity_snapshot(
         "momentum",
-        date(2026, 6, 2),
+        date(2026, 6, 3),
         15_000.0,
         15_000.0,
         0.0,
@@ -108,6 +118,7 @@ def test_divergence_monitor_series_unaffected_by_null_columns(
         trading_currency="USD",
         fx_base_per_trading=1.35,
         valuation_at=NOW,
+        session_date=date(2026, 6, 2),
     )
 
     series = load_live_equity_series(state, "momentum")

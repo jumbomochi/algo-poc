@@ -93,7 +93,7 @@ from shared.observability import DEFAULT_TRADING_METRICS
 from services.execution.ib_account import IBAccountReader
 from services.execution.reconciliation import ReconciliationResult
 from shared.logging import get_logger
-from shared.session_dating import stamp_session
+from shared.session_dating import equity_by_session, stamp_session
 from shared.universe import DRILL_PORTFOLIO, is_excluded_portfolio
 from shared.session_close import (
     UnclosedSession,
@@ -132,7 +132,12 @@ SHADOW_WINDOW_SESSIONS = DEFAULT_WINDOW_DAYS
 
 
 def live_equity_by_sleeve(state: PaperTradingState) -> dict[str, dict[date, float]]:
-    """Live NAV by session for each graded sleeve.
+    """Live NAV by US session for each graded sleeve.
+
+    Keyed by ``session_date``, the session each snapshot valued, not by the
+    SGT run date (KAN-103): the shadow replays by bar date, so a run-date key
+    seeds it with Monday's close at "Tuesday". Unstamped rows are skipped and
+    a re-valued session keeps its latest row (``equity_by_session``).
 
     Synthetic portfolios are dropped on the same contract the rest of the
     evidence path uses (``docs/operations/drill-evidence-isolation.md``): the
@@ -143,10 +148,7 @@ def live_equity_by_sleeve(state: PaperTradingState) -> dict[str, dict[date, floa
     for name in state.get_portfolio_names():
         if is_excluded_portfolio(name):
             continue
-        curve = {
-            date.fromisoformat(row["date"]): float(row["equity"])
-            for row in state.get_equity_history(name)
-        }
+        curve = equity_by_session(state.get_equity_history(name))
         if curve:
             out[name] = curve
     return out
@@ -203,9 +205,10 @@ def produce_shadow_artifact(
         window_sessions=window_sessions,
         whole_shares=whole_shares,
     )
-    # The session this shadow speaks for is the last one LIVE recorded, not
-    # today's wall-clock date: a Saturday catch-up run scores Friday's session,
-    # and the monitor dates its verdicts the same way.
+    # The session this shadow speaks for is the last US session LIVE valued
+    # (live is keyed by session_date since KAN-103), not today's wall-clock
+    # date: a Tuesday 04:15 run speaks for Monday, and the monitor dates its
+    # verdicts the same way.
     graded_sessions = {s for curve in series.values() for s in curve}
     dump_shadow(
         output_path,
@@ -830,6 +833,7 @@ def run_daily(
     candidate_observer: CandidateObserver | None = None,
     record_aggregate: bool = True,
     capital: CapitalBudget | None = None,
+    priced_at: datetime | None = None,
 ) -> list[dict]:
     """Run one daily cycle: generate signals for all portfolios.
 
@@ -846,6 +850,10 @@ def run_daily(
     the FX rate costs no extra IB call and introduces no new failure mode.
     When it is absent (a bare test harness) the currency columns stay NULL,
     which is what every row before KAN-44 looks like.
+
+    ``priced_at`` is the instant the bar fetch started (KAN-104). It is the
+    ``session_date`` stamp's fallback instant when there is no budget to
+    supply ``valuation_at`` (KAN-103).
     """
     signals_generated: list[dict] = []
     currency_context: dict[str, Any] = (
@@ -873,7 +881,7 @@ def run_daily(
     # KAN-103: ``today`` is the SGT run date; this is the US session those
     # closes are from, or None if it had not closed by valuation.
     marks_session = _marks_session(
-        bars_by_ticker, currency_context.get("valuation_at")
+        bars_by_ticker, currency_context.get("valuation_at"), priced_at
     )
 
     for name, pc in portfolios.items():
@@ -1090,18 +1098,20 @@ def _contract_by_symbol(
 def _marks_session(
     bars_by_ticker: Mapping[str, list[dict]],
     valuation_at: datetime | None,
+    priced_at: datetime | None = None,
 ) -> date | None:
     """The US session whose closes ``current_prices`` holds (KAN-103).
 
-    Taken from the bars actually priced, cross-checked against the valuation
-    instant (``valuation_at``, or now for a harness run without a budget):
-    a session that had not closed by then is a partial bar and yields None.
+    The session is the one the KAN-104 close guard checks,
+    ``newest_bar_session``. It is cross-checked against the valuation
+    instant: ``valuation_at`` (the broker snapshot), else ``priced_at`` (the
+    fetch start), else now for a bare harness. A session that had not closed
+    by then is a partial bar and yields None, which behind the close guard
+    only a tagged drill run can reach.
     """
-    sessions = [_bar_date(bars[-1]["date"]) for bars in bars_by_ticker.values() if bars]
-    if not sessions:
-        return None
     return stamp_session(
-        max(sessions), valuation_at or datetime.now(timezone.utc)
+        newest_bar_session(dict(bars_by_ticker)),
+        valuation_at or priced_at or datetime.now(timezone.utc),
     )
 
 
@@ -2077,6 +2087,7 @@ def main() -> int | None:
             candidate_observer=candidate_observer,
             record_aggregate=portfolio_tag is None,
             capital=preparation.capital,
+            priced_at=fetch_started_at,
         )
         if args.publish and signals:
             contracts = resolve_contract_details_from_ib(

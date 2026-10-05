@@ -15,10 +15,23 @@ is the case that needs a human.
 
 THE DECISION (KAN-67, 2026-08-26)
 ---------------------------------
-See :data:`DECISION`. In short: 2026-08-13 and 2026-08-18 are accepted as
-permanent holes rather than backfilled, because ``scripts/run_paper.py`` has no
-as-of date and building one would put look-ahead risk into the exact runner
-that produces the gate evidence.
+See :data:`DECISION`. In short: the two sessions the missed runs of 2026-08-13
+and 2026-08-18 (SGT) would have valued — US sessions 2026-08-12 and 2026-08-17
+— are accepted as permanent holes rather than backfilled, because
+``scripts/run_paper.py`` has no as-of date and building one would put
+look-ahead risk into the exact runner that produces the gate evidence.
+
+RE-DATED (KAN-103, 2026-10-05)
+------------------------------
+KAN-67 registered 2026-08-13 and 2026-08-18. Those are the SGT dates of the
+runs that did not happen, and the readers then keyed evidence by run date. A
+04:15 SGT run values the US session that closed at 04:00 SGT, so the sessions
+with no live value are the day before each: 2026-08-12 and 2026-08-17. Once
+the readers key by the session valued (``equity_snapshots.session_date``),
+the old dates are valued sessions, and the entries would go inert while the
+real holes read as unexplained. Same causes, same references, same decision;
+only the dates moved. The reasoning is in
+docs/decisions/divergence-session-dating-2026-10.md.
 
 WHAT THIS REGISTRY DOES NOT DO
 ------------------------------
@@ -63,8 +76,14 @@ class AbsentSession:
 
 
 DECISION = """\
-KAN-67, decided 2026-08-26: accept 2026-08-13 and 2026-08-18 as permanent
-evidence gaps (Option A). Neither is backfilled.
+KAN-67, decided 2026-08-26: accept the two missed paper runs of 2026-08-13 and
+2026-08-18 (SGT run dates) as permanent evidence gaps (Option A). Neither is
+backfilled.
+
+Re-dated by KAN-103 on 2026-10-05: the register holds US sessions, and the US
+sessions those runs would have valued are 2026-08-12 and 2026-08-17. KAN-67
+recorded the run dates because every reader then keyed evidence by run date.
+The decision itself is unchanged.
 
 Two of the 9 NYSE sessions in 2026-08-11..2026-08-21 are absent, not one. Any
 streak, continuity or epoch computation spanning that range must treat both as
@@ -80,13 +99,15 @@ if it is wanted for its own sake — never as a backfill.
 """
 
 
-#: Ascending by date. Every entry must be an NYSE trading day — a holiday or
-#: weekend entry would be silently inert, because ``blindness`` only ever asks
-#: about dates the calendar yields. Asserted against the real calendar in
-#: ``tests/shared/test_absent_sessions.py``.
+#: Ascending by date. Every entry is the US session a missed run would have
+#: VALUED, not the SGT date of the run (KAN-103). It must also be an NYSE
+#: trading day — a holiday or weekend entry would be silently inert, because
+#: ``blindness`` only ever asks about dates the calendar yields. Asserted
+#: against the real calendar in ``tests/shared/test_absent_sessions.py``.
 KNOWN_ABSENT_SESSIONS: tuple[AbsentSession, ...] = (
     AbsentSession(
-        session_date=date(2026, 8, 13),
+        # The SGT 2026-08-13 run (KAN-67 registered that run date; KAN-103).
+        session_date=date(2026, 8, 12),
         cause=(
             "the 04:15 paper run and 04:45 divergence monitor both aborted on a "
             ".env named pipe installed by 1Password, and every alert path "
@@ -95,7 +116,8 @@ KNOWN_ABSENT_SESSIONS: tuple[AbsentSession, ...] = (
         reference="KAN-16",
     ),
     AbsentSession(
-        session_date=date(2026, 8, 18),
+        # The SGT 2026-08-18 run (KAN-67 registered that run date; KAN-103).
+        session_date=date(2026, 8, 17),
         cause=(
             "IB Gateway never came up on 7497 after the 23:55 auto-restart "
             "rejected the login, so the paper run aborted; the abort alerted "

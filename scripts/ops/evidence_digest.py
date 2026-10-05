@@ -58,7 +58,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from sqlalchemy import func, select  # noqa: E402
+from sqlalchemy import select  # noqa: E402
 
 from scripts.ops.record_epoch import _open_epoch  # noqa: E402
 from services.notifications.channels import (  # noqa: E402
@@ -72,15 +72,18 @@ from shared.evidence_store import (  # noqa: E402
     _resolve_calendar,
     blindness,
     breach_streak,
+    UnstampedSnapshots,
     epoch_progress,
+    session_snapshots,
+    unstamped_snapshots,
 )
-from shared.models.equity_snapshot import EquitySnapshot  # noqa: E402
 from shared.models.evidence import (  # noqa: E402
     DivergenceDaily,
     DivergenceStatus,
     DrillType,
 )
 from shared.redis_client import DEAD_LETTER_SUFFIX  # noqa: E402
+from shared.session_dating import last_closed_session  # noqa: E402
 
 ALERTS_STREAM = "stream:alerts"
 #: Exported by the launchd wrapper from the keychain (KAN-15).
@@ -196,6 +199,9 @@ class DigestSnapshot:
     partial: PartialReport | None = None
     #: One entry per source that could not be read, already formatted.
     missing: list[str] = field(default_factory=list)
+    #: KAN-103 pre-flight: rendered only when most of the week's snapshots
+    #: carry no session_date, i.e. the operator backfill has not run.
+    unstamped: UnstampedSnapshots | None = None
     #: Bare names of the sources that failed. Carried separately from
     #: ``missing`` because rendering has to tell "absent" from "broken": a
     #: missing epoch is the normal state before Rung 0, while a failed epoch
@@ -275,6 +281,12 @@ def _absent_line(blind: BlindReport | None) -> list[str]:
         f"◻️ ABSENT (accepted) — {count} of {blind.total_sessions} {noun} "
         f"a recorded cause ({days})"
     ]
+
+
+def _unstamped_line(unstamped: UnstampedSnapshots | None) -> list[str]:
+    if unstamped is None or not unstamped.alarming:
+        return []
+    return ["🚨 UNSTAMPED — " + unstamped.describe("this week")]
 
 
 def _missing_line(missing: list[str]) -> list[str]:
@@ -379,6 +391,8 @@ def render_digest(snapshot: DigestSnapshot) -> str:
     the most alarming true fact.
     """
     lines: list[str] = [
+        # First: when it fires, every line below it is an artifact of it.
+        *_unstamped_line(snapshot.unstamped),
         *_blind_line(snapshot.blind),
         *_partial_line(snapshot.partial),
         *_missing_line(snapshot.missing),
@@ -416,6 +430,8 @@ class Sources:
     #: tooling) is not forced to supply one; absent simply means the line
     #: is not rendered.
     partial: Callable[[], object] | None = None
+    #: Optional for the same reason as ``partial``.
+    unstamped: Callable[[], object] | None = None
 
 
 def collect_snapshot(
@@ -450,6 +466,10 @@ def collect_snapshot(
         _read("partial", sources.partial, None)
         if sources.partial is not None else None
     )
+    unstamped = (
+        _read("unstamped", sources.unstamped, None)
+        if sources.unstamped is not None else None
+    )
 
     return DigestSnapshot(
         as_of=as_of,
@@ -457,6 +477,7 @@ def collect_snapshot(
         epoch=epoch,
         blind=blind,
         partial=partial,
+        unstamped=unstamped,
         sleeves=sleeves,
         equity=equity,
         dlq=dlq,
@@ -642,29 +663,25 @@ def equity_source(
     """
 
     def _read() -> EquityLine | None:
-        rows = session.execute(
-            select(
-                EquitySnapshot.date,
-                func.sum(EquitySnapshot.equity),
-                func.max(EquitySnapshot.trading_currency),
-            )
-            .where(
-                EquitySnapshot.date >= window_start,
-                EquitySnapshot.date <= as_of,
-                ~EquitySnapshot.portfolio.startswith(excluded_prefix, autoescape=True),
-            )
-            .group_by(EquitySnapshot.date)
-            .order_by(EquitySnapshot.date)
-        ).all()
-        if not rows:
+        # Dated by the US session valued, one row of record per sleeve per
+        # session (KAN-103) — the same series epoch_progress grades on.
+        by_session = session_snapshots(
+            session, start=window_start, end=as_of,
+            excluded_prefix=excluded_prefix,
+        )
+        if not by_session:
             return None
 
-        first = float(rows[0][1] or 0.0)
-        last = float(rows[-1][1] or 0.0)
-        change = (last - first) / first * 100.0 if first else 0.0
-        return EquityLine(
-            latest=last, currency=rows[-1][2] or "USD", change_pct=change
+        days = sorted(by_session)
+        first = sum(float(r.equity or 0.0) for r in by_session[days[0]].values())
+        latest_rows = by_session[days[-1]].values()
+        last = sum(float(r.equity or 0.0) for r in latest_rows)
+        currency = max(
+            (r.trading_currency for r in latest_rows if r.trading_currency),
+            default="USD",
         )
+        change = (last - first) / first * 100.0 if first else 0.0
+        return EquityLine(latest=last, currency=currency, change_pct=change)
 
     return _read
 
@@ -903,6 +920,11 @@ def build_sources(
         ),
         # Resolved at call time, inside the guard, for the same reason.
         drills=lambda: drills_source(session, epoch_id=_epoch_id())(),
+        # Run dates, not sessions: an unstamped row has no session. The run
+        # that values the week's last session lands the day after it.
+        unstamped=lambda: unstamped_snapshots(
+            session, start=window_start, end=as_of + timedelta(days=1)
+        ),
     )
 
 
@@ -999,13 +1021,36 @@ def _ping_deadman() -> None:
     urllib.request.urlopen(url, timeout=10, context=context).close()
 
 
+def resolve_window(
+    as_of: date | None,
+    *,
+    window_days: int,
+    now: datetime | None = None,
+) -> tuple[date, date]:
+    """``(as_of, window_start)`` for the reported week.
+
+    The window starts ``window_days`` before the reference day (``--as-of``,
+    else today's UTC date) and ends at the last NYSE session CLOSED by now
+    (KAN-103). At Monday 08:00 SGT the UTC date is a US Monday that has not
+    opened, and ending the window there reported it BLIND every week. An
+    explicit past ``--as-of`` is left as given.
+    """
+    moment = now or datetime.now(timezone.utc)
+    reference = as_of or moment.astimezone(timezone.utc).date()
+    window_start = reference - timedelta(days=window_days)
+    closed = last_closed_session(moment)
+    end = min(reference, closed) if closed is not None else reference
+    return end, window_start
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Weekly evidence digest (KAN-29).")
     parser.add_argument(
         "--as-of",
         type=date.fromisoformat,
         default=None,
-        help="Last day of the reported week (default: today).",
+        help="Last day of the reported week (default: the last NYSE session "
+        "closed by now; a later date is clamped to it).",
     )
     parser.add_argument(
         "--window-days",
@@ -1020,8 +1065,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    as_of = args.as_of or datetime.now(timezone.utc).date()
-    window_start = as_of - timedelta(days=args.window_days)
+    as_of, window_start = resolve_window(
+        args.as_of, window_days=args.window_days
+    )
 
     session, engine = _open_session()
     try:
