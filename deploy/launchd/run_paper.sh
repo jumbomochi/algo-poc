@@ -242,10 +242,13 @@ if [ "$EXIT_CODE" != "0" ]; then
     elif [ "$EXIT_CODE" = "4" ]; then
         # KAN-104: run_paper.py refused before pricing anything, because the
         # NYSE session it would have priced had not closed. Not "no signals
-        # committed today" in the sense of a fault to chase: the fix is to re-run
-        # after the close, and the log line names the time.
+        # committed today" in the sense of a fault to chase. Usually this is a
+        # hand-started catch-up that landed inside the next session: say that
+        # retrying is pointless until the close and that the missed session is
+        # gone, or the operator retries in a loop. The rule is in README.md,
+        # "Catch-up runs"; the log line names the exact earliest re-run time.
         ICON="⏰"
-        DETAIL="REFUSED: the NYSE session had not closed yet, so nothing was priced (KAN-104). Re-run after the close; the log names the time."
+        DETAIL="REFUSED: the NYSE session had not closed yet, so nothing was priced (KAN-104). Do not retry before the close — let the next scheduled 05:15 SGT run do it. A missed session cannot be caught up once the next session has opened; record it as a gap (deploy/launchd/README.md, Catch-up runs)."
     elif tail -n "+$((LOG_LINES_BEFORE_RUN + 1))" "$LOG_FILE" 2>/dev/null \
         | grep -q "WARNING: publish to pipeline failed"; then
         DETAIL="Book committed, but no orders reached risk/execution; intents replay next run."

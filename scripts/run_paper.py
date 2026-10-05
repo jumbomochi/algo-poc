@@ -33,6 +33,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Mapping
+from zoneinfo import ZoneInfo
 
 # When invoked as ``python scripts/run_paper.py``, Python otherwise resolves
 # editable-package imports from the primary checkout instead of this worktree.
@@ -1675,6 +1676,10 @@ def bar_coverage_failure(summary, *, floor: float = MIN_BAR_COVERAGE) -> str | N
 # names it on Telegram and, being nonzero, withholds the dead-man ping.
 EXIT_SESSION_NOT_CLOSED = 4
 
+#: The zone the launchd schedule is written in, for naming a re-run time the
+#: operator can compare with the plist. Not used for any decision.
+PAPER_SCHEDULE_TZ = ZoneInfo("Asia/Singapore")
+
 
 def _utc_now() -> datetime:
     """The run's clock. One seam, so the close guard can be driven with faked
@@ -1691,10 +1696,17 @@ def refuse_unclosed_session(
     guaranteed signal is the exit code, which the launchd wrapper turns into a
     Telegram message and a withheld dead-man ping.
     """
+    safe_sgt = problem.safe_after.astimezone(PAPER_SCHEDULE_TZ)
     message = (
         f"run_paper.py REFUSED to price ({stage}): {problem.describe()} "
-        f"No signals, marks or orders were produced. Re-run after "
-        f"{problem.safe_after:%H:%M %Z} on {problem.safe_after:%Y-%m-%d}."
+        f"No signals, marks or orders were produced. Do not retry before that "
+        f"session closes: the earliest re-run is "
+        f"{problem.safe_after:%Y-%m-%d %H:%M %Z} ({safe_sgt:%Y-%m-%d %H:%M} "
+        f"SGT), and the next scheduled 05:15 SGT run is the one to let do it. "
+        f"If this was a catch-up for a missed run, the missed session can no "
+        f"longer be booked once the next session has opened — a run prices "
+        f"only the newest closed session (no as-of mode, KAN-67) — so record "
+        f"it as a gap. See 'Catch-up runs' in deploy/launchd/README.md."
     )
     print(f"ERROR: {message}")
     emit_alert_best_effort(

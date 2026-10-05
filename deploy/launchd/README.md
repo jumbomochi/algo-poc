@@ -44,6 +44,40 @@ closed per `shared/market_calendar.py`, including 13:00 ET half days, and the
 divergence monitor refuses a shadow priced before its session closed. See
 `shared/session_close.py`.
 
+### Catch-up runs — the window closes at the next open (KAN-104)
+
+When the 05:15 run is missed (host asleep, Gateway down, a fixed abort), a
+hand-started `~/ibc/run_paper.sh` can still book the missed session, but **only
+until the next NYSE open**. Every run prices the newest *closed* session, and
+`run_paper.py` has no as-of mode (KAN-67), so there is a window for each missed
+session and no way back once it shuts:
+
+| Missed slot | Catch-up window (SGT, same day) | Next open |
+|---|---|---|
+| 05:15 under EDT | from the failure to ~21:00 | 21:30 SGT |
+| 05:15 under EST | from the failure to ~22:00 | 22:30 SGT |
+
+- **Start the catch-up at least 30 minutes before the open.** The fetch takes
+  6–9 min, and a fetch that runs past 09:30 ET gets today's forming bar. The
+  guard's second half then refuses it (exit 4) *after* it has written a
+  capital snapshot and a reconciliation reading. Both are true pre-open broker
+  readings and the next good run supersedes them
+  (`tests/scripts/test_run_paper_close_guard.py::test_a_late_refusal_then_a_good_run_leaves_a_clean_book`),
+  but the session is still lost.
+- **Then catch up the divergence monitor too** (`~/ibc/run_divergence.sh`). The
+  shadow it grades is the one the catch-up just wrote; same SGT date, so it is
+  fresh.
+- **Inside a session, a catch-up is refused, and that is final for the missed
+  session.** Exit 4, with a Telegram ⏰ naming the earliest re-run time
+  (close + 5 min). Do not retry in a loop, and do not run by hand after the
+  close: the next scheduled 05:15 run is at most 15 minutes after the earliest
+  allowed time and books the newest closed session. The missed one is a
+  permanent gap. Accept it the sanctioned way: a PR adding it to
+  `shared/absent_sessions.py` with its cause (KAN-67).
+- **There is no override flag, by design.** The guard exists so that nothing
+  ever trades on a partial bar. A drill (`--portfolio-tag`) is the only exempt
+  run, and it is excluded from the graded evidence.
+
 `run_paper.sh` and `run_divergence.sh` export
 `ALGO_DATABASE_URL=postgresql://algo:<pw>@localhost:55432/algo_poc` (plus the
 authenticated redis URL) — the dockerized paper DB/redis on their machine-local

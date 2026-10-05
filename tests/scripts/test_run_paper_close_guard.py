@@ -167,7 +167,24 @@ def test_the_refusal_names_the_session_and_when_to_re_run(harness, capsys):
     out = capsys.readouterr().out
     assert "REFUSED" in out
     assert "16:00 EST" in out
-    assert "Re-run after 16:05 EST on 2026-11-02" in out
+    assert "earliest re-run is 2026-11-02 16:05 EST (2026-11-03 05:05 SGT)" in out
+    assert "next scheduled 05:15 SGT run" in out
+
+
+def test_the_refusal_tells_a_catch_up_what_it_has_lost(harness, capsys):
+    """Review MEDIUM-1. The 05:15 run was missed and the operator starts a
+    catch-up at 23:00 SGT — inside the next session. It is refused, correctly,
+    and the message must say that the missed session cannot be booked now and
+    where the rule is written down, rather than leave a retry loop."""
+    harness.clock = [datetime(2026, 11, 3, 23, 0, tzinfo=SGT)]  # Tue 10:00 EST
+
+    assert run_paper.main() == 4
+
+    out = capsys.readouterr().out
+    assert "2026-11-03" in out
+    assert "missed session can no longer be booked" in out
+    assert "Catch-up runs" in out
+    assert "no as-of mode" in out
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +247,154 @@ def test_the_fetch_start_not_its_end_is_what_is_checked():
 
 
 # ---------------------------------------------------------------------------
+# Side effects of a late refusal (review MEDIUM-2)
+# ---------------------------------------------------------------------------
+
+#: Captured at import, before any fixture patches the module.
+REAL_PREPARE_DAILY_RUN = run_paper.prepare_daily_run
+REAL_MAKE_DB_SESSION = run_paper.make_db_session
+
+
+def _broker_snapshot():
+    """A real BrokerAccountSnapshot, captured now (the FX staleness check in
+    calculate_capital_budget reads the real clock, not the faked one)."""
+    from datetime import timezone
+
+    from shared.broker_state import BrokerAccountSnapshot
+
+    captured_at = datetime.now(timezone.utc)
+    return BrokerAccountSnapshot(
+        account_id="DUTEST",
+        mode="paper",
+        base_currency="SGD",
+        trading_currency="USD",
+        net_liquidation_base=1_350_000,
+        fx_base_per_trading=1.35,
+        net_liquidation_trading_equivalent=1_000_000,
+        settled_cash_trading=50_000,
+        fx_source="test",
+        fx_captured_at=captured_at,
+        captured_at=captured_at,
+    )
+
+
+def test_a_late_refusal_then_a_good_run_leaves_a_clean_book(
+    harness, monkeypatch, tmp_path, capsys
+):
+    """The "newest bar unclosed" refusal fires AFTER read_broker_snapshot and
+    prepare_daily_run have committed a capital_snapshots and a
+    reconciliation_reports row. Drive that refusal against a real database,
+    then the next good run, and check what every reader of those tables sees.
+
+    What "clean" means here, reader by reader:
+
+    * risk_management takes the NEWEST capital_snapshots row (captured_at
+      desc, id desc), and its drawdown peak is a max over real broker NAVs;
+      reconciliation_status.py and gate_data_source.py take the NEWEST
+      reconciliation_reports row. So the good run's rows must be the newest,
+      and must not carry a stale blocking severity.
+    * Nothing priced from bars may exist from the refused run: no equity
+      snapshot, no order intent, no position.
+    * Entries are decided from the run's OWN reconciliation, not a stored one,
+      so the good run must report entries enabled.
+
+    The refused run's rows are kept on purpose: each is a true broker reading
+    taken before the open (the late half of the guard can only fire for a run
+    that started pre-open), not a price derived from a partial bar. Deferring
+    the commit to drop them would also drop the reconciliation reading when a
+    run crashes or times out mid-fetch, which the KAN-86 report depends on.
+    """
+    from sqlalchemy import create_engine, func, select
+    from sqlalchemy.orm import Session
+
+    from scripts.ops.reconciliation_status import collect_facts
+    from shared.models import (
+        Base,
+        CapitalSnapshot,
+        OrderIntent,
+        Position,
+        ReconciliationReport,
+    )
+    from shared.models.equity_snapshot import EquitySnapshot
+
+    db_url = f"sqlite:///{tmp_path / 'paper.db'}"
+    engine = create_engine(db_url)
+    Base.metadata.create_all(engine)
+
+    async def real_shaped_snapshot(**kwargs):
+        harness.broker_reads += 1
+        return _broker_snapshot()
+
+    monkeypatch.setattr(run_paper, "make_db_session", REAL_MAKE_DB_SESSION)
+    monkeypatch.setattr(run_paper, "read_broker_snapshot", real_shaped_snapshot)
+    monkeypatch.setattr(run_paper, "prepare_daily_run", REAL_PREPARE_DAILY_RUN)
+    monkeypatch.setattr(sys, "argv", [
+        "run_paper.py", "--db-url", db_url, "--redis-url", "redis://x",
+        "--no-entries-disabled",
+    ])
+
+    def counts():
+        with Session(engine) as s:
+            return {
+                model.__name__: s.scalar(select(func.count()).select_from(model))
+                for model in (
+                    CapitalSnapshot, ReconciliationReport,
+                    EquitySnapshot, OrderIntent, Position,
+                )
+            }
+
+    # 1. A catch-up started pre-open (Mon 2026-11-02 09:25 EST = 22:25 SGT),
+    #    whose fetch began after the open and returned the forming bar.
+    harness.clock = [
+        datetime(2026, 11, 2, 9, 25, tzinfo=ET),
+        datetime(2026, 11, 2, 9, 31, tzinfo=ET),
+    ]
+    harness.bars = _bars(date(2026, 11, 2))
+    assert run_paper.main() == 4
+    assert counts() == {
+        "CapitalSnapshot": 1, "ReconciliationReport": 1,
+        "EquitySnapshot": 0, "OrderIntent": 0, "Position": 0,
+    }
+    with Session(engine) as s:
+        refused_snapshot_id = s.scalar(select(CapitalSnapshot.id))
+
+    # 2. The scheduled run after the close (Tue 2026-11-03 05:15 SGT).
+    harness.clock = [
+        datetime(2026, 11, 3, 5, 15, tzinfo=SGT),
+        datetime(2026, 11, 3, 5, 15, 30, tzinfo=SGT),
+    ]
+    harness.bars = _bars(date(2026, 11, 2))
+    capsys.readouterr()
+    with pytest.raises(Reached, match="pricing"):
+        run_paper.main()
+    assert "entries: enabled" in capsys.readouterr().out
+    assert counts() == {
+        "CapitalSnapshot": 2, "ReconciliationReport": 2,
+        "EquitySnapshot": 0, "OrderIntent": 0, "Position": 0,
+    }
+
+    with Session(engine) as s:
+        newest_capital = s.scalars(
+            select(CapitalSnapshot).order_by(
+                CapitalSnapshot.captured_at.desc(), CapitalSnapshot.id.desc()
+            )
+        ).first()
+        assert newest_capital.id != refused_snapshot_id, (
+            "risk would size against the refused run's capital snapshot"
+        )
+        assert newest_capital.reconciliation_status == "ok"
+        newest_report = s.scalars(
+            select(ReconciliationReport).order_by(
+                ReconciliationReport.created_at.desc(), ReconciliationReport.id.desc()
+            )
+        ).first()
+        assert newest_report.entries_allowed is True
+        assert newest_report.status == "ok"
+        facts = collect_facts(s, mode="paper")
+        assert facts.status == "ok" and facts.entries_allowed
+
+
+# ---------------------------------------------------------------------------
 # The drill exemption
 # ---------------------------------------------------------------------------
 
@@ -264,3 +429,6 @@ def test_the_wrapper_names_exit_4_instead_of_no_signals_committed():
     text = WRAPPER.read_text()
     assert '[ "$EXIT_CODE" = "4" ]' in text
     assert "NYSE session had not closed" in text
+    # Review MEDIUM-1: the Telegram line must say what to do, not just what happened.
+    assert "next scheduled 05:15 SGT run" in text
+    assert "cannot be caught up once the next session has opened" in text
