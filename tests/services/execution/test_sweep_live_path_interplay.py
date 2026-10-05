@@ -180,6 +180,11 @@ class TestTheLivePathKeepsProvenance:
 
         [payload] = _published(redis, "stream:fills")
         assert FillMessage.from_stream_dict(payload).recovery_source == RECOVERY_SOURCE_SWEEP
+        # Paged in a batch once the burst settles (KAN-102), not per fill.
+        assert _published(redis, "stream:alerts") == []
+        await runner.maybe_page_recovered_fills(
+            asyncio.get_running_loop().time() + 3600
+        )
         [alert] = [AlertMessage.from_stream_dict(p)
                    for p in _published(redis, "stream:alerts")]
         assert alert.event_type == "execution_sweep_recovered"

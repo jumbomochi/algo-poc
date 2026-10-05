@@ -33,6 +33,11 @@ FILLS_STREAM = "stream:fills"
 #: two are a Gateway blip the next pass absorbs; three at the 15-minute
 #: default is 45 minutes of no recovery.
 EXECUTION_SWEEP_FAILURE_PAGE_AFTER = 3
+#: Quiet period before fills the live path booked from IB's execution record
+#: are paged, when no sweep pass pages them (KAN-102). A Gateway restart that
+#: dropped N fills replays them in one burst; the page waits for the burst to
+#: settle and lists them all, instead of paging once per fill.
+RECOVERY_PAGE_SETTLE_SECONDS = 10.0
 ALERTS_STREAM = "stream:alerts"
 
 CONSUMER_GROUP = "execution_service"
@@ -215,6 +220,11 @@ class ExecutionServiceRunner:
         # and an untracked broker order pages once per order id.
         self._execution_sweep_failures = 0
         self._execution_sweep_untracked_paged: set[str] = set()
+        # Fills the live path booked from IB's execution record, not yet
+        # paged (KAN-102). The next sweep pass pages them with its own; a
+        # burst no pass picks up is paged once it settles.
+        self._unpaged_recoveries: list[FillMessage] = []
+        self._last_recovery_queued_at: float | None = None
 
         # Post-halt reconcile sweep (KAN-13). Its own timer, and deliberately
         # NOT sharing the unfilled sweep's calendar gate: that sweep returns
@@ -276,6 +286,9 @@ class ExecutionServiceRunner:
         silently lost.
         """
         self.restore_pending_orders()
+        # Before the rebind: commission reports trailing connect's own
+        # execution sync fire on a rebound trade too (KAN-102).
+        self._seed_booked_executions()
         restore_broker = getattr(
             type(self._order_manager), "restore_broker_tracking", None
         )
@@ -376,6 +389,44 @@ class ExecutionServiceRunner:
                     ),
                 )
         self._order_ledger.session.rollback()
+
+    def _seed_booked_executions(self) -> None:
+        """Tell the executor which executions of restored orders are booked.
+
+        After a restart the first sweep's ``reqExecutions`` replays every
+        execution of a restored, partly filled order through its live
+        callback. The ones the book already holds are dropped at the executor
+        rather than handed over stamped as recovered (KAN-102, window c).
+        Best-effort: without the seed the runner's dedupe still drops them.
+        """
+        if self._order_ledger is None or not self._pending_orders:
+            return
+        mark = getattr(type(self._order_manager), "mark_executions_booked", None)
+        if mark is None:
+            return
+        try:
+            booked = self._order_ledger.booked_execution_ids(self._pending_orders)
+            mark(self._order_manager, booked)
+        except Exception:
+            self._logger.exception(
+                "Could not seed booked executions for restored orders; the "
+                "runner's dedupe still drops their replays"
+            )
+            return
+        finally:
+            # Its own guard: a rollback failure must not escape setup() and
+            # turn a best-effort seed into a startup failure.
+            try:
+                self._order_ledger.session.rollback()
+            except Exception:
+                self._logger.exception(
+                    "Rollback after seeding booked executions failed"
+                )
+        if booked:
+            self._logger.info(
+                "Seeded booked executions of restored orders",
+                count=len(booked),
+            )
 
     def _commit_ledger(self) -> None:
         if self._order_ledger is not None:
@@ -1133,20 +1184,17 @@ class ExecutionServiceRunner:
             self._order_ledger.session.rollback()
         await self._redis.publish(FILLS_STREAM, fill.to_stream_dict())
         if fill.recovery_source:
-            # The live callback first saw this execution in a reqExecutions
-            # replay: it was missed live. Same page as the sweep's (KAN-98).
-            await self._publish_alert_best_effort(
-                event_type="execution_sweep_recovered",
-                priority="medium",
-                message=(
-                    f"A fill first seen in IB's execution record rather "
-                    f"than live was booked: {fill.recommendation_id} "
-                    f"({fill.quantity:g} {fill.ticker}). Probably missed "
-                    "while execution's IB session was down; the book is now "
-                    "right. Recurring pages mean the session keeps dropping."
-                ),
-                context={"execution_id": str(fill.execution_id)},
-            )
+            # The live callback first saw this execution in IB's execution
+            # record: it was probably missed live (KAN-98). Paged in a batch
+            # with the rest of its sweep pass or burst (KAN-102). Queued once:
+            # if a later step here raises, the executor's retry runs this
+            # again for the same execution.
+            if fill.execution_id is None or all(
+                queued.execution_id != fill.execution_id
+                for queued in self._unpaged_recoveries
+            ):
+                self._unpaged_recoveries.append(fill)
+            self._last_recovery_queued_at = asyncio.get_running_loop().time()
 
         self._logger.info(
             "Fill published",
@@ -1991,23 +2039,14 @@ class ExecutionServiceRunner:
         that blocked every buy for five sessions in September — so it is
         worth a message even though the book is now right. An untracked
         execution is IB doing something the book will not record.
+
+        One recovered page per pass (KAN-102): it also lists the fills the
+        live path booked from this pass's ``reqExecutions`` reply, which the
+        executor lets finish before the sweep books its own.
         """
-        if outcome.recovered:
-            names = ", ".join(
-                f"{fill.recommendation_id} ({fill.quantity:g} {fill.ticker})"
-                for fill in outcome.recovered
-            )
-            await self._publish_alert_best_effort(
-                event_type="execution_sweep_recovered",
-                priority="medium",
-                message=(
-                    f"The execution sweep booked {len(outcome.recovered)} "
-                    f"fill(s) the live callback missed: {names}. The book is "
-                    "now right; a recurrence means execution is losing its IB "
-                    "session."
-                ),
-                context={"recovered": str(len(outcome.recovered))},
-            )
+        await self._page_recovered_fills(
+            swept=list(outcome.recovered), live=self._take_unpaged_recoveries()
+        )
         new_untracked = [
             order_id for order_id in outcome.untracked
             if order_id not in self._execution_sweep_untracked_paged
@@ -2026,6 +2065,78 @@ class ExecutionServiceRunner:
                 ),
                 context={"ib_order_ids": ",".join(new_untracked)},
             )
+
+    def _take_unpaged_recoveries(self) -> list[FillMessage]:
+        taken, self._unpaged_recoveries = self._unpaged_recoveries, []
+        self._last_recovery_queued_at = None
+        return taken
+
+    async def _page_recovered_fills(
+        self, *, swept: list[FillMessage], live: list[FillMessage]
+    ) -> None:
+        """One ``execution_sweep_recovered`` page listing every fill given.
+
+        ``swept`` are the sweep's own bookings; ``live`` are the fills the
+        live callback first saw in IB's execution record. Best-effort.
+        """
+        fills = [*swept, *live]
+        if not fills:
+            return
+        names = ", ".join(
+            f"{fill.recommendation_id} ({fill.quantity:g} {fill.ticker})"
+            for fill in fills
+        )
+        how = []
+        if swept:
+            how.append(
+                f"The execution sweep booked {len(swept)} of them, which the "
+                "live callback missed."
+            )
+        if live:
+            how.append(
+                f"{len(live)} reached the live callback only through IB's "
+                "execution record: probably missed while execution's IB "
+                "session was down."
+            )
+        await self._publish_alert_best_effort(
+            event_type="execution_sweep_recovered",
+            priority="medium",
+            message=(
+                f"{len(fills)} fill(s) were booked from IB's execution record "
+                f"rather than live: {names}. {' '.join(how)} The book is now "
+                "right; recurring pages mean execution keeps losing its IB "
+                "session."
+            ),
+            context={
+                "recovered": str(len(fills)),
+                "swept": str(len(swept)),
+                "live_path": str(len(live)),
+                "execution_ids": ",".join(
+                    str(fill.execution_id) for fill in fills
+                ),
+            },
+        )
+
+    async def maybe_page_recovered_fills(self, now: float) -> bool:
+        """Page the live path's recovered fills no sweep pass has paged.
+
+        ``now`` is the event loop's monotonic time. Waits until no fill has
+        joined the batch for ``RECOVERY_PAGE_SETTLE_SECONDS``, so a burst
+        becomes one page, and stays out of the way while a sweep pass runs —
+        that pass pages them with its own. Returns True when a page went out.
+        """
+        if not self._unpaged_recoveries:
+            return False
+        task = self._execution_sweep_task
+        if task is not None and not task.done():
+            return False
+        last = self._last_recovery_queued_at
+        if last is not None and (now - last) < RECOVERY_PAGE_SETTLE_SECONDS:
+            return False
+        await self._page_recovered_fills(
+            swept=[], live=self._take_unpaged_recoveries()
+        )
+        return True
 
     def _start_execution_sweep(self, now: float) -> bool:
         """Start the execution sweep as a task unless one is still running.
@@ -2305,6 +2416,10 @@ class ExecutionServiceRunner:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+        # Recovered fills still waiting for their batch page (KAN-102).
+        await self._page_recovered_fills(
+            swept=[], live=self._take_unpaged_recoveries()
+        )
         await self._order_manager.cancel_all_orders(include_stops=False)
         self._logger.info("Execution service shutdown complete — no orphaned orders")
 
@@ -2334,6 +2449,17 @@ class ExecutionServiceRunner:
                 await self.maybe_check_ib_connection(
                     asyncio.get_running_loop().time()
                 )
+                # Live-path recoveries no sweep pass paged, as one page per
+                # burst (KAN-102). Before the sweep starts: a running pass
+                # pages them itself, so this defers to one still running.
+                try:
+                    await self.maybe_page_recovered_fills(
+                        asyncio.get_running_loop().time()
+                    )
+                except Exception:
+                    self._logger.exception(
+                        "Paging recovered fills failed; continuing"
+                    )
                 # In-service execution sweep (KAN-95), started in the
                 # background so a hung reqExecutions cannot delay the kill
                 # stream below (KAN-98). The other IB steps stay inline.

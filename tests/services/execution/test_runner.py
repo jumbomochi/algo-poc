@@ -866,8 +866,13 @@ class TestDurableExecutionIdentity:
                 await runner.handle_ib_fill(payload)
             except RuntimeError as exc:
                 handler_errors.append(str(exc))
+                # Re-raised, as handle_ib_fill does when it is the handler:
+                # the executor turns the copy it held back into the retry
+                # only when it sees the first delivery fail (KAN-102).
+                raise
 
         executor = IBExecutor("h", 7497, 1)
+        executor._logger = MagicMock()
         executor._ib = MagicMock()
         executor._ib.accountValues.return_value = []
         executor.set_fill_handler(handle_with_error_capture)
@@ -900,7 +905,8 @@ class TestDurableExecutionIdentity:
         trade.fillEvent.emit(trade, fill)
         trade.commissionReportEvent.emit(trade, fill, report)
         trade.commissionReportEvent.emit(trade, fill, report)
-        await asyncio.sleep(0)
+        for _ in range(5):
+            await asyncio.sleep(0)
 
         assert handler_attempts == 2
         assert handler_errors == ["transient Redis failure"]

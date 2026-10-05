@@ -590,6 +590,10 @@ class OrderManager:
         """Changes whenever the executor reconnects (KAN-95)."""
         return int(self._executor.connection_generation)
 
+    def mark_executions_booked(self, execution_ids: Any) -> None:
+        """Seed the executor with executions the book already holds (KAN-102)."""
+        self._executor.mark_executions_booked(execution_ids)
+
     async def completed_order_states(self) -> dict[str, str]:
         """Terminal status per ``orderRef`` from IB's completed-order history.
 
