@@ -428,7 +428,8 @@ def _drive_wrapper(tmp_path, exit_code, report_payload=None, curl_exit=0,
                    renderer_fails=False, serve_credentials=True,
                    stale_report=None, serve_redis=True,
                    deadman_url=DIVERGENCE_DEADMAN_URL,
-                   pin=None, pin_resolver_fails=False):
+                   pin=None, pin_resolver_fails=False,
+                   alembic_current="a1b2c3d4e5f6"):
     """Run run_divergence.sh end-to-end against a stubbed monitor and curl.
 
     Everything the wrapper reaches out to is stubbed on PATH: ``nc`` (the DB
@@ -457,6 +458,14 @@ def _drive_wrapper(tmp_path, exit_code, report_payload=None, curl_exit=0,
 
     stub("nc", "#!/bin/bash\nexit 0\n")
     stub("osascript", "#!/bin/bash\nexit 0\n")
+    # The schema guard (KAN-103): DB at head, so the run proceeds.
+    alembic = stub("alembic", (
+        "#!/bin/bash\n"
+        'case "$1" in\n'
+        "  heads) echo 'a1b2c3d4e5f6 (head)' ;;\n"
+        f"  current) echo '{alembic_current}' ;;\n"
+        "esac\n"
+    ))
     # `security find-generic-password -w -s <service> -a <NAME>` — the name is
     # always the last argument.
     stub("security", """#!/bin/bash
@@ -524,6 +533,7 @@ exit {exit_code}
         PATH=f"{bin_dir}:{os.environ['PATH']}",
         ALGO_DIR=str(REPO),
         ALGO_PYTHON=str(fake_python),
+        ALGO_ALEMBIC_BIN=str(alembic),
         ALGO_DIVERGENCE_REPORT=str(report),
         ALGO_SECURITY_BIN=str(bin_dir / "security"),
         ALGO_OSASCRIPT_BIN=str(bin_dir / "osascript"),

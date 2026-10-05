@@ -301,6 +301,7 @@ logic silently stays behind.
 | `lib/launchd_wiring.sh` | installed-but-not-loaded reconciliation (KAN-64) |
 | `lib/power.sh` | the caffeinate power assertion (KAN-77) |
 | `lib/reconciliation.sh` | how long the book has been fail-closed (KAN-86) |
+| `lib/schema_guard.sh` | is the paper DB at the code's alembic head — refused before any DB read (KAN-103) |
 | `lib/telegram.sh` | the shared Telegram sender (KAN-43) |
 
 `scripts/` and `config/` are read from the tree the same way, so a pull changes

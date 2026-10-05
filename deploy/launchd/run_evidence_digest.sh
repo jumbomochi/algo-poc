@@ -98,6 +98,19 @@ else
     echo "$(ts): WARNING - ALGO_DEADMAN_DIGEST_URL is in neither the environment nor the keychain; nothing outside this host will notice a missing digest. Import it: deploy/launchd/secrets.sh --import" >> "$LOG_FILE"
 fi
 
+# Refuse a schema behind the code (KAN-103) before reading the evidence store:
+# a pull without `alembic upgrade head` would otherwise fail mid-render on a
+# raw UndefinedColumn, and the operator would see only "digest FAILED".
+# shellcheck source=deploy/launchd/lib/schema_guard.sh
+. "$ALGO_DIR/deploy/launchd/lib/schema_guard.sh"
+if ! algo_schema_guard "$ALGO_DIR"; then
+    SCHEMA_MSG="${ALGO_SCHEMA_ERROR:-schema guard unavailable (lib/schema_guard.sh not sourced)}"
+    echo "$(ts): ERROR - $SCHEMA_MSG" >> "$LOG_FILE"
+    algo_alert_local "evidence digest aborted — $SCHEMA_MSG"
+    telegram "❌ Weekly evidence digest ABORTED: $SCHEMA_MSG. The dead-man check was NOT pinged."
+    exit 1
+fi
+
 cd "$ALGO_DIR"
 "$VENV" scripts/ops/evidence_digest.py >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?

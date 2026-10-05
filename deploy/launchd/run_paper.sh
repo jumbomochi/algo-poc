@@ -163,19 +163,19 @@ cd "$ALGO_DIR"
 # Fail loudly if the paper DB schema is behind the code's migrations.
 # Without this, a migration landing without `alembic upgrade head` surfaces
 # mid-run as a cryptic psycopg2 UndefinedColumn error (2026-07-25 incident).
-ALEMBIC="$ALGO_DIR/.venv/bin/alembic"
-DB_REV=$("$ALEMBIC" current 2>/dev/null | grep -oE '[0-9a-f]{12}' | head -1)
-HEAD_REV=$("$ALEMBIC" heads 2>/dev/null | grep -oE '[0-9a-f]{12}' | head -1)
-if [ -z "$HEAD_REV" ]; then
-    echo "$(date): ERROR - could not determine alembic head revision" >> "$LOG_FILE"
-    algo_alert_local "paper run aborted — could not determine alembic head revision"
-    telegram "🚨 Paper trading run ABORTED: could not determine alembic head revision."
-    paper_exit 1
-fi
-if [ "$DB_REV" != "$HEAD_REV" ]; then
-    echo "$(date): ERROR - paper DB schema out of date (DB at '${DB_REV:-none}', head '$HEAD_REV'); run '.venv/bin/alembic upgrade head' with ALGO_DATABASE_URL set" >> "$LOG_FILE"
-    algo_alert_local "paper run aborted — DB schema at '${DB_REV:-none}', head '$HEAD_REV'"
-    telegram "🚨 Paper trading run ABORTED: paper DB schema out of date (DB '${DB_REV:-none}' vs head '$HEAD_REV'). Run: .venv/bin/alembic upgrade head"
+# The check is shared with every DB-reading wrapper (lib/schema_guard.sh).
+# shellcheck source=deploy/launchd/lib/schema_guard.sh
+. "$ALGO_DIR/deploy/launchd/lib/schema_guard.sh"
+if ! algo_schema_guard "$ALGO_DIR"; then
+    if [ -z "${ALGO_SCHEMA_HEAD_REV:-}" ]; then
+        echo "$(date): ERROR - ${ALGO_SCHEMA_ERROR:-could not determine alembic head revision}" >> "$LOG_FILE"
+        algo_alert_local "paper run aborted — could not determine alembic head revision"
+        telegram "🚨 Paper trading run ABORTED: could not determine alembic head revision."
+        paper_exit 1
+    fi
+    echo "$(date): ERROR - $ALGO_SCHEMA_ERROR" >> "$LOG_FILE"
+    algo_alert_local "paper run aborted — DB schema at '${ALGO_SCHEMA_DB_REV:-none}', head '$ALGO_SCHEMA_HEAD_REV'"
+    telegram "🚨 Paper trading run ABORTED: paper DB schema out of date (DB '${ALGO_SCHEMA_DB_REV:-none}' vs head '$ALGO_SCHEMA_HEAD_REV'). Run: .venv/bin/alembic upgrade head"
     paper_exit 1
 fi
 

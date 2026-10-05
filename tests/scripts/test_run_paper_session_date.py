@@ -206,3 +206,31 @@ def test_paper_state_defaults_session_date_to_null(session, state):
     (row,) = session.execute(select(EquitySnapshot)).scalars().all()
     assert row.session_date is None
 
+
+
+# ---------------------------------------------------------------- schema guard
+
+
+def test_load_refuses_a_database_behind_the_migration(tmp_path, monkeypatch):
+    """A hand-run ops script fails with the fix, not a raw UndefinedColumn."""
+    from pathlib import Path
+
+    from alembic import command
+    from alembic.config import Config
+
+    from scripts.paper_state import SchemaOutOfDateError
+
+    url = f"sqlite:///{tmp_path / 'behind.db'}"
+    monkeypatch.setenv("ALGO_DATABASE_URL", url)
+    config = Config(str(Path(__file__).resolve().parents[2] / "alembic.ini"))
+    config.set_main_option("sqlalchemy.url", url)
+    command.upgrade(config, "007388445941")
+
+    with Session(create_engine(url)) as s:
+        with pytest.raises(SchemaOutOfDateError, match="alembic upgrade head"):
+            PaperTradingState.load(s)
+
+    command.upgrade(config, "head")
+    with Session(create_engine(url)) as s:
+        with pytest.raises(ValueError, match="No paper trading state"):
+            PaperTradingState.load(s)  # past the schema check: an empty book
