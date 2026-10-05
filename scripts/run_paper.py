@@ -93,7 +93,7 @@ from shared.observability import DEFAULT_TRADING_METRICS
 from services.execution.ib_account import IBAccountReader
 from services.execution.reconciliation import ReconciliationResult
 from shared.logging import get_logger
-from shared.session_dating import stamp_session
+from shared.session_dating import equity_by_session, stamp_session
 from shared.universe import DRILL_PORTFOLIO, is_excluded_portfolio
 from shared.session_close import (
     UnclosedSession,
@@ -132,7 +132,12 @@ SHADOW_WINDOW_SESSIONS = DEFAULT_WINDOW_DAYS
 
 
 def live_equity_by_sleeve(state: PaperTradingState) -> dict[str, dict[date, float]]:
-    """Live NAV by session for each graded sleeve.
+    """Live NAV by US session for each graded sleeve.
+
+    Keyed by ``session_date``, the session each snapshot valued, not by the
+    SGT run date (KAN-103): the shadow replays by bar date, so a run-date key
+    seeds it with Monday's close at "Tuesday". Unstamped rows are skipped and
+    a re-valued session keeps its latest row (``equity_by_session``).
 
     Synthetic portfolios are dropped on the same contract the rest of the
     evidence path uses (``docs/operations/drill-evidence-isolation.md``): the
@@ -143,10 +148,7 @@ def live_equity_by_sleeve(state: PaperTradingState) -> dict[str, dict[date, floa
     for name in state.get_portfolio_names():
         if is_excluded_portfolio(name):
             continue
-        curve = {
-            date.fromisoformat(row["date"]): float(row["equity"])
-            for row in state.get_equity_history(name)
-        }
+        curve = equity_by_session(state.get_equity_history(name))
         if curve:
             out[name] = curve
     return out
@@ -203,9 +205,10 @@ def produce_shadow_artifact(
         window_sessions=window_sessions,
         whole_shares=whole_shares,
     )
-    # The session this shadow speaks for is the last one LIVE recorded, not
-    # today's wall-clock date: a Saturday catch-up run scores Friday's session,
-    # and the monitor dates its verdicts the same way.
+    # The session this shadow speaks for is the last US session LIVE valued
+    # (live is keyed by session_date since KAN-103), not today's wall-clock
+    # date: a Tuesday 04:15 run speaks for Monday, and the monitor dates its
+    # verdicts the same way.
     graded_sessions = {s for curve in series.values() for s in curve}
     dump_shadow(
         output_path,

@@ -31,7 +31,9 @@ def _run_paper_parser() -> argparse.ArgumentParser:
 
 
 def test_the_registry_records_both_accepted_gaps() -> None:
-    assert known_absent_dates() == {date(2026, 8, 13), date(2026, 8, 18)}
+    # The US sessions the missed SGT 08-13 and 08-18 runs would have valued
+    # (KAN-103 re-dated them from the run dates KAN-67 registered).
+    assert known_absent_dates() == {date(2026, 8, 12), date(2026, 8, 17)}
 
 
 def test_every_entry_carries_a_cause_and_a_reference() -> None:
@@ -41,26 +43,56 @@ def test_every_entry_carries_a_cause_and_a_reference() -> None:
 
 
 def test_absent_session_looks_one_date_up() -> None:
-    entry = absent_session(date(2026, 8, 18))
+    entry = absent_session(date(2026, 8, 17))
     assert entry is not None
     assert "IB" in entry.cause
-    assert absent_session(date(2026, 8, 19)) is None
+    assert absent_session(date(2026, 8, 18)) is None
 
 
 def test_absent_sessions_in_is_range_bounded_and_ascending() -> None:
     found = absent_sessions_in(date(2026, 8, 11), date(2026, 8, 21))
     assert [entry.session_date for entry in found] == [
-        date(2026, 8, 13),
-        date(2026, 8, 18),
+        date(2026, 8, 12),
+        date(2026, 8, 17),
     ]
 
-    assert absent_sessions_in(date(2026, 8, 14), date(2026, 8, 17)) == []
+    assert absent_sessions_in(date(2026, 8, 13), date(2026, 8, 16)) == []
 
 
 def test_the_decision_record_names_option_a_and_both_dates() -> None:
-    assert "2026-08-13" in DECISION
-    assert "2026-08-18" in DECISION
+    # The run dates KAN-67 decided on, and the sessions KAN-103 re-dated them to.
+    for day in ("2026-08-13", "2026-08-18", "2026-08-12", "2026-08-17"):
+        assert day in DECISION
     assert "Option A" in DECISION
+    assert "KAN-103" in DECISION
+
+
+def test_no_registered_session_was_valued_by_a_recorded_run() -> None:
+    """KAN-103: the register names sessions with no live value.
+
+    The runs that DID happen around each gap value the sessions either side
+    of it (decision doc, "Missed runs"): SGT 08-12 valued US 08-11, SGT 08-14
+    valued 08-13, SGT 08-15 valued 08-14 and SGT 08-19 valued 08-18. A
+    registered date that a recorded run valued would be inert, because
+    ``blindness`` lists an entry only when its session is unobserved.
+    """
+    from shared.session_dating import last_session_before
+
+    recorded_runs = [
+        date(2026, 8, 12), date(2026, 8, 14), date(2026, 8, 15),
+        date(2026, 8, 19),
+    ]
+    valued = {last_session_before(run) for run in recorded_runs}
+    assert valued == {
+        date(2026, 8, 11), date(2026, 8, 13), date(2026, 8, 14),
+        date(2026, 8, 18),
+    }
+    assert not known_absent_dates() & valued
+    # And each registered session is the one its missed run would have valued.
+    assert {
+        last_session_before(date(2026, 8, 13)),
+        last_session_before(date(2026, 8, 18)),
+    } == known_absent_dates()
 
 
 def test_the_decision_record_states_the_window_correctly() -> None:

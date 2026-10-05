@@ -571,6 +571,7 @@ def _green_epoch(
             EquitySnapshot(
                 portfolio="momentum",
                 date=day,
+                session_date=day,
                 equity=equity,
                 cash=equity - 100.0,
                 market_value=100.0,

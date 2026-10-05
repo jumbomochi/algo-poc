@@ -58,7 +58,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from sqlalchemy import func, select  # noqa: E402
+from sqlalchemy import select  # noqa: E402
 
 from scripts.ops.record_epoch import _open_epoch  # noqa: E402
 from services.notifications.channels import (  # noqa: E402
@@ -73,14 +73,15 @@ from shared.evidence_store import (  # noqa: E402
     blindness,
     breach_streak,
     epoch_progress,
+    session_snapshots,
 )
-from shared.models.equity_snapshot import EquitySnapshot  # noqa: E402
 from shared.models.evidence import (  # noqa: E402
     DivergenceDaily,
     DivergenceStatus,
     DrillType,
 )
 from shared.redis_client import DEAD_LETTER_SUFFIX  # noqa: E402
+from shared.session_dating import last_closed_session  # noqa: E402
 
 ALERTS_STREAM = "stream:alerts"
 #: Exported by the launchd wrapper from the keychain (KAN-15).
@@ -642,29 +643,25 @@ def equity_source(
     """
 
     def _read() -> EquityLine | None:
-        rows = session.execute(
-            select(
-                EquitySnapshot.date,
-                func.sum(EquitySnapshot.equity),
-                func.max(EquitySnapshot.trading_currency),
-            )
-            .where(
-                EquitySnapshot.date >= window_start,
-                EquitySnapshot.date <= as_of,
-                ~EquitySnapshot.portfolio.startswith(excluded_prefix, autoescape=True),
-            )
-            .group_by(EquitySnapshot.date)
-            .order_by(EquitySnapshot.date)
-        ).all()
-        if not rows:
+        # Dated by the US session valued, one row of record per sleeve per
+        # session (KAN-103) — the same series epoch_progress grades on.
+        by_session = session_snapshots(
+            session, start=window_start, end=as_of,
+            excluded_prefix=excluded_prefix,
+        )
+        if not by_session:
             return None
 
-        first = float(rows[0][1] or 0.0)
-        last = float(rows[-1][1] or 0.0)
-        change = (last - first) / first * 100.0 if first else 0.0
-        return EquityLine(
-            latest=last, currency=rows[-1][2] or "USD", change_pct=change
+        days = sorted(by_session)
+        first = sum(float(r.equity or 0.0) for r in by_session[days[0]].values())
+        latest_rows = by_session[days[-1]].values()
+        last = sum(float(r.equity or 0.0) for r in latest_rows)
+        currency = max(
+            (r.trading_currency for r in latest_rows if r.trading_currency),
+            default="USD",
         )
+        change = (last - first) / first * 100.0 if first else 0.0
+        return EquityLine(latest=last, currency=currency, change_pct=change)
 
     return _read
 
@@ -999,13 +996,36 @@ def _ping_deadman() -> None:
     urllib.request.urlopen(url, timeout=10, context=context).close()
 
 
+def resolve_window(
+    as_of: date | None,
+    *,
+    window_days: int,
+    now: datetime | None = None,
+) -> tuple[date, date]:
+    """``(as_of, window_start)`` for the reported week.
+
+    The window starts ``window_days`` before the reference day (``--as-of``,
+    else today's UTC date) and ends at the last NYSE session CLOSED by now
+    (KAN-103). At Monday 08:00 SGT the UTC date is a US Monday that has not
+    opened, and ending the window there reported it BLIND every week. An
+    explicit past ``--as-of`` is left as given.
+    """
+    moment = now or datetime.now(timezone.utc)
+    reference = as_of or moment.astimezone(timezone.utc).date()
+    window_start = reference - timedelta(days=window_days)
+    closed = last_closed_session(moment)
+    end = min(reference, closed) if closed is not None else reference
+    return end, window_start
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Weekly evidence digest (KAN-29).")
     parser.add_argument(
         "--as-of",
         type=date.fromisoformat,
         default=None,
-        help="Last day of the reported week (default: today).",
+        help="Last day of the reported week (default: the last NYSE session "
+        "closed by now; a later date is clamped to it).",
     )
     parser.add_argument(
         "--window-days",
@@ -1020,8 +1040,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    as_of = args.as_of or datetime.now(timezone.utc).date()
-    window_start = as_of - timedelta(days=args.window_days)
+    as_of, window_start = resolve_window(
+        args.as_of, window_days=args.window_days
+    )
 
     session, engine = _open_session()
     try:

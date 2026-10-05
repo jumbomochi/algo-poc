@@ -34,9 +34,9 @@ def _seed(session: Session) -> None:
     now = datetime.now(timezone.utc)
     mom, sec = 23080.0, 15380.0
     for d in SESSIONS:
-        session.add(EquitySnapshot(portfolio="momentum", date=d, equity=mom,
+        session.add(EquitySnapshot(portfolio="momentum", date=d, session_date=d, equity=mom,
                                    cash=mom, market_value=0.0, created_at=now))
-        session.add(EquitySnapshot(portfolio="sector_rotation", date=d, equity=sec,
+        session.add(EquitySnapshot(portfolio="sector_rotation", date=d, session_date=d, equity=sec,
                                    cash=sec, market_value=0.0, created_at=now))
         mom *= 1.002
         sec *= 1.001

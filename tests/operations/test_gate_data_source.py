@@ -62,6 +62,7 @@ def add_equity(
         EquitySnapshot(
             portfolio=portfolio,
             date=day,
+            session_date=day,
             equity=equity,
             cash=0.0,
             market_value=equity,

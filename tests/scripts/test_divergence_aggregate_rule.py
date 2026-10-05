@@ -47,9 +47,9 @@ def _seed(session: Session) -> dict[str, dict[date, float]]:
     mom, sec = 23080.0, 15380.0
     series: dict[str, dict[date, float]] = {"momentum": {}, "sector_rotation": {}}
     for d in SESSIONS:
-        session.add(EquitySnapshot(portfolio="momentum", date=d, equity=mom,
+        session.add(EquitySnapshot(portfolio="momentum", date=d, session_date=d, equity=mom,
                                    cash=mom, market_value=0.0, created_at=now))
-        session.add(EquitySnapshot(portfolio="sector_rotation", date=d, equity=sec,
+        session.add(EquitySnapshot(portfolio="sector_rotation", date=d, session_date=d, equity=sec,
                                    cash=sec, market_value=0.0, created_at=now))
         series["momentum"][d] = mom
         series["sector_rotation"][d] = sec

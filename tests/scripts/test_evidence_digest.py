@@ -636,6 +636,7 @@ def _equity(db, day: date, portfolio: str, equity: float) -> None:
         EquitySnapshot(
             portfolio=portfolio,
             date=day,
+            session_date=day,
             equity=equity,
             cash=0.0,
             market_value=equity,
@@ -1139,9 +1140,10 @@ def test_a_single_accepted_absence_reads_as_one_session():
 def test_the_no_pins_fallback_classifies_accepted_absences_too(db, cal):
     """The same date must not render 🚨 on one path and ◻️ on the other.
 
-    The window 2026-08-10..2026-08-17 contains 2026-08-13, which the registry
-    accounts for. Before Rung 0 there is no epoch and this fallback is the path
-    that actually runs, so it is the one an operator sees.
+    The window 2026-08-10..2026-08-17 contains 2026-08-12 and 2026-08-17,
+    which the registry accounts for (re-dated to US sessions by KAN-103).
+    Before Rung 0 there is no epoch and this fallback is the path that actually
+    runs, so it is the one an operator sees.
     """
     sources = build_sources(
         db, redis_factory=lambda: None, as_of=AS_OF, window_start=WINDOW_START, calendar=cal
@@ -1149,8 +1151,8 @@ def test_the_no_pins_fallback_classifies_accepted_absences_too(db, cal):
     report = sources.blind()
 
     assert report is not None
-    assert date(2026, 8, 13) in report.blind_sessions
-    assert report.absent_sessions == [date(2026, 8, 13)]
+    assert date(2026, 8, 12) in report.blind_sessions
+    assert report.absent_sessions == [date(2026, 8, 12), date(2026, 8, 17)]
 
 
 def test_the_accepted_absence_footnote_ranks_below_the_missing_sources_caveat():

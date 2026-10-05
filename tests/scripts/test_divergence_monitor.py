@@ -72,11 +72,11 @@ def _seed_state(session: Session, start: date | None = None) -> PaperTradingStat
     for i in range(7):
         d = date.fromordinal(base.toordinal() + i)
         session.add(EquitySnapshot(
-            portfolio="momentum", date=d,
+            portfolio="momentum", date=d, session_date=d,
             equity=mom_v, cash=mom_v, market_value=0.0, created_at=now,
         ))
         session.add(EquitySnapshot(
-            portfolio="sector_rotation", date=d,
+            portfolio="sector_rotation", date=d, session_date=d,
             equity=sec_v, cash=sec_v, market_value=0.0, created_at=now,
         ))
         mom_v *= 1.002
@@ -703,6 +703,7 @@ def _seed_drill_sleeve(session: Session) -> None:
         session.add(EquitySnapshot(
             portfolio=DRILL_PORTFOLIO,
             date=date.fromordinal(base.toordinal() + i),
+            session_date=date.fromordinal(base.toordinal() + i),
             equity=value, cash=value, market_value=0.0, created_at=now,
         ))
         value *= 0.98  # a losing drill: would breach if it were ever scored

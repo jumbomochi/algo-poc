@@ -709,6 +709,7 @@ def add_snapshot(
         EquitySnapshot(
             portfolio=portfolio,
             date=day,
+            session_date=day,
             equity=equity,
             cash=equity - market_value,
             market_value=market_value,
@@ -1298,7 +1299,9 @@ def test_exposure_is_measured_only_over_sessions_that_were_actually_observed(
 #: The window KAN-67 argued over: 9 NYSE sessions, two of them absent.
 GAP_WINDOW_START = date(2026, 8, 11)
 GAP_WINDOW_END = date(2026, 8, 21)
-ABSENT = (date(2026, 8, 13), date(2026, 8, 18))
+#: The US sessions the missed SGT 08-13 and 08-18 runs would have valued
+#: (re-dated by KAN-103 from the run dates KAN-67 registered).
+ABSENT = (date(2026, 8, 12), date(2026, 8, 17))
 
 
 def test_blindness_separates_accepted_absences_from_unexplained_ones(session, cal):
@@ -1320,8 +1323,8 @@ def test_an_accepted_absence_still_counts_toward_the_safety_incident(session, ca
     """The registry must not be able to launder a blind streak.
 
     2026-08-12..2026-08-19 is six sessions (12, 13, 14, 17, 18, 19), two of
-    them registered. If registration excused them the run would break into
-    1, 2 and 1, and safety would stay green.
+    them registered (12 and 17). If registration excused them the run would
+    break into 2 and 2, and safety would stay green.
     """
     days = cal.trading_sessions(date(2026, 8, 12), date(2026, 8, 19))
 
@@ -1384,8 +1387,8 @@ def test_epoch_reporting_names_the_absent_sessions_and_their_causes(session, cal
     )
     assert line is not None, progress.blocking
     assert "2 of 9" in line
-    assert "2026-08-13" in line
-    assert "2026-08-18" in line
+    assert "2026-08-12" in line
+    assert "2026-08-17" in line
     assert "KAN-16" in line
 
 
@@ -1404,7 +1407,7 @@ def test_an_unexplained_gap_is_reported_apart_from_the_accepted_ones(session, ca
     )
     assert line is not None, progress.blocking
     assert "2026-08-20" in line
-    assert "2026-08-13" not in line
+    assert "2026-08-12" not in line
 
 
 def test_an_epoch_with_no_absences_reports_neither_line(session, cal):
@@ -1441,11 +1444,11 @@ def test_the_session_in_flight_is_not_reported_as_an_unexplained_hole(
 def test_a_hole_older_than_the_session_in_flight_is_reported(session, cal):
     """One session further back, and it is overdue rather than pending.
 
-    ``days[-3]`` deliberately, not ``days[-2]``: this epoch's second-to-last
-    session is 2026-08-13, which the registry already accounts for.
+    ``days[-2]`` deliberately, not ``days[-3]``: this epoch's third-to-last
+    session is 2026-08-12, which the registry already accounts for.
     """
     epoch, days = build_epoch(session, cal)
-    overdue = days[-3]
+    overdue = days[-2]
     session.query(DivergenceDaily).filter(
         DivergenceDaily.session_date == overdue
     ).delete()
@@ -1467,9 +1470,10 @@ def test_a_streak_across_the_gap_window_neither_breaks_nor_counts_the_absences(
     """AC3 on the streak side, with the real dates as fixtures.
 
     Nine sessions span 2026-08-11..2026-08-21. BREACH is observed on the seven
-    that ran; 08-13 and 08-18 produced nothing. Absent means absent: the run is
-    seven long, not nine (they are not present) and not broken into 2 and 3
-    (they are not clearing verdicts either).
+    that ran; 08-12 and 08-17 produced nothing. Absent means absent: the run is
+    seven long, not nine (they are not present) and not broken into 1, 2 and 4
+    (they are not clearing verdicts either). The absent dates are the US
+    sessions 08-12 and 08-17 since KAN-103.
 
     This pins behaviour ``breach_streak`` already had — a missing verdict is a
     pause — because KAN-67's acceptance of the two gaps now depends on it.
@@ -1499,7 +1503,7 @@ def test_a_streak_across_the_gap_window_neither_breaks_nor_counts_the_absences(
 def test_an_absence_does_not_reset_a_run_that_reaches_the_trigger(session, cal):
     """A pause must not let a persisting breach be laundered into a short run.
 
-    Ten BREACH sessions with 2026-08-13 and 2026-08-18 absent inside them is
+    Ten BREACH sessions with 2026-08-12 and 2026-08-17 absent inside them is
     still one event observed for ten sessions.
     """
     days = cal.trading_sessions(date(2026, 8, 6), GAP_WINDOW_END)
@@ -1521,3 +1525,37 @@ def test_an_absence_does_not_reset_a_run_that_reaches_the_trigger(session, cal):
     assert streak.paused_sessions == 2
     assert streak.fires is True
 
+
+
+# ---------------------------------------------------------------------------
+# KAN-103: a session that has not closed is not yet owed a verdict
+# ---------------------------------------------------------------------------
+
+
+def test_epoch_progress_stops_at_the_last_closed_session(session, cal):
+    """Scored mid-session, today's US session has no verdict to have written.
+
+    AS_OF (Fri 08-14) is the in-progress session at 10:00 ET. Counting it
+    would pause the clock on a session that simply has not happened yet; on an
+    SGT Monday morning that was every week's unopened US Monday.
+    """
+    epoch, days = build_epoch(session, cal)
+    session.query(DivergenceDaily).filter(
+        DivergenceDaily.session_date == AS_OF
+    ).delete()
+    session.flush()
+    mid_session = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+
+    progress = _progress(session, cal, epoch, now=mid_session)
+
+    assert progress.sessions_paused == 0
+    assert progress.sessions_elapsed == len(days) - 1
+
+
+def test_epoch_progress_counts_a_session_once_it_has_closed(session, cal):
+    epoch, days = build_epoch(session, cal)
+    after_close = datetime(2026, 8, 14, 20, 30, tzinfo=timezone.utc)
+
+    progress = _progress(session, cal, epoch, now=after_close)
+
+    assert progress.sessions_elapsed == len(days)

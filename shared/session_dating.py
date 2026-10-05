@@ -17,6 +17,7 @@ UTC; a naive datetime is taken to be UTC, which is how sqlite hands back a
 """
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any
@@ -177,3 +178,37 @@ def infer_session(
     if valuation_at is not None:
         return last_closed_session(valuation_at, calendar=calendar)
     return last_session_before(run_date, calendar=calendar)
+
+
+def equity_by_session(rows: Iterable[Mapping[str, Any]]) -> dict[date, float]:
+    """Collapse snapshot rows to one live value per US session valued.
+
+    ``rows`` are ``PaperTradingState.get_equity_history`` dicts. Rows with no
+    ``session_date`` are skipped: an unstamped row (a partial bar, or history
+    the backfill has not reached) is ungradeable, never guessed. Where two run
+    dates valued one session — the Tuesday after a US Monday holiday, a weekend
+    catch-up — the later run wins; it is the newer valuation of the same
+    closes, and in every recorded case the values are identical.
+    """
+    latest: dict[date, tuple[date, float]] = {}
+    for row in rows:
+        raw = row.get("session_date")
+        if raw is None:
+            continue
+        session = raw if isinstance(raw, date) else date.fromisoformat(str(raw))
+        run = row["date"]
+        run = run if isinstance(run, date) else date.fromisoformat(str(run))
+        held = latest.get(session)
+        if held is None or run >= held[0]:
+            latest[session] = (run, float(row["equity"]))
+    return {session: value for session, (_, value) in sorted(latest.items())}
+
+
+def unstamped_run_dates(rows: Iterable[Mapping[str, Any]]) -> list[date]:
+    """Run dates of rows :func:`equity_by_session` skips, ascending."""
+    return sorted(
+        row["date"] if isinstance(row["date"], date)
+        else date.fromisoformat(str(row["date"]))
+        for row in rows
+        if row.get("session_date") is None
+    )

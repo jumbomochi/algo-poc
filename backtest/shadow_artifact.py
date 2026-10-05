@@ -42,6 +42,15 @@ SHADOW_ID_PREFIX = "shadow:"
 #: hex chars is 64 bits, far past collision risk for a handful of models.
 _DIGEST_CHARS = 16
 
+#: How live is dated when this shadow is graded against it. ``session_date``
+#: since KAN-103: live keyed by the US session each snapshot valued. Before
+#: it, live was keyed by the SGT run date and every compared pair was one
+#: session apart (docs/decisions/divergence-session-dating-2026-10.md). The
+#: two are different comparisons, so the version is part of the model: every
+#: verdict after the switch files under a new ``baseline_id``, and
+#: ``breach_streak`` treats the run-date-keyed rows as history.
+SHADOW_DATING_VERSION = "session_date"
+
 
 @dataclass(frozen=True)
 class ShadowArtifact:
@@ -90,8 +99,11 @@ def shadow_id_for(portfolios: Mapping[str, Any], *, whole_shares: bool = False) 
 
     ``whole_shares`` changes what the replay would do — a budget below one
     share opens nothing — so it is part of the model (KAN-60). It enters the
-    fingerprint only when true, which keeps every fractional id byte-identical
-    to the ones already filed in ``divergence_daily``.
+    fingerprint only when true.
+
+    :data:`SHADOW_DATING_VERSION` always enters it (KAN-103). That changed
+    every id on purpose: the verdicts filed before it compared live one
+    session off its shadow, and must not share a streak with ones that do not.
 
     Raises:
         ValueError: A sleeve exposes no ``shadow_params``. Defaulting to an
@@ -119,6 +131,7 @@ def shadow_id_for(portfolios: Mapping[str, Any], *, whole_shares: bool = False) 
     )
     if whole_shares:
         fingerprint.append(("__sizing__", "whole_shares"))
+    fingerprint.append(("__dating__", SHADOW_DATING_VERSION))
     digest = hashlib.sha256(
         json.dumps(fingerprint, sort_keys=True).encode()
     ).hexdigest()[:_DIGEST_CHARS]
