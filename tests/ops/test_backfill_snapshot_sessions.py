@@ -128,6 +128,24 @@ def test_the_plan_maps_each_run_date_to_the_session_it_valued(session):
         assert rows[key].status == FILL
 
 
+def test_a_row_valued_inside_the_settle_margin_is_unresolved(tmp_path):
+    """KAN-104's "in progress" includes the 5 minutes after the bell."""
+    url = f"sqlite:///{tmp_path / 'settle.db'}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    with Session(engine) as s:
+        # 16:02 ET on Mon 09-28: closed, but its daily bar not yet trusted.
+        at = datetime(2026, 9, 28, 20, 2, tzinfo=timezone.utc)
+        s.add(EquitySnapshot(
+            portfolio="momentum", date=date(2026, 9, 29), equity=1.0, cash=1.0,
+            market_value=0.0, valuation_at=at, created_at=at,
+        ))
+        s.commit()
+        (row,) = plan_backfill(s).rows
+    assert row.status == UNRESOLVED
+    assert "inside the 2026-09-28 session" in row.reason
+
+
 def test_a_row_valued_while_a_session_traded_is_unresolved(session):
     row = _by_key(plan_backfill(session))[("momentum", date(2026, 9, 29))]
     assert row.status == UNRESOLVED

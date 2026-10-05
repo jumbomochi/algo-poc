@@ -833,6 +833,7 @@ def run_daily(
     candidate_observer: CandidateObserver | None = None,
     record_aggregate: bool = True,
     capital: CapitalBudget | None = None,
+    priced_at: datetime | None = None,
 ) -> list[dict]:
     """Run one daily cycle: generate signals for all portfolios.
 
@@ -849,6 +850,10 @@ def run_daily(
     the FX rate costs no extra IB call and introduces no new failure mode.
     When it is absent (a bare test harness) the currency columns stay NULL,
     which is what every row before KAN-44 looks like.
+
+    ``priced_at`` is the instant the bar fetch started (KAN-104). It is the
+    ``session_date`` stamp's fallback instant when there is no budget to
+    supply ``valuation_at`` (KAN-103).
     """
     signals_generated: list[dict] = []
     currency_context: dict[str, Any] = (
@@ -876,7 +881,7 @@ def run_daily(
     # KAN-103: ``today`` is the SGT run date; this is the US session those
     # closes are from, or None if it had not closed by valuation.
     marks_session = _marks_session(
-        bars_by_ticker, currency_context.get("valuation_at")
+        bars_by_ticker, currency_context.get("valuation_at"), priced_at
     )
 
     for name, pc in portfolios.items():
@@ -1093,18 +1098,20 @@ def _contract_by_symbol(
 def _marks_session(
     bars_by_ticker: Mapping[str, list[dict]],
     valuation_at: datetime | None,
+    priced_at: datetime | None = None,
 ) -> date | None:
     """The US session whose closes ``current_prices`` holds (KAN-103).
 
-    Taken from the bars actually priced, cross-checked against the valuation
-    instant (``valuation_at``, or now for a harness run without a budget):
-    a session that had not closed by then is a partial bar and yields None.
+    The session is the one the KAN-104 close guard checks,
+    ``newest_bar_session``. It is cross-checked against the valuation
+    instant: ``valuation_at`` (the broker snapshot), else ``priced_at`` (the
+    fetch start), else now for a bare harness. A session that had not closed
+    by then is a partial bar and yields None, which behind the close guard
+    only a tagged drill run can reach.
     """
-    sessions = [_bar_date(bars[-1]["date"]) for bars in bars_by_ticker.values() if bars]
-    if not sessions:
-        return None
     return stamp_session(
-        max(sessions), valuation_at or datetime.now(timezone.utc)
+        newest_bar_session(dict(bars_by_ticker)),
+        valuation_at or priced_at or datetime.now(timezone.utc),
     )
 
 
@@ -2080,6 +2087,7 @@ def main() -> int | None:
             candidate_observer=candidate_observer,
             record_aggregate=portfolio_tag is None,
             capital=preparation.capital,
+            priced_at=fetch_started_at,
         )
         if args.publish and signals:
             contracts = resolve_contract_details_from_ib(
