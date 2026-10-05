@@ -278,7 +278,7 @@ that the rules above are executable: every step resolves against data, and the
 answer it produces is **not** the answer eyeballing the log would give.
 
 **The raw record** (from `output/divergence_*.json`; a report generated at
-04:45 SGT scores the previous US session):
+05:45 SGT scores the previous US session):
 
 | US session | `momentum` status | Baseline artifact |
 |---|---|---|

@@ -14,7 +14,7 @@ Deliberately quiet on failure: nothing on stdout and exit 1. Deciding that an
 unresolvable pin should stop the run belongs to exactly one place, and that
 place is the monitor — it exits 3 with `BASELINE_PIN_MISSING`, which alerts.
 If this script also refused, the wrapper would have two authorities that could
-disagree about whether the 04:45 job happens at all, and the failure mode of
+disagree about whether the 05:45 job happens at all, and the failure mode of
 the quieter one is a job that skips silently. That is the 2026-08-13 pattern.
 
 Usage:

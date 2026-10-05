@@ -153,7 +153,7 @@ class ExecutionFill(Base):
     #: rather than observed. ``executed_at`` is the broker's clock and can be
     #: weeks older than the repair — KAN-88 rebuilt 2026-09-18 executions on
     #: 2026-09-21 — so it cannot answer "what did we recover tonight", which
-    #: is the question the 04:52 digest exists to ask. ``None`` for every
+    #: is the question the 05:52 digest exists to ask. ``None`` for every
     #: fill the live callback delivered, and for every row written before
     #: this column existed; the digest coalesces to ``executed_at`` there.
     #:

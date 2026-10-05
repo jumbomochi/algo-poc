@@ -2094,7 +2094,7 @@ def make_ml_shadow_signals_fn(
     the live filter would measure the wrong thing, plausibly.
 
     Neither a scoring failure nor a recording failure may cost a trade: this
-    runs inside the 04:15 job, and an observation is worth less than an entry.
+    runs inside the 05:15 job, and an observation is worth less than an entry.
     """
     def shadow_signals_fn(ticker: str, bars: list[dict]) -> dict | None:
         signal = inner_fn(ticker, bars)
@@ -2118,7 +2118,7 @@ def make_ml_shadow_signals_fn(
             # Deliberately swallowed. This wrapper exists to OBSERVE; a failure
             # to observe must never remove an entry the sleeve asked for.
             # Printed rather than logged because this module has no logger and
-            # its output already goes to the 04:15 run log.
+            # its output already goes to the 05:15 run log.
             print(
                 f"  WARNING: ML shadow scoring failed for {strategy_name}/"
                 f"{ticker}; the signal is unaffected"

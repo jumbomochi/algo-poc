@@ -14,17 +14,21 @@
 	<string>/Users/huiliang/ibc/logs/backtest-refresh-launchd.log</string>
 	<key>StandardOutPath</key>
 	<string>/Users/huiliang/ibc/logs/backtest-refresh-launchd.log</string>
-	<!-- Tuesday 05:00 SGT: after Tue 04:15 paper run + 04:45 divergence, with
-	     the US Monday session closed and IBKR's data farms warm (they are
-	     routinely dead Sun-Mon pre-market). -->
+	<!-- Tuesday 06:30 SGT: after the whole daily chain (paper 05:15,
+	     divergence 05:45, report 05:52, backup 06:15), with the US Monday
+	     session closed in both seasons and IBKR's data farms warm (they are
+	     routinely dead Sun-Mon pre-market). The old 05:00 slot was exactly the
+	     EST close, and with the paper run at 05:15 it would have shared the
+	     gateway's pacing budget with it (KAN-104). Its 6h bound ends by 12:30,
+	     ahead of the 2:00 PM IBC AutoRestartTime. -->
 	<key>StartCalendarInterval</key>
 	<dict>
 		<key>Weekday</key>
 		<integer>2</integer>
 		<key>Hour</key>
-		<integer>5</integer>
+		<integer>6</integer>
 		<key>Minute</key>
-		<integer>0</integer>
+		<integer>30</integer>
 	</dict>
 </dict>
 </plist>

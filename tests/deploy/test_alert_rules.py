@@ -171,7 +171,7 @@ def test_the_cadence_sensitive_rules_require_upstream_activity() -> None:
 
 
 def test_the_no_fills_window_spans_a_weekend() -> None:
-    """The 04:15 SGT run places orders ~15 minutes after the US close, so they
+    """The 05:15 SGT run places orders ~20-80 minutes after the US close, so they
     cannot fill until the next session — and a Friday run's orders wait until
     Monday. Any window shorter than a weekend pages every Saturday."""
     assert "[3d]" in _rule("NoFillsRecently")["expr"]

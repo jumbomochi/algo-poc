@@ -119,7 +119,7 @@ _algo_baseline_coverage() {
     state="$(head -c 262144 "$1" 2>/dev/null \
              | awk '/"coverage"/{f=1} f && /"state"/{gsub(/[^A-Z_]/,""); print; exit}')"
     # Rounded: the raw value is a full float (11.284998021159765) and an alert
-    # body is read by a human at 04:52.
+    # body is read by a human at 05:52.
     pct="$(head -c 262144 "$1" 2>/dev/null \
            | awk '/"coverage"/{f=1} f && /"excluded_pct"/{gsub(/[^0-9.]/,""); printf "%.2f", $0; exit}')"
     [ -n "$state" ] || return 0

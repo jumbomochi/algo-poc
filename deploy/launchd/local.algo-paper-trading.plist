@@ -14,12 +14,16 @@
 	<string>/Users/huiliang/ibc/logs/paper-launchd.log</string>
 	<key>StandardOutPath</key>
 	<string>/Users/huiliang/ibc/logs/paper-launchd.log</string>
-	<!-- Run at 4:15 AM SGT Tue-Sat (= 4:15 PM ET Mon-Fri, after US market close) -->
+	<!-- Run at 05:15 SGT Tue-Sat, after the US close in both seasons (KAN-104):
+	     = 17:15 ET Mon-Fri under EDT (close 04:00 SGT) and 16:15 ET under EST
+	     (close 05:00 SGT). SGT has no DST, so the old 04:15 slot fell 45 min
+	     BEFORE the close every EST winter. scripts/run_paper.py refuses to
+	     price an unclosed session regardless; this slot just avoids tripping it. -->
 	<key>StartCalendarInterval</key>
 	<array>
 		<dict>
 			<key>Hour</key>
-			<integer>4</integer>
+			<integer>5</integer>
 			<key>Minute</key>
 			<integer>15</integer>
 			<key>Weekday</key>
@@ -27,7 +31,7 @@
 		</dict>
 		<dict>
 			<key>Hour</key>
-			<integer>4</integer>
+			<integer>5</integer>
 			<key>Minute</key>
 			<integer>15</integer>
 			<key>Weekday</key>
@@ -35,7 +39,7 @@
 		</dict>
 		<dict>
 			<key>Hour</key>
-			<integer>4</integer>
+			<integer>5</integer>
 			<key>Minute</key>
 			<integer>15</integer>
 			<key>Weekday</key>
@@ -43,7 +47,7 @@
 		</dict>
 		<dict>
 			<key>Hour</key>
-			<integer>4</integer>
+			<integer>5</integer>
 			<key>Minute</key>
 			<integer>15</integer>
 			<key>Weekday</key>
@@ -51,7 +55,7 @@
 		</dict>
 		<dict>
 			<key>Hour</key>
-			<integer>4</integer>
+			<integer>5</integer>
 			<key>Minute</key>
 			<integer>15</integer>
 			<key>Weekday</key>

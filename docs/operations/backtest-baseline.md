@@ -367,7 +367,7 @@ Re-pin deliberately; it is a change to what the evidence means.
 3. Set `divergence.baseline_pin` to the new path and land it through a PR.
 4. A config-only change needs **no** redeploy: `~/ibc/run_divergence.sh` resolves
    the pin by running `$ALGO_DIR/scripts/ops/baseline_pin.py`, which reads the
-   repo checkout's `config/default.yaml`, so the next 04:45 run picks it up.
+   repo checkout's `config/default.yaml`, so the next 05:45 run picks it up.
    (One exception — **the pin mechanism itself does not exist in production until
    the wrappers are redeployed.** `local.algo-divergence.plist` runs the deployed
    copy of `run_divergence.sh`, so until `deploy/launchd/deploy.sh` has run after
@@ -551,7 +551,7 @@ omitted. Treat any headline number produced without it as indicative only.
 
 ### The weekly refresh passes the snapshot too
 
-`deploy/launchd/run_backtest_refresh.sh` (Tuesdays 05:00 SGT) reruns the same
+`deploy/launchd/run_backtest_refresh.sh` (Tuesdays 06:30 SGT) reruns the same
 backtest so the baseline stays current. It passes `--universe-snapshots`, and
 **aborts with exit 2 and a Telegram alert if the snapshot file is missing**
 rather than running without it. Producing nothing is strictly better than
@@ -570,8 +570,8 @@ one, and `run_backtest.py` issues one historical-data request per ticker-year �
 so `--years 10` goes from ~1,400 requests to ~8,300. Against IB's pacing limits
 that is hours, not minutes. The wrapper therefore bounds the run at
 `ALGO_REFRESH_TIMEOUT_SECONDS` (default 6h) and kills it past that, alerting on
-exit 124, so a runaway 05:00 SGT job cannot still be contending for the gateway
-when the next day's 04:15 paper run starts. (There is no clientId collision —
+exit 124, so a runaway 06:30 SGT job cannot still be contending for the gateway
+when the next day's 05:15 paper run starts. (There is no clientId collision —
 the backtest uses 10, `run_paper` 58/59 — but they share one pacing budget.)
 Record the measured wall-clock of the first full PIT run here and re-tune the
 deadline if 6h turns out to be tight.

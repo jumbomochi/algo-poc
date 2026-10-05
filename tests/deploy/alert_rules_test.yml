@@ -132,7 +132,7 @@ tests:
                 rule in this file could have told you, because they all run on
                 the machine that died. Paired with the run_paper.sh dead-man
                 ping (deploy/launchd/deadman.sh), which covers the narrower case
-                of "the host is up but the 04:15 trading run did not happen".
+                of "the host is up but the 05:15 trading run did not happen".
 
   # -------------------------------------------------------------------------
   # AC3 — a normal NO-TRADE day. Not a weekend: the run happened, on a real
@@ -450,4 +450,4 @@ tests:
                 rule in this file could have told you, because they all run on
                 the machine that died. Paired with the run_paper.sh dead-man
                 ping (deploy/launchd/deadman.sh), which covers the narrower case
-                of "the host is up but the 04:15 trading run did not happen".
+                of "the host is up but the 05:15 trading run did not happen".

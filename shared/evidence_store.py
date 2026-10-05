@@ -724,7 +724,7 @@ def epoch_progress(
             + "; ".join(entry.describe() for entry in absent)
             + ". The reasoning is in shared/absent_sessions.py."
         )
-    # The session in flight is excluded: at 04:52 the day's own divergence row
+    # The session in flight is excluded: at 05:52 the day's own divergence row
     # may legitimately not be written yet, and reporting it as unaccounted-for
     # would put this note on nearly every routine run — turning the one signal
     # that a gap is going unnoticed into noise.

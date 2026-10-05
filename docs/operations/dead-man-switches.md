@@ -7,7 +7,7 @@ asleep, or off the network, the thing that was supposed to shout is the thing
 that is gone.** A monitor cannot report its own absence.
 
 There is a second, subtler blind spot. This system trades **once a day**
-(`deploy/launchd/run_paper.sh`, ~04:15 SGT). From inside, a day on which every
+(`deploy/launchd/run_paper.sh`, ~05:15 SGT). From inside, a day on which every
 signal was a SKIP and a day on which the run never happened at all look
 *identical*: no recommendations, no approved orders, no fills, every stream
 flat. No PromQL over `redis_stream_*` can tell those apart — which is why
@@ -20,10 +20,10 @@ has to detect anything. The absence of a message is the message.
 | Switch | Pinged by | Cadence | Covers |
 |---|---|---|---|
 | `DEADMAN_WATCHDOG_URL` | Alertmanager, from the always-firing `Watchdog` rule | every 5 min | Prometheus / Alertmanager / docker / the host stopped |
-| `ALGO_DEADMAN_PAPER_URL` | `deploy/launchd/run_paper.sh`, on a **successful** run only | once a day (~04:20 SGT, Tue–Sat) | the host is up, but the trading run did not happen or failed |
-| `ALGO_DEADMAN_DIVERGENCE_URL` | `deploy/launchd/run_divergence.sh`, on a run that reached a **verdict** (exit 0/1/3/4, not 2) | once a day (~04:50 SGT, Tue–Sat) | the 04:45 drift check did not happen — as on 2026-08-13/14, which left a permanent hole in the gate evidence |
-| `ALGO_DEADMAN_REFRESH_URL` | `deploy/launchd/run_backtest_refresh.sh`, on a **successful** run only | once a week (~Tue 05:00–11:00 SGT) | the weekly baseline refresh did not happen — as on 2026-08-11, when the host booted after the calendar slot and launchd did not re-fire it |
-| `ALGO_DEADMAN_BACKUP_URL` | `deploy/launchd/run_db_backup.sh`, on a **verified** dump | once a day (~05:16 SGT) | the RPO ≤ 1 day promise quietly stopped being kept |
+| `ALGO_DEADMAN_PAPER_URL` | `deploy/launchd/run_paper.sh`, on a **successful** run only | once a day (~05:22 SGT, Tue–Sat) | the host is up, but the trading run did not happen or failed |
+| `ALGO_DEADMAN_DIVERGENCE_URL` | `deploy/launchd/run_divergence.sh`, on a run that reached a **verdict** (exit 0/1/3/4, not 2) | once a day (~05:46 SGT, Tue–Sat) | the 05:45 drift check did not happen — as on 2026-08-13/14, which left a permanent hole in the gate evidence |
+| `ALGO_DEADMAN_REFRESH_URL` | `deploy/launchd/run_backtest_refresh.sh`, on a **successful** run only | once a week (~Tue 06:30–12:30 SGT) | the weekly baseline refresh did not happen — as on 2026-08-11, when the host booted after the calendar slot and launchd did not re-fire it |
+| `ALGO_DEADMAN_BACKUP_URL` | `deploy/launchd/run_db_backup.sh`, on a **verified** dump | once a day (~06:16 SGT) | the RPO ≤ 1 day promise quietly stopped being kept |
 | `ALGO_DEADMAN_DIGEST_URL` | `scripts/ops/evidence_digest.py`, on a **delivered** digest | once a week (Mon ~08:00 SGT) | the weekly evidence digest was not sent |
 
 Two jobs deliberately have no switch, and say so in their own headers:
@@ -58,10 +58,10 @@ in SGT, because the launchd slots are.
 | Check | Switch | Provider schedule | Grace | Why |
 |---|---|---|---|---|
 | Watchdog | `DEADMAN_WATCHDOG_URL` | `*/5 * * * *` | ≥ 15 min | Alertmanager re-notifies every 5 min; the grace must survive one missed ping without a false page. |
-| Paper run | `ALGO_DEADMAN_PAPER_URL` | `15 4 * * 2-6` | 2 h | `local.algo-paper-trading.plist` is `Weekday` 2–6, i.e. **Tue–Sat SGT** — which is US Mon–Fri, because the 04:15 SGT run covers the session that closed at 04:00 SGT that morning. Sunday and Monday are legitimately quiet. A flat 26 h period instead of this cron pages every Sunday and stays red through Monday. |
-| Divergence | `ALGO_DEADMAN_DIVERGENCE_URL` | `45 4 * * 2-6` | 4 h | Same Tue–Sat shape, 30 min after the paper run. The 4 h grace covers the 5-minute DB port wait plus a slow cold boot. |
-| Backtest refresh | `ALGO_DEADMAN_REFRESH_URL` | `0 5 * * 2` | 12 h | Weekly (Tue 05:00 SGT), and the run itself can take hours against ~830 point-in-time tickers, so the grace is generous enough that a merely slow run does not page. |
-| DB backup | `ALGO_DEADMAN_BACKUP_URL` | `15 5 * * *` | 2 h | Daily at 05:15 — this one really is every day, weekends included. |
+| Paper run | `ALGO_DEADMAN_PAPER_URL` | `15 5 * * 2-6` | 2 h | `local.algo-paper-trading.plist` is `Weekday` 2–6, i.e. **Tue–Sat SGT** — which is US Mon–Fri, because the 05:15 SGT run covers the session that closed earlier that morning (04:00 SGT under EDT, 05:00 under EST; KAN-104 moved it from 04:15, which fell before the EST close). A run refused by the close guard (exit 4) does not ping, so this check pages for it. Sunday and Monday are legitimately quiet. A flat 26 h period instead of this cron pages every Sunday and stays red through Monday. |
+| Divergence | `ALGO_DEADMAN_DIVERGENCE_URL` | `45 5 * * 2-6` | 4 h | Same Tue–Sat shape, 30 min after the paper run. The 4 h grace covers the 5-minute DB port wait plus a slow cold boot. |
+| Backtest refresh | `ALGO_DEADMAN_REFRESH_URL` | `30 6 * * 2` | 12 h | Weekly (Tue 06:30 SGT, after the daily chain — KAN-104), and the run itself can take hours against ~830 point-in-time tickers, so the grace is generous enough that a merely slow run does not page. |
+| DB backup | `ALGO_DEADMAN_BACKUP_URL` | `15 6 * * *` | 2 h | Daily at 06:15 (05:15 until KAN-104 put the paper run there) — this one really is every day, weekends included. |
 | Evidence digest | `ALGO_DEADMAN_DIGEST_URL` | `0 8 * * 1` | 12 h | Weekly (Mon 08:00 SGT). Prefer the cron over a plain "8 days": an 8-day period lets a missed Monday stay invisible for over a week, which is the failure KAN-64 existed to close. |
 
 The cron is the **expected check-in time**, and every wrapper waits on a port or

@@ -7,8 +7,9 @@
 # for why delivery does not reuse the notifications service).
 #
 # CADENCE — read this before adding or retuning a rule.
-# This system trades ONCE A DAY: deploy/launchd/run_paper.sh fires at ~04:15
-# SGT (20:15 UTC, ~16:15 ET, just after the US close). Outside that window,
+# This system trades ONCE A DAY: deploy/launchd/run_paper.sh fires at ~05:15
+# SGT (21:15 UTC; 16:15 ET under EST, 17:15 under EDT — after the US close in
+# both seasons, KAN-104). Outside that window,
 # and all weekend, every stream is idle and every service is simply waiting.
 # "Idle" is therefore the normal state, not a symptom.
 #
@@ -165,7 +166,7 @@ groups:
       # legitimate no-trade day and on every weekend.
       #
       # Now: orders were approved and NOTHING filled. The window is 3 days
-      # rather than hours because the 04:15 SGT run places orders ~15 minutes
+      # rather than hours because the 05:15 SGT run places orders ~20-80 minutes
       # AFTER the US close, so they cannot fill until the next session opens
       # (~22:30 SGT) — and a Friday run's orders do not get a session until
       # Monday. Anything shorter than a weekend would page on a completely
@@ -300,4 +301,4 @@ groups:
             rule in this file could have told you, because they all run on
             the machine that died. Paired with the run_paper.sh dead-man
             ping (deploy/launchd/deadman.sh), which covers the narrower case
-            of "the host is up but the 04:15 trading run did not happen".
+            of "the host is up but the 05:15 trading run did not happen".

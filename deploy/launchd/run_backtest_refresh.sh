@@ -1,5 +1,7 @@
 #!/bin/bash
-# Weekly backtest refresh for algo-poc — Tuesdays 05:00 SGT.
+# Weekly backtest refresh for algo-poc — Tuesdays 06:30 SGT (05:00 until
+# KAN-104: that slot was exactly the NYSE close under EST, and would have
+# overlapped the paper run once it moved to 05:15).
 #
 # Re-runs the full 10yr backtest so a *current* artifact is always available to
 # pin (without a refresh the live equity dates eventually stop overlapping any
@@ -10,8 +12,8 @@
 #
 # Tuesday, not the runbook's original Monday: IBKR's historical-data farm is
 # routinely dead through Monday pre-market (observed 2026-07-05/06 — down
-# from Saturday night until Monday's 21:30 SGT open). By Tuesday 05:00 SGT
-# the US Monday session has closed and the farms are warm.
+# from Saturday night until Monday's 21:30 SGT open). By Tuesday 06:30 SGT
+# the US Monday session has closed in both seasons and the farms are warm.
 #
 # Exit-code contract:
 #   0 = refresh OK
@@ -38,7 +40,7 @@
 # ------------------------------------------------
 # Every alert below is sent by this script, about this script, so all of them
 # require this script to be running. On 2026-08-11 the host was booted at 07:59
-# — after the 05:00 slot — and launchd does NOT re-fire a StartCalendarInterval
+# — after the then-05:00 slot — and launchd does NOT re-fire a StartCalendarInterval
 # job that was missed while the machine was down. The refresh simply never
 # happened: no checks, no exit code, no message. That was indistinguishable
 # from a healthy Tuesday, and the baseline aged another week unnoticed.
@@ -224,7 +226,7 @@ fi
 # output/ looking like a candidate at the next re-pin, and an operator picking it
 # reverts the monitor to exit 3 (BLIND) — undoing KAN-23, just later. A local
 # misconfiguration must also not be masked by whatever IB happens to be doing at
-# 05:00. Exit 2 keeps it distinct from the gateway's exit 1 in the launchd log.
+# 06:30. Exit 2 keeps it distinct from the gateway's exit 1 in the launchd log.
 if [ ! -f "$MEMBERSHIP_SNAPSHOT" ]; then
     echo "$(ts): ERROR - membership snapshot missing at $MEMBERSHIP_SNAPSHOT;" \
          "refusing to write a survivorship-biased baseline" >> "$LOG_FILE"
@@ -244,8 +246,8 @@ cd "$ALGO_DIR"
 # bigger: resolve_backtest_universe goes from the 140-ticker sleeve union to
 # ~830 names once the membership calendar is passed, and run_backtest.py issues
 # one historical-data request per ticker-year. Against IB's pacing limits that
-# is hours, and an unbounded job started at 05:00 SGT could still be holding
-# the gateway when the next day's 04:15 paper run wants it. (No clientId
+# is hours, and an unbounded job started at 06:30 SGT could still be holding
+# the gateway when the next day's 05:15 paper run wants it. (No clientId
 # collision — the backtest uses 10, run_paper 58/59 — but they contend for the
 # same historical-data pacing budget.) On expiry: SIGTERM, then SIGKILL, then
 # exit 124, the conventional timeout code.

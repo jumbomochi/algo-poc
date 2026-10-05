@@ -1,14 +1,14 @@
-"""Serialising the rolling shadow between the 04:15 and 04:45 jobs.
+"""Serialising the rolling shadow between the 05:15 and 05:45 jobs.
 
-The 04:15 paper run already holds the fetched bars, the sleeve configs and the
+The 05:15 paper run already holds the fetched bars, the sleeve configs and the
 risk engines, so it produces the shadow (``backtest.shadow_series``) for about
-0.06s of work on data it has anyway, and writes it here. The 04:45 monitor
-reads it. The alternative — a second IB historical fetch at 04:45 — was
+0.06s of work on data it has anyway, and writes it here. The 05:45 monitor
+reads it. The alternative — a second IB historical fetch at 05:45 — was
 rejected because the gateway is the dependency that has already killed
 scheduled runs twice.
 
 That split has one deliberate consequence worth stating: the monitor's feed now
-depends on the 04:15 job. A **missing** artifact therefore means the paper run
+depends on the 05:15 job. A **missing** artifact therefore means the paper run
 did not happen, which is exactly the blind signal
 ``shared.evidence_store.blindness`` derives from absence. It must never be read
 as "no sleeves were gradeable", so :func:`load_shadow` raises rather than
@@ -29,7 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -52,7 +52,7 @@ class ShadowArtifact:
     window_sessions: int
     #: The session this shadow was produced for. Carried *inside* the file
     #: rather than inferred from its name, because a stale shadow is otherwise
-    #: indistinguishable from a fresh one: if the 04:15 run fails, yesterday's
+    #: indistinguishable from a fresh one: if the 05:15 run fails, yesterday's
     #: artifact is still on disk and the monitor would grade today's live
     #: against yesterday's model curve. Filenames cannot settle it — a copy or
     #: a re-run rewrites them, which is the same reason ``baseline_age``
@@ -62,16 +62,23 @@ class ShadowArtifact:
     #:
     #: Separate from ``session_date`` because they are different facts and
     #: conflating them broke the freshness check outright. ``session_date`` is
-    #: the last COMPLETE market session the curve covers; at 04:15 SGT that is
+    #: the last COMPLETE market session the curve covers; at 05:15 SGT that is
     #: always the previous calendar day, while the live book's
     #: ``equity_snapshots`` row is stamped with the run's own SGT date. The two
     #: are therefore always one day apart, so comparing them reported "stale"
     #: every single day (measured 2026-09-04: live 09-04, shadow 09-03).
     #:
-    #: Freshness asks "did today's 04:15 run write this", which is exactly this
+    #: Freshness asks "did today's 05:15 run write this", which is exactly this
     #: field — and it still catches the case the check exists for, a failed
     #: morning leaving yesterday's artifact on disk.
     produced_on: date
+    #: KAN-104 provenance: the newest NYSE session (ET date) the bars behind
+    #: this curve cover, and the instant the fetch of those bars STARTED. The
+    #: monitor uses the pair to refuse a shadow that was priced before its
+    #: session closed. ``None`` on artifacts written before the field existed,
+    #: which the monitor reports and grades as before.
+    bars_session: date | None = None
+    priced_at: datetime | None = None
 
 
 def shadow_id_for(portfolios: Mapping[str, Any], *, whole_shares: bool = False) -> str:
@@ -126,6 +133,8 @@ def dump_shadow(
     window_sessions: int,
     session_date: date,
     produced_on: date,
+    bars_session: date | None = None,
+    priced_at: datetime | None = None,
 ) -> None:
     """Write the shadow artifact.
 
@@ -141,6 +150,8 @@ def dump_shadow(
         "window_sessions": window_sessions,
         "session_date": session_date.isoformat(),
         "produced_on": produced_on.isoformat(),
+        "bars_session": bars_session.isoformat() if bars_session else None,
+        "priced_at": priced_at.isoformat() if priced_at else None,
         "series": {
             sleeve: {session.isoformat(): value for session, value in curve.items()}
             for sleeve, curve in series.items()
@@ -153,7 +164,7 @@ def load_shadow(path: str | Path) -> ShadowArtifact:
     """Read a shadow artifact.
 
     Raises:
-        FileNotFoundError: The artifact is absent, which means the 04:15 job did
+        FileNotFoundError: The artifact is absent, which means the 05:15 job did
             not run. That is the blind signal and the caller has to see it as
             one — returning an empty result here would launder a dead paper run
             into "nothing was gradeable today".
@@ -175,5 +186,13 @@ def load_shadow(path: str | Path) -> ShadowArtifact:
         # predate the fix and should not be graded against.
         produced_on=date.fromisoformat(
             raw.get("produced_on") or raw["session_date"]
+        ),
+        bars_session=(
+            date.fromisoformat(raw["bars_session"])
+            if raw.get("bars_session") else None
+        ),
+        priced_at=(
+            datetime.fromisoformat(raw["priced_at"])
+            if raw.get("priced_at") else None
         ),
     )

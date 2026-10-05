@@ -31,14 +31,14 @@
 # absence.
 #
 # It therefore lives here and is called from a job that is already reliably
-# running on the host — the 04:52 pipeline report, which already reads job logs
+# running on the host — the 05:52 pipeline report, which already reads job logs
 # and already alerts. deploy.sh calls it too, so its reload hint names the
 # labels that are actually outstanding.
 #
 # SCOPE is `local.algo-*`. local.ibc-gateway is deliberately excluded: its plist
 # is not in this repo (it is IBC's own), and its failure mode is not silent —
 # an unloaded Gateway job means port 7497 goes unreachable, which the watchdog,
-# the 04:15 paper run and the Tuesday refresh all already alert on.
+# the 05:15 paper run and the Tuesday refresh all already alert on.
 #
 # THIS FILE NEVER LOADS OR UNLOADS A JOB. It only reads `launchctl list` and
 # prints the commands a human should run. bootout/bootstrap stays a human step.

@@ -93,6 +93,12 @@ from services.execution.ib_account import IBAccountReader
 from services.execution.reconciliation import ReconciliationResult
 from shared.logging import get_logger
 from shared.universe import DRILL_PORTFOLIO, is_excluded_portfolio
+from shared.session_close import (
+    UnclosedSession,
+    newest_bar_session,
+    session_in_progress,
+    unclosed_session,
+)
 
 if TYPE_CHECKING:
     from research.shadow import CandidateObserver
@@ -155,6 +161,8 @@ def produce_shadow_artifact(
     live_equity: dict[str, dict[date, float]],
     window_sessions: int,
     whole_shares: bool = False,
+    bars_session: date | None = None,
+    priced_at: datetime | None = None,
 ):
     """Replay every sleeve over its rolling window and write the artifact.
 
@@ -171,8 +179,12 @@ def produce_shadow_artifact(
     until the paper book itself sizes in whole shares (KAN-33): a whole-share
     shadow graded against a fractional book would manufacture drift.
 
+    ``bars_session`` / ``priced_at``: KAN-104 provenance — the newest session
+    the bars cover and the instant their fetch started — so the monitor can
+    refuse a curve priced before its session closed.
+
     Returns the path written. Raises on failure: the caller decides whether a
-    shadow failure is worth stopping the paper run for, and at 04:15 it is not.
+    shadow failure is worth stopping the paper run for, and at 05:15 it is not.
     """
     shadow_portfolios = build_portfolios(
         capital=capital,
@@ -200,9 +212,11 @@ def produce_shadow_artifact(
         window_sessions=window_sessions,
         session_date=max(graded_sessions) if graded_sessions else date.today(),
         # The wall-clock date of THIS run, not the session it covers. The
-        # monitor's freshness check asks "did today's 04:15 run write this",
-        # and the two dates are always a day apart at 04:15 SGT.
+        # monitor's freshness check asks "did today's 05:15 run write this",
+        # and the two dates are always a day apart at 05:15 SGT.
         produced_on=date.today(),
+        bars_session=bars_session,
+        priced_at=priced_at,
     )
     return output_path
 
@@ -212,7 +226,7 @@ def load_ml_shadow_model(model_path: str):
 
     Returns ``(model, categorical_features)``, or ``None`` when there is no
     usable model. Absence is the normal state before one has been trained, and
-    a corrupt file is an ops problem — neither may stop the 04:15 run, because
+    a corrupt file is an ops problem — neither may stop the 05:15 run, because
     the shadow only observes and an observation is worth less than a trading
     session.
 
@@ -1228,7 +1242,7 @@ ALERTS_STREAM = "stream:alerts"
 _DSN_CREDENTIAL = re.compile(r"(?P<prefix>[a-zA-Z][\w+.-]*://[^\s/@]*:).*@")
 
 # Both legs talk to a server that is, by hypothesis, sick — a half-open Redis
-# that accepts the socket and never answers would otherwise hold the 04:15 job
+# that accepts the socket and never answers would otherwise hold the 05:15 job
 # open past its window, which is the silent-stall failure class KAN-16 was
 # about. The publish leg gets the more generous read timeout because it does
 # real work (one xadd per intent) and a spurious cut there costs a trading day;
@@ -1653,6 +1667,53 @@ def bar_coverage_failure(summary, *, floor: float = MIN_BAR_COVERAGE) -> str | N
     )
 
 
+# KAN-104: the session being priced had not closed. Distinct from 1-3 because
+# the fix is in a different place again — not the gateway, not the data, but
+# WHEN the run happened: a manual catch-up started inside a session, a host that
+# woke late, or a schedule that has drifted back before the close (the launchd
+# slot is SGT, which has no DST; the close is ET, which does). The wrapper
+# names it on Telegram and, being nonzero, withholds the dead-man ping.
+EXIT_SESSION_NOT_CLOSED = 4
+
+
+def _utc_now() -> datetime:
+    """The run's clock. One seam, so the close guard can be driven with faked
+    EST, EDT and half-day instants in tests; production never overrides it."""
+    return datetime.now(timezone.utc)
+
+
+def refuse_unclosed_session(
+    problem: UnclosedSession, *, redis_url: str, stage: str
+) -> int:
+    """Log, alert and return the exit code for a run that must not price.
+
+    The alert is best-effort (Redis may be down with everything else); the
+    guaranteed signal is the exit code, which the launchd wrapper turns into a
+    Telegram message and a withheld dead-man ping.
+    """
+    message = (
+        f"run_paper.py REFUSED to price ({stage}): {problem.describe()} "
+        f"No signals, marks or orders were produced. Re-run after "
+        f"{problem.safe_after:%H:%M %Z} on {problem.safe_after:%Y-%m-%d}."
+    )
+    print(f"ERROR: {message}")
+    emit_alert_best_effort(
+        redis_url,
+        event_type="paper_run_session_not_closed",
+        priority="high",
+        message=message,
+        context={
+            "script": "run_paper.py",
+            "stage": stage,
+            "session": problem.session.isoformat(),
+            "closes_at": problem.closes_at.isoformat(),
+            "checked_at": problem.now.isoformat(),
+        },
+        label="session-not-closed",
+    )
+    return EXIT_SESSION_NOT_CLOSED
+
+
 def main() -> int | None:
     """Run the CLI. The return value IS the process exit code (see the entry
     point below); ``None`` from an early path means success."""
@@ -1741,7 +1802,27 @@ def main() -> int | None:
         session.close()
         return
 
-    # Daily run
+    # Daily run.
+    #
+    # KAN-104 close guard, first half: refuse before touching the broker or the
+    # book if an NYSE session is in progress right now. A tagged (drill) run is
+    # exempt on purpose — docs/operations/drill-runbook.md opens the drill
+    # position during RTH so the entry fills, and the drill sleeve is excluded
+    # from every graded reader — but it says so, so nobody mistakes the exemption
+    # for the guard having passed.
+    if portfolio_tag is None:
+        in_progress = session_in_progress(_utc_now())
+        if in_progress is not None:
+            session.close()
+            return refuse_unclosed_session(
+                in_progress, redis_url=args.redis_url, stage="session in progress"
+            )
+    else:
+        print(
+            f"NOTE: tagged run '{portfolio_tag}' is exempt from the KAN-104 "
+            f"close guard; it may price an in-progress session by design."
+        )
+
     try:
         state = PaperTradingState.load(session)
     except ValueError as e:
@@ -1811,9 +1892,12 @@ def main() -> int | None:
     # defaults to 10 — the backtest's own id — so omitting it made the daily run
     # present the weekly refresh's identity on its historical-data connection.
     # IB refuses a duplicate client id, so a catch-up started inside the Tuesday
-    # 05:00-11:00 refresh window failed at "No data fetched" below, naming the
+    # refresh window (then 05:00-11:00) failed at "No data fetched" below, naming the
     # wrong cause. See run_backtest_refresh.sh, whose timeout design assumes
     # these two never collide on identity.
+    # Taken BEFORE the fetch: the fetch runs for minutes, and a bar fetched
+    # before the close stays partial however late the fetch finishes.
+    fetch_started_at = _utc_now()
     bars_by_ticker = fetch_bars_from_ib(
         tickers=all_tickers,
         years=args.years,
@@ -1832,6 +1916,22 @@ def main() -> int | None:
     if coverage_problem is not None:
         print(f"ERROR: {coverage_problem}")
         sys.exit(EXIT_INSUFFICIENT_BAR_COVERAGE)
+
+    # KAN-104 close guard, second half: ask the bars themselves. The first half
+    # cannot see a run that started before the open and fetched into it — IB
+    # then returns today's forming bar for every ticker requested after 09:30
+    # ET. The session the newest bar covers must have closed by the time the
+    # fetch STARTED. Broker reconciliation and the capital snapshot above are
+    # already committed; they are the broker's own figures, not priced from
+    # bars. Nothing priced from the bars is written.
+    bars_session = newest_bar_session(bars_by_ticker)
+    if portfolio_tag is None and bars_session is not None:
+        unclosed = unclosed_session(bars_session, fetch_started_at)
+        if unclosed is not None:
+            session.close()
+            return refuse_unclosed_session(
+                unclosed, redis_url=args.redis_url, stage="newest bar unclosed"
+            )
 
     # Load caches
     fundamentals_cache = load_fundamentals_cache("data/cache/fundamentals.json")
@@ -1956,7 +2056,7 @@ def main() -> int | None:
             )
         session.commit()
 
-        # The divergence monitor's feed (04:45 reads what this writes). Placed
+        # The divergence monitor's feed (05:45 reads what this writes). Placed
         # after the commit so today's equity_snapshots row is durable and the
         # window can include today; skipped for a tagged run, since a drill's
         # book is excluded from the graded evidence either way.
@@ -2013,6 +2113,8 @@ def main() -> int | None:
                     earnings_lookup=earnings_lookup,
                     live_equity=live_equity_by_sleeve(state),
                     window_sessions=SHADOW_WINDOW_SESSIONS,
+                    bars_session=bars_session,
+                    priced_at=fetch_started_at,
                 )
                 print(f"  Shadow series written to {shadow_path}")
             except Exception:

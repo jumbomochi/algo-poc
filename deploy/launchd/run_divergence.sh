@@ -1,6 +1,6 @@
 #!/bin/bash
 # Daily divergence monitor for algo-poc
-# Runs at 4:45 AM SGT, ~30 min after run_paper.sh (4:15) has written the day's
+# Runs at 05:45 SGT, ~30 min after run_paper.sh (05:15) has written the day's
 # equity_snapshots row AND the rolling shadow series. Compares live paper equity
 # to that shadow: the model replayed over the bars live actually saw, whose last
 # session is today.
@@ -16,12 +16,13 @@
 # Exit-code contract (from scripts/divergence_monitor.py):
 #   0 = all portfolios OK or WARNING       -> no action
 #   1 = at least one portfolio BREACH      -> alert
-#   2 = hard error (DB/backtest/args)      -> page
+#   2 = hard error (DB/backtest/args, or a shadow priced before its NYSE
+#       session closed — KAN-104)          -> page
 #   5 = some sleeves graded, some not      -> alert; a DEGRADATION, not an
 #       outage. Drift detection IS running for the graded half, so this must
 #       never reuse exit 3's "no drift detection is running" wording.
 #   3 = nothing could be graded at all     -> alert; the monitor is BLIND
-#       (the 04:15 paper run did not produce one). The fault is upstream in
+#       (the 05:15 paper run did not produce one). The fault is upstream in
 #       the paper run. Historically this also covered a non-comparable pinned
 #       baseline; that path is gone with the pin. Regenerate the baseline
 #        per docs/operations/backtest-baseline.md. Do NOT read this as OK.
@@ -48,7 +49,7 @@
 #      same evidence row, while a coverage figure measured over 2016-2020
 #      forced every verdict to NO_DATA.
 #
-# The shadow is written by the 04:15 paper run: each sleeve replayed over the
+# The shadow is written by the 05:15 paper run: each sleeve replayed over the
 # bars live actually saw, seeded at live's NAV, so its last session is today.
 # The path is dated and absolute rather than discovered — "newest shadow in
 # output/" would let a stale curve from a failed morning grade today's book.
@@ -201,7 +202,7 @@ wait_for_port() {
 # message-bus lockdown).
 if ! algo_load_secrets POSTGRES_PASSWORD; then
     echo "$(date): ERROR - $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
-    algo_alert_local "divergence monitor aborted 04:45 — $ALGO_SECRETS_ERROR"
+    algo_alert_local "divergence monitor aborted 05:45 — $ALGO_SECRETS_ERROR"
     telegram "🚨 Divergence monitor ABORTED: $ALGO_SECRETS_ERROR"
     exit 2
 fi
@@ -232,7 +233,7 @@ fi
 
 cd "$ALGO_DIR"
 
-# The rolling shadow the 04:15 run wrote. Named explicitly rather than
+# The rolling shadow the 05:15 run wrote. Named explicitly rather than
 # discovered: the monitor must never fall back to "whatever shadow is newest in
 # output/", which would let a stale curve from a failed morning grade today's
 # book. A shadow that is absent is the blind signal, and the monitor exits 3
@@ -242,7 +243,7 @@ if [ -f "$SHADOW_FILE" ]; then
     echo "$(date): shadow series: $SHADOW_FILE" >> "$LOG_FILE"
 else
     echo "$(date): WARNING - no shadow series at $SHADOW_FILE;" \
-         "the 04:15 paper run did not produce one, so the monitor will exit 3" \
+         "the 05:15 paper run did not produce one, so the monitor will exit 3" \
          "(blind). The fault is in the paper run, not in divergence." \
          >> "$LOG_FILE"
 fi
@@ -277,11 +278,11 @@ case "$EXIT_CODE" in
         ;;
     3)
         echo "$(date): ALERT - divergence monitor BLIND (exit 3): no sleeve could" \
-             "be graded, so no drift detection is running. Usually the 04:15 paper" \
+             "be graded, so no drift detection is running. Usually the 05:15 paper" \
              "run produced no shadow series - check ~/ibc/logs/paper_*.log" \
              >> "$LOG_FILE"
         # A blind monitor is an outage, not a pass.
-        telegram "$(divergence_alert_text 3 "⚠️ Divergence monitor is BLIND (exit 3): no sleeve could be graded, so no drift detection is running. Usually the 04:15 paper run produced no shadow series — check ~/ibc/logs/paper_*.log")"
+        telegram "$(divergence_alert_text 3 "⚠️ Divergence monitor is BLIND (exit 3): no sleeve could be graded, so no drift detection is running. Usually the 05:15 paper run produced no shadow series — check ~/ibc/logs/paper_*.log")"
         ;;
     4)
         echo "$(date): ALERT - divergence baseline is STALE (exit 4): the verdicts" \

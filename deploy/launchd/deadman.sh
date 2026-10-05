@@ -50,12 +50,13 @@
 # The SCHEDULE is a separate matter, and getting the two confused is what broke
 # the external check between 2026-08-21 and 2026-09-08. local.algo-paper-trading
 # and local.algo-divergence-monitor are Weekday 2-6 — Tuesday to Saturday SGT,
-# which is US Monday to Friday, because the 04:15 SGT run covers the session
-# that closed at 04:00 SGT that morning. Sunday and Monday are legitimately
-# quiet, so a flat ~26h external period is WRONG for these two: it pages every
-# Sunday and stays red through Monday. Give them a Tue-Sat cron instead
-# (`15 4 * * 2-6` and `45 4 * * 2-6`). The daily backup at 05:15 really is
-# every day and a ~26h period is right for it.
+# which is US Monday to Friday, because the 05:15 SGT run covers the session
+# that closed earlier that morning (04:00 SGT under EDT, 05:00 under EST —
+# KAN-104 moved the run from 04:15, which fell before the EST close). Sunday
+# and Monday are legitimately quiet, so a flat ~26h external period is WRONG
+# for these two: it pages every Sunday and stays red through Monday. Give them
+# a Tue-Sat cron instead (`15 5 * * 2-6` and `45 5 * * 2-6`). The daily backup
+# at 06:15 really is every day and a ~26h period is right for it.
 #
 # docs/operations/dead-man-switches.md carries the full table, and
 # tests/operations/test_dead_man_switches_note.py fails if it stops matching

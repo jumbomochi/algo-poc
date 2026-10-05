@@ -65,6 +65,7 @@ from shared.models.evidence import DivergenceDaily
 from backtest.shadow_artifact import ShadowArtifact, load_shadow
 from backtest.sleeve_comparability import SleeveComparability
 from shared.universe import is_excluded_portfolio
+from shared.session_close import unclosed_session
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +355,7 @@ def scoreable_sleeves(names: Iterable[str]) -> set[str]:
     Takes names rather than a path so the baseline side can be fed the mapping
     ``load_backtest_equity_series`` already returned: a baseline JSON is tens of
     megabytes and main() parses it twice already, so a third parse to recover a
-    set of keys it is holding would be pure cost at 04:45.
+    set of keys it is holding would be pure cost at 05:45.
 
     Used on both sides of the shape comparison, so the exclusion contract in
     docs/operations/drill-evidence-isolation.md ("_aggregate", "__drill__",
@@ -819,7 +820,7 @@ ALERTS_STREAM = "stream:alerts"
 _DSN_CREDENTIAL = re.compile(r"(?P<prefix>[a-zA-Z][\w+.-]*://[^\s/@]*:).*@")
 
 # The store is a side effect of a run whose real job is the verdict; a wedged
-# Redis must not hold the 04:45 job open past its window.
+# Redis must not hold the 05:45 job open past its window.
 ALERT_SOCKET_TIMEOUT_SECONDS = 5
 
 
@@ -882,6 +883,18 @@ def emit_persist_failure_alert(error: BaseException, *, redis_url: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def shadow_priced_before_close(artifact: ShadowArtifact):
+    """The unclosed session behind ``artifact``, or None if it is safe to grade.
+
+    None also for an artifact without provenance (pre-KAN-104): refusing those
+    would blind the monitor for the one night after the deploy, for a check
+    whose producer is itself guarded.
+    """
+    if artifact.bars_session is None or artifact.priced_at is None:
+        return None
+    return unclosed_session(artifact.bars_session, artifact.priced_at)
+
+
 def main() -> int:
     # Load default DB URL from config (may fail if config file missing, that's OK).
     try:
@@ -928,7 +941,7 @@ def main() -> int:
     parser.add_argument(
         "--shadow", default=None,
         help=(
-            "Path to the rolling shadow series written by the 04:15 paper run "
+            "Path to the rolling shadow series written by the 05:15 paper run "
             "(output/shadow_<YYYYMMDD>.json). Grades live against the model "
             "replayed over the bars live actually saw, whose last session is "
             "today — unlike a pinned artifact, whose last bar caps the "
@@ -1052,7 +1065,7 @@ def main() -> int:
         # 11.28% exclusion that blinded this monitor is a property of the
         # 10-year artifact, not of a 30-session window over live's current
         # universe. Comparability is judged per sleeve instead, below.
-        # A missing shadow means the 04:15 paper run did not produce one, which
+        # A missing shadow means the 05:15 paper run did not produce one, which
         # is the blind signal — not a breach. Letting FileNotFoundError escape
         # would make Python exit 1, and run_divergence.sh maps exit 1 to
         # "Divergence BREACH": a dead paper run would page as a strategy
@@ -1066,7 +1079,7 @@ def main() -> int:
         except FileNotFoundError:
             print(
                 f"  ⚠ {BASELINE_PIN_MISSING}: no shadow series at "
-                f"{args.shadow}. The 04:15 paper run did not produce one, so "
+                f"{args.shadow}. The 05:15 paper run did not produce one, so "
                 "there is nothing to grade against and no drift detection is "
                 "running. Check ~/ibc/logs/paper_YYYYMMDD.log — the fault is "
                 "in the paper run, not in divergence."
@@ -1077,6 +1090,29 @@ def main() -> int:
             f"  Shadow source: {args.shadow}  "
             f"[{shadow_artifact.shadow_id}, session {shadow_artifact.session_date}]"
         )
+        # KAN-104: never grade a curve that was priced before its session
+        # closed. The monitor prices nothing itself — every number it grades
+        # was written by the paper run — so the check is on the artifact's own
+        # provenance, not on when this job happens to run: a catch-up of the
+        # monitor during US hours grades the morning's closed session and is
+        # fine, while a shadow priced inside a session is wrong whenever it is
+        # read. Exit 2, not 3: nothing was judged, and 2 is the one code the
+        # wrapper does not count as a healthy dead-man beat.
+        unclosed = shadow_priced_before_close(shadow_artifact)
+        if unclosed is not None:
+            print(
+                f"ERROR: refusing to grade {args.shadow}: it was priced while "
+                f"its newest session was still open — {unclosed.describe()} "
+                "The paper run that wrote it should have refused; check "
+                "~/ibc/logs/paper_trading_YYYYMMDD.log and re-run the paper "
+                "run after the close, then this monitor."
+            )
+            return EXIT_ERROR
+        if shadow_artifact.bars_session is None or shadow_artifact.priced_at is None:
+            print(
+                "  ⚠ shadow carries no KAN-104 provenance (written before the "
+                "close guard existed); its session close cannot be verified."
+            )
     else:
         shadow_artifact = None
         bt_per_portfolio, bt_aggregate = load_backtest_equity_series(backtest_path)

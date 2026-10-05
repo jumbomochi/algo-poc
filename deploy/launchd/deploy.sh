@@ -140,7 +140,7 @@ sync_one() {
         # adrift, mid-word. That skipped the whole tail of the wrapper, which is
         # where refresh_exit's single dead-man decision, the TIMEOUT_FLAG branch
         # and the output/ prune protection live. run_paper.sh runs for minutes
-        # from 04:15, so the same hazard applies to a live trading run.
+        # from 05:15, so the same hazard applies to a live trading run.
         #
         # rename(2) is atomic and leaves the old inode readable until the last
         # descriptor closes, so a running job finishes against the version it

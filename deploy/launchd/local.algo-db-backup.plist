@@ -14,14 +14,16 @@
 	<string>/Users/huiliang/ibc/logs/db-backup-launchd.log</string>
 	<key>StandardOutPath</key>
 	<string>/Users/huiliang/ibc/logs/db-backup-launchd.log</string>
-	<!-- 05:15 SGT daily: after the 04:15 paper run and 04:45 divergence monitor
-	     have written the day's rows, so each dump captures that day's state.
+	<!-- 06:15 SGT daily: after the 05:15 paper run, 05:45 divergence monitor
+	     and 05:52 report have written the day's rows, so each dump captures
+	     that day's state. Moved from 05:15 by KAN-104, which put the paper run
+	     on that minute.
 	     Runs every day (not just Tue-Sat): a dump of an unchanged DB is cheap,
 	     and a fixed daily cadence keeps the RPO <= 1 day guarantee simple. -->
 	<key>StartCalendarInterval</key>
 	<dict>
 		<key>Hour</key>
-		<integer>5</integer>
+		<integer>6</integer>
 		<key>Minute</key>
 		<integer>15</integer>
 	</dict>

@@ -93,7 +93,7 @@ transient or overwritten, so they are reports, not evidence.
   scored under different pins is a different observation, so the monitor prints
   its reason and leaves the row alone — exploring a threshold must not be able
   to clear a firing breach streak. Re-run with the canonical pins (the defaults,
-  which is what the 04:45 job uses) to update it.
+  which is what the 05:45 job uses) to update it.
 - **`NO_DATA` is recorded, absence is not.** A recorded `NO_DATA` means the
   monitor ran and could not judge; a missing row on an NYSE trading day means
   the monitor did not run. Both pause the epoch clock, and the store has to be
@@ -124,7 +124,7 @@ window_end=2026-08-14` and rewrote the same evidence row. **The monitor had not
 looked at a new session since 2026-08-14**, and a breach streak could never
 exceed 1 because only one `session_date` ever existed per baseline.
 
-`--shadow output/shadow_<YYYYMMDD>.json` replaces the feed. The 04:15 paper run
+`--shadow output/shadow_<YYYYMMDD>.json` replaces the feed. The 05:15 paper run
 replays each sleeve's own signal function over the bars it just fetched, seeded
 at live's NAV `--window` sessions back, and writes the resulting curve. The
 monitor grades against that, so `window_end` is the current session.
@@ -149,7 +149,7 @@ monitor grades against that, so `window_end` is the current session.
   filename. `shadow_<date>.json` changes nightly; using the name would put every
   session under its own baseline and no streak could ever fire.
 
-A **missing** shadow is not an empty book: it means the 04:15 run did not
+A **missing** shadow is not an empty book: it means the 05:15 run did not
 produce one, which is the blind signal `evidence_store.blindness` derives from
 absence.
 
@@ -160,7 +160,7 @@ absence.
 | 0 | All portfolios OK or WARNING (or genuinely no overlapping history yet) | None |
 | 1 | At least one portfolio BREACH | Alert (Slack/email) |
 | 2 | Hard error (DB unreachable, backtest missing, invalid args) | Page on-call |
-| 3 | **Nothing could be graded** — the monitor is blind and no drift detection is running. On the shadow feed this usually means the 04:15 paper run produced no shadow series | Alert; check `~/ibc/logs/paper_*.log` — the fault is in the paper run |
+| 3 | **Nothing could be graded** — the monitor is blind and no drift detection is running. On the shadow feed this usually means the 05:15 paper run produced no shadow series | Alert; check `~/ibc/logs/paper_*.log` — the fault is in the paper run |
 | 5 | **Some sleeves graded, some not** — a degradation, not an outage. Drift detection IS running for the graded half | Alert; the message names which sleeves were skipped and why |
 | 4 | Baseline **stale** — the verdicts are real, but the artifact they were scored against is older than `--max-baseline-age-days` | Alert; the fault is upstream in the weekly refresh, not in divergence |
 
@@ -185,7 +185,7 @@ procedure, are in
 
 ### Baseline staleness (code 4)
 
-The weekly refresh (`deploy/launchd/run_backtest_refresh.sh`, Tue 05:00 SGT)
+The weekly refresh (`deploy/launchd/run_backtest_refresh.sh`, Tue 06:30 SGT)
 keeps the baseline current. Between **2026-07-28 and 2026-08-18 it did not
 succeed once**: one Tuesday the host was booted after the calendar slot and
 launchd never re-fired the job, the next the IB Gateway was unreachable. Only
@@ -270,7 +270,7 @@ window. Compare to expected trade frequency per sleeve.
 The script runs once per day via launchd, after the paper-trading run has
 written that day's `equity_snapshots` row. The deployed job is:
 
-- **Label:** `local.algo-divergence-monitor` (loaded; runs 04:45 SGT, Tue–Sat)
+- **Label:** `local.algo-divergence-monitor` (loaded; runs 05:45 SGT, Tue–Sat)
 - **Wrapper:** `~/ibc/run_divergence.sh` — handles the exit-code routing below
 - **Plist:** `~/Library/LaunchAgents/local.algo-divergence-monitor.plist`
 - **Version-controlled copies + install/reload steps:** `deploy/launchd/`
@@ -278,13 +278,15 @@ written that day's `equity_snapshots` row. The deployed job is:
 - **Prometheus textfile:** `~/ibc/metrics/divergence.prom` (node_exporter not yet
   installed — repoint at its textfile collector once it is)
 
-**Order on this SGT-timezone host (US market closes at 04:00 SGT next day):**
+**Order on this SGT-timezone host (US market closes at 04:00 SGT next day under
+EDT, 05:00 SGT under EST — SGT has no DST, so the chain starts at 05:15 to be
+after the close in both seasons, KAN-104):**
 
 | Time (SGT) | Job | Why |
 |---|---|---|
-| 04:15 | `scripts/run_paper.py` | Daily signal run, persists state to DB |
-| 04:45 | `scripts/divergence_monitor.py --prometheus-textfile ...` | Reads the snapshots just written |
-| 05:00 Tue | Backtest refresh (weekly, `local.algo-backtest-refresh`) | Updates the baseline that divergence is measured against. Tuesday, not Monday: IBKR's hist-data farm is routinely down from Saturday night through Monday pre-market. |
+| 05:15 | `scripts/run_paper.py` | Daily signal run, persists state to DB. Refuses (exit 4) if the session it would price has not closed |
+| 05:45 | `scripts/divergence_monitor.py --prometheus-textfile ...` | Reads the snapshots just written. Refuses (exit 2) a shadow priced before its session closed |
+| 06:30 Tue | Backtest refresh (weekly, `local.algo-backtest-refresh`) | Updates the baseline that divergence is measured against. Tuesday, not Monday: IBKR's hist-data farm is routinely down from Saturday night through Monday pre-market. |
 
 **Alert wiring:** the script exits non-zero on BREACH (1), on a non-comparable
 baseline (3) and on a stale one (4). Wrap the cron line in:

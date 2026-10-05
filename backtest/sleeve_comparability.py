@@ -23,7 +23,7 @@ requirements is satisfied by construction or is inapplicable to that feed:
 
 What *can* go wrong with a shadow is different, and this is the list:
 
-1. **It is stale.** The 04:15 run failed and yesterday's artifact is still on
+1. **It is stale.** The 05:15 run failed and yesterday's artifact is still on
    disk, so today's live would be graded against yesterday's model curve.
 2. **The sleeve is not in it.** No live history to seed from, or the replay
    produced nothing for it.
@@ -77,7 +77,7 @@ class SleeveComparability:
     #: The first version of this check compared SESSION dates and was wrong
     #: every day. ``equity_snapshots.date`` carries the run's SGT wall-clock
     #: date; the shadow's last bar is the last COMPLETE US session, which at
-    #: 04:15 SGT is always the day before. They are one day apart by
+    #: 05:15 SGT is always the day before. They are one day apart by
     #: construction, so every sleeve was refused as stale, permanently — and
     #: since verdicts are dated by the compared window, the 2026-09-03 run
     #: wrote its NO_DATA rows over session 09-02 and left 09-03 with no
@@ -107,7 +107,7 @@ class SleeveComparability:
         elif self.shadow_produced_on != self.run_date:
             reasons.append(
                 f"shadow is stale: written on {self.shadow_produced_on}, but "
-                f"this run is {self.run_date}. The 04:15 run most likely did "
+                f"this run is {self.run_date}. The 05:15 run most likely did "
                 "not produce one today, leaving the previous day's artifact on "
                 "disk"
             )

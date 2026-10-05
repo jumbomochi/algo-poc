@@ -148,6 +148,16 @@ Sunday. On a weekday there is no automatic cold-restart backstop at all.
 >   run rather than 4h16m before it.
 > - The auth branch no longer touches `$MARKER`. The extra grace pass described
 >   above cannot recur.
+>
+> **Schedule moved 2026-10 — [KAN-104](https://huiliang.atlassian.net/browse/KAN-104).**
+> Every time of day in this note is the schedule as it stood during the
+> incident. The paper run is now at **05:15** SGT (divergence 05:45, report
+> 05:52, backup 06:15, Tuesday refresh 06:30), because SGT has no DST and the
+> 04:15 slot fell 45 minutes *before* the NYSE close every EST winter. The
+> 2:00 PM `AutoRestartTime` is now ~15h ahead of the run rather than ~14h; the
+> escalating re-alert counts down to 05:15. The Tue–Sat argument below is
+> unchanged — the 05:15 run still covers the session that closed earlier that
+> same SGT morning.
 
 ---
 

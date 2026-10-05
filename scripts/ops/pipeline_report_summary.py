@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the authoritative part of the 04:52 daily digest.
+"""Render the authoritative part of the 05:52 daily digest.
 
 KAN-30. The digest used to report order counts scraped out of the paper log,
 which means it could report success while the pipeline never received an order
