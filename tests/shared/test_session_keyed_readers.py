@@ -207,3 +207,61 @@ def test_session_dated_verdicts_file_under_a_new_baseline_id(whole_shares):
     assert new == shadow_id_for(dict(reversed(list(roster.items()))),
                                 whole_shares=whole_shares)
     assert SHADOW_DATING_VERSION == "session_date"
+
+
+# ------------------------------------------------------------- pre-flight
+
+
+def test_unstamped_snapshots_counts_by_run_date_and_skips_drills(db):
+    from shared.evidence_store import unstamped_snapshots
+
+    _snap(db, "momentum", date(2026, 9, 29), None, 1.0)
+    _snap(db, "momentum", date(2026, 9, 30), None, 1.0)
+    _snap(db, "momentum", date(2026, 10, 1), date(2026, 9, 30), 1.0)
+    _snap(db, "__drill__", date(2026, 9, 30), None, 1.0)
+    _snap(db, "momentum", date(2026, 8, 1), None, 1.0)  # before the span
+
+    counted = unstamped_snapshots(
+        db, start=date(2026, 9, 28), end=date(2026, 10, 3)
+    )
+
+    assert (counted.unstamped, counted.total) == (2, 3)
+    assert counted.alarming
+    assert "backfill not applied?" in counted.describe("this week")
+
+
+def test_one_partial_bar_row_is_not_an_alarm(db):
+    from shared.evidence_store import unstamped_snapshots
+
+    for i in range(4):
+        _snap(db, "momentum", date(2026, 9, 29) + timedelta(days=i),
+              date(2026, 9, 28) + timedelta(days=i), 1.0)
+    _snap(db, "momentum", date(2026, 10, 3), None, 1.0)
+
+    assert not unstamped_snapshots(db, start=date(2026, 9, 28)).alarming
+
+
+def test_the_digest_leads_with_an_unapplied_backfill(db):
+    from scripts.ops.evidence_digest import (
+        build_sources,
+        collect_snapshot,
+        render_digest,
+    )
+
+    for run in (date(2026, 9, 29), date(2026, 9, 30), date(2026, 10, 2)):
+        _snap(db, "momentum", run, None, 1_000.0)
+    as_of, window_start = date(2026, 10, 2), date(2026, 9, 28)
+
+    snapshot = collect_snapshot(
+        build_sources(
+            db, redis_factory=lambda: None, as_of=as_of,
+            window_start=window_start, calendar=MarketCalendar(),
+        ),
+        as_of=as_of, window_start=window_start,
+    )
+    body = render_digest(snapshot)
+
+    first = body.splitlines()[0]
+    assert first.startswith("🚨 UNSTAMPED — 3 of 3 equity snapshots this week")
+    assert "backfill_snapshot_sessions.py" in first
+    assert snapshot.equity is None  # the reason the equity line is empty

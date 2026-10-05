@@ -571,6 +571,67 @@ def _round_trips(
     )
 
 
+#: Above this share of unstamped rows, the cause is not a stray partial-bar
+#: run (one NULL row per sleeve) but history the operator backfill has not
+#: filled — and every session-keyed reader is about to read NO_DATA or empty.
+UNSTAMPED_ALARM_SHARE = 0.5
+
+BACKFILL_HINT = (
+    "backfill not applied? Run scripts/ops/backfill_snapshot_sessions.py "
+    "(dry-run, then --apply)"
+)
+
+
+@dataclass(frozen=True)
+class UnstampedSnapshots:
+    """How many real-sleeve snapshots in a run-date span carry no session."""
+
+    unstamped: int
+    total: int
+
+    @property
+    def share(self) -> float:
+        return self.unstamped / self.total if self.total else 0.0
+
+    @property
+    def alarming(self) -> bool:
+        return self.total > 0 and self.share >= UNSTAMPED_ALARM_SHARE
+
+    def describe(self, span: str) -> str:
+        return (
+            f"{self.unstamped} of {self.total} equity snapshots {span} carry "
+            f"no session_date (KAN-103) — {BACKFILL_HINT}. Until then those "
+            "sessions are excluded, so they read as NO_DATA or empty, not as "
+            "a clean record"
+        )
+
+
+def unstamped_snapshots(
+    session: Session,
+    *,
+    start: date | None,
+    end: date | None = None,
+    excluded_prefix: str = EXCLUDED_PORTFOLIO_PREFIX,
+) -> UnstampedSnapshots:
+    """Count unstamped rows by RUN date (``date``), the only date they have.
+
+    The pre-flight for every session-keyed reader: a quiet NO_DATA after a
+    deploy that skipped the backfill would look exactly like a dead monitor.
+    """
+    filters = [~EquitySnapshot.portfolio.startswith(excluded_prefix, autoescape=True)]
+    if start is not None:
+        filters.append(EquitySnapshot.date >= start)
+    if end is not None:
+        filters.append(EquitySnapshot.date <= end)
+    total, unstamped = session.execute(
+        select(
+            func.count(),
+            func.count().filter(EquitySnapshot.session_date.is_(None)),
+        ).where(*filters)
+    ).one()
+    return UnstampedSnapshots(unstamped=int(unstamped or 0), total=int(total or 0))
+
+
 def session_snapshots(
     session: Session,
     *,

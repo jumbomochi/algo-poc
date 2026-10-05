@@ -302,6 +302,45 @@ class TestMaxDrawdown:
         with pytest.raises(GateDataUnavailable):
             source.get_max_drawdown()
 
+    def test_the_first_mark_is_kept_when_rows_value_the_previous_session(
+        self, session, tmp_path
+    ):
+        """KAN-103: the clock is a run date, the series a session date.
+
+        The 07-30 run valued US 07-29. Bounding the session-keyed series by
+        the run date dropped that first mark — here the peak — and reported a
+        1% drawdown for a 10% one.
+        """
+        for run, valued, value in [
+            (date(2026, 7, 30), date(2026, 7, 29), 100_000.0),
+            (date(2026, 7, 31), date(2026, 7, 30), 91_000.0),
+            (date(2026, 8, 1), date(2026, 7, 31), 90_000.0),
+            (date(2026, 8, 4), date(2026, 8, 3), 95_000.0),
+        ]:
+            session.add(EquitySnapshot(
+                portfolio=SLEEVE, date=run, session_date=valued,
+                equity=value, cash=0.0, market_value=value, created_at=NOW,
+            ))
+        session.commit()
+        source = PostgresGateDataSource(
+            session, output_dir=tmp_path, now=lambda: NOW,
+            paper_start=date(2026, 7, 30),
+        )
+
+        assert source.get_max_drawdown() == pytest.approx(0.10)
+
+    def test_unstamped_history_is_unavailable_and_names_the_backfill(
+        self, session, source
+    ):
+        session.add(EquitySnapshot(
+            portfolio=SLEEVE, date=date(2026, 7, 30), session_date=None,
+            equity=1.0, cash=0.0, market_value=1.0, created_at=NOW,
+        ))
+        session.commit()
+
+        with pytest.raises(GateDataUnavailable, match="backfill_snapshot_sessions"):
+            source.get_max_drawdown()
+
 
 # ---------------------------------------------------------------------------
 # Gate 4 — execution quality

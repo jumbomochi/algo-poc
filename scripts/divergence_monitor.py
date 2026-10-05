@@ -64,6 +64,7 @@ from sqlalchemy import select
 from shared.config import load_config
 from shared.models import GateEpoch
 from shared.models.evidence import DivergenceDaily
+from shared.evidence_store import unstamped_snapshots
 from shared.session_dating import equity_by_session, unstamped_run_dates
 from backtest.shadow_artifact import ShadowArtifact, load_shadow
 from backtest.sleeve_comparability import SleeveComparability
@@ -1231,6 +1232,19 @@ def main() -> int:
         )
     print(f"  Live history from: {live_boundary or 'all'}  [{live_boundary_source}]")
 
+    # KAN-103 pre-flight. Live is keyed by session_date; if most of the
+    # window is unstamped the backfill has not run, and every sleeve is about
+    # to read NO_DATA for a reason that has nothing to do with drift. Say so
+    # on the console and in every sleeve's notes, which the exit-3 alert
+    # renders, rather than leave it to look like a dead monitor.
+    unstamped_note: str | None = None
+    unstamped = unstamped_snapshots(session, start=live_boundary)
+    if unstamped.alarming:
+        unstamped_note = unstamped.describe(
+            f"since {live_boundary}" if live_boundary else "on record"
+        )
+        print(f"  ‼ PRE-FLIGHT: {unstamped_note}.")
+
     # --- Build per-portfolio reports ---
     reports: list[PortfolioDivergenceReport] = []
     live_series_by_portfolio: dict[str, dict[date, float]] = {}
@@ -1308,6 +1322,9 @@ def main() -> int:
     # not derived truth — the digest recomputes the roll-up from these rows),
     # so the sleeve list is captured here rather than filtered by name later.
     sleeve_reports = list(reports)
+    if unstamped_note is not None:
+        for report in sleeve_reports:
+            report.notes.insert(0, unstamped_note)
 
     # --- Aggregate report (only over sleeves that exist in both) ---
     if not args.portfolio:

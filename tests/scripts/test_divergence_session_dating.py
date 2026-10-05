@@ -300,3 +300,51 @@ def test_the_shadow_is_seeded_at_live_s_value_for_the_same_session(tmp_path):
     assert curve[day0] == pytest.approx(_equity("momentum", day0))
     # Monday is in the shadow now that live is keyed by session.
     assert MONDAY in curve
+
+
+# ------------------------------------------------------------- pre-flight
+
+
+def test_an_unbackfilled_book_is_called_out_not_quietly_no_data(
+    tmp_path, monkeypatch, capsys
+):
+    """Every row NULL is what PR 2 deployed before the backfill looks like."""
+    url = f"sqlite:///{tmp_path / 'unbackfilled.db'}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    s = sessionmaker(bind=engine)()
+    PaperTradingState.create_new(
+        portfolio_capitals={"momentum": 20_000.0, "sector_rotation": 15_000.0},
+        session=s,
+    )
+    for run in RUN_DATES:
+        for sleeve in SLEEVES:
+            s.add(EquitySnapshot(
+                portfolio=sleeve, date=run, session_date=None, equity=1.0,
+                cash=1.0, market_value=0.0, created_at=datetime.now(timezone.utc),
+            ))
+    s.commit()
+    s.close()
+    out = tmp_path / "divergence.json"
+
+    _run(monkeypatch, db_url=url, shadow=_shadow(tmp_path, through=MONDAY),
+         output=out)
+
+    printed = capsys.readouterr().out
+    assert (
+        "PRE-FLIGHT: 22 of 22 equity snapshots on record carry no session_date"
+        in printed
+    )
+    assert "backfill not applied?" in printed
+    for report in json.loads(out.read_text())["reports"]:
+        if report["portfolio"] in SLEEVES:
+            assert report["status"] == "NO_DATA"
+            assert "backfill not applied?" in report["notes"][0]
+
+
+def test_a_stamped_book_raises_no_pre_flight(tmp_path, monkeypatch, capsys):
+    _run(monkeypatch, db_url=_db(tmp_path, "stamped"),
+         shadow=_shadow(tmp_path, through=MONDAY),
+         output=tmp_path / "divergence.json")
+
+    assert "PRE-FLIGHT" not in capsys.readouterr().out

@@ -72,8 +72,10 @@ from shared.evidence_store import (  # noqa: E402
     _resolve_calendar,
     blindness,
     breach_streak,
+    UnstampedSnapshots,
     epoch_progress,
     session_snapshots,
+    unstamped_snapshots,
 )
 from shared.models.evidence import (  # noqa: E402
     DivergenceDaily,
@@ -197,6 +199,9 @@ class DigestSnapshot:
     partial: PartialReport | None = None
     #: One entry per source that could not be read, already formatted.
     missing: list[str] = field(default_factory=list)
+    #: KAN-103 pre-flight: rendered only when most of the week's snapshots
+    #: carry no session_date, i.e. the operator backfill has not run.
+    unstamped: UnstampedSnapshots | None = None
     #: Bare names of the sources that failed. Carried separately from
     #: ``missing`` because rendering has to tell "absent" from "broken": a
     #: missing epoch is the normal state before Rung 0, while a failed epoch
@@ -276,6 +281,12 @@ def _absent_line(blind: BlindReport | None) -> list[str]:
         f"◻️ ABSENT (accepted) — {count} of {blind.total_sessions} {noun} "
         f"a recorded cause ({days})"
     ]
+
+
+def _unstamped_line(unstamped: UnstampedSnapshots | None) -> list[str]:
+    if unstamped is None or not unstamped.alarming:
+        return []
+    return ["🚨 UNSTAMPED — " + unstamped.describe("this week")]
 
 
 def _missing_line(missing: list[str]) -> list[str]:
@@ -380,6 +391,8 @@ def render_digest(snapshot: DigestSnapshot) -> str:
     the most alarming true fact.
     """
     lines: list[str] = [
+        # First: when it fires, every line below it is an artifact of it.
+        *_unstamped_line(snapshot.unstamped),
         *_blind_line(snapshot.blind),
         *_partial_line(snapshot.partial),
         *_missing_line(snapshot.missing),
@@ -417,6 +430,8 @@ class Sources:
     #: tooling) is not forced to supply one; absent simply means the line
     #: is not rendered.
     partial: Callable[[], object] | None = None
+    #: Optional for the same reason as ``partial``.
+    unstamped: Callable[[], object] | None = None
 
 
 def collect_snapshot(
@@ -451,6 +466,10 @@ def collect_snapshot(
         _read("partial", sources.partial, None)
         if sources.partial is not None else None
     )
+    unstamped = (
+        _read("unstamped", sources.unstamped, None)
+        if sources.unstamped is not None else None
+    )
 
     return DigestSnapshot(
         as_of=as_of,
@@ -458,6 +477,7 @@ def collect_snapshot(
         epoch=epoch,
         blind=blind,
         partial=partial,
+        unstamped=unstamped,
         sleeves=sleeves,
         equity=equity,
         dlq=dlq,
@@ -900,6 +920,11 @@ def build_sources(
         ),
         # Resolved at call time, inside the guard, for the same reason.
         drills=lambda: drills_source(session, epoch_id=_epoch_id())(),
+        # Run dates, not sessions: an unstamped row has no session. The run
+        # that values the week's last session lands the day after it.
+        unstamped=lambda: unstamped_snapshots(
+            session, start=window_start, end=as_of + timedelta(days=1)
+        ),
     )
 
 
