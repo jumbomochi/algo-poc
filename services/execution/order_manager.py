@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Collection, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
@@ -340,53 +340,76 @@ class OrderManager:
                     "is missing at IB"
                 )
 
-    async def resolve_tracked_orders(
-        self, recommendation_ids: Collection[str]
-    ) -> dict[str, str]:
-        """Re-run the startup restore for tracked orders, after a reconnect.
+    def tracked_order_id(self, recommendation_id: str) -> str | None:
+        """The broker order id this process tracks for a recommendation."""
+        return self._submitted.get(recommendation_id)
+
+    async def resolve_tracked_order(
+        self,
+        recommendation_id: str,
+        *,
+        expected_generation: int | None = None,
+        intent_snapshot: dict[str, Any] | None = None,
+    ) -> str:
+        """Re-run the startup restore for one tracked order, after a reconnect.
 
         KAN-106. A restart resolves an order IB no longer knows (KAN-96); a
         reconnect used to only warn about it, leaving a DAY order that expired
         while the Gateway was down SUBMITTED until a human restarted
         execution — and reconciliation blocking entries in the meantime. This
-        is the same per-order resolution as :meth:`restore_broker_tracking`,
-        through the same :meth:`IBExecutor.restore_order_by_ref`, limited to
-        the submissions the caller names (the ones the book still holds
-        working).
+        is the same resolution as :meth:`restore_broker_tracking`, through
+        the same :meth:`IBExecutor.restore_order_by_ref`, one order at a time
+        so the caller can re-check its preconditions before each.
 
-        Unlike the startup restore it never raises: one order's failure is
-        logged and reported as ``"failed"`` and the rest still resolve, so a
-        retry has only the failures left to do. Returns ``order_id`` →
-        ``"open"`` (still working at IB; callbacks are never bound twice),
-        ``"resolved"`` (terminal status reported from completed-order history,
-        or expired absent), ``"unresolved"`` (absent, with no status handler
-        to terminalize it) or ``"failed"``.
+        Unlike the startup restore it never raises. Returns ``"open"`` (IB
+        still lists it; callbacks are never bound twice), ``"resolved"``
+        (terminal status reported from completed-order history, or expired
+        absent), ``"unresolved"`` (absent, with no status handler to
+        terminalize it), ``"stale"`` (the IB session changed under it;
+        nothing was reported), ``"failed"`` (logged; nothing was reported) or
+        ``"untracked"``.
         """
-        wanted = set(recommendation_ids)
-        outcomes: dict[str, str] = {}
-        for recommendation_id, order_id in list(self._submitted.items()):
-            if recommendation_id not in wanted:
-                continue
-            try:
-                restored = await self._executor.restore_order_by_ref(
-                    recommendation_id, order_id
-                )
-            except Exception:
-                self._logger.exception(
-                    "Could not resolve a tracked order after reconnect; "
-                    "retrying after the next execution sweep",
-                    order_id=order_id,
-                    recommendation_id=recommendation_id,
-                )
-                outcomes[order_id] = "failed"
-                continue
-            if restored is True:
-                outcomes[order_id] = "open"
-            elif restored is False:
-                outcomes[order_id] = "resolved"
-            else:
-                outcomes[order_id] = "unresolved"
-        return outcomes
+        from services.execution.ib_executor import BrokerSessionChangedError
+
+        order_id = self._submitted.get(recommendation_id)
+        if order_id is None:
+            return "untracked"
+        try:
+            restored = await self._executor.restore_order_by_ref(
+                recommendation_id,
+                order_id,
+                expected_generation=expected_generation,
+                intent_snapshot=intent_snapshot,
+            )
+        except BrokerSessionChangedError:
+            self._logger.warning(
+                "IB session changed while resolving a tracked order; "
+                "retrying after the next execution sweep",
+                order_id=order_id,
+                recommendation_id=recommendation_id,
+            )
+            return "stale"
+        except Exception:
+            self._logger.exception(
+                "Could not resolve a tracked order after reconnect; "
+                "retrying after the next execution sweep",
+                order_id=order_id,
+                recommendation_id=recommendation_id,
+            )
+            return "failed"
+        if restored is True:
+            return "open"
+        if restored is False:
+            return "resolved"
+        return "unresolved"
+
+    async def broker_session_generation(self) -> int:
+        """Changes only on a fresh IB session, not on a 1101 (KAN-106)."""
+        return int(self._executor.session_generation)
+
+    def broker_served_fill_quantities(self) -> dict[str, float]:
+        """Cumulative quantity per order IB has served, settled or not."""
+        return dict(self._executor.served_fill_quantities())
 
     async def reconcile_submission(
         self, recommendation_id: str, order_id: str

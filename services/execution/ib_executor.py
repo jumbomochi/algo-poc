@@ -38,6 +38,13 @@ CONNECTIVITY_MARKER_NAME = "gateway_connectivity_lost"
 # failed pass, not the loop.
 REQ_EXECUTIONS_TIMEOUT_SECONDS = 30
 
+# Bounds on the two order-state reads that resolve a tracked order
+# (``restore_order_by_ref``). A request that does not answer in time is a
+# failure, never an empty answer: an order is expired only when IB has
+# *answered* that it holds it neither open nor completed (KAN-106).
+REQ_OPEN_ORDERS_TIMEOUT_SECONDS = 30
+REQ_COMPLETED_ORDERS_TIMEOUT_SECONDS = 30
+
 # How long the sweep waits, after IB's reply, for the fill deliveries that
 # reply set off through the live callback (KAN-102). Deliveries that finish
 # first are booked unstamped by the live path instead of being raced by the
@@ -129,9 +136,18 @@ class IBExecutorProtocol(Protocol):
         ...
 
     async def restore_order_by_ref(
-        self, recommendation_id: str, expected_order_id: str
+        self,
+        recommendation_id: str,
+        expected_order_id: str,
+        *,
+        expected_generation: int | None = None,
+        intent_snapshot: dict[str, Any] | None = None,
     ) -> bool | None:
         """Restore callbacks; false means completed, None means missing."""
+        ...
+
+    def served_fill_quantities(self) -> dict[str, float]:
+        """Highest cumulative quantity per order id IB has served, settled or not."""
         ...
 
     async def list_open_orders(self) -> list[OpenBrokerOrder]:
@@ -167,6 +183,11 @@ class IBExecutorProtocol(Protocol):
         """Count of successful connects; changes on every reconnect."""
         ...
 
+    @property
+    def session_generation(self) -> int:
+        """Count of fresh sessions; a same-socket Error 1101 leaves it alone."""
+        ...
+
 
 class NotConnectedError(RuntimeError):
     """Raised when an order operation is attempted without an IB connection."""
@@ -174,6 +195,14 @@ class NotConnectedError(RuntimeError):
 
 class WrongAccountTypeError(RuntimeError):
     """Raised when the Gateway session's account type contradicts the mode."""
+
+
+class BrokerStateUnavailableError(RuntimeError):
+    """IB did not answer an order-state request; nothing may be inferred."""
+
+
+class BrokerSessionChangedError(RuntimeError):
+    """The IB session changed under a resolution that expected another one."""
 
 
 class OrderSkippedError(RuntimeError):
@@ -221,6 +250,14 @@ class IBExecutor:
         # Bumped on every successful connect, so the runner can tell a
         # reconnect happened — through any path — and sweep at once (KAN-95).
         self._connection_generation = 0
+        # Bumped only by connect(): a fresh IB client, whose order state was
+        # rebuilt from IB. A same-socket Error 1101 bumps the connection
+        # generation (so the runner sweeps) but not this, so it never starts
+        # an absent-order resolution (KAN-106).
+        self._session_generation = 0
+        # ib_insync keys reqOpenOrders and reqAllOpenOrders on one request
+        # slot ('openOrders'); a second concurrent request orphans the first.
+        self._open_orders_lock = asyncio.Lock()
         # KAN-98. IB answers reqExecutions with a commissionReport per
         # execution, and ib_insync emits it into the tracked trade's
         # commissionReportEvent — the live fill callback. Executions the fill
@@ -323,6 +360,10 @@ class IBExecutor:
     def connection_generation(self) -> int:
         return self._connection_generation
 
+    @property
+    def session_generation(self) -> int:
+        return self._session_generation
+
     def _on_ib_error(
         self, reqId: int, errorCode: int, errorString: str, contract: Any = None
     ) -> None:
@@ -402,19 +443,20 @@ class IBExecutor:
 
         Orders absent from that answer are logged by
         :meth:`_reregister_open_trades` and left tracked. They are NOT
-        terminalized here: an order that vanished across a 1101 may well have
+        terminalized: an order that vanished across a 1101 may well have
         filled, and guessing "cancelled" is exactly how 15 filled positions
-        became phantoms on 2026-09-18. The generation bump below makes the
-        runner sweep executions first and only then resolve them through
-        :meth:`restore_order_by_ref` (KAN-106), which reads the local
-        ``openTrades()`` cache — an order that filled unobserved still sits
-        there as open, so it is left alone, never expired.
+        became phantoms on 2026-09-18. The connection-generation bump below
+        makes the runner sweep executions; the session generation is left
+        alone, so a 1101 never starts the post-reconnect absent-order
+        resolution (KAN-106) — that runs only after connect() has built a
+        fresh client.
         """
         await self._page_connectivity_data_lost(error_code)
         if self._ib is None:
             return
         try:
-            open_trades = list(await self._ib.reqOpenOrdersAsync())
+            async with self._open_orders_lock:
+                open_trades = list(await self._ib.reqOpenOrdersAsync())
         except Exception:
             self._logger.exception(
                 "Failed to re-request open orders after IB Error 1101 — the "
@@ -596,6 +638,7 @@ class IBExecutor:
             # reconciliation — see _reregister_open_trades.)
             self._reregister_open_trades()
             self._connection_generation += 1
+            self._session_generation += 1
             # connectAsync returns only after its own reqExecutions, so the
             # wrapper now holds every execution IB serves (window a) — unless
             # a connectivity event arrived during the handshake, in which case
@@ -1198,19 +1241,50 @@ class IBExecutor:
         return total
 
     async def restore_order_by_ref(
-        self, recommendation_id: str, expected_order_id: str
+        self,
+        recommendation_id: str,
+        expected_order_id: str,
+        *,
+        expected_generation: int | None = None,
+        intent_snapshot: dict[str, Any] | None = None,
     ) -> bool | None:
         """Reattach callbacks, or reconcile a terminal completed order.
 
         The one resolution path for a tracked order, run at startup
-        (``OrderManager.restore_broker_tracking``) and after every reconnect
-        (``OrderManager.resolve_tracked_orders``, KAN-106): still open →
+        (``OrderManager.restore_broker_tracking``) and after a reconnect
+        (``OrderManager.resolve_tracked_order``, KAN-106): still open →
         callbacks attached, never twice; in completed-order history → its
         true terminal status; in neither → expired with
         ``ABSENT_AT_IB_REASON`` (KAN-96). Each outcome is logged.
+
+        "Open" is IB's answer to ``reqAllOpenOrders``, never ib_insync's
+        ``openTrades()`` cache: ``connectAsync`` gives its own open-orders
+        request a few seconds and on a timeout only logs, so after a connect
+        the cache can be empty or partial while the order is still working.
+        The account-wide request also sees an order a repair tool placed on
+        another client id. Either request failing or timing out raises
+        :class:`BrokerStateUnavailableError` — an order is expired only on an
+        answer, never on a silence.
+
+        ``expected_generation`` (reconnect path) is the connection generation
+        the caller's execution sweep ran on; if the session changes before an
+        outcome is reported — including through this method's own
+        reconnect — :class:`BrokerSessionChangedError` is raised and nothing
+        is reported. ``intent_snapshot`` rides on an absent expiry so the
+        status handler can refuse it when the intent moved since the caller
+        read it.
         """
         await self._ensure_connected()
-        for trade in self._ib.openTrades():
+        self._require_generation(expected_generation)
+        ib = self._ib
+        async with self._open_orders_lock:
+            open_trades = await self._answer_or_raise(
+                ib.reqAllOpenOrdersAsync(),
+                REQ_OPEN_ORDERS_TIMEOUT_SECONDS,
+                "open orders",
+            )
+        self._require_generation(expected_generation)
+        for trade in open_trades:
             if str(getattr(trade.order, "orderRef", "")) != recommendation_id:
                 continue
             order_id = str(trade.order.orderId)
@@ -1219,8 +1293,16 @@ class IBExecutor:
                     f"orderRef {recommendation_id} maps to broker order "
                     f"{order_id}, expected {expected_order_id}"
                 )
+            # Whatever its status (an Inactive order included), an order IB
+            # still lists is not absent and is never expired here.
+            client_id = getattr(trade.order, "clientId", None)
+            own = client_id is None or int(client_id) == self._client_id
             action = str(getattr(trade.order, "action", "")).lower()
-            reattached = order_id not in self._trades
+            # Same-object guard: a trade already bound (connect re-binds what
+            # its own cache held) is never bound twice; a stale binding from a
+            # previous client is replaced. Another client's order is left
+            # unbound — its fills are not ours to attribute.
+            reattached = own and self._trades.get(order_id) is not trade
             if reattached:
                 self._register_trade(
                     order_id,
@@ -1232,11 +1314,21 @@ class IBExecutor:
                 "Tracked order still open at IB",
                 order_id=order_id,
                 recommendation_id=recommendation_id,
-                outcome="reattached" if reattached else "still_open",
+                status=str(getattr(trade.orderStatus, "status", "") or ""),
+                outcome=(
+                    "reattached" if reattached
+                    else "still_open" if own
+                    else "open_on_another_client"
+                ),
             )
             return True
 
-        completed = await self._ib.reqCompletedOrdersAsync(apiOnly=False)
+        completed = await self._answer_or_raise(
+            ib.reqCompletedOrdersAsync(apiOnly=False),
+            REQ_COMPLETED_ORDERS_TIMEOUT_SECONDS,
+            "completed orders",
+        )
+        self._require_generation(expected_generation)
         for trade in completed:
             if (
                 str(getattr(trade.order, "orderRef", ""))
@@ -1265,34 +1357,101 @@ class IBExecutor:
                     ),
                     "completed_order_confirmed": True,
                 })
+            self._forget_trade(str(expected_order_id))
             return False
 
-        # Absent from both open trades and completed-order history. IB does not
-        # retain order state across session boundaries, so a day order that
-        # filled or expired before a restart is simply gone the next session —
-        # the normal case, not a fault. Terminalize it (EXPIRED) via the status
-        # handler so the ledger intent stops wedging restarts and reconciliation.
-        # Position-level safety (a fill missed while disconnected) is caught
-        # independently by the reconciler's broker-vs-DB position comparison.
+        # Absent from both open orders and completed-order history. IB does
+        # not retain order state across session boundaries, so a day order
+        # that filled or expired before a restart is simply gone the next
+        # session — the normal case, not a fault. Terminalize it (EXPIRED) via
+        # the status handler so the ledger intent stops wedging restarts and
+        # reconciliation. Position-level safety (a fill missed while
+        # disconnected) is caught independently by the reconciler's
+        # broker-vs-DB position comparison.
         # Without a handler there is no safe terminalization path, so preserve
         # the fail-closed None (the caller raises).
         if self._order_status_handler is not None:
             self._logger.warning(
-                "Tracked order absent from IB open trades and completed-order "
+                "Tracked order absent from IB open orders and completed-order "
                 "history — expiring it",
                 order_id=str(expected_order_id),
                 recommendation_id=recommendation_id,
                 reason=ABSENT_AT_IB_REASON,
                 outcome="expired_absent",
             )
-            await self._order_status_handler({
+            payload: dict[str, Any] = {
                 "order_id": str(expected_order_id),
                 "status": "Expired",
                 "reason": ABSENT_AT_IB_REASON,
                 "order_absent_at_ib": True,
-            })
+            }
+            if intent_snapshot is not None:
+                payload["intent_snapshot"] = dict(intent_snapshot)
+            await self._order_status_handler(payload)
+            self._forget_trade(str(expected_order_id))
             return False
         return None
+
+    def _require_generation(self, expected: int | None) -> None:
+        if expected is not None and self._connection_generation != expected:
+            raise BrokerSessionChangedError(
+                f"IB session changed (generation {self._connection_generation}, "
+                f"expected {expected})"
+            )
+
+    @staticmethod
+    async def _answer_or_raise(request: Any, timeout: float, what: str) -> list:
+        try:
+            return list(await asyncio.wait_for(request, timeout))
+        except Exception as exc:
+            raise BrokerStateUnavailableError(
+                f"IB did not answer the {what} request: {exc!r}"
+            ) from exc
+
+    def _forget_trade(self, order_id: str) -> None:
+        """Stop tracking an order IB reported terminal or no longer knows.
+
+        Its callbacks stay bound to the trade object, so a late event on it
+        is still delivered (they close over the order's identity and never
+        read these maps); only the reconnect re-binding and the
+        absent-after-reconnect warning stop carrying it.
+        """
+        self._trades.pop(order_id, None)
+        self._trade_meta.pop(order_id, None)
+
+    def served_fill_quantities(self) -> dict[str, float]:
+        """Highest cumulative quantity per broker order id IB has served.
+
+        Read from the wrapper's execution record — connect's own sync plus
+        every ``reqExecutions`` reply on this client — *including* executions
+        whose commission report has not arrived, which :meth:`recent_executions`
+        leaves for a later pass. Right after a reconnect that is the usual
+        state of a fill that completed during the outage, and resolving its
+        order first (KAN-106) would expire it, or terminalize it from history
+        so that the sweep could no longer book the fill.
+        """
+        fills = getattr(getattr(self._ib, "wrapper", None), "fills", None)
+        if not isinstance(fills, dict):
+            return {}
+        served: dict[str, float] = {}
+        for fill in list(fills.values()):
+            execution = getattr(fill, "execution", None)
+            if execution is None:
+                continue
+            if (
+                self._account_id is not None
+                and str(getattr(execution, "acctNumber", "") or "")
+                != self._account_id
+            ):
+                continue
+            order_id = str(getattr(execution, "orderId", "") or "")
+            if not order_id:
+                continue
+            served[order_id] = max(
+                served.get(order_id, 0.0),
+                float(getattr(execution, "cumQty", 0.0) or 0.0),
+            )
+        return served
 
     async def submit_limit_order(
         self,

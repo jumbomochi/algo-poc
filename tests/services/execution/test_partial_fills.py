@@ -218,6 +218,7 @@ class TestIBExecutionIdentity:
         fake_ib = MagicMock()
         fake_ib.isConnected.return_value = True
         fake_ib.openTrades.return_value = []
+        fake_ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[])
         completed = MagicMock()
         completed.order.orderRef = "rec-1"
         completed.order.orderId = 77
@@ -259,6 +260,7 @@ class TestIBExecutionIdentity:
         fake_ib = MagicMock()
         fake_ib.isConnected.return_value = True
         fake_ib.openTrades.return_value = []
+        fake_ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[])
         completed = MagicMock()
         completed.order.orderRef = "rec-1"
         completed.order.orderId = 9
@@ -292,6 +294,7 @@ class TestIBExecutionIdentity:
         fake_ib = MagicMock()
         fake_ib.isConnected.return_value = True
         fake_ib.openTrades.return_value = []
+        fake_ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[])
         fake_ib.reqCompletedOrdersAsync = AsyncMock(return_value=[])
         executor._ib = fake_ib
         handler = AsyncMock()
@@ -315,6 +318,7 @@ class TestIBExecutionIdentity:
         fake_ib = MagicMock()
         fake_ib.isConnected.return_value = True
         fake_ib.openTrades.return_value = []
+        fake_ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[])
         fake_ib.reqCompletedOrdersAsync = AsyncMock(return_value=[])
         executor._ib = fake_ib
 
@@ -328,6 +332,7 @@ class TestIBExecutionIdentity:
         fake_ib = MagicMock()
         fake_ib.isConnected.return_value = True
         fake_ib.openTrades.return_value = []
+        fake_ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[])
         completed = MagicMock()
         completed.order.orderRef = "rec-1"
         completed.order.orderId = 9
@@ -352,6 +357,7 @@ class TestIBExecutionIdentity:
         fake_ib = MagicMock()
         fake_ib.isConnected.return_value = True
         fake_ib.openTrades.return_value = []
+        fake_ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[])
         completed = MagicMock()
         completed.order.orderRef = "rec-1"
         completed.order.orderId = 9
@@ -388,6 +394,7 @@ class TestIBExecutionIdentity:
         fake_ib = MagicMock()
         fake_ib.isConnected.return_value = True
         fake_ib.openTrades.return_value = []
+        fake_ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[])
         fake_ib.reqCompletedOrdersAsync = AsyncMock(return_value=[])
         executor._ib = fake_ib
         handler = AsyncMock()

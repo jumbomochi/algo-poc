@@ -226,18 +226,18 @@ class ExecutionServiceRunner:
         self._unpaged_recoveries: list[FillMessage] = []
         self._last_recovery_queued_at: float | None = None
         # Resolving orders IB no longer knows after a reconnect (KAN-106).
-        # A reconnect makes it pending; a sweep pass that started after the
-        # reconnect and succeeded makes it ready, so a fill IB still serves
-        # is booked before any expiry. One attempt per successful pass: a
-        # failure waits for the next interval or reconnect, not the next loop.
+        # A fresh IB session (the executor's session generation; a
+        # same-socket 1101 does not count) makes it pending. A sweep pass that
+        # started after it, succeeded, and ended on the same connection
+        # generation makes it ready, so a fill IB still serves is booked
+        # before any expiry. One attempt per successful pass: a failure waits
+        # for the next interval or reconnect, not the next loop.
         self._absent_resolution_pending = False
         self._absent_resolution_ready = False
-        # Highest cumulative quantity per broker order id in the executions
-        # the last successful sweep pass read. An order whose served fills the
-        # book has not applied yet (the projector is another service) is not
-        # resolved until it has — expiring it first would leave the intent
-        # EXPIRED holding a fill.
-        self._served_cumulative: dict[str, float] = {}
+        # The connection generation the ready pass swept on; the resolution
+        # stops the moment the session moves off it.
+        self._absent_resolution_generation: int | None = None
+        self._last_session_generation: int | None = None
 
         # Post-halt reconcile sweep (KAN-13). Its own timer, and deliberately
         # NOT sharing the unfilled sweep's calendar gate: that sweep returns
@@ -1559,6 +1559,28 @@ class ExecutionServiceRunner:
             self._order_ledger.session.rollback()
             return
 
+        snapshot = status_info.get("intent_snapshot")
+        if status_info.get("order_absent_at_ib") is True and snapshot is not None:
+            # The post-reconnect resolution read the intent before asking IB
+            # (KAN-106). A fill or status that landed since means the order
+            # was not simply gone; the expiry is a guess that evidence has
+            # overtaken, so it is refused and the resolution looks again.
+            if (
+                str(intent.status) != str(snapshot.get("status"))
+                or float(intent.filled_quantity or 0.0)
+                > float(snapshot.get("filled_quantity", 0.0)) + 1e-9
+            ):
+                self._logger.warning(
+                    "Refusing an absent-at-IB expiry: the intent changed "
+                    "since the resolution read it",
+                    order_id=order_id,
+                    snapshot=snapshot,
+                    current_status=intent.status,
+                    current_filled_quantity=intent.filled_quantity,
+                )
+                self._order_ledger.session.rollback()
+                return
+
         broker_status = str(status_info.get("status", ""))
         reason = status_info.get("reason") or None
         if (
@@ -1989,11 +2011,18 @@ class ExecutionServiceRunner:
             return False
         self._last_execution_sweep_at = now
         self._last_execution_sweep_generation = generation
-        if reconnected:
-            # Resolved once this pass (or a later one) has read IB's
-            # executions on the new session (KAN-106).
+        session = await self._broker_session_generation()
+        if (
+            session is not None
+            and self._last_session_generation is not None
+            and session != self._last_session_generation
+        ):
+            # A fresh IB session: resolved once this pass (or a later one)
+            # has read IB's executions on it (KAN-106).
             self._absent_resolution_pending = True
             self._absent_resolution_ready = False
+        if session is not None:
+            self._last_session_generation = session
 
         try:
             executions = await self._order_manager.recent_broker_executions()
@@ -2035,15 +2064,22 @@ class ExecutionServiceRunner:
             return True
 
         self._execution_sweep_failures = 0
-        served: dict[str, float] = {}
-        for execution in executions:
-            order_id = str(execution.ib_order_id)
-            served[order_id] = max(
-                served.get(order_id, 0.0), float(execution.cumulative_quantity)
-            )
-        self._served_cumulative = served
         if self._absent_resolution_pending:
-            self._absent_resolution_ready = True
+            # Ready only if the pass read executions on the session it started
+            # on: a second reconnect during the pass means its read describes
+            # a session that is gone, and the next pass (a reconnect) sweeps
+            # the new one first.
+            after = await self._read_connection_generation()
+            if generation is not None and after == generation:
+                self._absent_resolution_ready = True
+                self._absent_resolution_generation = generation
+            else:
+                self._logger.info(
+                    "IB session changed during the execution sweep; resolving "
+                    "absent orders after the next pass",
+                    swept_generation=generation,
+                    current_generation=after,
+                )
         await self._page_execution_sweep_outcome(outcome)
         log = self._logger.warning if outcome.recovered else self._logger.info
         log(
@@ -2214,82 +2250,172 @@ class ExecutionServiceRunner:
         intent stayed SUBMITTED, reconciliation read ``order_missing_at_ib``
         and entries were disabled until execution was restarted. Its startup
         restore is what healed it, so this runs the same resolution — through
-        ``OrderManager.resolve_tracked_orders`` and
+        ``OrderManager.resolve_tracked_order`` and
         ``IBExecutor.restore_order_by_ref`` — for every order the book still
-        holds working: re-attached if open, its true status if IB's
-        completed-order history has it, otherwise EXPIRED with
+        holds working: re-attached if IB still lists it open, its true status
+        if IB's completed-order history has it, otherwise EXPIRED with
         ``ABSENT_AT_IB_REASON`` (KAN-96, which also pages a probable missed
         fill when IB holds shares the book does not).
 
-        Runs only once a sweep pass that started after the reconnect has
-        succeeded (see ``_absent_resolution_ready``), and defers any order
-        whose served executions the book has not applied yet. A failure is
-        logged and retried after the next successful pass — the next interval
-        or the next reconnect. Returns True when a resolution pass ran.
+        Runs only once a sweep pass that started on the new session has
+        succeeded and ended on it (``_absent_resolution_ready``). Before each
+        order it re-checks that the session is still the one swept, and
+        defers the order — whatever IB would answer for it — while IB has
+        served an execution the book has not applied, settled or not. Its
+        snapshot of the intent rides on an absent expiry, which the status
+        handler refuses if a fill or status landed in between. Anything
+        failed, deferred, refused or interrupted keeps the resolution pending
+        for the next successful pass — the next interval or reconnect.
+        Returns True when a resolution pass ran.
         """
         if not (self._absent_resolution_pending and self._absent_resolution_ready):
             return False
         self._absent_resolution_ready = False
         resolve = getattr(
-            type(self._order_manager), "resolve_tracked_orders", None
+            type(self._order_manager), "resolve_tracked_order", None
         )
         if resolve is None or self._order_ledger is None:
             self._absent_resolution_pending = False
             return False
 
-        candidates, deferred = self._absent_resolution_candidates()
+        generation = self._absent_resolution_generation
         outcomes: dict[str, str] = {}
-        if candidates:
-            outcomes = dict(await resolve(self._order_manager, candidates))
-        failed = sorted(
+        deferred: list[str] = []
+        for recommendation_id in self._absent_resolution_candidates():
+            if await self._read_connection_generation() != generation:
+                outcomes["session"] = "stale"
+                break
+            snapshot = self._working_intent_snapshot(recommendation_id)
+            if snapshot is None:
+                continue  # terminal since the candidates were read
+            order_id = snapshot["order_id"]
+            if self._has_unbooked_served_fill(order_id, snapshot):
+                deferred.append(order_id)
+                continue
+            outcome = await resolve(
+                self._order_manager,
+                recommendation_id,
+                expected_generation=generation,
+                intent_snapshot={
+                    "status": snapshot["status"],
+                    "filled_quantity": snapshot["filled_quantity"],
+                },
+            )
+            if outcome == "resolved":
+                after = self._working_intent_snapshot(recommendation_id)
+                if after is not None and (
+                    after["status"] != snapshot["status"]
+                    or after["filled_quantity"] != snapshot["filled_quantity"]
+                ):
+                    # The intent moved under the resolution (a live fill or
+                    # status) and the handler refused to expire it: look again
+                    # next pass, from the new state.
+                    outcome = "refused"
+                elif after is not None:
+                    # IB's status maps to no transition (e.g. a partly filled
+                    # order IB reports Expired); asking again changes nothing.
+                    outcome = "no_transition"
+            outcomes[order_id] = outcome
+            if outcome == "stale":
+                break
+
+        retry_outcomes = {"failed", "stale", "refused"}
+        retry = sorted(
             order_id for order_id, outcome in outcomes.items()
-            if outcome == "failed"
+            if outcome in retry_outcomes
         )
-        unresolved = sorted(
-            order_id for order_id, outcome in outcomes.items()
-            if outcome == "unresolved"
-        )
-        self._absent_resolution_pending = bool(failed or deferred)
+        self._absent_resolution_pending = bool(retry or deferred)
         if outcomes or deferred:
+            quiet = all(
+                outcome in {"open", "resolved", "untracked"}
+                for outcome in outcomes.values()
+            )
             log = (
-                self._logger.warning
-                if failed or deferred or unresolved
-                else self._logger.info
+                self._logger.info
+                if quiet and not deferred
+                else self._logger.warning
             )
             log(
                 "Resolved tracked orders after reconnect",
                 outcomes=outcomes,
-                failed=failed,
-                deferred_unapplied_fills=deferred,
-                unresolved=unresolved,
+                retry=retry,
+                deferred_unbooked_fills=sorted(deferred),
                 retrying=self._absent_resolution_pending,
             )
         return True
 
-    def _absent_resolution_candidates(self) -> tuple[set[str], list[str]]:
-        """Working intents to resolve, and broker order ids held back.
+    def _absent_resolution_candidates(self) -> list[str]:
+        """Recommendation ids of every intent the book holds working at IB.
 
-        Only intents the book still holds working are candidates: an order
-        that is already terminal needs nothing from IB, and asking would cost
-        a completed-order request each. Held back are orders IB served
-        executions for that the book has not applied yet. Reads and releases
-        the shared session before any await.
+        An order that is already terminal needs nothing from IB, and asking
+        would cost a completed-order request each. Reads and releases the
+        shared session before any await.
         """
-        candidates: set[str] = set()
-        deferred: list[str] = []
         try:
-            for intent in self._order_ledger.load_pending_orders():
-                if intent.ib_order_id is None:
-                    continue
-                order_id = str(intent.ib_order_id)
-                served = self._served_cumulative.get(order_id, 0.0)
-                if served - float(intent.filled_quantity or 0.0) > 1e-9:
-                    deferred.append(order_id)
-                    continue
-                candidates.add(str(intent.recommendation_id))
+            return [
+                str(intent.recommendation_id)
+                for intent in self._order_ledger.load_pending_orders()
+                if intent.ib_order_id is not None
+            ]
         finally:
             self._order_ledger.session.rollback()
-        return candidates, sorted(deferred)
+
+    def _working_intent_snapshot(
+        self, recommendation_id: str
+    ) -> dict[str, Any] | None:
+        """The intent's state now, or None once it is no longer working."""
+        try:
+            intent = self._order_ledger.get(recommendation_id)
+            if (
+                intent.ib_order_id is None
+                or OrderStatus(intent.status) in TERMINAL_STATUSES
+            ):
+                return None
+            return {
+                "order_id": str(intent.ib_order_id),
+                "status": str(intent.status),
+                "filled_quantity": float(intent.filled_quantity or 0.0),
+            }
+        finally:
+            self._order_ledger.session.rollback()
+
+    def _has_unbooked_served_fill(
+        self, order_id: str, snapshot: dict[str, Any]
+    ) -> bool:
+        """True while IB has served this order more than the book has applied.
+
+        Counts executions whose commission report has not arrived, which the
+        sweep cannot book yet: right after a reconnect that is the usual state
+        of a fill that completed during the outage. Resolving such an order
+        first — to an absent expiry, or to a terminal status from history —
+        would leave a terminal intent the sweep then refuses to book onto.
+        """
+        read = getattr(
+            type(self._order_manager), "broker_served_fill_quantities", None
+        )
+        if read is None:
+            return False
+        served = float(read(self._order_manager).get(order_id, 0.0))
+        return served - snapshot["filled_quantity"] > 1e-9
+
+    async def _read_connection_generation(self) -> int | None:
+        try:
+            return int(await self._order_manager.broker_connection_generation())
+        except Exception:
+            self._logger.exception("Could not read the IB connection generation")
+            return None
+
+    async def _broker_session_generation(self) -> int | None:
+        read = getattr(
+            type(self._order_manager), "broker_session_generation", None
+        )
+        if read is None:
+            return None
+        try:
+            return int(await read(self._order_manager))
+        except Exception:
+            self._logger.exception("Could not read the IB session generation")
+            return None
 
     async def maybe_run_unfilled_sweep(self, now: float) -> bool:
         """Run the unfilled-order sweep when the reprice interval has elapsed.
