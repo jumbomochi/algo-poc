@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -1368,12 +1369,30 @@ class TestReFireAndReSize:
         assert float(order["quantity"]) == pytest.approx(25.0)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "stamp",
+        [
+            None,
+            # KAN-107: the old check substring-matched "10.0" against the whole
+            # alert, timestamp included, so a run whose clock read :10.0x
+            # seconds failed (main 6c29d28, CI run 37471360510).
+            datetime(2026, 10, 6, 13, 34, 10, 12345, tzinfo=timezone.utc),
+        ],
+        ids=["live-clock", "clock-reads-10.0"],
+    )
     async def test_the_trigger_alert_reports_the_size_that_was_actually_sent(
-        self, db_runner, mock_redis
+        self, db_runner, mock_redis, monkeypatch, stamp
     ):
         """An operator reading the stop-loss alert during an incident must see
         the order that went out, not what the control asked for before the
         re-fire ceiling cut it down."""
+        if stamp is not None:
+            class _Stamped(runner_module.AlertMessage):
+                def __init__(self, **kwargs):
+                    kwargs["timestamp"] = stamp
+                    super().__init__(**kwargs)
+
+            monkeypatch.setattr(runner_module, "AlertMessage", _Stamped)
         runner, _ledger, session = db_runner
         _prior_exit(
             session, status=OrderStatus.CANCELLED, requested=10.0, filled=6.0
@@ -1384,9 +1403,15 @@ class TestReFireAndReSize:
 
         (order,) = _published_orders(mock_redis)
         assert float(order["quantity"]) == pytest.approx(4.0)
-        (triggered,) = [a for a in _alerts(mock_redis) if "stop_loss_triggered" in a]
-        assert "4.0" in triggered
-        assert "10.0" not in triggered
+        (triggered,) = [
+            call.args[1]
+            for call in mock_redis.publish.call_args_list
+            if call.args[0] == "stream:alerts"
+            and call.args[1].get("event_type") == "stop_loss_triggered"
+        ]
+        context = json.loads(triggered["context"])
+        assert float(context["quantity"]) == pytest.approx(4.0)
+        assert float(context["quantity"]) != pytest.approx(10.0)
 
     @pytest.mark.asyncio
     async def test_an_orphan_the_position_no_longer_covers_alerts_and_holds(
