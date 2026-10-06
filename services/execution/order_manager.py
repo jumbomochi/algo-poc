@@ -16,6 +16,11 @@ logger = get_logger("order_manager")
 # the caller is an emergency sell, and waiting forever is its own failure.
 CANCEL_ACK_BACKOFF_SECONDS: tuple[float, ...] = (0.5, 1.0, 2.0)
 
+# Retries for a startup restore whose order-state request IB did not answer
+# (KAN-106). Each attempt is itself bounded by the executor's request
+# timeouts, so the whole schedule costs at most a couple of minutes.
+RESTORE_UNAVAILABLE_BACKOFF_SECONDS: tuple[float, ...] = (2.0, 5.0)
+
 # Order types the unfilled-limit sweep must not touch: neither has a limit to
 # reprice, and neither should be cancelled for still being open.
 _SWEEP_EXEMPT_ORDER_TYPES = frozenset({"market", "stop"})
@@ -77,6 +82,7 @@ class OrderManager:
 
         # Overridable so tests do not sleep out the real schedule.
         self._cancel_ack_backoff = CANCEL_ACK_BACKOFF_SECONDS
+        self._restore_backoff = RESTORE_UNAVAILABLE_BACKOFF_SECONDS
 
     async def submit_entry(
         self,
@@ -328,17 +334,56 @@ class OrderManager:
         self._submitted[recommendation_id] = order_id
         self.open_orders.setdefault(order_id, restored)
 
-    async def restore_broker_tracking(self) -> None:
-        """Reattach executor callbacks for submissions loaded from the DB."""
-        for recommendation_id, order_id in self._submitted.items():
-            restored = await self._executor.restore_order_by_ref(
-                recommendation_id, order_id
+    async def restore_broker_tracking(self) -> list[str]:
+        """Reattach executor callbacks for submissions loaded from the DB.
+
+        Returns the order ids left unresolved because IB did not answer its
+        order-state requests (KAN-106 follow-up). Those are retried with
+        backoff first; once IB has failed a full schedule, the rest are not
+        asked at all — the service must start, not spend minutes on a Gateway
+        that is not answering, and the runner resolves them after its first
+        successful sweep. Only that one failure is tolerated: an order
+        missing at IB with no way to terminalize it, or an orderRef that maps
+        to a different broker order, still raises as before.
+        """
+        from services.execution.ib_executor import BrokerStateUnavailableError
+
+        degraded: list[str] = []
+        for recommendation_id, order_id in list(self._submitted.items()):
+            if degraded:
+                degraded.append(order_id)
+                continue
+            for attempt, delay in enumerate((0.0, *self._restore_backoff)):
+                if delay:
+                    await asyncio.sleep(delay)
+                try:
+                    restored = await self._executor.restore_order_by_ref(
+                        recommendation_id, order_id
+                    )
+                except BrokerStateUnavailableError:
+                    self._logger.warning(
+                        "IB did not answer while restoring a tracked order",
+                        order_id=order_id,
+                        recommendation_id=recommendation_id,
+                        attempt=attempt + 1,
+                    )
+                    continue
+                if restored is None:
+                    raise RuntimeError(
+                        f"persisted order {order_id} ({recommendation_id}) "
+                        "is missing at IB"
+                    )
+                break
+            else:
+                degraded.append(order_id)
+        if degraded:
+            self._logger.error(
+                "Starting with order tracking degraded: IB did not answer "
+                "order-state requests; these orders resolve after the first "
+                "successful execution sweep",
+                order_ids=degraded,
             )
-            if restored is None:
-                raise RuntimeError(
-                    f"persisted order {order_id} ({recommendation_id}) "
-                    "is missing at IB"
-                )
+        return degraded
 
     def tracked_order_id(self, recommendation_id: str) -> str | None:
         """The broker order id this process tracks for a recommendation."""

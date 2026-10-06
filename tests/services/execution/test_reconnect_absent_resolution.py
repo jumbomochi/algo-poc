@@ -36,7 +36,7 @@ from services.portfolio_accounting.projector import FillProjector
 from shared.config import AppConfig, ExecutionConfig, IBConfig
 from shared.models import Base, OrderStatus, PortfolioConfig
 from shared.order_ledger import ABSENT_AT_IB_REASON, OrderLedger
-from shared.schemas.messages import FillMessage
+from shared.schemas.messages import AlertMessage, FillMessage
 
 ACCOUNT = "DUN551088"
 ARKW_REC = "sleeve-2026-10-05-DUN551088-paper-thematic_momentum-ARKW-buy"
@@ -1055,3 +1055,292 @@ class TestATerminalizedOrderIsForgotten:
         for _ in range(5):
             await asyncio.sleep(0)
         assert [f.execution_id for f in h.published_fills()] == ["late.01"]
+
+
+# ==========================================================================
+# PR #232 re-review
+# ==========================================================================
+
+
+def _alerts(h: Harness) -> list[AlertMessage]:
+    return [
+        AlertMessage.from_stream_dict(c.args[1])
+        for c in h.redis.publish.await_args_list
+        if c.args[0] == "stream:alerts"
+    ]
+
+
+async def _start_up(h: Harness, ib: MagicMock) -> None:
+    """A process start: connected, nothing bound yet, then setup()."""
+    h.executor._ib = ib
+    h.executor._connection_generation = 1
+    h.executor._session_generation = 1
+    h.order_manager._restore_backoff = (0.001, 0.001)
+    h.redis.drain_pending = AsyncMock(return_value=[])
+    await h.runner.setup()
+
+
+# R1 — startup never crash-loops on an IB that does not answer
+
+
+class TestStartupDegradesInsteadOfCrashing:
+    async def test_an_unanswered_restore_starts_pages_and_resolves_later(
+        self, session
+    ):
+        h = Harness(session)
+        _seed_submitted(h.ledger)
+        ib = _fake_ib()
+        ib.reqAllOpenOrdersAsync = MagicMock(side_effect=_hung)
+
+        with patch(
+            "services.execution.ib_executor.REQ_OPEN_ORDERS_TIMEOUT_SECONDS", 0.01
+        ):
+            await _start_up(h, ib)  # does not raise
+
+        assert ib.reqAllOpenOrdersAsync.call_count == 3  # first try + 2 retries
+        [alert] = _alerts(h)
+        assert alert.event_type == "order_tracking_degraded"
+        assert alert.priority == "high"
+        assert ARKW_ORDER in alert.message
+        assert h.intent().status == OrderStatus.SUBMITTED.value
+        assert h.runner._absent_resolution_pending is True
+        assert h.runner._absent_resolution_ready is False
+
+        # IB answers again; the first successful sweep resolves 241.
+        ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[])
+        await h.loop_pass()
+
+        assert ib.reqExecutionsAsync.await_count == 1
+        assert h.intent().status == OrderStatus.EXPIRED.value
+        assert h.runner._absent_resolution_pending is False
+
+    async def test_the_first_sweep_must_succeed_before_resolving(self, session):
+        h = Harness(session, execution_sweep_interval_minutes=1)
+        _seed_submitted(h.ledger)
+        ib = _fake_ib()
+        ib.reqAllOpenOrdersAsync = AsyncMock(side_effect=ConnectionError("down"))
+        await _start_up(h, ib)
+        ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[])
+        ib.reqExecutionsAsync = AsyncMock(side_effect=asyncio.TimeoutError())
+
+        await h.loop_pass()
+
+        ib.reqAllOpenOrdersAsync.assert_not_awaited()
+        assert h.intent().status == OrderStatus.SUBMITTED.value
+
+        ib.reqExecutionsAsync = AsyncMock(return_value=[])
+        await h.loop_pass(advance=61.0)
+
+        assert h.intent().status == OrderStatus.EXPIRED.value
+
+    async def test_a_transient_failure_is_absorbed_by_the_retries(self, session):
+        h = Harness(session)
+        _seed_submitted(h.ledger)
+        working = _trade(ARKW_ORDER)
+        ib = _fake_ib(open_trades=[working])
+        ib.reqAllOpenOrdersAsync = AsyncMock(
+            side_effect=[ConnectionError("blip"), [working]]
+        )
+
+        await _start_up(h, ib)
+
+        assert _alerts(h) == []
+        assert h.runner._absent_resolution_pending is False
+        assert h.executor._trades[ARKW_ORDER] is working
+        assert len(working.commissionReportEvent.handlers) == 1
+
+    async def test_after_one_exhausted_order_the_rest_are_not_asked(
+        self, session
+    ):
+        h = Harness(session)
+        _seed_submitted(h.ledger)
+        other_rec = ARKW_REC.replace("ARKW", "ARKK")
+        _seed_submitted(
+            h.ledger, rec=other_rec, ib_order_id="242", symbol="ARKK",
+            con_id=270633029,
+        )
+        ib = _fake_ib()
+        ib.reqAllOpenOrdersAsync = AsyncMock(side_effect=ConnectionError("down"))
+
+        await _start_up(h, ib)
+
+        assert ib.reqAllOpenOrdersAsync.await_count == 3
+        [alert] = _alerts(h)
+        assert alert.context["order_ids"] == "241,242"
+
+    async def test_an_order_ref_mismatch_still_stops_startup(self, session):
+        h = Harness(session)
+        _seed_submitted(h.ledger)
+        imposter = _trade("999")  # our ref, our client, another broker id
+
+        with pytest.raises(RuntimeError, match="maps to broker order 999"):
+            await _start_up(h, _fake_ib(open_trades=[imposter]))
+
+        assert _alerts(h) == []
+
+    async def test_another_clients_order_under_our_ref_is_not_a_mismatch(
+        self, session
+    ):
+        """Never a new crash cause: before KAN-106 the client-scoped cache
+        could not see it at all."""
+        h = Harness(session)
+        _seed_submitted(h.ledger)
+        theirs = _trade("999")
+        theirs.order.clientId = 58
+
+        await _start_up(h, _fake_ib(open_trades=[theirs]))
+
+        # Ours is in neither book: expired, as before.
+        assert h.intent().status == OrderStatus.EXPIRED.value
+
+
+# R2 — reqAllOpenOrders must not widen any openTrades() reader
+
+
+def _client_trade(order_id: str, client_id: int, *, rec: str = "", symbol="ARKW"):
+    trade = _trade(order_id, rec=rec, symbol=symbol)
+    trade.order.clientId = client_id
+    trade.order.totalQuantity = 5.0
+    trade.order.account = ACCOUNT
+    trade.order.auxPrice = None
+    return trade
+
+
+class TestOtherClientsOrdersStayInvisible:
+    def _polluting_ib(self, ours, theirs):
+        """openTrades() is ib_insync's cache; reqAllOpenOrders adds every
+        client's order to it, and nothing updates the foreign ones."""
+        ib = _fake_ib()
+        cache = [ours]
+        ib.openTrades.side_effect = lambda: list(cache)
+
+        async def req_all_open_orders():
+            cache.append(theirs)
+            return [ours, theirs]
+
+        ib.reqAllOpenOrdersAsync = AsyncMock(side_effect=req_all_open_orders)
+        return ib
+
+    async def test_cancel_by_id_cancels_ours_never_theirs(self):
+        executor = IBExecutor("h", 7497, 1)
+        executor._logger = MagicMock()
+        theirs = _client_trade("300", 58)
+        ours = _client_trade("300", 1)
+        executor._ib = _fake_ib()
+        executor._ib.openTrades.return_value = [theirs, ours]
+
+        assert await executor.cancel_broker_order("300") is True
+
+        executor._ib.cancelOrder.assert_called_once_with(ours.order)
+
+    async def test_the_halt_sweeps_list_is_unchanged_by_a_resolution(self):
+        executor = IBExecutor("h", 7497, 1)
+        executor._logger = MagicMock()
+        executor.set_order_status_handler(AsyncMock())
+        ours = _client_trade(ARKW_ORDER, 1, rec=ARKW_REC)
+        theirs = _client_trade("77", 58, rec="repair-ref", symbol="MSFT")
+        executor._ib = self._polluting_ib(ours, theirs)
+        before = await executor.list_open_orders()
+
+        assert await executor.restore_order_by_ref(ARKW_REC, ARKW_ORDER) is True
+
+        after = await executor.list_open_orders()
+        assert [o.order_id for o in before] == [ARKW_ORDER]
+        assert after == before
+
+    async def test_find_by_ref_never_binds_another_clients_order(self):
+        executor = IBExecutor("h", 7497, 1)
+        executor._logger = MagicMock()
+        theirs = _client_trade("77", 58, rec=ARKW_REC)
+        executor._ib = _fake_ib()
+        executor._ib.openTrades.return_value = [theirs]
+
+        assert await executor.find_order_by_ref(ARKW_REC) is None
+        assert theirs.commissionReportEvent.handlers == []
+
+    async def test_a_reconnect_never_rebinds_onto_a_foreign_id_twin(self):
+        executor = IBExecutor("h", 7497, 1)
+        executor._logger = MagicMock()
+        executor._register_trade(ARKW_ORDER, _trade(ARKW_ORDER), "ARKW", "buy")
+        theirs = _client_trade(ARKW_ORDER, 58)
+        executor._ib = _fake_ib()
+        executor._ib.openTrades.return_value = [theirs]
+
+        executor._reregister_open_trades()
+
+        assert theirs.commissionReportEvent.handlers == []
+
+
+# R3 — a hung 1101 re-subscription cannot stall the resolution or the sweep
+
+
+class TestAHung1101NeverStallsTheSweep:
+    async def test_the_sweep_task_finishes_and_the_next_pass_resolves(
+        self, session
+    ):
+        h = Harness(session)
+        _seed_submitted(h.ledger)
+        h.track()
+        old_ib = await h.run_before_outage()
+        old_ib.reqOpenOrdersAsync = MagicMock(side_effect=_hung)
+
+        with patch(
+            "services.execution.ib_executor.REQ_OPEN_ORDERS_TIMEOUT_SECONDS", 0.05
+        ):
+            # The 1101 re-subscription holds the open-orders lock, hung.
+            resubscribe = asyncio.ensure_future(
+                h.executor._resubscribe_after_data_loss(1101)
+            )
+            await asyncio.sleep(0)
+            new_ib = _fake_ib()
+            await asyncio.wait_for(h.reconnect_to(new_ib), timeout=2)
+            await asyncio.wait_for(resubscribe, timeout=2)
+
+        assert h.runner._execution_sweep_task.done()
+        if h.intent().status != OrderStatus.EXPIRED.value:
+            # It lost the race for the lock: one failed attempt, retried.
+            await asyncio.wait_for(
+                h.loop_pass(advance=SWEEP_INTERVAL_S + 1), timeout=2
+            )
+        assert h.intent().status == OrderStatus.EXPIRED.value
+
+    async def test_a_hung_1101_request_gives_up(self):
+        executor = IBExecutor("h", 7497, 1)
+        executor._logger = MagicMock()
+        executor._ib = _fake_ib()
+        executor._ib.reqOpenOrdersAsync = MagicMock(side_effect=_hung)
+        before = executor.connection_generation
+
+        with patch(
+            "services.execution.ib_executor.REQ_OPEN_ORDERS_TIMEOUT_SECONDS", 0.01
+        ):
+            await asyncio.wait_for(
+                executor._resubscribe_after_data_loss(1101), timeout=1
+            )
+
+        assert executor._logger.exception.called
+        assert executor.connection_generation == before
+        assert not executor._open_orders_lock.locked()
+
+
+# R4 — an order held back pass after pass is paged once
+
+
+class TestAHeldBackOrderIsPagedOnce:
+    async def test_paged_after_n_passes_and_not_again(self, session):
+        from services.execution.runner import ABSENT_HOLDBACK_PAGE_AFTER
+
+        h = Harness(session)
+        _seed_submitted(h.ledger)
+        h.track()
+        await h.run_before_outage()
+        # A served execution whose commission report never arrives.
+        await h.reconnect_to(_fake_ib(wrapper_fills=[_ib_fill(settled=False)]))
+        for _ in range(ABSENT_HOLDBACK_PAGE_AFTER + 2):
+            await h.loop_pass(advance=SWEEP_INTERVAL_S + 1)
+
+        held = [a for a in _alerts(h) if a.event_type == "absent_resolution_held_back"]
+        assert len(held) == 1
+        assert held[0].priority == "high"
+        assert held[0].context["ib_order_id"] == ARKW_ORDER
+        assert h.intent().status == OrderStatus.SUBMITTED.value

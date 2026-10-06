@@ -455,8 +455,10 @@ class IBExecutor:
         if self._ib is None:
             return
         try:
-            async with self._open_orders_lock:
-                open_trades = list(await self._ib.reqOpenOrdersAsync())
+            ib = self._ib
+            open_trades = await self._open_orders_request(
+                ib.reqOpenOrdersAsync, "open orders (1101)"
+            )
         except Exception:
             self._logger.exception(
                 "Failed to re-request open orders after IB Error 1101 — the "
@@ -690,10 +692,11 @@ class IBExecutor:
             return
         if open_trades is None:
             try:
-                open_trades = list(self._ib.openTrades())
+                open_trades = self._own_open_trades()
             except Exception:  # pragma: no cover - defensive
                 self._logger.exception("Could not list open trades on reconnect")
                 return
+        open_trades = [t for t in open_trades if self._is_own(t)]
         open_ids = set()
         reattached = 0
         for trade in open_trades:
@@ -1036,7 +1039,7 @@ class IBExecutor:
     async def find_order_by_ref(self, recommendation_id: str) -> str | None:
         """Recover an IB-accepted order from its stable recommendation ref."""
         await self._ensure_connected()
-        trades = list(self._ib.openTrades())
+        trades = self._own_open_trades()
         for trade in trades:
             if str(getattr(trade.order, "orderRef", "")) != recommendation_id:
                 continue
@@ -1056,16 +1059,20 @@ class IBExecutor:
     async def list_open_orders(self) -> list[OpenBrokerOrder]:
         """Enumerate every order live at the broker, with its ``orderRef``.
 
-        Account-wide and ledger-independent on purpose: the post-halt sweep
-        exists to find an order whose broker id never reached the ledger, so
-        no ledger-keyed lookup can see it. Nothing is registered as a tracked
-        trade here — an order returned by this call may belong to another
-        client id or to a manual TWS session, and binding our fill/status
-        callbacks to someone else's order would corrupt attribution.
+        Ledger-independent on purpose: the post-halt sweep exists to find an
+        order whose broker id never reached the ledger, so no ledger-keyed
+        lookup can see it. Nothing is registered as a tracked trade here —
+        binding our fill/status callbacks to an order this process did not
+        place would corrupt attribution.
+
+        Scoped to this client's orders, as ``openTrades()`` always was: the
+        KAN-106 resolution's ``reqAllOpenOrders`` leaves other clients'
+        orders in that cache, and widening what the halt sweep may cancel is
+        a decision of its own (see ``broker_stops`` ``_confirm_absent``).
         """
         await self._ensure_connected()
         orders: list[OpenBrokerOrder] = []
-        for trade in list(self._ib.openTrades()):
+        for trade in self._own_open_trades():
             order = trade.order
             orders.append(
                 OpenBrokerOrder(
@@ -1102,7 +1109,7 @@ class IBExecutor:
             trade = next(
                 (
                     open_trade
-                    for open_trade in self._ib.openTrades()
+                    for open_trade in self._own_open_trades()
                     if str(open_trade.order.orderId) == str(order_id)
                 ),
                 None,
@@ -1277,26 +1284,27 @@ class IBExecutor:
         await self._ensure_connected()
         self._require_generation(expected_generation)
         ib = self._ib
-        async with self._open_orders_lock:
-            open_trades = await self._answer_or_raise(
-                ib.reqAllOpenOrdersAsync(),
-                REQ_OPEN_ORDERS_TIMEOUT_SECONDS,
-                "open orders",
-            )
+        open_trades = await self._open_orders_request(
+            ib.reqAllOpenOrdersAsync, "open orders"
+        )
         self._require_generation(expected_generation)
         for trade in open_trades:
             if str(getattr(trade.order, "orderRef", "")) != recommendation_id:
                 continue
             order_id = str(trade.order.orderId)
+            own = self._is_own(trade)
             if order_id != str(expected_order_id):
+                if not own:
+                    # Another client's order under the same ref is a
+                    # different order (its ids are that client's), not a
+                    # contradiction of ours.
+                    continue
                 raise RuntimeError(
                     f"orderRef {recommendation_id} maps to broker order "
                     f"{order_id}, expected {expected_order_id}"
                 )
             # Whatever its status (an Inactive order included), an order IB
             # still lists is not absent and is never expired here.
-            client_id = getattr(trade.order, "clientId", None)
-            own = client_id is None or int(client_id) == self._client_id
             action = str(getattr(trade.order, "action", "")).lower()
             # Same-object guard: a trade already bound (connect re-binds what
             # its own cache held) is never bound twice; a stale binding from a
@@ -1398,6 +1406,43 @@ class IBExecutor:
                 f"IB session changed (generation {self._connection_generation}, "
                 f"expected {expected})"
             )
+
+    async def _open_orders_request(
+        self, request: Callable[[], Any], what: str
+    ) -> list:
+        """One open-orders request, serialized and bounded end to end.
+
+        ib_insync keys reqOpenOrders and reqAllOpenOrders on one request slot,
+        so they take turns under ``_open_orders_lock``. Waiting for the lock
+        counts against the same bound as the request: a hung 1101
+        re-subscription must cost the resolution one failed attempt, never
+        the sweep task (which then never finishes, so no later pass starts).
+        The request is issued only once the lock is held.
+        """
+
+        async def locked() -> list:
+            async with self._open_orders_lock:
+                return list(await request())
+
+        return await self._answer_or_raise(
+            locked(), REQ_OPEN_ORDERS_TIMEOUT_SECONDS, what
+        )
+
+    def _is_own(self, trade: Any) -> bool:
+        """Whether this client placed ``trade``.
+
+        ``reqAllOpenOrders`` leaves other clients' orders in ib_insync's
+        trade cache as Trades that never get a status update on this
+        (non-master) client, so every reader of ``openTrades()`` keeps to its
+        own client's orders — what that cache held before KAN-106.
+        """
+        client_id = getattr(getattr(trade, "order", None), "clientId", None)
+        if not isinstance(client_id, int):
+            return True
+        return client_id == self._client_id
+
+    def _own_open_trades(self) -> list[Any]:
+        return [t for t in self._ib.openTrades() if self._is_own(t)]
 
     @staticmethod
     async def _answer_or_raise(request: Any, timeout: float, what: str) -> list:

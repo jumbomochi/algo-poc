@@ -33,6 +33,10 @@ FILLS_STREAM = "stream:fills"
 #: two are a Gateway blip the next pass absorbs; three at the 15-minute
 #: default is 45 minutes of no recovery.
 EXECUTION_SWEEP_FAILURE_PAGE_AFTER = 3
+#: Consecutive resolution passes an order may be held back (deferred on an
+#: unbooked served fill, or retried after a failure) before it is paged once
+#: (KAN-106). Four at the 15-minute sweep interval is an hour.
+ABSENT_HOLDBACK_PAGE_AFTER = 4
 #: Quiet period before fills the live path booked from IB's execution record
 #: are paged, when no sweep pass pages them (KAN-102). A Gateway restart that
 #: dropped N fills replays them in one burst; the page waits for the burst to
@@ -238,6 +242,10 @@ class ExecutionServiceRunner:
         # stops the moment the session moves off it.
         self._absent_resolution_generation: int | None = None
         self._last_session_generation: int | None = None
+        # Consecutive passes each order has been held back, and the ones
+        # already paged for it.
+        self._absent_holdback_passes: dict[str, int] = {}
+        self._absent_holdback_paged: set[str] = set()
 
         # Post-halt reconcile sweep (KAN-13). Its own timer, and deliberately
         # NOT sharing the unfilled sweep's calendar gate: that sweep returns
@@ -306,7 +314,9 @@ class ExecutionServiceRunner:
             type(self._order_manager), "restore_broker_tracking", None
         )
         if restore_broker is not None:
-            await restore_broker(self._order_manager)
+            degraded = await restore_broker(self._order_manager)
+            if degraded:
+                await self._start_with_tracking_degraded(list(degraded))
 
         await self._redis.create_consumer_group(
             APPROVED_ORDERS_STREAM, CONSUMER_GROUP
@@ -366,6 +376,36 @@ class ExecutionServiceRunner:
                 kills=len(pending_kills),
             )
         self._logger.info("Execution service consumer groups created")
+
+    async def _start_with_tracking_degraded(self, order_ids: list[str]) -> None:
+        """Start anyway when IB would not say what became of restored orders.
+
+        Refusing to start is the 2026-08 restart deadlock: a crash-looping
+        execution books no fills, places no stops and reads no kill. So the
+        service starts, pages, and hands the orders to the post-reconnect
+        resolution, which runs after the first successful execution sweep —
+        that pass both books any fill IB serves and makes it ready. Not ready
+        now: resolving before a sweep is exactly the pre-emption KAN-106
+        orders against. New submissions are unaffected: they are idempotent
+        by recommendation id, and the sweep books fills the unbound callbacks
+        miss.
+        """
+        self._absent_resolution_pending = True
+        self._absent_resolution_ready = False
+        await self._publish_alert_best_effort(
+            event_type="order_tracking_degraded",
+            priority="high",
+            message=(
+                "Execution started with order tracking DEGRADED: IB did not "
+                "answer its open/completed-order requests at startup, so "
+                f"{len(order_ids)} restored order(s) ({', '.join(order_ids)}) "
+                "have no live callbacks yet. They are resolved after the "
+                "first successful execution sweep, which also books any fill "
+                "IB serves; until then reconciliation may block entries. "
+                "Check the Gateway if this page repeats."
+            ),
+            context={"order_ids": ",".join(order_ids)},
+        )
 
     def restore_pending_orders(self) -> None:
         """Rebuild execution attribution and idempotency from PostgreSQL."""
@@ -2325,6 +2365,16 @@ class ExecutionServiceRunner:
             if outcome in retry_outcomes
         )
         self._absent_resolution_pending = bool(retry or deferred)
+        await self._track_holdbacks(
+            held={
+                order_id for order_id in [*retry, *deferred]
+                if order_id != "session"
+            },
+            settled={
+                order_id for order_id, outcome in outcomes.items()
+                if outcome not in retry_outcomes
+            },
+        )
         if outcomes or deferred:
             quiet = all(
                 outcome in {"open", "resolved", "untracked"}
@@ -2343,6 +2393,40 @@ class ExecutionServiceRunner:
                 retrying=self._absent_resolution_pending,
             )
         return True
+
+    async def _track_holdbacks(self, *, held: set[str], settled: set[str]) -> None:
+        """Page once for an order the resolution keeps holding back.
+
+        A served execution that never settles or never projects, or a
+        request IB keeps failing for one order, would otherwise keep the
+        resolution pending and only log every interval while reconciliation
+        blocks entries on the order.
+        """
+        for order_id in settled:
+            self._absent_holdback_passes.pop(order_id, None)
+            self._absent_holdback_paged.discard(order_id)
+        for order_id in held:
+            passes = self._absent_holdback_passes.get(order_id, 0) + 1
+            self._absent_holdback_passes[order_id] = passes
+            if (
+                passes >= ABSENT_HOLDBACK_PAGE_AFTER
+                and order_id not in self._absent_holdback_paged
+            ):
+                self._absent_holdback_paged.add(order_id)
+                await self._publish_alert_best_effort(
+                    event_type="absent_resolution_held_back",
+                    priority="high",
+                    message=(
+                        f"IB order {order_id} has been held back from the "
+                        f"post-reconnect resolution for {passes} passes: IB "
+                        "served an execution the book has not applied, or "
+                        "its order-state request keeps failing. It stays "
+                        "working in the book, so reconciliation may block "
+                        "entries. Check execution's logs ('Resolved tracked "
+                        "orders after reconnect') and the fills DLQ."
+                    ),
+                    context={"ib_order_id": order_id, "passes": str(passes)},
+                )
 
     def _absent_resolution_candidates(self) -> list[str]:
         """Recommendation ids of every intent the book holds working at IB.
