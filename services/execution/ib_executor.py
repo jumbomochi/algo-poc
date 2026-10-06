@@ -1297,7 +1297,17 @@ class IBExecutor:
                 if not own:
                     # Another client's order under the same ref is a
                     # different order (its ids are that client's), not a
-                    # contradiction of ours.
+                    # contradiction of ours — but someone placed an order
+                    # for our recommendation, which must not pass silently.
+                    self._logger.warning(
+                        "Another client holds an order under this "
+                        "recommendation's orderRef; it is not ours and is "
+                        "ignored",
+                        recommendation_id=recommendation_id,
+                        expected_order_id=str(expected_order_id),
+                        other_order_id=order_id,
+                        other_client_id=getattr(trade.order, "clientId", None),
+                    )
                     continue
                 raise RuntimeError(
                     f"orderRef {recommendation_id} maps to broker order "

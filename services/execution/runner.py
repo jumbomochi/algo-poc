@@ -315,8 +315,10 @@ class ExecutionServiceRunner:
         )
         if restore_broker is not None:
             degraded = await restore_broker(self._order_manager)
-            if degraded:
-                await self._start_with_tracking_degraded(list(degraded))
+            if isinstance(degraded, (list, tuple, set)) and degraded:
+                await self._start_with_tracking_degraded(
+                    [str(order_id) for order_id in degraded]
+                )
 
         await self._redis.create_consumer_group(
             APPROVED_ORDERS_STREAM, CONSUMER_GROUP
@@ -392,19 +394,38 @@ class ExecutionServiceRunner:
         """
         self._absent_resolution_pending = True
         self._absent_resolution_ready = False
+        open_orders = getattr(self._order_manager, "open_orders", None)
+        if not isinstance(open_orders, dict):
+            open_orders = {}
+        described = []
+        recommendation_ids = []
+        for order_id in order_ids:
+            attribution = self._pending_orders.get(order_id)
+            recommendation_id = str(
+                getattr(attribution, "recommendation_id", None) or "unknown"
+            )
+            info = open_orders.get(order_id)
+            ticker = (
+                str(info.get("ticker") or "?") if isinstance(info, dict) else "?"
+            )
+            recommendation_ids.append(recommendation_id)
+            described.append(f"{order_id} ({ticker}, {recommendation_id})")
         await self._publish_alert_best_effort(
             event_type="order_tracking_degraded",
             priority="high",
             message=(
                 "Execution started with order tracking DEGRADED: IB did not "
                 "answer its open/completed-order requests at startup, so "
-                f"{len(order_ids)} restored order(s) ({', '.join(order_ids)}) "
-                "have no live callbacks yet. They are resolved after the "
+                f"{len(order_ids)} restored order(s) — {'; '.join(described)} "
+                "— have no live callbacks yet. They are resolved after the "
                 "first successful execution sweep, which also books any fill "
                 "IB serves; until then reconciliation may block entries. "
                 "Check the Gateway if this page repeats."
             ),
-            context={"order_ids": ",".join(order_ids)},
+            context={
+                "order_ids": ",".join(order_ids),
+                "recommendation_ids": ",".join(recommendation_ids),
+            },
         )
 
     def restore_pending_orders(self) -> None:

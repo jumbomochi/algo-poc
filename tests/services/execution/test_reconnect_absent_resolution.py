@@ -1102,6 +1102,9 @@ class TestStartupDegradesInsteadOfCrashing:
         assert alert.event_type == "order_tracking_degraded"
         assert alert.priority == "high"
         assert ARKW_ORDER in alert.message
+        assert "ARKW" in alert.message.replace(ARKW_REC, "")
+        assert ARKW_REC in alert.message
+        assert alert.context["recommendation_ids"] == ARKW_REC
         assert h.intent().status == OrderStatus.SUBMITTED.value
         assert h.runner._absent_resolution_pending is True
         assert h.runner._absent_resolution_ready is False
@@ -1192,6 +1195,28 @@ class TestStartupDegradesInsteadOfCrashing:
 
         # Ours is in neither book: expired, as before.
         assert h.intent().status == OrderStatus.EXPIRED.value
+        # ...but the foreign order under our ref is never skipped silently.
+        [skipped] = [
+            c for c in h.executor._logger.warning.call_args_list
+            if "other_order_id" in c.kwargs
+        ]
+        assert skipped.kwargs["recommendation_id"] == ARKW_REC
+        assert skipped.kwargs["expected_order_id"] == ARKW_ORDER
+        assert skipped.kwargs["other_order_id"] == "999"
+        assert skipped.kwargs["other_client_id"] == 58
+
+    async def test_a_non_list_restore_result_never_breaks_startup(self, session):
+        h = Harness(session)
+        _seed_submitted(h.ledger)
+
+        with patch.object(
+            OrderManager, "restore_broker_tracking",
+            AsyncMock(return_value=MagicMock()),
+        ):
+            await _start_up(h, _fake_ib())
+
+        assert _alerts(h) == []
+        assert h.runner._absent_resolution_pending is False
 
 
 # R2 — reqAllOpenOrders must not widen any openTrades() reader
