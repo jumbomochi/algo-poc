@@ -38,12 +38,21 @@ reimplemented here.
   the held quantity. Planning issues SELECTs only, takes no row locks, and on
   Postgres runs inside a ``READ ONLY`` transaction, so it cannot write even by
   mistake.
-* **``--apply``** needs an interactive TTY and the exact phrase
-  ``REPROJECT BURNED FILLS``. Each fill is ONE transaction: un-expire (below),
-  project, set ``projection_applied=true``, commit. Any failure rolls all of
-  it back -- the row stays exactly as it was, still re-projectable -- and the
-  run stops there rather than trying the rest against a book that just
-  moved.
+* **``--apply``** takes explicit ``--execution-id`` values and ``--account``
+  only (``--all-unapplied`` is a dry-run survey: a fill nobody looked at, or
+  a burned row on another account, must not ride along). It needs an
+  interactive TTY and the exact phrase ``REPROJECT BURNED FILLS``, and proves
+  the artifact directory writable before the first transaction. Each fill is
+  ONE transaction: un-expire (below), project, set
+  ``projection_applied=true``, commit. Any failure -- a projector refusal or
+  an unexpected database error -- rolls all of that fill back (the row stays
+  re-projectable), is recorded, and stops the run. The artifact is written in
+  a ``finally``, so it always records what did commit. Afterwards the book is
+  re-read and each sleeve's cash and position quantity compared with the
+  dry-run prediction.
+* **Stale marks.** A re-projected buy opens its position with
+  ``current_price``, ``peak_price`` and ``highest_price_since_entry`` at the
+  fill price; the next mark-to-market (the next paper run) corrects them.
 * **Un-expiry.** An intent EXPIRED with ``ABSENT_AT_IB_REASON`` was a guess
   ("the order vanished from IB") that the recorded execution refutes; it is
   restored to SUBMITTED with ``OrderLedger.restore_absent_terminalization``,
@@ -94,8 +103,11 @@ from another checkout (the editable install points elsewhere), so set
         --execution-id 0000e0d5.6ac63cba.01.01 --account DUN551088
     PYTHONPATH=$PWD .venv/bin/python scripts/ops/reproject_fill.py \\
         --execution-id 0000e0d5.6ac63cba.01.01 --account DUN551088 --apply
-    # or every unprojected row for the account:
+    # survey every unprojected row for the account (dry run only):
     ... --all-unapplied --account DUN551088
+
+Run the dry run IMMEDIATELY before ``--apply``: the cash check is only as
+fresh as the plan.
 
 Then ``scripts/reconcile_paper.py --report`` and confirm severity ok.
 
@@ -106,6 +118,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -205,6 +218,10 @@ class FillPlan:
     cash_before: float | None = None
     cash_delta: float | None = None
     cash_after: float | None = None
+    #: The sleeve's open quantity on this contract before and after, as
+    #: predicted; ``verify`` compares the book against ``position_after``.
+    position_before: float | None = None
+    position_after: float | None = None
     checks: tuple[Check, ...] = ()
 
     @property
@@ -317,6 +334,7 @@ def _plan_fill(
     *,
     cash_overlay: dict[str, float],
     filled_overlay: dict[str, float],
+    position_overlay: dict[tuple[str, int], float],
 ) -> FillPlan:
     side = row.side.lower()
     base = dict(
@@ -468,6 +486,16 @@ def _plan_fill(
             ),
         ))
 
+    position_key = (portfolio, int(intent.con_id))
+    position_before = position_overlay.get(
+        position_key, float(existing.quantity) if existing is not None else 0.0
+    )
+    if side == "buy":
+        position_after = position_before + float(row.quantity)
+    else:
+        position_after = max(position_before - float(row.quantity), 0.0)
+    position_overlay[position_key] = position_after
+
     cash_before = cash_delta = cash_after = None
     if config is None:
         checks.append(Check(
@@ -480,8 +508,8 @@ def _plan_fill(
         if side == "buy":
             cash_delta = -(float(row.price) * float(row.quantity) + commission)
         else:
-            held_qty = float(existing.quantity) if existing is not None else 0.0
-            covered = existing is not None and float(row.quantity) <= held_qty + _EPS
+            held_qty = position_before
+            covered = held_qty > 0 and float(row.quantity) <= held_qty + _EPS
             checks.append(Check(
                 "position quantity", covered,
                 "" if covered else (
@@ -524,6 +552,8 @@ def _plan_fill(
         cash_before=cash_before,
         cash_delta=cash_delta,
         cash_after=cash_after,
+        position_before=position_before,
+        position_after=position_after,
         checks=tuple(checks),
     )
 
@@ -537,8 +567,8 @@ def plan_reprojection(
 ) -> ReprojectionPlan:
     """Work out what re-projecting each selected row would do. SELECTs only.
 
-    Sleeve cash and an order's filled quantity are carried forward between
-    fills in the plan, so a second burned fill on the same sleeve or order is
+    Sleeve cash, an order's filled quantity and the sleeve's position are
+    carried forward between fills in the plan, so a second burned fill on the same sleeve or order is
     judged against the book as the first one will leave it.
     """
     rows, already, missing = _select_rows(
@@ -550,10 +580,13 @@ def plan_reprojection(
     projector = FillProjector(session)
     cash_overlay: dict[str, float] = {}
     filled_overlay: dict[str, float] = {}
+    position_overlay: dict[tuple[str, int], float] = {}
     fills = tuple(
         _plan_fill(
             session, projector, row,
-            cash_overlay=cash_overlay, filled_overlay=filled_overlay,
+            cash_overlay=cash_overlay,
+            filled_overlay=filled_overlay,
+            position_overlay=position_overlay,
         )
         for row in rows
     )
@@ -698,11 +731,25 @@ def _apply_one(session: Session, fill: FillPlan) -> AppliedFill | None:
 
 
 def apply_reprojection(
-    session: Session, plan: ReprojectionPlan, *, confirm: str
+    session: Session,
+    plan: ReprojectionPlan,
+    *,
+    confirm: str,
+    applied_sink: list[AppliedFill] | None = None,
 ) -> ReprojectionResult:
     """Re-project every planned fill, one transaction each, stopping at a
     failure. Refuses a plan that carries any problem: a dry run that listed a
-    refusal is not something to apply around."""
+    refusal is not something to apply around.
+
+    ANY exception from a fill -- a projector refusal, but equally a lock
+    timeout, a dropped connection or an IntegrityError -- is recorded as that
+    fill's failure and stops the loop. It is never allowed to escape past
+    fills that already COMMITTED: those are real changes to the book, and a
+    raw traceback would leave the operator without the artifact and the
+    verify that say what they were. ``applied_sink``, when given, receives
+    each fill the moment it commits, so a caller's ``finally`` can record
+    them even if something below ``Exception`` (an interrupt) unwinds this.
+    """
     if confirm != CONFIRMATION:
         raise ReprojectRefusedError(
             f"exact confirmation required: expected {CONFIRMATION!r}"
@@ -716,7 +763,7 @@ def apply_reprojection(
     if session.in_transaction():
         session.rollback()
 
-    applied: list[AppliedFill] = []
+    applied = applied_sink if applied_sink is not None else []
     for fill in plan.fills:
         try:
             record = _apply_one(session, fill)
@@ -726,24 +773,119 @@ def apply_reprojection(
             return ReprojectionResult(
                 applied=tuple(applied), failed=((fill.execution_id, str(exc)),)
             )
+        except Exception as exc:  # noqa: BLE001 -- see the docstring
+            _discard(session)
+            return ReprojectionResult(
+                applied=tuple(applied),
+                failed=((
+                    fill.execution_id,
+                    f"unexpected {type(exc).__name__}: {exc}",
+                ),),
+            )
         if record is not None:
             applied.append(record)
     return ReprojectionResult(applied=tuple(applied))
 
 
-def verify(session: Session, result: ReprojectionResult) -> list[str]:
-    """Refuse to report success unless every applied row reads projected."""
-    session.expire_all()
-    problems = []
+def _discard(session: Session) -> None:
+    """Best-effort rollback on a session whose connection may be gone."""
+    try:
+        session.rollback()
+    except Exception:  # noqa: BLE001 -- nothing useful to do with it
+        pass
+
+
+@dataclass(frozen=True)
+class Verification:
+    lines: tuple[str, ...] = ()
+    problems: tuple[str, ...] = ()
+
+
+def verify(
+    session: Session, result: ReprojectionResult, plan: ReprojectionPlan
+) -> Verification:
+    """Re-read the book and compare it with what the plan predicted.
+
+    Success is not reported unless every applied row reads projected, and
+    each sleeve's cash and each position's quantity match the dry run the
+    operator approved. A mismatch is not undone -- the fills are committed --
+    but it is said out loud, because it means the book moved between the
+    plan and the write.
+    """
+    planned = {fill.execution_id: fill for fill in plan.fills}
+    # The LAST applied fill per sleeve / per contract is the one whose
+    # prediction the book should now equal.
+    cash_expected: dict[str, float] = {}
+    position_expected: dict[tuple[str, str, int], float] = {}
     for record in result.applied:
-        row = session.scalar(select(ExecutionFill).where(
-            ExecutionFill.account_id == record.account_id,
-            ExecutionFill.execution_id == record.execution_id,
-        ))
-        if row is None or not row.projection_applied:
-            problems.append(f"{record.execution_id} does not read projected")
-    session.rollback()
-    return problems
+        fill = planned.get(record.execution_id)
+        if fill is None:
+            continue
+        if fill.cash_after is not None:
+            cash_expected[record.portfolio] = fill.cash_after
+        if fill.position_after is not None:
+            position_expected[
+                (record.account_id, record.portfolio, record.con_id)
+            ] = fill.position_after
+
+    lines: list[str] = []
+    problems: list[str] = []
+    try:
+        session.expire_all()
+        for record in result.applied:
+            row = session.scalar(select(ExecutionFill).where(
+                ExecutionFill.account_id == record.account_id,
+                ExecutionFill.execution_id == record.execution_id,
+            ))
+            projected = row is not None and bool(row.projection_applied)
+            lines.append(
+                f"  {record.execution_id}: projection_applied="
+                f"{str(projected).lower()}"
+            )
+            if not projected:
+                problems.append(f"{record.execution_id} does not read projected")
+        for portfolio, expected in sorted(cash_expected.items()):
+            actual = _sleeve_cash(session, portfolio)
+            ok = isclose(actual, expected, rel_tol=0, abs_tol=1e-6)
+            lines.append(
+                f"  sleeve {portfolio} cash {actual:,.6f} "
+                f"(planned {expected:,.6f}){'' if ok else '  MISMATCH'}"
+            )
+            if not ok:
+                problems.append(
+                    f"sleeve {portfolio} cash is {actual:,.6f}, the plan "
+                    f"predicted {expected:,.6f}"
+                )
+        for (account_id, portfolio, con_id), expected in sorted(
+            position_expected.items()
+        ):
+            actual = sum(
+                float(quantity) for quantity in session.scalars(
+                    select(Position.quantity).where(
+                        Position.account_id == account_id,
+                        Position.portfolio == portfolio,
+                        Position.con_id == con_id,
+                        Position.status == "open",
+                    )
+                )
+            )
+            ok = isclose(actual, expected, rel_tol=0, abs_tol=1e-9)
+            lines.append(
+                f"  position {portfolio} con_id {con_id} quantity {actual:g} "
+                f"(planned {expected:g}){'' if ok else '  MISMATCH'}"
+            )
+            if not ok:
+                problems.append(
+                    f"{portfolio} con_id {con_id} holds {actual:g}, the plan "
+                    f"predicted {expected:g}"
+                )
+    except Exception as exc:  # noqa: BLE001 -- verification must not mask
+        problems.append(
+            f"could not re-read the book to verify: {type(exc).__name__}: {exc}"
+        )
+    finally:
+        _discard(session)
+    return Verification(lines=tuple(lines), problems=tuple(problems))
 
 
 # --------------------------------------------------------------------------
@@ -821,6 +963,11 @@ def render(plan: ReprojectionPlan) -> str:
             f"  sleeve  {fill.portfolio}: cash {_money(fill.cash_before)} -> "
             f"{_money(fill.cash_after)}  (delta {_money(fill.cash_delta)})"
         )
+        if fill.position_after is not None:
+            lines.append(
+                f"          {fill.symbol} position {fill.position_before:g} -> "
+                f"{fill.position_after:g}"
+            )
         lines.append("  pre-checks:")
         for check in fill.checks:
             mark = "ok  " if check.ok else "FAIL"
@@ -860,11 +1007,37 @@ def write_exclusive(directory: Path, stem: str, payload: Mapping) -> Path:
     raise ReprojectRefusedError(f"could not find a free artifact name for {stem}")
 
 
-def _unrepainted_snapshots(
-    session: Session, result: ReprojectionResult
-) -> list[dict]:
-    """``equity_snapshots`` rows written after a fill, for its sleeve.
+def ensure_writable(directory: Path) -> Path:
+    """Prove the artifact can be written BEFORE anything commits.
 
+    The artifact is the only durable record of what a partial run changed,
+    so a directory that cannot take it is a refusal, not a warning after
+    the fact.
+    """
+    directory = Path(directory)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            dir=directory, prefix=".reproject-fill-probe-"
+        ) as probe:
+            probe.write(b"ok")
+            probe.flush()
+    except OSError as exc:
+        raise ReprojectRefusedError(
+            f"the audit artifact directory {directory} is not writable "
+            f"({exc}). Nothing has been written to the database. Fix it or "
+            "pass --artifact-dir."
+        ) from exc
+    return directory
+
+
+def _unrepainted_snapshots(
+    session: Session, result: ReprojectionResult, *, repaired_at: datetime
+) -> list[dict]:
+    """``equity_snapshots`` rows that valued a sleeve without its fill.
+
+    Bounded on both sides: written at or after the fill executed, and before
+    the repair -- anything written after ``repaired_at`` already sees it.
     Each valued the sleeve without the position it held: cash overstated and
     market value understated by the cost of a buy (or the reverse for a sell).
     """
@@ -882,7 +1055,7 @@ def _unrepainted_snapshots(
             created = snapshot.created_at
             if created.tzinfo is None:
                 created = created.replace(tzinfo=timezone.utc)
-            if created < since:
+            if not since <= created < repaired_at:
                 continue
             rows.append({
                 "portfolio": portfolio,
@@ -891,6 +1064,7 @@ def _unrepainted_snapshots(
                     snapshot.session_date.isoformat()
                     if snapshot.session_date else None
                 ),
+                "created_at": _iso(created),
                 "equity": snapshot.equity,
                 "cash": snapshot.cash,
                 "market_value": snapshot.market_value,
@@ -898,22 +1072,59 @@ def _unrepainted_snapshots(
     return rows
 
 
+def mark_note(record: AppliedFill) -> str | None:
+    """What a re-projected buy leaves stale until the next mark-to-market."""
+    if record.side != "BUY":
+        return None
+    return (
+        f"{record.symbol} current_price, peak_price and "
+        "highest_price_since_entry start at the fill price "
+        f"({record.price:,.4f}) and are corrected at the next mark-to-market "
+        "(the next paper run)."
+    )
+
+
 def build_artifact(
-    session: Session, result: ReprojectionResult, *, applied_at: str
+    session: Session,
+    result: ReprojectionResult,
+    *,
+    applied_at: datetime,
+    verification: Verification | None = None,
 ) -> dict:
-    snapshots = _unrepainted_snapshots(session, result)
-    session.rollback()
+    """The audit record. Never raises on a database error: it is written
+    from a ``finally``, possibly after the connection died, and must not
+    mask what committed."""
+    snapshot_error = None
+    try:
+        snapshots = _unrepainted_snapshots(
+            session, result, repaired_at=applied_at
+        )
+    except Exception as exc:  # noqa: BLE001
+        snapshots = None
+        snapshot_error = f"{type(exc).__name__}: {exc}"
+    finally:
+        _discard(session)
     return {
         "repair": "KAN-108 reproject_fill",
-        "applied_at": applied_at,
+        "applied_at": applied_at.isoformat(),
         "applied": [
-            {**record.__dict__, "cash_delta": record.cash_delta}
+            {
+                **record.__dict__,
+                "cash_delta": record.cash_delta,
+                "mark_note": mark_note(record),
+            }
             for record in result.applied
         ],
         "failed": [
             {"execution_id": execution_id, "reason": reason}
             for execution_id, reason in result.failed
         ],
+        "verification": (
+            None if verification is None else {
+                "lines": list(verification.lines),
+                "problems": list(verification.problems),
+            }
+        ),
         "dlq": {
             "stream": DLQ_STREAM,
             "execution_ids": [record.execution_id for record in result.applied],
@@ -923,10 +1134,11 @@ def build_artifact(
             ),
         },
         "equity_snapshots_not_repainted": snapshots,
+        "equity_snapshots_error": snapshot_error,
         "equity_series_note": (
             "The equity_snapshots rows listed above were recorded after the "
-            "fill executed but before it was projected, so they value the "
-            "sleeve without it: for a buy, cash overstated and market value "
+            "fill executed and before this repair, so they value the sleeve "
+            "without it: for a buy, cash overstated and market value "
             "understated by the cost basis (the reverse for a sell). They are "
             "NOT rewritten: correcting them needs per-position daily marks "
             "that were never stored (the same limitation "
@@ -951,15 +1163,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--execution-id", action="append", default=[], dest="execution_ids",
-        help="an execution to re-project (repeatable)",
+        help="an execution to re-project (repeatable; the only selector "
+             "--apply accepts)",
     )
     parser.add_argument(
         "--all-unapplied", action="store_true",
-        help="every execution_fills row with projection_applied=false",
+        help="dry-run survey of every execution_fills row with "
+             "projection_applied=false (refused with --apply)",
     )
     parser.add_argument(
         "--account", default=None,
-        help="restrict to this IB account (recommended)",
+        help="restrict to this IB account (required with --apply)",
     )
     parser.add_argument(
         "--database-url", default=None,
@@ -979,6 +1193,21 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("select fills with --execution-id and/or --all-unapplied")
 
     try:
+        if args.apply and args.all_unapplied:
+            # A survey is not a work order. One burned row on another account,
+            # or a fill the operator never looked at, must not ride along with
+            # the one they meant -- and N fills confirmed against one dry run
+            # are N chances for the cash figure to have gone stale.
+            raise ReprojectRefusedError(
+                "--apply takes explicit --execution-id values only. Use "
+                "--all-unapplied for the dry-run survey, then apply each fill "
+                "by id."
+            )
+        if args.apply and not args.account:
+            raise ReprojectRefusedError(
+                "--apply requires --account: name the IB account this repair "
+                "is for."
+            )
         return _run(args)
     except ReprojectRefusedError as exc:
         print(f"\nRefused: {exc}", file=sys.stderr)
@@ -1021,29 +1250,59 @@ def _run(args: argparse.Namespace) -> int:
             print("\nNothing to re-project.")
             return 0
         if not args.apply:
-            print("\nDry-run only. Re-run with --apply to write it.\n")
+            print(
+                "\nDry-run only. To write it, re-run IMMEDIATELY with --apply, "
+                "the same --execution-id value(s) and --account.\n"
+            )
             print(dlq_instructions(ids))
             return 0
 
         if not sys.stdin.isatty():
             raise ReprojectRefusedError("--apply requires an interactive TTY")
+        directory = ensure_writable(durable_artifact_dir(
+            args.artifact_dir or DEFAULT_ARTIFACT_DIR,
+            explicit=args.artifact_dir is not None,
+        ))
         answer = input(
             f"\nType {CONFIRMATION} to re-project {len(plan.fills)} fill(s): "
         )
-        result = apply_reprojection(session, plan, confirm=answer.strip())
+        if answer.strip() != CONFIRMATION:
+            raise ReprojectRefusedError(
+                f"exact confirmation required: expected {CONFIRMATION!r}"
+            )
 
-        artifact_path = None
-        if result.applied or result.failed:
-            directory = durable_artifact_dir(
-                args.artifact_dir or DEFAULT_ARTIFACT_DIR,
-                explicit=args.artifact_dir is not None,
-            )
-            stamp = datetime.now(timezone.utc)
-            artifact_path = write_exclusive(
-                directory,
-                f"reproject-fill-{stamp:%Y%m%dT%H%M%SZ}",
-                build_artifact(session, result, applied_at=stamp.isoformat()),
-            )
+        started = datetime.now(timezone.utc)
+        committed: list[AppliedFill] = []
+        result = ReprojectionResult()
+        verification: Verification | None = None
+        try:
+            try:
+                result = apply_reprojection(
+                    session, plan, confirm=answer.strip(),
+                    applied_sink=committed,
+                )
+            except BaseException as exc:
+                # An interrupt between commits: record what DID commit.
+                result = ReprojectionResult(
+                    applied=tuple(committed),
+                    failed=((
+                        "<interrupted>", f"{type(exc).__name__}: {exc}",
+                    ),),
+                )
+                raise
+            verification = verify(session, result, plan)
+        finally:
+            if result.applied or result.failed:
+                artifact_path = write_exclusive(
+                    directory,
+                    f"reproject-fill-{started:%Y%m%dT%H%M%SZ}",
+                    build_artifact(
+                        session, result,
+                        applied_at=started, verification=verification,
+                    ),
+                )
+                print(f"\nAudit artifact: {artifact_path}")
+
         for record in result.applied:
             print(
                 f"\nRe-projected {record.execution_id} ({record.symbol}): "
@@ -1051,14 +1310,24 @@ def _run(args: argparse.Namespace) -> int:
                 f"{record.intent_status_after}, sleeve {record.portfolio} cash "
                 f"{record.cash_before:,.6f} -> {record.cash_after:,.6f}"
             )
-        if artifact_path is not None:
-            print(f"\nAudit artifact: {artifact_path}")
+            note = mark_note(record)
+            if note:
+                print(f"  note: {note}")
+        if verification is not None and verification.lines:
+            print("\nPost-apply check (book vs plan):")
+            for line in verification.lines:
+                print(line)
 
-        problems = verify(session, result)
+        problems = verification.problems if verification is not None else ()
         if result.failed or problems:
+            if result.applied:
+                print(
+                    f"\n{len(result.applied)} fill(s) above COMMITTED before "
+                    "the failure and stay applied."
+                )
             for execution_id, reason in result.failed:
                 print(
-                    f"\n🚨 {execution_id} was REJECTED: {reason}\n"
+                    f"\n🚨 {execution_id} FAILED: {reason}\n"
                     "   Its transaction rolled back completely: the row is "
                     "still unprojected and the intent is as it was. Fix the "
                     "cause and re-run the dry run."

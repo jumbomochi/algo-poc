@@ -288,7 +288,7 @@ def test_apply_projects_the_burned_fill(tmp_path, monkeypatch, capsys):
     _fund(engine)
     _confirm(monkeypatch)
 
-    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--apply") == 0
+    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--account", ACCOUNT, "--apply") == 0
 
     with Session(engine) as session:
         position = session.scalar(
@@ -330,7 +330,7 @@ def test_apply_writes_an_audit_artifact_naming_the_equity_gap(
     _fund(engine)
     _confirm(monkeypatch)
 
-    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--apply") == 0
+    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--account", ACCOUNT, "--apply") == 0
 
     [artifact] = list((tmp_path / "reconciliation").glob("reproject-fill-*.json"))
     payload = json.loads(artifact.read_text())
@@ -360,7 +360,7 @@ def test_an_intent_expired_for_another_reason_is_refused(
     assert _cli(url, tmp_path, "--execution-id", EXEC_ID) == 1
     assert "IB reported Inactive" in capsys.readouterr().out
 
-    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--apply") == 1
+    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--account", ACCOUNT, "--apply") == 1
     assert _state(engine) == before
 
 
@@ -382,7 +382,7 @@ def test_a_submitted_intent_is_filled_without_un_expiring(tmp_path, monkeypatch)
     _fund(engine)
     _confirm(monkeypatch)
 
-    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--apply") == 0
+    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--account", ACCOUNT, "--apply") == 0
 
     with Session(engine) as session:
         intent = session.scalar(
@@ -442,7 +442,7 @@ def test_a_failure_is_written_to_the_artifact(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr(FillProjector, "project_recorded", drained)
 
-    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--apply") == 1
+    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--account", ACCOUNT, "--apply") == 1
 
     [artifact] = list((tmp_path / "reconciliation").glob("reproject-fill-*.json"))
     payload = json.loads(artifact.read_text())
@@ -465,13 +465,13 @@ def test_re_running_after_success_changes_nothing(tmp_path, monkeypatch, capsys)
     url, engine = _book(tmp_path)
     _fund(engine)
     _confirm(monkeypatch)
-    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--apply") == 0
+    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--account", ACCOUNT, "--apply") == 0
     after_first = _state(engine)
     capsys.readouterr()
 
-    assert _cli(url, tmp_path, "--all-unapplied", "--apply") == 0
+    assert _cli(url, tmp_path, "--all-unapplied", "--account", ACCOUNT) == 0
     assert "No unprojected fills" in capsys.readouterr().out
-    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--apply") == 0
+    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--account", ACCOUNT, "--apply") == 0
     assert "already projected" in capsys.readouterr().out
 
     assert _state(engine) == after_first
@@ -516,7 +516,7 @@ def test_apply_without_a_tty_is_refused(tmp_path, monkeypatch, capsys):
     before = _state(engine)
     _confirm(monkeypatch, tty=False)
 
-    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--apply") == 2
+    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--account", ACCOUNT, "--apply") == 2
 
     assert "TTY" in capsys.readouterr().err
     assert _state(engine) == before
@@ -528,11 +528,13 @@ def test_apply_with_the_wrong_phrase_is_refused(tmp_path, monkeypatch, capsys):
     before = _state(engine)
     _confirm(monkeypatch, answer="yes")
 
-    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--apply") == 2
+    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--account", ACCOUNT, "--apply") == 2
 
     assert CONFIRMATION in capsys.readouterr().err
     assert _state(engine) == before
-    assert not (tmp_path / "reconciliation").exists()
+    # The directory is proven writable before the prompt; no record is made
+    # of a repair that never started.
+    assert list((tmp_path / "reconciliation").glob("*.json")) == []
 
 
 def test_apply_reprojection_demands_the_phrase(tmp_path):
@@ -653,7 +655,7 @@ def test_reconciliation_reads_ok_after_the_repair(tmp_path, monkeypatch):
     }
 
     _confirm(monkeypatch)
-    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--apply") == 0
+    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--account", ACCOUNT, "--apply") == 0
 
     with Session(engine) as session:
         after, plan = reconcile_snapshot(session, _ib_after_arkg_sale())
@@ -676,3 +678,211 @@ def test_an_existing_artifact_is_never_overwritten(tmp_path):
     assert first != second
     assert json.loads(first.read_text()) == {"a": 1}
     assert json.loads(second.read_text()) == {"a": 2}
+
+
+# --------------------------------------------------------------------------
+# PR #234 review follow-ups.
+# --------------------------------------------------------------------------
+
+CLOU_CON = 360975905
+EXEC_CLOU = "0000e0d5.6ac63cbb.01.01"
+REC_CLOU = "sleeve-2026-10-07-DUN551088-paper-thematic_momentum-CLOU-buy"
+
+
+def _second_burn(engine):
+    """A second burned buy in the same sleeve, recorded after ARKW's."""
+    with Session(engine) as session:
+        session.add(_intent(
+            REC_CLOU, action="BUY", symbol="CLOU", con_id=CLOU_CON,
+            quantity=10.0, order_id="273",
+        ))
+        session.commit()
+        fill = _arkw_fill().model_copy(update={
+            "ticker": "CLOU", "con_id": CLOU_CON, "execution_id": EXEC_CLOU,
+            "recommendation_id": REC_CLOU, "order_id": "273",
+            "quantity": 10.0, "cumulative_quantity": 10.0, "fill_price": 30.0,
+        })
+        with pytest.raises(InvalidFillError, match="sleeve cash negative"):
+            FillProjector(session).apply(fill)
+        session.execute(text(
+            "UPDATE portfolio_config SET cash = 10000 WHERE portfolio = :p"
+        ), {"p": SLEEVE})
+        session.commit()
+
+
+def _applied(session, execution_id) -> bool:
+    return session.scalar(
+        select(ExecutionFill.projection_applied)
+        .where(ExecutionFill.execution_id == execution_id)
+    )
+
+
+def test_an_unexpected_error_after_a_commit_still_leaves_the_artifact(
+    tmp_path, monkeypatch, capsys
+):
+    """M1. Fill 1 lands; fill 2 hits a database error that is not a
+    projector refusal. The run must still record fill 1 as applied and
+    fill 2 as failed, rather than dying with a traceback and no record."""
+    from sqlalchemy.exc import OperationalError
+
+    url, engine = _book(tmp_path)
+    _second_burn(engine)
+    original = FillProjector.project_recorded
+
+    def flaky(self, execution, intent, *, order_done):
+        if execution.execution_id == EXEC_CLOU:
+            raise OperationalError(
+                "SELECT 1", {}, Exception("lock timeout")
+            )
+        return original(self, execution, intent, order_done=order_done)
+
+    monkeypatch.setattr(FillProjector, "project_recorded", flaky)
+    _confirm(monkeypatch)
+
+    assert _cli(
+        url, tmp_path, "--execution-id", EXEC_ID, "--execution-id", EXEC_CLOU,
+        "--account", ACCOUNT, "--apply",
+    ) == 1
+
+    [artifact] = list((tmp_path / "reconciliation").glob("reproject-fill-*.json"))
+    payload = json.loads(artifact.read_text())
+    assert [a["execution_id"] for a in payload["applied"]] == [EXEC_ID]
+    [failed] = payload["failed"]
+    assert failed["execution_id"] == EXEC_CLOU
+    assert "OperationalError" in failed["reason"]
+    assert "COMMITTED" in capsys.readouterr().out
+    with Session(engine) as session:
+        assert _applied(session, EXEC_ID) is True
+        assert _applied(session, EXEC_CLOU) is False
+
+
+def test_an_unwritable_artifact_dir_refuses_before_any_write(
+    tmp_path, monkeypatch, capsys
+):
+    """M1. The artifact is proven writable before the first transaction."""
+    url, engine = _book(tmp_path)
+    _fund(engine)
+    before = _state(engine)
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("a file where the directory should be")
+    asked = []
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr(
+        "builtins.input", lambda *a: asked.append(a) or CONFIRMATION
+    )
+
+    assert main([
+        "--database-url", url, "--artifact-dir", str(blocker / "sub"),
+        "--execution-id", EXEC_ID, "--account", ACCOUNT, "--apply",
+    ]) == 2
+
+    assert "not writable" in capsys.readouterr().err
+    assert asked == []
+    assert _state(engine) == before
+
+
+def test_apply_refuses_all_unapplied(tmp_path, monkeypatch, capsys):
+    """M2. --all-unapplied is a survey; --apply needs explicit ids."""
+    url, engine = _book(tmp_path)
+    _fund(engine)
+    before = _state(engine)
+    _confirm(monkeypatch)
+
+    assert _cli(
+        url, tmp_path, "--all-unapplied", "--account", ACCOUNT, "--apply"
+    ) == 2
+    assert "--execution-id" in capsys.readouterr().err
+    assert _cli(
+        url, tmp_path, "--all-unapplied", "--execution-id", EXEC_ID,
+        "--account", ACCOUNT, "--apply",
+    ) == 2
+    assert _state(engine) == before
+
+
+def test_apply_requires_an_account(tmp_path, monkeypatch, capsys):
+    """M2."""
+    url, engine = _book(tmp_path)
+    _fund(engine)
+    before = _state(engine)
+    _confirm(monkeypatch)
+
+    assert _cli(url, tmp_path, "--execution-id", EXEC_ID, "--apply") == 2
+
+    assert "--account" in capsys.readouterr().err
+    assert _state(engine) == before
+
+
+def test_verify_reports_cash_and_position_against_the_plan(
+    tmp_path, monkeypatch, capsys
+):
+    """L3. Success prints the book as re-read, next to the plan."""
+    url, engine = _book(tmp_path)
+    _fund(engine)
+    _confirm(monkeypatch)
+
+    assert _cli(
+        url, tmp_path, "--execution-id", EXEC_ID, "--account", ACCOUNT,
+        "--apply",
+    ) == 0
+
+    out = capsys.readouterr().out
+    expected_cash = SLEEVE_CASH + ARKG_PROCEEDS - ARKW_COST
+    assert f"cash {expected_cash:,.6f} (planned {expected_cash:,.6f})" in out
+    assert f"con_id {ARKW_CON} quantity 11 (planned 11)" in out
+    assert "MISMATCH" not in out
+    # The stale marks are named, not left for the operator to discover.
+    assert "next mark-to-market" in out
+
+
+def test_verify_flags_a_book_that_moved_under_the_plan(
+    tmp_path, monkeypatch, capsys
+):
+    """L3. Something else moved the sleeve's cash inside the window."""
+    url, engine = _book(tmp_path)
+    _fund(engine)
+    _confirm(monkeypatch)
+    original = FillProjector.project_recorded
+
+    def with_side_effect(self, execution, intent, *, order_done):
+        self.session.execute(text(
+            "UPDATE portfolio_config SET cash = cash + 5 WHERE portfolio = :p"
+        ), {"p": SLEEVE})
+        return original(self, execution, intent, order_done=order_done)
+
+    monkeypatch.setattr(FillProjector, "project_recorded", with_side_effect)
+
+    assert _cli(
+        url, tmp_path, "--execution-id", EXEC_ID, "--account", ACCOUNT,
+        "--apply",
+    ) == 1
+
+    out = capsys.readouterr().out
+    assert "MISMATCH" in out
+    assert "the plan predicted" in out
+
+
+def test_snapshots_written_after_the_repair_are_not_listed(
+    tmp_path, monkeypatch
+):
+    url, engine = _book(tmp_path)
+    _fund(engine)
+    with Session(engine) as session:
+        session.add(EquitySnapshot(
+            portfolio=SLEEVE, date=date(2099, 1, 2), equity=1.0, cash=1.0,
+            market_value=0.0,
+            created_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
+        ))
+        session.commit()
+    _confirm(monkeypatch)
+
+    assert _cli(
+        url, tmp_path, "--execution-id", EXEC_ID, "--account", ACCOUNT,
+        "--apply",
+    ) == 0
+
+    [artifact] = list((tmp_path / "reconciliation").glob("reproject-fill-*.json"))
+    payload = json.loads(artifact.read_text())
+    assert [s["date"] for s in payload["equity_snapshots_not_repainted"]] == [
+        "2026-10-08"
+    ]
+    assert "next mark-to-market" in payload["applied"][0]["mark_note"]
