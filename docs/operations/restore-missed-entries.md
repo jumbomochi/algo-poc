@@ -101,8 +101,9 @@ Two warnings can appear here, and both refuse `--apply`:
   row but `projection_applied` is false: a previous run committed the
   audit row and then the projector rejected the fill. Because
   `execution_fill_exists` does not look at `projection_applied`, they now
-  read as "already recorded" and **this tool can never recover them**. Go
-  to [backups.md](backups.md).
+  read as "already recorded" and **this tool can never recover them**. Fix
+  the cause, then re-project them with `scripts/ops/reproject_fill.py`
+  (KAN-108; dry-run first), or restore per [backups.md](backups.md).
 - **`⚠ TIME ZONE`** — fills that, read in `--statement-tz`, fall outside US
   trading hours: almost always the wrong zone. `--apply` is refused. For a
   genuine extended-hours fill, pass `--accept-outside-session`; the
@@ -233,7 +234,7 @@ rejected one is burned; do not re-run `--apply` hoping to catch it.
 | `contains only SELL rows` | Wrong tool | Use `restore_missed_exit.py` |
 | `Refusing to apply ... sleeve cash` | Preflight: not enough cash | Check the sleeve's `portfolio_config.cash` before repairing |
 | `Refusing to apply ... ownership is unresolved` | Open position on the con_id with no `account_id` | Resolve that position's ownership first |
-| `Refusing to apply ... never projected` | A previous burn | Unrecoverable by this tool; see [backups.md](backups.md) |
+| `Refusing to apply ... never projected` | A previous burn | Unrecoverable by this tool; re-project with `scripts/ops/reproject_fill.py` (KAN-108) |
 
 ## Background
 

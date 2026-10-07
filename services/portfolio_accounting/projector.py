@@ -108,33 +108,7 @@ class FillProjector:
             )
             try:
                 with self.session.begin_nested():
-                    cumulative = self._validate(fill, intent, execution)
-                    self._paper_state._apply_fill_accounting(
-                        account_id=intent.account_id,
-                        portfolio=intent.portfolio,
-                        ticker=intent.symbol,
-                        action=fill.side,
-                        quantity=fill.quantity,
-                        price=fill.fill_price,
-                        fill_datetime=fill.timestamp,
-                        commission=fill.commission_trading,
-                        recommendation_id=intent.recommendation_id,
-                        con_id=intent.con_id,
-                        exchange=intent.exchange,
-                        currency=intent.currency,
-                        strict_quantity=True,
-                        exit_reason=intent.reason,
-                        # Sector never travels on the intent or the IB fill;
-                        # resolve it here or the position row lands NULL and
-                        # the risk service's concentration check degrades to
-                        # one account-wide "Unknown" bucket.
-                        sector=lookup_sector(intent.symbol),
-                    )
-                    self._advance_intent(
-                        intent, cumulative, order_done=fill.order_done
-                    )
-                    execution.projection_applied = True
-                    self.session.flush()
+                    self._project(fill, intent, execution)
             except (FillProjectionError, ValueError, DataError) as exc:
                 # Do not raise inside the transaction: the immutable execution
                 # row is the durable audit record and must survive the failure.
@@ -160,6 +134,96 @@ class FillProjector:
         if projection_error is not None:
             raise projection_error
         return True
+
+    def check_recorded(
+        self,
+        execution: ExecutionFill,
+        intent: OrderIntent | Any | None,
+        *,
+        order_done: bool,
+    ) -> float:
+        """Run the projector's own validation on a recorded execution.
+
+        Read-only: it issues SELECTs at most and takes no row locks, so it is
+        safe inside a READ ONLY transaction. Returns the cumulative quantity
+        the intent would advance to; raises :class:`FillProjectionError` with
+        the projector's own reason otherwise. ``intent`` may be a plain
+        attribute view of the row (``_validate`` only reads it), which is how
+        a dry run asks "as it will stand after the un-expiry".
+        """
+        fill = fill_message_from_execution(execution, order_done=order_done)
+        return self._validate(fill, intent, execution)
+
+    def project_recorded(
+        self,
+        execution: ExecutionFill,
+        intent: OrderIntent | None,
+        *,
+        order_done: bool,
+    ) -> None:
+        """Project an execution that is already in ``execution_fills``.
+
+        KAN-108. :meth:`apply` commits the immutable audit row BEFORE it
+        validates, so a rejected fill ("fill would make sleeve cash
+        negative") stays recorded with ``projection_applied=false`` and every
+        replay of it is skipped by :meth:`_existing_fill`. This is the one way
+        back: the same :meth:`_project` that ``apply`` runs, against the row
+        that is already there.
+
+        The CALLER owns the transaction. Nothing here commits, and any
+        failure is raised as :class:`FillProjectionError`, so a caller's
+        ``with session.begin():`` rolls the accounting, the intent and the
+        flag back together. Unlike ``apply`` there is no audit row to save on
+        the way out -- it already exists and is never touched.
+        """
+        if execution.projection_applied:
+            raise FillProjectionError(
+                f"execution {execution.execution_id} is already projected"
+            )
+        fill = fill_message_from_execution(execution, order_done=order_done)
+        try:
+            self._project(fill, intent, execution)
+        except (ValueError, DataError) as exc:
+            raise InvalidFillError(str(exc)) from exc
+
+    def _project(
+        self,
+        fill: FillMessage,
+        intent: OrderIntent | None,
+        execution: ExecutionFill,
+    ) -> None:
+        """Validate one recorded execution and apply it to sleeve state.
+
+        The single "project this execution row" path: :meth:`apply` runs it
+        for a fresh broker message, :meth:`project_recorded` for a row a
+        previous attempt recorded but could not project. The caller owns the
+        transaction (``apply`` wraps it in a savepoint).
+        """
+        cumulative = self._validate(fill, intent, execution)
+        self._paper_state._apply_fill_accounting(
+            account_id=intent.account_id,
+            portfolio=intent.portfolio,
+            ticker=intent.symbol,
+            action=fill.side,
+            quantity=fill.quantity,
+            price=fill.fill_price,
+            fill_datetime=fill.timestamp,
+            commission=fill.commission_trading,
+            recommendation_id=intent.recommendation_id,
+            con_id=intent.con_id,
+            exchange=intent.exchange,
+            currency=intent.currency,
+            strict_quantity=True,
+            exit_reason=intent.reason,
+            # Sector never travels on the intent or the IB fill; resolve it
+            # here or the position row lands NULL and the risk service's
+            # concentration check degrades to one account-wide "Unknown"
+            # bucket.
+            sector=lookup_sector(intent.symbol),
+        )
+        self._advance_intent(intent, cumulative, order_done=fill.order_done)
+        execution.projection_applied = True
+        self.session.flush()
 
     def _end_read_only_autobegin(self) -> None:
         if not self.session.in_transaction():
@@ -446,6 +510,41 @@ class FillProjector:
             else OrderStatus.PARTIALLY_FILLED
         )
         self._ledger.transition(intent.recommendation_id, new_status)
+
+
+def fill_message_from_execution(
+    execution: ExecutionFill, *, order_done: bool
+) -> FillMessage:
+    """Rebuild the broker message a recorded execution row was written from.
+
+    The inverse of :meth:`FillProjector._fill_values`: every field the row
+    stores comes back verbatim, so ``_validate`` judges the same economics
+    the original message carried. ``order_done`` is the one field the row
+    does not keep (it is IB's ``isDone()`` at callback time), so the caller
+    supplies it.
+    """
+    return FillMessage(
+        ticker=execution.symbol,
+        timestamp=execution.executed_at,
+        side=execution.side.lower(),
+        quantity=execution.quantity,
+        fill_price=execution.price,
+        commission=execution.commission,
+        commission_currency=execution.commission_currency,
+        commission_trading=execution.commission_trading,
+        commission_fx_base_per_trading=execution.commission_fx_base_per_trading,
+        recommendation_id=execution.recommendation_id or "",
+        order_id=execution.ib_order_id,
+        execution_id=execution.execution_id,
+        account_id=execution.account_id,
+        cumulative_quantity=execution.cumulative_quantity,
+        portfolio=execution.portfolio,
+        con_id=execution.con_id,
+        exchange=execution.exchange,
+        currency=execution.currency,
+        order_done=order_done,
+        recovery_source=execution.recovery_source,
+    )
 
 
 def _same_value(left: Any, right: Any) -> bool:
