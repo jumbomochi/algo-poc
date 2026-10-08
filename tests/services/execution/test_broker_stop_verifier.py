@@ -1634,7 +1634,7 @@ class TestKillDoesNotOrphanStopCoverage:
 
         order = []
 
-        async def submit_exit(*, ticker, quantity, recommendation_id):
+        async def submit_exit(*, ticker, quantity, recommendation_id, kill=False):
             order.append(("sell", ticker))
             if first_sell_fails and ticker == "AAPL":
                 raise RuntimeError("IB refused the liquidation")

@@ -89,6 +89,31 @@ class OpenBrokerOrder:
         return max(0.0, self.quantity - self.filled_quantity)
 
 
+@dataclass(frozen=True)
+class OrderPlacedElsewhere:
+    """``find_order_by_ref``'s answer when only ANOTHER client has it working.
+
+    KAN-112. IB lists an open order carrying our recommendation id as its
+    ``orderRef``, but a different client id placed it (an ops or repair tool,
+    a TWS user). It is neither "not found" — submitting would place a second
+    order for the same recommendation — nor an id this process may bind: the
+    id is in that client's id space and its fills are not ours to attribute.
+
+    Deliberately not a ``str``/``int`` and not ``None``, and truthy, so a
+    caller that tests for a bindable id or for "nothing there" cannot mistake
+    it for either. Callers must handle it explicitly; the order manager turns
+    it into :class:`~services.execution.order_manager.OrderPlacedElsewhereError`.
+    """
+
+    recommendation_id: str
+    order_id: str
+    client_id: int | None
+    ticker: str
+    action: str
+    status: str
+    quantity: float
+
+
 @runtime_checkable
 class IBExecutorProtocol(Protocol):
     """Protocol for order execution backends."""
@@ -131,7 +156,7 @@ class IBExecutorProtocol(Protocol):
 
     async def find_order_by_ref(
         self, recommendation_id: str
-    ) -> str | None:
+    ) -> str | OrderPlacedElsewhere | None:
         """Find an open or completed broker order by stable orderRef."""
         ...
 
@@ -1036,25 +1061,107 @@ class IBExecutor:
                 states[ref] = status
         return states
 
-    async def find_order_by_ref(self, recommendation_id: str) -> str | None:
-        """Recover an IB-accepted order from its stable recommendation ref."""
+    async def find_order_by_ref(
+        self, recommendation_id: str
+    ) -> str | OrderPlacedElsewhere | None:
+        """The idempotency probe: is there already an order for this ref?
+
+        Run by every submit path before placing. Three answers:
+
+        * an order id (``str``) — this client's open order (callbacks bound,
+          never twice) or any client's completed order. Unchanged by KAN-112.
+        * :class:`OrderPlacedElsewhere` — IB lists an open order under this
+          ref that ANOTHER client id placed. Nothing is bound: its id is that
+          client's and its fills are not ours. The caller must not submit.
+        * ``None`` — IB answered both requests and holds nothing under it.
+
+        "Open" is IB's account-wide answer to ``reqAllOpenOrders`` (KAN-112),
+        through the same bounded, serialized request the KAN-106 resolution
+        uses: ``openTrades()`` holds only what this client placed (or, after a
+        resolution, foreign orders that never update), so a working order a
+        repair tool placed under our ref was invisible and execution would
+        place a second. ib_insync's own-client cache is still consulted after
+        IB's answer, so the probe never matches less than it did before.
+
+        Either request failing or timing out raises
+        :class:`BrokerStateUnavailableError`: whether an order already exists
+        is exactly what an unanswered request cannot tell, so the caller must
+        not submit on it. ``list_open_orders``, the cancel fallback and the
+        reconnect rebind keep KAN-106's client scoping — only this probe
+        widens.
+        """
         await self._ensure_connected()
-        trades = self._own_open_trades()
-        for trade in trades:
+        ib = self._ib
+        open_trades = await self._open_orders_request(
+            ib.reqAllOpenOrdersAsync, "open orders (idempotency probe)"
+        )
+        elsewhere: OrderPlacedElsewhere | None = None
+        for trade in open_trades:
             if str(getattr(trade.order, "orderRef", "")) != recommendation_id:
                 continue
-            order_id = str(trade.order.orderId)
-            action = str(getattr(trade.order, "action", "")).lower()
-            side = "buy" if action == "buy" else "sell"
-            ticker = str(trade.contract.symbol)
-            if order_id not in self._trades:
-                self._register_trade(order_id, trade, ticker=ticker, side=side)
-            return order_id
-        completed = await self._ib.reqCompletedOrdersAsync(apiOnly=False)
+            if self._is_own(trade):
+                return self._bind_own_open_trade(trade)
+            if elsewhere is None:
+                elsewhere = self._placed_elsewhere(recommendation_id, trade)
+        for trade in self._own_open_trades():
+            if str(getattr(trade.order, "orderRef", "")) == recommendation_id:
+                return self._bind_own_open_trade(trade)
+        if elsewhere is not None:
+            self._logger.warning(
+                "Another client has an order working under this "
+                "recommendation's orderRef; not submitting and not binding it",
+                recommendation_id=recommendation_id,
+                other_order_id=elsewhere.order_id,
+                other_client_id=elsewhere.client_id,
+                status=elsewhere.status,
+            )
+            return elsewhere
+        completed = await self._answer_or_raise(
+            ib.reqCompletedOrdersAsync(apiOnly=False),
+            REQ_COMPLETED_ORDERS_TIMEOUT_SECONDS,
+            "completed orders (idempotency probe)",
+        )
         for trade in completed:
             if str(getattr(trade.order, "orderRef", "")) == recommendation_id:
                 return str(trade.order.orderId)
         return None
+
+    def _bind_own_open_trade(self, trade: Any) -> str:
+        """Track one of this client's open orders and return its id.
+
+        Same-object guard, as in :meth:`restore_order_by_ref`: a trade already
+        bound is never bound twice, and a stale binding (a previous client's
+        Trade object for the same id) is replaced.
+        """
+        order_id = str(trade.order.orderId)
+        if self._trades.get(order_id) is not trade:
+            action = str(getattr(trade.order, "action", "")).lower()
+            self._register_trade(
+                order_id,
+                trade,
+                ticker=str(trade.contract.symbol),
+                side="buy" if action == "buy" else "sell",
+            )
+        return order_id
+
+    @staticmethod
+    def _placed_elsewhere(
+        recommendation_id: str, trade: Any
+    ) -> OrderPlacedElsewhere:
+        order = trade.order
+        client_id = getattr(order, "clientId", None)
+        return OrderPlacedElsewhere(
+            recommendation_id=recommendation_id,
+            order_id=str(order.orderId),
+            client_id=client_id if isinstance(client_id, int) else None,
+            ticker=str(getattr(trade.contract, "symbol", "") or ""),
+            action=str(getattr(order, "action", "") or "").upper(),
+            status=str(
+                getattr(getattr(trade, "orderStatus", None), "status", "")
+                or ""
+            ),
+            quantity=float(getattr(order, "totalQuantity", 0.0) or 0.0),
+        )
 
     async def list_open_orders(self) -> list[OpenBrokerOrder]:
         """Enumerate every order live at the broker, with its ``orderRef``.

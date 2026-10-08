@@ -46,6 +46,10 @@ from typing import Any
 
 from sqlalchemy import func, select
 
+from services.execution.order_manager import (
+    OrderPlacedElsewhereError,
+    SubmissionDeferredError,
+)
 from shared.logging import get_logger
 from shared.models import OrderStatus, Position
 from shared.order_ledger import BROKER_STOP_ORDER_TYPE, OrderLedger
@@ -333,6 +337,46 @@ class BrokerStopManager:
                 tif=self._tif,
                 outside_rth=self._outside_rth,
             )
+        except OrderPlacedElsewhereError as exc:
+            # KAN-112. Another IB client already has an order working under
+            # this stop's ref; the order manager has paged. The intent stays
+            # APPROVED, which counts as coverage — truthfully, something rests
+            # for it. SUBMISSION_FAILED would have the next scan mint a fresh
+            # id and place a second stop for the same shares: over-coverage,
+            # a short on trigger. A human resolves it.
+            self._ledger.session.rollback()
+            self._logger.error(
+                "Protective stop not placed: another IB client has an order "
+                "working under its ref; intent left APPROVED",
+                symbol=symbol,
+                con_id=con_id,
+                recommendation_id=proposal.recommendation_id,
+                other_order_id=exc.placement.order_id,
+                other_client_id=exc.placement.client_id,
+            )
+            return None
+        except SubmissionDeferredError as exc:
+            # KAN-112. IB did not answer whether a stop already rests under
+            # this ref, so none was placed. The intent stays APPROVED: the
+            # verification scan's _resume_unsubmitted_stops re-drives it on
+            # every pass until IB answers. Paged now, because until then the
+            # position is unprotected at the broker.
+            self._ledger.session.rollback()
+            self._logger.error(
+                "Protective stop not placed this pass: IB did not answer the "
+                "idempotency probe; the next verification scan retries it",
+                symbol=symbol,
+                con_id=con_id,
+                recommendation_id=proposal.recommendation_id,
+            )
+            await self._report_failure(
+                symbol=symbol,
+                con_id=con_id,
+                quantity=shortfall,
+                stop_price=stop_price,
+                reason=f"{exc}; retried on the next verification scan",
+            )
+            return None
         except Exception as exc:
             self._ledger.session.rollback()
             # The order may have reached IB before the error did: placeOrder
@@ -1165,6 +1209,22 @@ class BrokerStopManager:
                     tif=self._tif,
                     outside_rth=self._outside_rth,
                 )
+            except (OrderPlacedElsewhereError, SubmissionDeferredError) as exc:
+                # KAN-112: left APPROVED, never terminalised — see
+                # ensure_coverage. Elsewhere waits for a human (paged once by
+                # the order manager); unanswered is re-driven next scan. Its
+                # shares are claimed from the budget either way, so no sibling
+                # scope tops up against them and over-covers once it resumes.
+                self._ledger.session.rollback()
+                self._logger.warning(
+                    "Unsubmitted stop not resumed this pass; left APPROVED",
+                    recommendation_id=recommendation_id,
+                    symbol=symbol,
+                    reason=str(exc),
+                )
+                if budget is not None and con_id is not None:
+                    self._spend_con_id_budget(int(con_id), budget, quantity)
+                continue
             except Exception as exc:
                 self._ledger.session.rollback()
                 self._ledger.transition(

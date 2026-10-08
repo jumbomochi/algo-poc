@@ -7,6 +7,10 @@ from types import SimpleNamespace
 from typing import Any
 
 from services.execution.broker_stops import BrokerStopManager
+from services.execution.order_manager import (
+    OrderPlacedElsewhereError,
+    SubmissionDeferredError,
+)
 from shared.config import AppConfig
 from shared.halt_state import HaltStateRepository
 from shared.heartbeat import write_heartbeat
@@ -51,6 +55,13 @@ CONSUMER_NAME = "execution_worker_1"
 # retry; the first attempt is not delayed. Exhausting the schedule raises
 # HaltStateUnavailable — it never degrades into "assume clear".
 HALT_LOOKUP_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 2.0, 4.0)
+
+# How often an approved order whose idempotency probe IB did not answer is
+# retried (KAN-112). Its message stays unacked in the PEL meanwhile, so a
+# restart replays it too. Each retry costs at most the executor's bounded
+# open/completed-order requests, and a pass stops at the first one IB still
+# does not answer — the loop also has the kill stream to read.
+DEFERRED_ORDER_RETRY_SECONDS: float = 30.0
 
 # Cadence of the post-halt reconcile sweep while a halt is active. The sweep
 # fires immediately the first time a halt is seen, so this only bounds how
@@ -247,6 +258,25 @@ class ExecutionServiceRunner:
         self._absent_holdback_passes: dict[str, int] = {}
         self._absent_holdback_paged: set[str] = set()
 
+        # Approved orders not submitted because IB did not answer the
+        # idempotency probe (KAN-112): message id -> (stream, message,
+        # parser, handler). Unacked, so they are also in the PEL for a
+        # restart; retried on their own timer until IB answers.
+        self._deferred_messages: dict[str, tuple[str, Any, Any, Any]] = {}
+        self._deferred_retry_interval_seconds = DEFERRED_ORDER_RETRY_SECONDS
+        self._last_deferred_retry_at: float | None = None
+        # Exits already paged for being withheld this way — once each.
+        self._deferred_exit_paged: set[str] = set()
+        # KAN-112: the order manager pages, once per recommendation, when
+        # another IB client already has the order working. Probed on the type
+        # like restore_broker_tracking, so stand-in order managers are left
+        # alone.
+        set_elsewhere_handler = getattr(
+            type(order_manager), "set_submitted_elsewhere_handler", None
+        )
+        if set_elsewhere_handler is not None:
+            set_elsewhere_handler(order_manager, self._alert_submitted_elsewhere)
+
         # Post-halt reconcile sweep (KAN-13). Its own timer, and deliberately
         # NOT sharing the unfilled sweep's calendar gate: that sweep returns
         # False whenever `_market_calendar` is unset, and a halt-safety path
@@ -338,6 +368,14 @@ class ExecutionServiceRunner:
             except HaltStateUnavailable as exc:
                 await self._retain_for_unknown_halt_state(
                     APPROVED_ORDERS_STREAM, msg.message_id, exc
+                )
+            except SubmissionDeferredError as exc:
+                self._defer_message(
+                    APPROVED_ORDERS_STREAM,
+                    msg,
+                    ApprovedOrderMessage.from_stream_dict,
+                    self.process_approved_order,
+                    exc,
                 )
             except Exception as exc:
                 self._logger.exception(
@@ -739,6 +777,33 @@ class ExecutionServiceRunner:
                     quantity=quantity,
                     recommendation_id=order.recommendation_id,
                 )
+        except OrderPlacedElsewhereError as exc:
+            # KAN-112. Another IB client already has an order working for
+            # this recommendation; the order manager has paged. The intent
+            # stays APPROVED — no new status, no migration — because that is
+            # what the ledger can truthfully say: approved, not submitted by
+            # us. SUBMISSION_FAILED would claim no order exists, and for an
+            # exit it would let the risk service re-emit under seq + 1 (a
+            # terminal intent no longer suppresses it) and sell twice. The
+            # message is acked: retrying cannot resolve it, a human does.
+            self._logger.error(
+                "Order not submitted: another IB client has it working; "
+                "intent left APPROVED for manual resolution",
+                ticker=order.ticker,
+                action=order.action,
+                recommendation_id=order.recommendation_id,
+                other_order_id=exc.placement.order_id,
+                other_client_id=exc.placement.client_id,
+            )
+            return
+        except SubmissionDeferredError as exc:
+            # KAN-112. IB did not answer whether an order already exists, so
+            # nothing was placed. The intent stays APPROVED and the caller
+            # keeps the message unacked and retries it — never
+            # SUBMISSION_FAILED, which would drop the order on a Gateway blip.
+            if order.action != "buy":
+                await self._page_exit_deferred_once(order, exc)
+            raise
         except OrderSkippedError as exc:
             # Not a failure: the order cannot be sized on this account
             # (e.g. sub-1-share on a no-fractional account). Ack and move on.
@@ -1544,6 +1609,110 @@ class ExecutionServiceRunner:
             context={"stream": stream, "message_id": str(message_id)},
         )
 
+    async def _alert_submitted_elsewhere(self, placement: Any, path: str) -> None:
+        """Page: an order for this recommendation is working under another client.
+
+        KAN-112. Wired into the order manager, which calls it once per
+        recommendation. Nothing was submitted and nothing was bound; a human
+        decides whether that order stands (and reconciles it) or is cancelled.
+        """
+        await self._publish_alert(
+            event_type="order_submitted_elsewhere",
+            priority="high",
+            message=(
+                f"{path} for {placement.recommendation_id} NOT submitted: IB "
+                f"already has order {placement.order_id} ({placement.action} "
+                f"{placement.quantity:g} {placement.ticker}, "
+                f"{placement.status or 'status unknown'}) working for it under "
+                f"client id {placement.client_id}. Not duplicated and not "
+                "tracked by execution — resolve by hand."
+            ),
+            context={
+                "recommendation_id": placement.recommendation_id,
+                "other_order_id": str(placement.order_id),
+                "other_client_id": str(placement.client_id),
+                "ticker": placement.ticker,
+                "action": placement.action,
+                "path": path,
+            },
+        )
+
+    async def _page_exit_deferred_once(
+        self, order: ApprovedOrderMessage, exc: SubmissionDeferredError
+    ) -> None:
+        """Page once when an exit is withheld because IB did not answer.
+
+        An entry waits with a warning; an exit is the position's way out and
+        must not sit unsent in silence (KAN-112).
+        """
+        if order.recommendation_id in self._deferred_exit_paged:
+            return
+        self._deferred_exit_paged.add(order.recommendation_id)
+        await self._publish_alert_best_effort(
+            event_type="exit_submission_deferred",
+            priority="high",
+            message=(
+                f"Exit {order.action} {order.quantity:g} {order.ticker} "
+                f"({order.recommendation_id}) NOT submitted: IB did not answer "
+                "whether an order already exists for it. Retrying every "
+                f"{self._deferred_retry_interval_seconds:g}s until it does."
+            ),
+            context={
+                "recommendation_id": order.recommendation_id,
+                "ticker": order.ticker,
+                "reason": exc.reason,
+            },
+        )
+
+    def _defer_message(
+        self,
+        stream: str,
+        msg: Any,
+        parser: Any,
+        handler: Any,
+        exc: SubmissionDeferredError,
+    ) -> None:
+        """Keep a message unacked and queue it for the deferred-order retry."""
+        self._logger.warning(
+            "Order not submitted: IB did not answer the idempotency probe; "
+            "message left unacked for retry",
+            stream=stream,
+            message_id=str(msg.message_id),
+            recommendation_id=exc.recommendation_id,
+            retry_in_seconds=self._deferred_retry_interval_seconds,
+        )
+        self._deferred_messages[str(msg.message_id)] = (
+            stream, msg, parser, handler,
+        )
+        if self._last_deferred_retry_at is None:
+            self._last_deferred_retry_at = asyncio.get_running_loop().time()
+
+    async def maybe_retry_deferred_orders(self, now: float) -> bool:
+        """Retry orders whose idempotency probe IB did not answer (KAN-112).
+
+        On its own timer. Each message is re-run through the same handler, so
+        the halt gate, the ledger checks and the probe all run again; a pass
+        stops at the first message IB still does not answer.
+        """
+        if not self._deferred_messages:
+            self._last_deferred_retry_at = None
+            return False
+        if (
+            self._last_deferred_retry_at is not None
+            and now - self._last_deferred_retry_at
+            < self._deferred_retry_interval_seconds
+        ):
+            return False
+        self._last_deferred_retry_at = now
+        for message_id in list(self._deferred_messages):
+            stream, msg, parser, handler = self._deferred_messages.pop(
+                message_id
+            )
+            outcome = await self._handle_message(stream, msg, parser, handler)
+            if outcome == "deferred":
+                break
+        return True
+
     async def _publish_alert(
         self,
         *,
@@ -1836,10 +2005,17 @@ class ExecutionServiceRunner:
                     )
                     continue
                 await self._cancel_stops_before_liquidating(ticker)
+                # kill=True: submitted even when IB does not answer the
+                # idempotency probe (KAN-112). This position's stop was
+                # cancelled a line above and process_kill is one-shot, so
+                # withholding the sell would leave it unprotected AND
+                # un-flattened. Another client's working order under this id
+                # is an answer, and still blocks it.
                 await self._order_manager.submit_exit(
                     ticker=ticker,
                     quantity=quantity,
                     recommendation_id=exit_id,
+                    kill=True,
                 )
                 liquidated += 1
                 self._logger.info(
@@ -2852,6 +3028,17 @@ class ExecutionServiceRunner:
                         "Broker stop verification failed; continuing"
                     )
 
+                # Approved orders IB would not say were safe to submit
+                # (KAN-112), on their own timer. Best-effort like the sweeps.
+                try:
+                    await self.maybe_retry_deferred_orders(
+                        asyncio.get_running_loop().time()
+                    )
+                except Exception:
+                    self._logger.exception(
+                        "Deferred-order retry failed; continuing"
+                    )
+
                 await self._consume_and_process(
                     APPROVED_ORDERS_STREAM,
                     ApprovedOrderMessage.from_stream_dict,
@@ -2891,45 +3078,57 @@ class ExecutionServiceRunner:
             stream, CONSUMER_GROUP, CONSUMER_NAME, count=count, block_ms=block_ms
         )
         for msg in messages:
+            await self._handle_message(stream, msg, parser, handler)
+
+    async def _handle_message(
+        self, stream: str, msg: Any, parser: Any, handler: Any
+    ) -> str:
+        """Process one message and settle it: ``"processed"`` (acked),
+        ``"retained"`` (halt latch unreadable), ``"deferred"`` (IB did not
+        answer the idempotency probe, KAN-112) or ``"dead_lettered"``."""
+        try:
+            await handler(parser(msg.data))
+        except HaltStateUnavailable as exc:
+            await self._retain_for_unknown_halt_state(
+                stream, msg.message_id, exc
+            )
+            return "retained"
+        except SubmissionDeferredError as exc:
+            self._defer_message(stream, msg, parser, handler, exc)
+            return "deferred"
+        except Exception as exc:
+            self._logger.exception(
+                "Poison message; sending to DLQ",
+                stream=stream,
+                message_id=msg.message_id,
+            )
             try:
-                await handler(parser(msg.data))
-            except HaltStateUnavailable as exc:
-                await self._retain_for_unknown_halt_state(
-                    stream, msg.message_id, exc
-                )
-                continue
-            except Exception as exc:
-                self._logger.exception(
-                    "Poison message; sending to DLQ",
-                    stream=stream,
-                    message_id=msg.message_id,
-                )
-                try:
-                    await self._redis.send_to_dead_letter(stream, msg, str(exc))
-                    await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
-                except Exception:
-                    self._logger.exception(
-                        "Failed to dead-letter poison message",
-                        stream=stream,
-                        message_id=msg.message_id,
-                    )
-                await self._publish_alert(
-                    event_type="poison_message",
-                    priority="high",
-                    message=f"Poison message on {stream} dead-lettered: {exc}",
-                    context={"stream": stream, "message_id": str(msg.message_id)},
-                )
-                continue
-            # A transient ack failure after a successful handler must not
-            # dead-letter an already-processed message.
-            try:
+                await self._redis.send_to_dead_letter(stream, msg, str(exc))
                 await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
             except Exception:
                 self._logger.exception(
-                    "Ack failed after processing; relying on redelivery",
+                    "Failed to dead-letter poison message",
                     stream=stream,
                     message_id=msg.message_id,
                 )
+            await self._publish_alert(
+                event_type="poison_message",
+                priority="high",
+                message=f"Poison message on {stream} dead-lettered: {exc}",
+                context={"stream": stream, "message_id": str(msg.message_id)},
+            )
+            return "dead_lettered"
+        # A transient ack failure after a successful handler must not
+        # dead-letter an already-processed message.
+        try:
+            await self._redis.ack(stream, CONSUMER_GROUP, msg.message_id)
+        except Exception:
+            self._logger.exception(
+                "Ack failed after processing; relying on redelivery",
+                stream=stream,
+                message_id=msg.message_id,
+            )
+        return "processed"
 
 
 if __name__ == "__main__":
