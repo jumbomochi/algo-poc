@@ -52,7 +52,9 @@ class OrderPlacedElsewhereError(RuntimeError):
     leaves the intent APPROVED rather than terminalizing it: an order IS
     working for it, and a terminal intent would let the risk service re-emit
     the exit (or the verifier re-cover the stop) under a fresh id — the very
-    duplicate this exists to prevent. A human resolves it.
+    duplicate this exists to prevent. The caller re-probes it slowly (the
+    runner every few minutes, the stop verifier every scan), so it goes out
+    once that order is gone; a human decides whether that order stands.
     """
 
     def __init__(self, placement: Any, path: str) -> None:
@@ -68,6 +70,27 @@ class OrderPlacedElsewhereError(RuntimeError):
 # Async page for an order another client already has working (KAN-112). Gets
 # the executor's OrderPlacedElsewhere and the submit path's name.
 SubmittedElsewhereHandler = Callable[[Any, str], Awaitable[None]]
+
+
+@dataclass
+class KillProbe:
+    """One kill's shared view of the idempotency probe (KAN-112).
+
+    ``process_kill`` sells position after position, serially, each moments
+    after cancelling that position's protective stop, and it never retries. So
+    a kill liquidation is submitted even when IB does not answer whether an
+    order already exists — and after the first probe IB leaves unanswered,
+    the rest of this kill's sells skip it instead of each waiting out the same
+    bound (30 s per position against a hung Gateway). Every skipped or
+    unanswered probe still checks this session's own order state first.
+
+    What remains: a blind sell doubles an order for the same liquidation id
+    that a previous process placed (it crashed before the in-process map or
+    the ledger had it) when connect's best-effort open-order sync did not
+    cache it either, or one another client holds — while IB is not answering.
+    """
+
+    unanswered: bool = False
 
 
 @dataclass
@@ -141,12 +164,16 @@ class OrderManager:
         """Wire the page for an order another IB client already has working."""
         self._submitted_elsewhere_handler = handler
 
+    def forget_submitted_elsewhere(self, recommendation_id: str) -> None:
+        """The episode is over (intent resolved or abandoned): a new one pages."""
+        self._submitted_elsewhere_paged.discard(recommendation_id)
+
     async def _existing_order(
         self,
         recommendation_id: str,
         path: str,
         *,
-        submit_if_unanswered: bool = False,
+        kill: KillProbe | None = None,
     ) -> str | None:
         """The idempotency probe every submit path runs before placing.
 
@@ -154,36 +181,45 @@ class OrderManager:
         nothing exists under this ref (submit). Raises
         :class:`OrderPlacedElsewhereError` when another client has one working
         (paged once here) and :class:`SubmissionDeferredError` when IB did not
-        answer.
+        answer — including when it is not connected at all.
 
-        ``submit_if_unanswered`` is the kill path's exception (KAN-112): a
-        liquidation sell must not be withheld because IB is slow to list its
-        open orders — the position's protective stop has just been cancelled
-        for it, and ``process_kill`` never retries — so on no answer it
-        returns None and the caller submits. The in-process ``_submitted``
-        map (and ``process_kill``'s ledger check) still ran first; a definite
-        answer that another client holds the order still blocks it.
+        ``kill`` is the kill path's exception (KAN-112) — see
+        :class:`KillProbe`. On no answer it falls back to this session's own
+        order state (:meth:`IBExecutor.find_own_order_by_ref`) and otherwise
+        returns None, so the caller submits; a definite answer that another
+        client holds the order still blocks it.
         """
         from services.execution.ib_executor import (
             BrokerStateUnavailableError,
             OrderPlacedElsewhere,
         )
 
+        if kill is not None and kill.unanswered:
+            self._logger.critical(
+                "IB did not answer this kill's idempotency probe; skipping it "
+                "for the rest of the kill",
+                recommendation_id=recommendation_id,
+                path=path,
+            )
+            return self._own_order_from_local_state(recommendation_id)
         try:
             found = await self._executor.find_order_by_ref(recommendation_id)
         except BrokerStateUnavailableError as exc:
-            if submit_if_unanswered:
+            if kill is not None:
+                kill.unanswered = True
                 self._logger.critical(
                     "IB did not answer the idempotency probe; submitting the "
-                    "kill liquidation anyway",
+                    "kill liquidation unless this session already holds it",
                     recommendation_id=recommendation_id,
                     path=path,
                     reason=str(exc),
                 )
-                return None
-            self._logger.warning(
+                return self._own_order_from_local_state(recommendation_id)
+            # Info, not warning: the runner throttles the per-order warning,
+            # and this repeats on every retry pass.
+            self._logger.info(
                 "IB did not answer the idempotency probe; not submitting "
-                "this pass, retrying later",
+                "this pass",
                 recommendation_id=recommendation_id,
                 path=path,
                 reason=str(exc),
@@ -192,14 +228,33 @@ class OrderManager:
         if isinstance(found, OrderPlacedElsewhere):
             await self._page_submitted_elsewhere(found, path)
             raise OrderPlacedElsewhereError(found, path)
+        # Any other answer ends a submitted-elsewhere episode for this ref.
+        self._submitted_elsewhere_paged.discard(recommendation_id)
         if isinstance(found, (str, int)):
             self._recovered.add(recommendation_id)
             return str(found)
         return None
 
+    def _own_order_from_local_state(self, recommendation_id: str) -> str | None:
+        finder = getattr(type(self._executor), "find_own_order_by_ref", None)
+        if finder is None:
+            return None
+        found = finder(self._executor, recommendation_id)
+        if isinstance(found, (str, int)):
+            self._logger.warning(
+                "Kill liquidation already placed by this session; adopting it",
+                recommendation_id=recommendation_id,
+                order_id=str(found),
+            )
+            self._recovered.add(recommendation_id)
+            return str(found)
+        return None
+
     async def _page_submitted_elsewhere(self, placement: Any, path: str) -> None:
-        """Page once per recommendation; a dead alert path never unblocks it."""
-        self._logger.error(
+        """Page once per episode; a dead alert path never unblocks it."""
+        first = placement.recommendation_id not in self._submitted_elsewhere_paged
+        log = self._logger.error if first else self._logger.info
+        log(
             "Order not submitted: another IB client already has one working "
             "for this recommendation",
             recommendation_id=placement.recommendation_id,
@@ -207,10 +262,7 @@ class OrderManager:
             other_client_id=placement.client_id,
             path=path,
         )
-        if (
-            self._submitted_elsewhere_handler is None
-            or placement.recommendation_id in self._submitted_elsewhere_paged
-        ):
+        if self._submitted_elsewhere_handler is None or not first:
             return
         try:
             await self._submitted_elsewhere_handler(placement, path)
@@ -297,16 +349,16 @@ class OrderManager:
         quantity: int,
         recommendation_id: str,
         *,
-        kill: bool = False,
+        kill: KillProbe | None = None,
     ) -> str:
         """Submit a market exit order.
 
         Idempotent: if the recommendation_id has already been submitted,
         returns the existing order ID without submitting again.
 
-        ``kill`` marks the kill switch's own liquidation (``process_kill``):
-        it submits even when IB does not answer the idempotency probe — see
-        :meth:`_existing_order`.
+        ``kill`` marks the kill switch's own liquidation (``process_kill``),
+        shared across that kill's sells: it submits even when IB does not
+        answer the idempotency probe — see :class:`KillProbe`.
 
         Args:
             ticker: The stock ticker symbol.
@@ -327,8 +379,8 @@ class OrderManager:
 
         recovered = await self._existing_order(
             recommendation_id,
-            "kill_exit" if kill else "exit",
-            submit_if_unanswered=kill,
+            "kill_exit" if kill is not None else "exit",
+            kill=kill,
         )
         if recovered is not None:
             order_id = recovered

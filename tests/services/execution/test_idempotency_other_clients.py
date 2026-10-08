@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -38,8 +38,10 @@ from services.execution.ib_executor import (
     BrokerStateUnavailableError,
     IBExecutor,
     OrderPlacedElsewhere,
+    WrongAccountTypeError,
 )
 from services.execution.order_manager import (
+    KillProbe,
     OrderManager,
     OrderPlacedElsewhereError,
     SubmissionDeferredError,
@@ -47,8 +49,11 @@ from services.execution.order_manager import (
 from services.execution.runner import (
     APPROVED_ORDERS_STREAM,
     CONSUMER_GROUP,
+    DEFERRED_PAST_SESSION_REASON,
     ExecutionServiceRunner,
+    HaltStateUnavailable,
 )
+from shared.market_calendar import MarketCalendar
 from shared.config import AppConfig, ExecutionConfig, IBConfig
 from shared.liquidation import liquidation_exit_id
 from shared.models import Base, OrderStatus, PortfolioConfig, Position
@@ -66,6 +71,16 @@ SELL_REC = "sleeve-2026-10-08-DUN551088-paper-momentum-MSFT-sell"
 STOP_REC = f"stop-{ACCOUNT}-{PORTFOLIO}-{AAPL[1]}-0"  # the first stop id minted
 SEEDED_AT = datetime(2026, 10, 8, 8, 0, tzinfo=timezone.utc)
 SHORT_BOUND = 0.01  # seconds; the probe's request bounds, shortened
+# SEEDED_AT is 04:00 ET on Thursday 2026-10-08: the BUYs here are sized for
+# that day's session, which closes 16:00 ET (20:00 UTC).
+SESSION_CLOSE = datetime(2026, 10, 8, 20, 0, tzinfo=timezone.utc)
+_CALENDAR: list = []
+
+
+def _calendar() -> MarketCalendar:
+    if not _CALENDAR:
+        _CALENDAR.append(MarketCalendar())
+    return _CALENDAR[0]
 
 
 # --------------------------------------------------------------------------
@@ -120,10 +135,11 @@ class Gateway:
         client.getReqId = self._get_req_id
         client.placeOrder = self._place_order
 
-    def working(self, symbol_con_id, order_id, client_id, ref, **kw) -> None:
+    def working(self, symbol_con_id, order_id, client_id, ref, *,
+                status="Submitted", **kw) -> None:
         self.open_orders.append(
             (_contract(symbol_con_id), _order(order_id, client_id, ref, **kw),
-             "Submitted")
+             status)
         )
 
     def done(self, symbol_con_id, order_id, client_id, ref, status="Filled",
@@ -132,6 +148,26 @@ class Gateway:
             (_contract(symbol_con_id), _order(order_id, client_id, ref, **kw),
              status)
         )
+
+    def cache_own(self, symbol_con_id, order_id, ref, **kw) -> None:
+        """An order of ours ib_insync cached at connect (its own open-order
+        sync), with IB itself now not answering."""
+        from ib_insync import OrderState
+
+        self.ib.wrapper.openOrder(
+            order_id, _contract(symbol_con_id),
+            _order(order_id, OUR_CLIENT, ref, **kw), OrderState(status="Submitted"),
+        )
+
+    def go_down(self, executor: IBExecutor) -> None:
+        """The socket drops and every reconnect is refused."""
+        self.ib.isConnected = lambda: False
+        executor.connect = AsyncMock(
+            side_effect=ConnectionRefusedError("gateway down")
+        )
+
+    def come_back(self) -> None:
+        self.ib.isConnected = lambda: True
 
     def _req_all_open_orders(self) -> None:
         from ib_insync import OrderState
@@ -357,7 +393,18 @@ class Harness:
         self.executor.set_order_status_handler(
             self.runner.handle_ib_order_status
         )
+        # Inside the session the BUYs were sized for, unless a test moves it.
+        self.now = SEEDED_AT + timedelta(hours=1)
+        self.runner._utcnow = lambda: self.now
+        self.runner._deferral_calendar = _calendar()
         self._next_message = 0
+
+    def due(self) -> float:
+        """A loop time at which every deferred message is due."""
+        return max(r.due_at for r in self.runner._deferred_messages.values())
+
+    async def retry_when_due(self) -> bool:
+        return await self.runner.maybe_retry_deferred_orders(self.due())
 
     def approve(self, rec: str, symbol_con_id, action: str,
                 quantity: float = 10.0) -> ApprovedOrderMessage:
@@ -461,10 +508,50 @@ class TestEntryAndExitPaths:
         assert page.context["other_order_id"] == "77"
         assert page.context["other_client_id"] == str(REPAIR_CLIENT)
         assert page.context["path"] == path
-        # Acked, not dead-lettered and not retried: a human resolves it.
-        assert h.acked(first) and h.acked(redelivered)
+        # Not acked and not dead-lettered: held for the slow re-probe.
+        assert not h.acked(first) and not h.acked(redelivered)
         h.redis.send_to_dead_letter.assert_not_awaited()
+        assert {r.kind for r in h.runner._deferred_messages.values()} == {
+            "elsewhere"
+        }
+
+    @pytest.mark.parametrize(
+        ("rec", "symbol_con_id", "action"),
+        [(BUY_REC, AAPL, "buy"), (SELL_REC, MSFT, "sell")],
+    )
+    async def test_it_goes_out_once_the_other_clients_order_is_gone(
+        self, session, rec, symbol_con_id, action
+    ):
+        """An APPROVED exit left behind would mute the position's next exit
+        forever, and an APPROVED entry would hold its reservation forever."""
+        h = Harness(session)
+        order = h.approve(rec, symbol_con_id, action)
+        h.gw.working(symbol_con_id, 77, REPAIR_CLIENT, rec,
+                     action=action.upper())
+        msg = await h.deliver(order)
+        (record,) = h.runner._deferred_messages.values()
+        slow = h.runner._elsewhere_retry_interval_seconds
+        fast = h.runner._deferred_retry_interval_seconds
+        assert record.due_at - asyncio.get_running_loop().time() > fast
+
+        # Due, still there: still held, still one page.
+        await h.retry_when_due()
+        assert h.gw.placed == []
+        assert len(h.alerts("order_submitted_elsewhere")) == 1
+        assert record.attempts == 2
+        assert record.due_at >= asyncio.get_running_loop().time() + slow - 1
+
+        # A human cancelled theirs before IB's session rolled? Then it is in
+        # completed history and is adopted (unchanged completed-order
+        # behaviour). Here it is gone from both: ours goes out.
+        h.gw.open_orders.clear()
+        await h.retry_when_due()
+
+        assert h.placed_refs() == [rec]
+        assert h.status(rec) == OrderStatus.SUBMITTED.value
+        assert h.acked(msg)
         assert h.runner._deferred_messages == {}
+        assert rec not in h.order_manager._submitted_elsewhere_paged
 
     async def test_our_own_working_entry_is_adopted_as_before(self, session):
         h = Harness(session)
@@ -513,27 +600,30 @@ class TestEntryAndExitPaths:
         interval = h.runner._deferred_retry_interval_seconds
 
         with open_bound, completed_bound:
+            before = asyncio.get_running_loop().time()
             msg = await h.deliver(order)
 
+            # Scheduled from when the attempt FINISHED: the probe's bound is
+            # not taken out of the interval.
+            (record,) = h.runner._deferred_messages.values()
+            assert record.due_at >= before + SHORT_BOUND + interval
             assert h.gw.placed == []
             assert h.status(BUY_REC) == OrderStatus.APPROVED.value
             assert not h.acked(msg)
             h.redis.send_to_dead_letter.assert_not_awaited()
             assert list(h.runner._deferred_messages) == [msg.message_id]
-            start = h.runner._last_deferred_retry_at
+            due = h.due()
 
             # Not before its interval.
-            assert await h.runner.maybe_retry_deferred_orders(start + 1) is False
+            assert await h.runner.maybe_retry_deferred_orders(due - 1) is False
             # IB still silent: still nothing placed, still queued.
-            assert await h.runner.maybe_retry_deferred_orders(
-                start + interval
-            ) is True
+            assert await h.runner.maybe_retry_deferred_orders(due) is True
             assert h.gw.placed == []
             assert list(h.runner._deferred_messages) == [msg.message_id]
             assert not h.acked(msg)
 
             h.gw.answers_open = True
-            await h.runner.maybe_retry_deferred_orders(start + 2 * interval)
+            await h.retry_when_due()
 
         assert h.placed_refs() == [BUY_REC]
         assert h.status(BUY_REC) == OrderStatus.SUBMITTED.value
@@ -547,12 +637,10 @@ class TestEntryAndExitPaths:
         order = h.approve(SELL_REC, MSFT, "sell")
         h.gw.answers_completed = False
         open_bound, completed_bound = _short_bounds()
-        interval = h.runner._deferred_retry_interval_seconds
 
         with open_bound, completed_bound:
             msg = await h.deliver(order)
-            start = h.runner._last_deferred_retry_at
-            await h.runner.maybe_retry_deferred_orders(start + interval)
+            await h.retry_when_due()
 
             assert h.gw.placed == []
             assert h.status(SELL_REC) == OrderStatus.APPROVED.value
@@ -561,7 +649,7 @@ class TestEntryAndExitPaths:
             assert page.context["recommendation_id"] == SELL_REC
 
             h.gw.answers_completed = True
-            await h.runner.maybe_retry_deferred_orders(start + 2 * interval)
+            await h.retry_when_due()
 
         assert h.placed_refs() == [SELL_REC]
         assert h.status(SELL_REC) == OrderStatus.SUBMITTED.value
@@ -581,10 +669,7 @@ class TestEntryAndExitPaths:
             await h.deliver(first)
             await h.deliver(second)
             requests = h.gw.open_requests
-            start = h.runner._last_deferred_retry_at
-            await h.runner.maybe_retry_deferred_orders(
-                start + h.runner._deferred_retry_interval_seconds
-            )
+            await h.retry_when_due()
 
         assert h.gw.open_requests == requests + 1
         assert len(h.runner._deferred_messages) == 2
@@ -606,10 +691,7 @@ class TestEntryAndExitPaths:
             assert list(h.runner._deferred_messages) == [msg.message_id]
 
             h.gw.answers_open = True
-            start = h.runner._last_deferred_retry_at
-            await h.runner.maybe_retry_deferred_orders(
-                start + h.runner._deferred_retry_interval_seconds
-            )
+            await h.retry_when_due()
 
         assert h.placed_refs() == [BUY_REC]
         assert h.acked(msg)
@@ -626,17 +708,31 @@ class TestEntryAndExitPaths:
             h.gw.answers_open = True
             h.redis.read_group = AsyncMock(return_value=[])
 
-            async def stop_after_one_pass(*args, **kwargs):
-                h.runner._running = False
+            steps: list[str] = []
+
+            async def read(stream, *args, **kwargs):
+                steps.append(stream)
+                if stream == "stream:kill":
+                    h.runner._running = False
                 return []
 
-            h.redis.read_group = AsyncMock(side_effect=stop_after_one_pass)
+            real_retry = h.runner.maybe_retry_deferred_orders
+
+            async def retry(now):
+                steps.append("retry")
+                return await real_retry(now)
+
+            h.redis.read_group = AsyncMock(side_effect=read)
             with patch.object(h.runner, "setup", AsyncMock()), patch.object(
                 h.runner, "shutdown", AsyncMock()
+            ), patch.object(
+                h.runner, "maybe_retry_deferred_orders", retry
             ), patch("services.execution.runner.write_heartbeat"):
                 await h.runner.run()
 
         assert h.placed_refs() == [BUY_REC]
+        # The kill stream is read before a retry can spend its bound.
+        assert steps == [APPROVED_ORDERS_STREAM, "stream:kill", "retry"]
 
 
 class TestStopPath:
@@ -788,7 +884,7 @@ class TestOrderManagerContract:
         with pytest.raises(OrderPlacedElsewhereError):
             await manager.submit_exit("AAPL", 1, "r")
         with pytest.raises(OrderPlacedElsewhereError):
-            await manager.submit_exit("AAPL", 1, "r", kill=True)
+            await manager.submit_exit("AAPL", 1, "r", kill=KillProbe())
         with pytest.raises(OrderPlacedElsewhereError):
             await manager.submit_stop("AAPL", 1, 90.0, "r")
 
@@ -813,7 +909,9 @@ class TestOrderManagerContract:
             await manager.submit_exit("AAPL", 1, "r2")
         with pytest.raises(SubmissionDeferredError):
             await manager.submit_stop("AAPL", 1, 90.0, "r3")
-        assert await manager.submit_exit("AAPL", 1, "r4", kill=True) == "900"
+        assert await manager.submit_exit(
+            "AAPL", 1, "r4", kill=KillProbe()
+        ) == "900"
 
         executor.submit_limit_order.assert_not_awaited()
         executor.submit_stop_order.assert_not_awaited()
@@ -837,3 +935,323 @@ class TestOrderManagerContract:
 
         assert page.await_count == 2  # failed, then delivered; never again
 
+
+
+# --------------------------------------------------------------------------
+# Review follow-ups (PR #237)
+# --------------------------------------------------------------------------
+
+
+class TestADisconnectedGatewayDefersInsteadOfDropping:
+    """The commonest outage: the socket is gone and the reconnect fails. The
+    probe's NotConnectedError used to reach the generic handler, which
+    terminalized the intent and acked the message — the order was dropped."""
+
+    async def test_the_probe_reports_it_as_no_answer(self):
+        gw = Gateway()
+        executor = _executor(gw)
+        gw.go_down(executor)
+
+        with pytest.raises(BrokerStateUnavailableError):
+            await executor.find_order_by_ref(BUY_REC)
+
+        assert gw.open_requests == 0
+
+    async def test_a_wrong_account_session_still_stops_the_service(self):
+        gw = Gateway()
+        executor = _executor(gw)
+        gw.ib.isConnected = lambda: False
+        executor.connect = AsyncMock(side_effect=WrongAccountTypeError("live"))
+
+        with pytest.raises(WrongAccountTypeError):
+            await executor.find_order_by_ref(BUY_REC)
+
+    @pytest.mark.parametrize(
+        ("rec", "symbol_con_id", "action"),
+        [(BUY_REC, AAPL, "buy"), (SELL_REC, MSFT, "sell")],
+    )
+    async def test_entry_and_exit_are_held_and_go_out_on_reconnect(
+        self, session, rec, symbol_con_id, action
+    ):
+        h = Harness(session)
+        order = h.approve(rec, symbol_con_id, action)
+        h.gw.go_down(h.executor)
+
+        msg = await h.deliver(order)
+
+        assert h.gw.placed == []
+        assert h.status(rec) == OrderStatus.APPROVED.value
+        assert not h.acked(msg)
+        h.redis.send_to_dead_letter.assert_not_awaited()
+        assert list(h.runner._deferred_messages) == [msg.message_id]
+
+        h.gw.come_back()
+        await h.retry_when_due()
+
+        assert h.placed_refs() == [rec]
+        assert h.status(rec) == OrderStatus.SUBMITTED.value
+        assert h.acked(msg)
+
+    async def test_a_stop_stays_approved_and_the_next_scan_places_it(
+        self, session
+    ):
+        h = Harness(session, broker_stops=True)
+        h.gw.go_down(h.executor)
+
+        assert await TestStopPath()._cover(h) is None
+
+        assert h.gw.placed == []
+        assert h.status(STOP_REC) == OrderStatus.APPROVED.value
+        assert len(h.alerts("broker_stop_not_placed")) == 1
+
+        h.gw.come_back()
+        assert await h.runner._broker_stops._resume_unsubmitted_stops() == [
+            STOP_REC
+        ]
+        assert h.placed_refs() == [STOP_REC]
+
+
+class TestAKillAgainstAHungGateway:
+    def _kill(self) -> KillMessage:
+        return TestKillPath()._kill()
+
+    def _exit_id(self, ticker: str) -> str:
+        return TestKillPath()._exit_id(ticker)
+
+    async def test_only_the_first_sell_waits_on_the_probe(self, session):
+        h = Harness(session)
+        TestKillPath()._hold(h, (AAPL, 10.0), (MSFT, 5.0), (("NVDA", 4815), 3.0))
+        h.gw.answers_open = False
+        open_bound, completed_bound = _short_bounds()
+
+        with open_bound, completed_bound:
+            await h.runner.process_kill(self._kill())
+
+        assert h.gw.open_requests == 1
+        assert sorted(h.placed_refs()) == sorted(
+            self._exit_id(t) for t in ("AAPL", "MSFT", "NVDA")
+        )
+
+    async def test_a_sell_this_session_already_holds_is_not_placed_again(
+        self, session
+    ):
+        """Blind only after the own-client cache: connect's open-order sync
+        cached our earlier sell for this liquidation; IB now does not answer."""
+        h = Harness(session)
+        TestKillPath()._hold(h, (AAPL, 10.0), (MSFT, 5.0))
+        h.gw.cache_own(AAPL, 900, self._exit_id("AAPL"), action="SELL",
+                       order_type="MKT")
+        h.gw.answers_open = False
+        open_bound, completed_bound = _short_bounds()
+
+        with open_bound, completed_bound:
+            await h.runner.process_kill(self._kill())
+
+        assert h.placed_refs() == [self._exit_id("MSFT")]
+        assert h.order_manager.tracked_order_id(self._exit_id("AAPL")) == "900"
+        assert "900" in h.executor._trades
+
+    async def test_the_cache_is_checked_on_the_first_unanswered_probe_too(
+        self, session
+    ):
+        h = Harness(session)
+        TestKillPath()._hold(h, (AAPL, 10.0))
+        h.gw.cache_own(AAPL, 900, self._exit_id("AAPL"), action="SELL",
+                       order_type="MKT")
+        h.gw.answers_open = False
+        open_bound, completed_bound = _short_bounds()
+
+        with open_bound, completed_bound:
+            await h.runner.process_kill(self._kill())
+
+        assert h.gw.open_requests == 1
+        assert h.gw.placed == []
+
+    async def test_each_kill_probes_afresh(self, session):
+        h = Harness(session)
+        manager = h.order_manager
+        h.gw.answers_open = False
+        open_bound, completed_bound = _short_bounds()
+
+        with open_bound, completed_bound:
+            await manager.submit_exit("AAPL", 1, "liq-a", kill=KillProbe())
+            await manager.submit_exit("MSFT", 1, "liq-b", kill=KillProbe())
+
+        assert h.gw.open_requests == 2
+
+
+class TestTheDeferredQueueNeverLosesAMessage:
+    async def test_an_unreadable_halt_latch_keeps_it_queued(self, session):
+        h = Harness(session)
+        order = h.approve(BUY_REC, AAPL, "buy")
+        h.gw.answers_open = False
+        open_bound, completed_bound = _short_bounds()
+
+        with open_bound, completed_bound:
+            msg = await h.deliver(order)
+        h.gw.answers_open = True
+        with patch.object(
+            h.runner, "_load_active_halt",
+            AsyncMock(side_effect=HaltStateUnavailable("db down")),
+        ):
+            await h.retry_when_due()
+
+        assert list(h.runner._deferred_messages) == [msg.message_id]
+        assert not h.acked(msg)
+        assert len(h.alerts("halt_state_unavailable")) == 1
+
+        await h.retry_when_due()
+
+        assert h.placed_refs() == [BUY_REC]
+        assert h.acked(msg)
+        assert h.runner._deferred_messages == {}
+
+    async def test_a_cancellation_mid_pass_keeps_it_queued(self, session):
+        h = Harness(session)
+        order = h.approve(BUY_REC, AAPL, "buy")
+        h.gw.go_down(h.executor)
+        msg = await h.deliver(order)
+
+        with patch.object(
+            h.runner, "_handle_message",
+            AsyncMock(side_effect=asyncio.CancelledError()),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await h.retry_when_due()
+
+        assert list(h.runner._deferred_messages) == [msg.message_id]
+
+    async def test_the_warning_is_throttled(self, session):
+        h = Harness(session)
+        order = h.approve(BUY_REC, AAPL, "buy")
+        h.gw.go_down(h.executor)
+        h.runner._logger = MagicMock()
+
+        await h.deliver(order)
+        await h.retry_when_due()
+        await h.retry_when_due()
+
+        warnings = [
+            c for c in h.runner._logger.warning.call_args_list
+            if "left unacked" in c.args[0]
+        ]
+        assert len(warnings) == 1
+        (record,) = h.runner._deferred_messages.values()
+        assert record.attempts == 3
+
+
+class TestADeferredBuyExpiresWithItsSession:
+    async def test_after_the_close_it_is_failed_and_acked_never_placed(
+        self, session
+    ):
+        h = Harness(session)
+        order = h.approve(BUY_REC, AAPL, "buy")
+        h.gw.go_down(h.executor)
+        msg = await h.deliver(order)
+
+        h.gw.come_back()
+        h.now = SESSION_CLOSE + timedelta(minutes=1)
+        await h.retry_when_due()
+
+        assert h.gw.placed == []
+        intent = h.ledger.get(BUY_REC)
+        assert intent.status == OrderStatus.SUBMISSION_FAILED.value
+        assert intent.reason == DEFERRED_PAST_SESSION_REASON
+        h.session.rollback()
+        assert h.acked(msg)
+        assert h.runner._deferred_messages == {}
+
+    async def test_before_the_close_it_is_still_placed(self, session):
+        h = Harness(session)
+        order = h.approve(BUY_REC, AAPL, "buy")
+        h.gw.go_down(h.executor)
+        await h.deliver(order)
+
+        h.gw.come_back()
+        h.now = SESSION_CLOSE - timedelta(minutes=1)
+        await h.retry_when_due()
+
+        assert h.placed_refs() == [BUY_REC]
+
+    async def test_an_exit_never_expires(self, session):
+        h = Harness(session)
+        order = h.approve(SELL_REC, MSFT, "sell")
+        h.gw.go_down(h.executor)
+        await h.deliver(order)
+
+        h.gw.come_back()
+        h.now = SESSION_CLOSE + timedelta(days=3)
+        await h.retry_when_due()
+
+        assert h.placed_refs() == [SELL_REC]
+
+    async def test_a_buy_approved_after_the_close_is_sized_for_the_next_day(
+        self, session
+    ):
+        h = Harness(session)
+        after_close = SESSION_CLOSE + timedelta(minutes=15)  # 16:15 ET Thu
+
+        close = h.runner._session_close_for(after_close)
+
+        assert close == datetime(2026, 10, 9, 20, 0, tzinfo=timezone.utc)
+
+
+class TestOnlyAWorkingForeignOrderBlocks:
+    @pytest.mark.parametrize("status", ["Inactive", "PendingCancel"])
+    async def test_a_parked_or_dying_one_does_not(self, session, status):
+        h = Harness(session)
+        order = h.approve(BUY_REC, AAPL, "buy")
+        h.gw.working(AAPL, 77, REPAIR_CLIENT, BUY_REC, status=status)
+
+        await h.deliver(order)
+
+        assert h.placed_refs() == [BUY_REC]
+        assert h.alerts("order_submitted_elsewhere") == []
+
+    @pytest.mark.parametrize(
+        "status", ["PendingSubmit", "ApiPending", "PreSubmitted", "Submitted"]
+    )
+    async def test_a_working_one_does(self, status):
+        gw = Gateway()
+        gw.working(AAPL, 77, REPAIR_CLIENT, BUY_REC, status=status)
+
+        found = await _executor(gw).find_order_by_ref(BUY_REC)
+
+        assert isinstance(found, OrderPlacedElsewhere)
+
+
+class TestPagingEpisodes:
+    async def test_a_failed_withheld_exit_page_is_retried(self, session):
+        h = Harness(session)
+        order = h.approve(SELL_REC, MSFT, "sell")
+        h.gw.go_down(h.executor)
+        real_publish = h.redis.publish
+        h.redis.publish = AsyncMock(side_effect=ConnectionError("redis"))
+
+        await h.deliver(order)
+        assert SELL_REC not in h.runner._deferred_exit_paged
+
+        h.redis.publish = real_publish
+        await h.retry_when_due()
+        await h.retry_when_due()
+
+        assert len(h.alerts("exit_submission_deferred")) == 1
+        assert SELL_REC in h.runner._deferred_exit_paged
+
+    async def test_both_paged_sets_are_pruned_when_it_resolves(self, session):
+        h = Harness(session)
+        order = h.approve(SELL_REC, MSFT, "sell")
+        h.gw.go_down(h.executor)
+        await h.deliver(order)
+        h.gw.come_back()
+        h.gw.working(MSFT, 77, REPAIR_CLIENT, SELL_REC, action="SELL")
+        await h.retry_when_due()
+        assert SELL_REC in h.runner._deferred_exit_paged
+        assert SELL_REC in h.order_manager._submitted_elsewhere_paged
+
+        h.gw.open_orders.clear()
+        await h.retry_when_due()
+
+        assert h.placed_refs() == [SELL_REC]
+        assert SELL_REC not in h.runner._deferred_exit_paged
+        assert SELL_REC not in h.order_manager._submitted_elsewhere_paged

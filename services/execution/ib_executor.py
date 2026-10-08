@@ -45,6 +45,14 @@ REQ_EXECUTIONS_TIMEOUT_SECONDS = 30
 REQ_OPEN_ORDERS_TIMEOUT_SECONDS = 30
 REQ_COMPLETED_ORDERS_TIMEOUT_SECONDS = 30
 
+# Another client's order blocks a submission only while it can still execute
+# (KAN-112). One parked Inactive (rejected, or held for a missing permission)
+# or on its way out (PendingCancel) is not a working duplicate, and treating it
+# as one would block the recommendation for as long as IB keeps listing it.
+FOREIGN_WORKING_STATUSES = frozenset(
+    {"PendingSubmit", "ApiPending", "PreSubmitted", "Submitted"}
+)
+
 # How long the sweep waits, after IB's reply, for the fill deliveries that
 # reply set off through the live callback (KAN-102). Deliveries that finish
 # first are booked unstamped by the live path instead of being raced by the
@@ -1083,14 +1091,26 @@ class IBExecutor:
         place a second. ib_insync's own-client cache is still consulted after
         IB's answer, so the probe never matches less than it did before.
 
-        Either request failing or timing out raises
-        :class:`BrokerStateUnavailableError`: whether an order already exists
-        is exactly what an unanswered request cannot tell, so the caller must
-        not submit on it. ``list_open_orders``, the cancel fallback and the
-        reconnect rebind keep KAN-106's client scoping — only this probe
-        widens.
+        Another client's order counts only while it can still execute
+        (:data:`FOREIGN_WORKING_STATUSES`); an Inactive or PendingCancel one is
+        passed over and the probe goes on to completed history.
+
+        No connection (a reconnect that fails), or either request failing or
+        timing out, raises :class:`BrokerStateUnavailableError`: whether an
+        order already exists is exactly what an unanswered request cannot
+        tell, so the caller must not submit on it — and must not terminalize
+        the order either, which is what an unmapped ``NotConnectedError`` used
+        to make it do. ``WrongAccountTypeError`` still propagates: that one is
+        meant to stop the service. ``list_open_orders``, the cancel fallback
+        and the reconnect rebind keep KAN-106's client scoping — only this
+        probe widens.
         """
-        await self._ensure_connected()
+        try:
+            await self._ensure_connected()
+        except NotConnectedError as exc:
+            raise BrokerStateUnavailableError(
+                f"IB not connected for the idempotency probe: {exc}"
+            ) from exc
         ib = self._ib
         open_trades = await self._open_orders_request(
             ib.reqAllOpenOrdersAsync, "open orders (idempotency probe)"
@@ -1101,6 +1121,19 @@ class IBExecutor:
                 continue
             if self._is_own(trade):
                 return self._bind_own_open_trade(trade)
+            status = str(
+                getattr(getattr(trade, "orderStatus", None), "status", "") or ""
+            )
+            if status not in FOREIGN_WORKING_STATUSES:
+                self._logger.info(
+                    "Another client's order under this orderRef is not "
+                    "working; it does not block submission",
+                    recommendation_id=recommendation_id,
+                    other_order_id=str(trade.order.orderId),
+                    other_client_id=getattr(trade.order, "clientId", None),
+                    status=status,
+                )
+                continue
             if elsewhere is None:
                 elsewhere = self._placed_elsewhere(recommendation_id, trade)
         for trade in self._own_open_trades():
@@ -1124,6 +1157,34 @@ class IBExecutor:
         for trade in completed:
             if str(getattr(trade.order, "orderRef", "")) == recommendation_id:
                 return str(trade.order.orderId)
+        return None
+
+    def find_own_order_by_ref(self, recommendation_id: str) -> str | None:
+        """This client's order for a ref, from local state only — no request.
+
+        The kill path's fallback when IB does not answer the idempotency
+        probe (KAN-112): what this process tracks, then ib_insync's own-client
+        open-order cache (filled best-effort by connect). It can miss an order
+        a previous process placed, and it never sees another client's; it
+        exists so a blind liquidation at least never doubles an order this
+        session already knows about.
+        """
+        for order_id, trade in self._trades.items():
+            order = getattr(trade, "order", None)
+            if str(getattr(order, "orderRef", "")) == recommendation_id:
+                return order_id
+        if self._ib is None:
+            return None
+        try:
+            cached = self._own_open_trades()
+        except Exception:
+            self._logger.exception(
+                "Could not read the open-order cache", ref=recommendation_id
+            )
+            return None
+        for trade in cached:
+            if str(getattr(trade.order, "orderRef", "")) == recommendation_id:
+                return self._bind_own_open_trade(trade)
         return None
 
     def _bind_own_open_trade(self, trade: Any) -> str:

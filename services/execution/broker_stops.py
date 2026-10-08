@@ -343,7 +343,8 @@ class BrokerStopManager:
             # APPROVED, which counts as coverage — truthfully, something rests
             # for it. SUBMISSION_FAILED would have the next scan mint a fresh
             # id and place a second stop for the same shares: over-coverage,
-            # a short on trigger. A human resolves it.
+            # a short on trigger. Every scan re-probes it (resume), so it is
+            # placed once that order is gone.
             self._ledger.session.rollback()
             self._logger.error(
                 "Protective stop not placed: another IB client has an order "
