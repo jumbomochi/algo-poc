@@ -837,3 +837,95 @@ def test_an_infrastructure_error_still_escapes_rather_than_being_audited(
 
     with pytest.raises(OperationalError):
         projector.apply(fill)
+
+
+# --------------------------------------------------------------------------
+# KAN-108: re-projecting a recorded-but-rejected execution row.
+# --------------------------------------------------------------------------
+
+
+def _burn_overdraft(projector, session) -> ExecutionFill:
+    """A buy the sleeve cannot afford: recorded, rejected, unprojected."""
+    seed_intent(session)
+    with pytest.raises(InvalidFillError, match="sleeve cash negative"):
+        projector.apply(make_fill(price=1_000))
+    return session.scalar(select(ExecutionFill))
+
+
+def _top_up(session, cash: float) -> None:
+    session.execute(
+        PortfolioConfig.__table__.update().values(cash=cash)
+    )
+    session.commit()
+
+
+def test_a_burned_fill_replay_is_still_a_silent_no_op(projector, session):
+    """The bug KAN-108 repairs, pinned: apply() never revisits the row."""
+    _burn_overdraft(projector, session)
+    _top_up(session, 20_000)
+
+    assert projector.apply(make_fill(price=1_000)) is False
+    assert session.scalar(select(ExecutionFill)).projection_applied is False
+    assert get_position(session) is None
+
+
+def test_project_recorded_projects_a_burned_row_through_the_same_path(
+    projector, session
+):
+    row = _burn_overdraft(projector, session)
+    _top_up(session, 20_000)
+
+    with session.begin():
+        intent = session.scalar(select(OrderIntent))
+        projector.project_recorded(row, intent, order_done=True)
+
+    assert get_position(session).quantity == 10
+    assert get_position(session).sector == "Technology"
+    assert get_cash(session) == pytest.approx(20_000 - 10_000 - 1)
+    assert session.scalar(select(OrderIntent)).status == OrderStatus.FILLED.value
+    assert session.scalar(select(ExecutionFill)).projection_applied is True
+    assert fill_count(session) == 1
+
+
+def test_project_recorded_failure_rolls_back_with_the_callers_transaction(
+    projector, session
+):
+    row = _burn_overdraft(projector, session)
+    cash = get_cash(session)
+    session.rollback()  # end the read's autobegin; the caller owns the next
+
+    with pytest.raises(InvalidFillError, match="sleeve cash negative"):
+        with session.begin():
+            intent = session.scalar(select(OrderIntent))
+            projector.project_recorded(row, intent, order_done=True)
+
+    assert get_cash(session) == pytest.approx(cash)
+    assert get_position(session) is None
+    assert session.scalar(select(ExecutionFill)).projection_applied is False
+    assert session.scalar(select(OrderIntent)).status == (
+        OrderStatus.SUBMITTED.value
+    )
+
+
+def test_project_recorded_refuses_an_already_projected_row(projector, session):
+    seed_intent(session)
+    assert projector.apply(make_fill()) is True
+    row = session.scalar(select(ExecutionFill))
+
+    with pytest.raises(FillProjectionError, match="already projected"):
+        projector.project_recorded(
+            row, session.scalar(select(OrderIntent)), order_done=True
+        )
+
+
+def test_check_recorded_runs_validation_without_writing(projector, session):
+    row = _burn_overdraft(projector, session)
+    intent = session.scalar(select(OrderIntent))
+
+    assert projector.check_recorded(row, intent, order_done=True) == 10
+    assert not (session.new or session.dirty or session.deleted)
+
+    intent.ib_order_id = "999"
+    with pytest.raises(UnattributedFillError, match="order"):
+        projector.check_recorded(row, intent, order_done=True)
+    session.rollback()

@@ -592,8 +592,9 @@ def preflight(
     ``projection_applied`` -- so a rejected fill reads as already-recorded
     forever. For the nightly sweep that is survivable, because IB serves the
     execution again tomorrow. Here there is no tomorrow: ``reqExecutions``
-    is long past and the statement is the only surviving record. A burn is
-    recoverable only by a database restore.
+    is long past and the statement is the only surviving record. Since
+    KAN-108 a burn can be re-projected with ``scripts/ops/reproject_fill.py``
+    once its cause is fixed, but refusing up front is still far cheaper.
 
     Both checks mirror a ``ValueError`` in
     ``PaperTradingState._apply_fill_accounting`` that the projector converts
@@ -1034,7 +1035,8 @@ def _run(args) -> int:
             print(
                 "\nRefusing to apply: executions listed above are recorded "
                 "but were never projected. They cannot be recovered by this "
-                "tool -- see docs/operations/backups.md for the restore path."
+                "tool. Fix the cause, then re-project them with "
+                "scripts/ops/reproject_fill.py (KAN-108)."
             )
             session.rollback()
             return 1
@@ -1110,8 +1112,9 @@ def _run(args) -> int:
                     f"{reason}\n"
                     "   Its execution_fills row is committed but unprojected, "
                     "so this tool can never recover it again -- it will read "
-                    "as 'already recorded'. Restore from the dump above, or "
-                    "see docs/operations/backups.md."
+                    "as 'already recorded'. Fix the cause, then re-project it "
+                    "with scripts/ops/reproject_fill.py (KAN-108), or restore "
+                    "from the dump above."
                 )
             for problem in problems:
                 print(f"🚨 {problem}")
