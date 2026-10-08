@@ -30,6 +30,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+from scripts.ops import reconciliation_status as recon
 from scripts.ops.pipeline_report_summary import (
     _redact,
     collect_facts,
@@ -531,36 +532,68 @@ def _make_branch_fixture(deploy: Path, state: str) -> None:
         git(deploy, "commit", "-q", "-m", "unpromoted")
 
 
-def _seed_reconciliation(session, state: str) -> None:
+#: The zone ``reconciliation_status`` names a trading session by — its own
+#: constant, so the fixture cannot drift from the reader.
+_SESSION_TZ = recon.SESSION_TZ
+
+
+def _earlier_session(newest: datetime, sessions_back: int) -> datetime:
+    """05:20 SGT on the SGT date ``sessions_back`` sessions before ``newest``'s.
+
+    Anchored to the session DATE, not to ``newest - N days``: the reader groups
+    by SGT date, and a relative offset lands on a different date depending on
+    the hour it is computed at (KAN-114). 05:20 is the paper run's slot; any
+    time of day works, because every one of them falls on that earlier date
+    and so strictly before ``newest``.
+    """
+    day = newest.astimezone(_SESSION_TZ).date() - timedelta(days=sessions_back)
+    return datetime(day.year, day.month, day.day, 5, 20,
+                    tzinfo=_SESSION_TZ).astimezone(timezone.utc)
+
+
+def _seed_reconciliation(session, state: str, *, now: datetime | None = None) -> None:
     """Seed ``reconciliation_reports`` for KAN-86's section.
 
     Defaulted to a healthy, fresh reading for the same reason ``baseline``
     defaults to "ok": ALGO_DATABASE_URL is a real database this harness builds,
     and a book with no reading at all renders as *unknown* and escalates — so
     without this every test in this module would get a second message.
+
+    ``now`` is the wall clock the reader will judge freshness against; the
+    wrapper reads the real one, so callers driving it leave this alone.
+
+    The newest reading is 37 minutes old — the 05:15 run read by the 05:52
+    report — so it is fresh at any hour. Every OLDER reading is pinned to its
+    own earlier SGT session date rather than placed at ``now - N days``. The
+    relative version put ``now - 1d`` and ``now - 37min`` on the same SGT date
+    between 00:00 and 00:37 SGT, collapsed the two-session halt into one, and
+    failed three tests every night (KAN-114).
     """
     if state == "none":
         return
-    now = datetime.now(timezone.utc)
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    newest = now - timedelta(minutes=37)
     # "disabled" is a two-session halt (escalates); "transient" is one session
     # (renders, does not escalate); "stale" is a reading too old to be evidence.
-    plan: list[tuple[timedelta, bool]]
+    plan: list[tuple[datetime, bool]]
     if state == "ok":
-        plan = [(timedelta(minutes=37), True)]
+        plan = [(newest, True)]
     elif state == "transient":
-        plan = [(timedelta(days=1), True), (timedelta(minutes=37), False)]
+        plan = [(_earlier_session(newest, 1), True), (newest, False)]
     elif state == "disabled":
         plan = [
-            (timedelta(days=2), True),
-            (timedelta(days=1), False),
-            (timedelta(minutes=37), False),
+            (_earlier_session(newest, 2), True),
+            (_earlier_session(newest, 1), False),
+            (newest, False),
         ]
     elif state == "stale":
-        plan = [(timedelta(days=4), True)]
+        # Elapsed age, not a session: four days is past STALE_AFTER_HOURS
+        # whatever the hour, and staleness is measured in hours from ``now``.
+        plan = [(now - timedelta(days=4), True)]
     else:  # pragma: no cover - a typo in a test argument must not pass silently
         raise ValueError(f"unknown reconciliation state {state!r}")
 
-    for ago, allowed in plan:
+    for at, allowed in plan:
         session.add(ReconciliationReport(
             account_id="DUN551088", mode="paper",
             status="ok" if allowed else "major", entries_allowed=allowed,
@@ -575,7 +608,9 @@ def _seed_reconciliation(session, state: str) -> None:
                     "portfolio": "quality_value", "auto_correct": False,
                 }],
             },
-            created_at=now - ago,
+            # UTC on purpose: SQLite drops the offset and the reader takes a
+            # naive stamp as UTC.
+            created_at=at,
         ))
     session.commit()
 
@@ -1361,3 +1396,55 @@ def test_output_printed_before_a_nonzero_exit_is_still_used(tmp_path):
     bodies = _bodies(sends)
     assert any("9 consecutive sessions" in b for b in bodies), bodies
     assert not any("CHECK DID NOT RUN" in b for b in bodies), bodies
+
+
+# ---------------------------------------------------------------------------
+# The reconciliation fixture under a frozen clock (KAN-114)
+# ---------------------------------------------------------------------------
+
+def _sgt_clock(hour: int, minute: int) -> datetime:
+    return datetime(2026, 10, 9, hour, minute,
+                    tzinfo=_SESSION_TZ).astimezone(timezone.utc)
+
+
+@pytest.mark.parametrize(
+    "clock", [(0, 10), (0, 40), (5, 15), (23, 59)],
+    ids=["00:10SGT", "00:40SGT", "05:15SGT", "23:59SGT"],
+)
+@pytest.mark.parametrize(
+    "state, expected_status, expected_sessions, escalates",
+    [
+        ("disabled", "disabled", 2, True),
+        ("transient", "disabled", 1, False),
+        ("ok", "ok", 0, False),
+        ("stale", "stale", 0, True),
+    ],
+)
+def test_the_reconciliation_fixture_means_the_same_thing_at_any_hour(
+    session, clock, state, expected_status, expected_sessions, escalates,
+):
+    """KAN-114. ``_consecutive_disabled_sessions`` groups readings by SGT date,
+    and the "disabled" fixture once seeded now-1d and now-37min: between 00:00
+    and 00:37 SGT those share an SGT date, the two-session halt collapsed into
+    one, and three wrapper tests failed every night. The wrapper drives the
+    real clock, so this pins the fixture's meaning at the hours that matter,
+    against the same ``collect_facts`` the wrapper runs, with ``now`` injected
+    on both sides."""
+    now = _sgt_clock(*clock)
+    _seed_reconciliation(session, state, now=now)
+    facts = recon.collect_facts(session, mode="paper", now=now)
+
+    assert facts.status == expected_status, facts
+    assert facts.disabled_sessions == expected_sessions, facts
+    body = recon.alert_body(facts)
+    assert bool(body) is escalates, body
+    if state == "disabled":
+        assert "2 consecutive sessions" in body, body
+
+    # Each seeded reading stands for its own trading session. Asserted
+    # directly, not only through the count: under the old seeding "transient"
+    # still read as one blocked session at 00:10 SGT, but only because its
+    # allowing reading had been swallowed into the same session as the block.
+    stamps = [r.created_at for r in session.query(ReconciliationReport).all()]
+    keys = [recon._session_key(at) for at in stamps]
+    assert len(set(keys)) == len(keys), sorted(keys)
