@@ -310,6 +310,13 @@ pins"; this is the mechanism half of that.
 > (`{"downsized": n, "skipped": n}`), and the rolling shadow — which replays
 > through the same runner — files its verdicts under a new `baseline_id`
 > (`SHADOW_FUNDING_VERSION` in `backtest/shadow_artifact.py`).
+>
+> **From the KAN-111 release the weekly Tuesday refresh produces
+> cash-constrained numbers.** They are not comparable with the 2026-09-15 pin
+> (momentum 179.66% → 160.15%, aggregate 78.36% → 71.38% on the same bars), so
+> a refresh that "drops" against the pin is the model change, not a decay.
+> **A re-pin decision is outstanding**: until it is made, the pin of record is
+> a leveraged-sim artifact the code can no longer produce.
 
 ### Where the pin lives, and what enforces it
 

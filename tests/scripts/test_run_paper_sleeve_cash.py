@@ -292,15 +292,42 @@ def _project_buy(state, *, ticker, con_id, quantity, price, commission):
     )
 
 
+#: How an emitted buy fills, given (limit, qty, estimated commission, rng):
+#: returns (fill price, actual commission).
+#:
+#: ``slippage`` — the AC: at the limit grown by the whole buffer, commission as
+#: estimated. ``fee_overrun`` — the buffer spent on fees instead: a fill at a
+#: price improvement of 0-25 bps with commission 1.5x the estimate, capped at
+#: what the buffer plus that improvement pays for. The cap is the honest bound:
+#: the buffer is bps of NOTIONAL, so an uncapped 1.5x on a $1-minimum
+#: commission ($0.50 over) overdraws any order under ~$200 notional — 15 of
+#: these 150 books at no improvement, 13 at 10 bps (measured for KAN-111's
+#: review). That is not a live exposure: IBKR Pro Fixed charges a buy exactly
+#: ``max($1, $0.005/share)`` with exchange and regulatory fees included, which
+#: is what ``estimate_commission_usd`` computes.
+FILL_MODELS = {
+    "slippage": lambda px, qty, est, rng: (px * BUFFER, est),
+    "fee_overrun": lambda px, qty, est, rng: (
+        lambda improvement: (
+            px * (1 - improvement),
+            min(1.5 * est, est + qty * px * (BUFFER - 1 + improvement)),
+        )
+    )(rng.uniform(0, 0.0025)),
+}
+
+
+@pytest.mark.parametrize("fill_model", sorted(FILL_MODELS))
 @pytest.mark.parametrize("seed", range(150))
-def test_no_emitted_buy_can_overdraw_the_sleeve_at_its_limit_plus_buffer(seed):
+def test_no_emitted_buy_can_overdraw_the_sleeve_at_its_limit_plus_buffer(
+    seed, fill_model
+):
     """Whatever the book, every buy the run emits is one the projector books.
 
     Random cash, open buy orders (real ledger rows, counted through the same
     helper ``main`` uses) and a batch of candidate buys. Then the worst case is
     projected: every open order fills in full at its limit, and every emitted
-    buy fills at its limit grown by the buffer, with the estimated commission.
-    The real projector must accept all of them.
+    buy fills per ``fill_model`` (see :data:`FILL_MODELS`). The real projector
+    must accept all of them.
     """
     rng = random.Random(seed)
     engine = create_engine("sqlite:///:memory:")
@@ -358,10 +385,13 @@ def test_no_emitted_buy_can_overdraw_the_sleeve_at_its_limit_plus_buffer(seed):
         )
     for n, signal in enumerate(signals):
         qty = signal["quantity"]
+        price, commission = FILL_MODELS[fill_model](
+            signal["limit_price"], qty,
+            estimate_commission_usd(qty, per_share=0.005, minimum=1.0), rng,
+        )
         _project_buy(  # raises "fill would make sleeve cash negative" on a breach
             state, ticker=signal["ticker"], con_id=n + 1, quantity=qty,
-            price=signal["limit_price"] * BUFFER,
-            commission=estimate_commission_usd(qty, per_share=0.005, minimum=1.0),
+            price=price, commission=commission,
         )
     assert state.get_cash(SLEEVE) >= -1e-9
     session.close()
