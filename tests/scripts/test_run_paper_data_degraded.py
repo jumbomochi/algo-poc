@@ -333,3 +333,41 @@ def test_degradation_does_not_move_the_shadow_id(tmp_path):
     assert clean.shadow_id == degraded.shadow_id
     assert clean.data_degraded == {}
     assert clean.series["momentum"] == degraded.series["momentum"]
+
+
+# ---------------------------------------------------------------------------
+# PR #235 review: a rank replacement is a data-driven exit, a stop is not
+# ---------------------------------------------------------------------------
+
+EXITS = {"AAPL": "rank_replacement", "MSFT": "trailing_stop", "NVDA": "time_exit"}
+
+
+def _run_exits(state, **kwargs):
+    def signal_fn(ticker, bars):
+        return {"action": "sell", "limit_price": 100.0, "quantity": 1.0,
+                "exit_reason": EXITS[ticker]}
+
+    return run_paper.run_daily(
+        state, {"quality_value": _portfolio("quality_value", signal_fn)},
+        {t: _bars() for t in EXITS},
+        settled_cash_trading=1_000_000, active_buy_reservations_usd=0,
+        commission_per_share_usd=0.005, minimum_commission_usd=1,
+        minimum_settled_usd_reserve=0, **kwargs,
+    )
+
+
+def test_a_degraded_sleeve_holds_its_rank_replacements_but_takes_its_stops(state, capsys):
+    """Ranked on the untrusted cache, with the paired buy already skipped, a
+    rank replacement would sell a holding and buy nothing in its place."""
+    signals = _run_exits(state, data_degraded={"quality_value": "fundamentals cache STALE"})
+
+    assert sorted(s["exit_reason"] for s in signals) == ["time_exit", "trailing_stop"]
+    assert ("AAPL  [quality_value] (data-degraded: rank_replacement exit"
+            in capsys.readouterr().out)
+
+
+def test_a_healthy_sleeve_still_takes_its_rank_replacements(state):
+    signals = _run_exits(state, data_degraded={})
+    assert sorted(s["exit_reason"] for s in signals) == [
+        "rank_replacement", "time_exit", "trailing_stop",
+    ]

@@ -437,7 +437,8 @@ The fetchers stamp each file with `fetched_at` (KAN-109). A missing cache, one
 with no `fetched_at`, or one stale by the `data.fundamentals` / `data.earnings`
 thresholds makes the dependent sleeve **data-degraded** — this is not a quiet
 degradation any more: the paper run alerts once, the sleeve places no new
-entries (exits still run), its shadow is recorded ungraded (NO_DATA), and
+entries and takes no rank-replacement exits (stops and time exits still run),
+its shadow is recorded ungraded (NO_DATA), and
 `run_backtest.py` refuses unless `--allow-degraded-data` is passed (which marks
 the artifact `config.data_degraded`). The periods in which these sleeves'
 evidence was produced from missing or stale caches are on record in

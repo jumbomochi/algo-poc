@@ -129,6 +129,13 @@ CAPITAL_ALLOCATIONS = {
 }
 
 
+#: Exit reasons a sleeve derives from its fundamentals/earnings data rather
+#: than from price. A data-degraded sleeve (KAN-109) must not act on them:
+#: quality_value's rank replacement sells a holding for a better-ranked name,
+#: ranked on the cache that is missing or stale.
+DATA_DRIVEN_EXIT_REASONS = frozenset({"rank_replacement"})
+
+
 #: Sessions the shadow replays. Taken from the monitor's own default so the two
 #: cannot drift: producing fewer than the monitor compares would silently
 #: shorten every window. A wider ad-hoc ``--window`` still works — the monitor
@@ -877,7 +884,9 @@ def run_daily(
 
     ``data_degraded`` maps a sleeve to why its fundamentals/earnings cache
     cannot be trusted (KAN-109). That sleeve's buys are skipped and printed
-    with the reason; its sells are processed exactly as before.
+    with the reason, and so are its exits whose reason is a judgement made
+    from the cache (:data:`DATA_DRIVEN_EXIT_REASONS`). Risk exits — trailing
+    stops, time exits — are processed exactly as before.
     """
     signals_generated: list[dict] = []
     degraded = dict(data_degraded or {})
@@ -1058,6 +1067,21 @@ def run_daily(
                         f"  BUY  {ticker:>6s}  {qty:>8.4f} @ ${price:>8.2f}  [{name}]"
                     )
                 elif action == "sell":
+                    if (
+                        name in degraded
+                        and signal.get("exit_reason") in DATA_DRIVEN_EXIT_REASONS
+                    ):
+                        # A rank replacement sells to make room for a better-
+                        # ranked name, by a ranking built on the untrusted
+                        # cache — and the paired buy is skipped above, so it
+                        # would sell a holding and buy nothing. Risk exits
+                        # (trailing stop, time exit) do not read the cache
+                        # and still run.
+                        print(
+                            f"  SKIP {ticker:>6s}  [{name}] (data-degraded: "
+                            f"{signal['exit_reason']} exit ranks on the cache)"
+                        )
+                        continue
                     if sell_availability is not None:
                         uncovered = max(
                             0.0, float(remaining_sell_quantity.get(ticker, 0.0))
@@ -1773,7 +1797,8 @@ def report_data_health(
     for sleeve, reason in sorted(degraded.items()):
         print(
             f"  DATA-DEGRADED: {sleeve} — {reason}. No new entries from this "
-            f"sleeve today; exits still run; its shadow is not graded."
+            f"sleeve today; risk exits still run, rank replacements are held; "
+            f"its shadow is not graded."
         )
     emit_alert_best_effort(
         redis_url,

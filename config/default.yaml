@@ -201,11 +201,12 @@ data:
   cache_dir: data/cache
   # A missing cache, or one stale by either rule below, marks the dependent
   # sleeve DATA-DEGRADED for the run: one alert, no new entries from that
-  # sleeve (exits still run), and its shadow is not graded. A cache written
+  # sleeve and no rank-replacement exits (stops and time exits still run),
+  # and its shadow is not graded. A cache written
   # before fetched_at existed has an unknown age and counts as stale.
   fundamentals:
     max_fetch_age_days: 14         # weekly refresh, one miss tolerated
-    max_period_age_days: 137       # longest quarter (92d) + 45d filing lag
+    max_period_age_days: 167       # longest quarter (92d) + 75d 10-K deadline
     max_stale_ticker_fraction: 0.2 # sleeve-kill-criteria.md's 20% bound
   earnings:
     max_fetch_age_days: 2          # = the lookup window: refresh daily

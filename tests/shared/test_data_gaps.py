@@ -64,7 +64,9 @@ def test_fundamentals_went_stale_when_the_next_quarter_became_available():
 def test_the_kan_109_check_would_have_fired_on_the_stale_fundamentals(tmp_path):
     """The shape of the 2026-03-26 cache — 82 tickers at 2025-12-31, 12 at
     2026-01-31, 2 at 2026-02-28, 1 at 2025-11-30 — trips the period check
-    from 2026-05-18 (137 days past 2025-12-31 is a Sunday) and not before."""
+    from 2026-06-17 (168 days past 2025-12-31) and not before. Later than the
+    register's 05-15 on purpose: the bound waits out the 10-K deadline, while
+    the register records when the data actually went stale."""
     periods = (["2025-12-31"] * 82 + ["2026-01-31"] * 12 + ["2026-02-28"] * 2
                + ["2025-11-30"])
     rows = {f"T{i}": [{"report_date": p}] for i, p in enumerate(periods)}
@@ -76,8 +78,8 @@ def test_the_kan_109_check_would_have_fired_on_the_stale_fundamentals(tmp_path):
         moment = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
         return not assess_fundamentals(doc, as_of=moment, max_fetch_age_days=1e9).fresh
 
-    assert not stale_on(date(2026, 5, 15))
-    assert stale_on(date(2026, 5, 18))
+    assert not stale_on(date(2026, 6, 16))
+    assert stale_on(date(2026, 6, 17))
 
 
 def test_earnings_went_stale_at_the_first_announcement_without_a_reported_eps():

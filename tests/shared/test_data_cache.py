@@ -211,7 +211,7 @@ def test_an_old_fetch_is_stale(tmp_path):
 
 def test_superseded_periods_are_stale_even_when_freshly_fetched(tmp_path):
     """The substantive check: the rows, not the stamp. 2026-03-31 is 189 days
-    old on 2026-10-06, past the 137-day bound for every ticker."""
+    old on 2026-10-06, past the 167-day bound for every ticker."""
     doc = _fund_doc(tmp_path, {"AAA": "2026-03-31", "BBB": "2026-03-31"})
     verdict = assess_fundamentals(doc, as_of=NOW)
     assert not verdict.fresh
@@ -226,13 +226,58 @@ def test_a_minority_of_late_filers_does_not_stale_the_cache(tmp_path):
 
 
 def test_the_period_bound_never_fires_before_the_next_quarter_exists(tmp_path):
-    """137 = the longest quarter (92d) + the 45-day filing lag. Q2 (ends
-    06-30) is followed by Q3 (09-30, 92 days later), available 11-14."""
+    """167 = the longest quarter (92d) + 75 days. Q2 (ends 06-30) is
+    superseded once Q3 (09-30) is filed; the bound gives it until 12-14."""
     doc = _fund_doc(tmp_path, {"AAA": "2026-06-30"})
-    day_137 = datetime(2026, 11, 13, 12, tzinfo=timezone.utc)  # 06-30 + 136
-    assert assess_fundamentals(doc, as_of=day_137, max_fetch_age_days=999).fresh
-    day_138 = datetime(2026, 11, 15, 12, tzinfo=timezone.utc)  # 06-30 + 138
-    assert not assess_fundamentals(doc, as_of=day_138, max_fetch_age_days=999).fresh
+    day_167 = datetime(2026, 12, 14, 12, tzinfo=timezone.utc)  # 06-30 + 167
+    assert assess_fundamentals(doc, as_of=day_167, max_fetch_age_days=999).fresh
+    day_168 = datetime(2026, 12, 15, 12, tzinfo=timezone.utc)
+    assert not assess_fundamentals(doc, as_of=day_168, max_fetch_age_days=999).fresh
+
+
+def test_a_fresh_mid_february_cache_is_not_stale(tmp_path):
+    """PR #235 review: Q4 has no 10-Q — it comes with the 10-K, due 60-75 days
+    after year-end. On 2026-02-20 a fresh fetch still shows 2025-09-30 for most
+    calendar-FY companies, and the old 137-day bound called that STALE every
+    February. Reproduced with the reviewer's shape: 80 of 100 at 09-30."""
+    periods = {f"Q3_{i}": "2025-09-30" for i in range(80)}
+    periods.update({f"Q4_{i}": "2025-12-31" for i in range(20)})
+    feb_20 = datetime(2026, 2, 20, 12, tzinfo=timezone.utc)
+    doc = _fund_doc(tmp_path, periods, fetched_at=feb_20 - timedelta(days=1))
+    verdict = assess_fundamentals(doc, as_of=feb_20)
+    assert verdict.fresh, verdict.problems
+    # The old bound is what made it fail.
+    assert not assess_fundamentals(doc, as_of=feb_20, max_period_age_days=137).fresh
+
+
+def test_a_genuinely_stale_cache_is_still_caught_with_the_wider_bound(tmp_path):
+    """The 2026-03-26 cache's shape, judged on 2026-07-01: freshly re-stamped,
+    its 2025-12-31 periods are 182 days old — a 10-K and a 10-Q have both been
+    filed since — and the check still fires."""
+    periods = {f"T{i}": "2025-12-31" for i in range(82)}
+    periods.update({f"J{i}": "2026-01-31" for i in range(12)})
+    periods.update({"F0": "2026-02-28", "F1": "2026-02-28", "N0": "2025-11-30"})
+    july_1 = datetime(2026, 7, 1, 12, tzinfo=timezone.utc)
+    doc = _fund_doc(tmp_path, periods, fetched_at=july_1)
+    verdict = assess_fundamentals(doc, as_of=july_1)
+    assert not verdict.fresh
+    assert "83 of 97 tickers" in verdict.describe()
+
+
+def test_an_aware_instant_is_converted_to_utc_not_relabelled(tmp_path):
+    """PR #235 review: the daily report passes local (SGT) time. 05:52 SGT on
+    2026-11-14 is 21:52 UTC on 11-13, so "today" for the period rule is 11-13
+    — the same day the paper run, which passes UTC, judges."""
+    from zoneinfo import ZoneInfo
+
+    doc = _fund_doc(tmp_path, {"AAA": "2026-05-30"})  # 167 days -> 11-13
+    sgt = datetime(2026, 11, 14, 5, 52, tzinfo=ZoneInfo("Asia/Singapore"))
+    utc = sgt.astimezone(timezone.utc)
+    assert utc.date() == date(2026, 11, 13)
+    a = assess_fundamentals(doc, as_of=sgt, max_fetch_age_days=999)
+    b = assess_fundamentals(doc, as_of=utc, max_fetch_age_days=999)
+    assert a.fresh and b.fresh  # 11-13 is day 167, still inside the bound
+    assert a.problems == b.problems
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +378,6 @@ def test_thresholds_come_from_config(tmp_path):
 def test_the_shipped_thresholds_are_the_documented_ones():
     cfg = load_config(str(Path(REPO_ROOT) / "config/default.yaml")).data
     assert cfg.fundamentals.max_fetch_age_days == 14
-    assert cfg.fundamentals.max_period_age_days == 137
+    assert cfg.fundamentals.max_period_age_days == 167
     assert cfg.fundamentals.max_stale_ticker_fraction == pytest.approx(0.2)
     assert cfg.earnings.max_fetch_age_days == 2

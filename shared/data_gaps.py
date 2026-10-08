@@ -25,8 +25,9 @@ From the only caches that ever existed, ``~/GitHub/algo-poc/data/cache/``
   5-7 quarters each. 82 of 97 tickers' latest period is 2025-12-31. The next
   quarter (2026-03-31) became available on 2026-05-15 under the 45-day filing
   lag the point-in-time lookup applies, and the cache never had it: STALE from
-  2026-05-15. (KAN-109's period check, with its default 137-day bound, would
-  first have fired on 2026-05-18.)
+  2026-05-15. (KAN-109's period check, with its default 167-day bound — set
+  for the 10-K's longer deadline — would first have fired on 2026-06-17; the
+  register records when the data went stale, not when the check notices.)
 * ``earnings.json`` — 98 tickers; the last announcement with a reported EPS is
   2026-03-19. Every announcement after the 2026-03-26 fetch is present only as
   a scheduled date with no reported EPS (NaN surprise). The first is

@@ -25,7 +25,8 @@ This module makes the condition loud. It owns three things:
    degrades (:data:`SLEEVE_CACHE`).
 
 What a degraded sleeve does is decided by its callers, and is the same
-everywhere: no new entries from that sleeve (exits still run), its rolling
+everywhere: no new entries from that sleeve and no exits ranked on the
+cache (risk exits — stops, time exits — still run), its rolling
 shadow is not graded, and a backtest refuses to run it unless told otherwise.
 """
 
@@ -291,7 +292,15 @@ class CacheVerdict:
 
 
 def _as_utc(moment: datetime) -> datetime:
-    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+    """``moment`` in UTC. Naive is taken to BE UTC; aware is converted.
+
+    Converting matters: a check's "today" is ``_as_utc(as_of).date()``, and an
+    SGT instant at 05:52 is still the previous UTC day. Attaching rather than
+    converting judged the daily report one day ahead of the paper run.
+    """
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
 
 
 def _presence_problems(doc: CacheDocument, cache: str) -> list[str]:
@@ -333,7 +342,7 @@ def assess_fundamentals(
     *,
     as_of: datetime,
     max_fetch_age_days: float = 14.0,
-    max_period_age_days: int = 137,
+    max_period_age_days: int = 167,
     max_stale_ticker_fraction: float = 0.20,
 ) -> CacheVerdict:
     """Judge the fundamentals cache as of ``as_of`` (an aware instant).
@@ -342,7 +351,7 @@ def assess_fundamentals(
     ``max_stale_ticker_fraction`` of tickers have a latest period older than
     ``max_period_age_days`` on ``as_of``'s date. The period rule is judged on
     the rows themselves, so it holds for a legacy cache too: the 2026-03-26
-    cache's dominant period (2025-12-31) passes it until 2026-05-17.
+    cache's dominant period (2025-12-31) passes it until 2026-06-16.
     """
     problems = _presence_problems(doc, FUNDAMENTALS)
     if problems:
@@ -473,7 +482,8 @@ class DataHealth:
         )
         return (
             f"DATA-DEGRADED: {', '.join(sorted(degraded))} will place NO new "
-            f"entries this run (exits still run; the shadow is not graded): "
+            f"entries this run (risk exits still run, rank replacements are held; "
+            f"the shadow is not graded): "
             f"{lines}. Refresh the cache(s) in data.cache_dir; see KAN-109."
         )
 
