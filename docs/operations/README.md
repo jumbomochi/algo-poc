@@ -17,6 +17,7 @@ Entry point for operational documentation.
 - `dead-man-switches.md` — The two external checks that page when this host goes quiet, why "no trades today" is deliberately not an internal alert, and the delivery drill (KAN-15)
 - `dlq-audit-2026-08.md` — 2026-08 audit of `stream:approved_orders:dlq`: the queue never existed, why the stop-loss dead-lettering was latent rather than active, and the two monitoring gaps left open (KAN-21)
 - `incident-2026-08-21-gateway-and-docker.md` — 2026-08-21 incident: an IB login rejection at the 23:55 IBC auto-restart and a dead Docker engine, overlapping. Why the loudest alert (a 20-hour Error 1100) was false, why `Weekday` 2–6 is correct and not a Mon–Fri bug, and the three evidence gaps to date (KAN-62…KAN-67)
+- `order-submitted-elsewhere.md` — `order_submitted_elsewhere` / `exit_submission_deferred`: an order held because another IB client has one working under its ref, or because IB did not answer; how each is retried, how to resolve, and the kill switch's blind-sell exception (KAN-112)
 - Reconciliation procedures (TBD)
 - Incident response/escalation procedures (TBD)
 

@@ -587,7 +587,9 @@ async def _cmd_cancel_probe(ib, config, args) -> int:
             findings[ref] = {
                 "ib_order_id": str(trade.order.orderId),
                 "find_order_by_ref": found,
-                "reachable_by_kill_path": found is not None,
+                # KAN-112: another client's order comes back as an
+                # OrderPlacedElsewhere, which the kill path cannot cancel.
+                "reachable_by_kill_path": isinstance(found, str),
             }
         _dump("executor recovery view of the resting stops", findings)
 

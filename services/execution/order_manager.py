@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
@@ -24,6 +24,73 @@ RESTORE_UNAVAILABLE_BACKOFF_SECONDS: tuple[float, ...] = (2.0, 5.0)
 # Order types the unfilled-limit sweep must not touch: neither has a limit to
 # reprice, and neither should be cancelled for still being open.
 _SWEEP_EXEMPT_ORDER_TYPES = frozenset({"market", "stop"})
+
+
+class SubmissionDeferredError(RuntimeError):
+    """The idempotency probe got no answer from IB; nothing was submitted.
+
+    KAN-112. Whether an order already exists for the recommendation is what
+    an unanswered ``reqAllOpenOrders``/``reqCompletedOrders`` cannot tell, and
+    placing one anyway is the duplicate risk itself. Not a failure of the
+    order: the caller leaves the intent where it is (APPROVED) and retries on
+    a later pass — it must never terminalize it on this.
+    """
+
+    def __init__(self, recommendation_id: str, reason: str) -> None:
+        super().__init__(
+            f"order for {recommendation_id} not submitted this pass: {reason}"
+        )
+        self.recommendation_id = recommendation_id
+        self.reason = reason
+
+
+class OrderPlacedElsewhereError(RuntimeError):
+    """Another IB client already has an order working for this recommendation.
+
+    KAN-112. Raised by every submit path instead of placing a second order.
+    The order manager has already paged (once per recommendation). The caller
+    leaves the intent APPROVED rather than terminalizing it: an order IS
+    working for it, and a terminal intent would let the risk service re-emit
+    the exit (or the verifier re-cover the stop) under a fresh id — the very
+    duplicate this exists to prevent. The caller re-probes it slowly (the
+    runner every few minutes, the stop verifier every scan), so it goes out
+    once that order is gone; a human decides whether that order stands.
+    """
+
+    def __init__(self, placement: Any, path: str) -> None:
+        super().__init__(
+            f"{placement.recommendation_id}: order {placement.order_id} is "
+            f"already working at IB under client id {placement.client_id}; "
+            f"{path} not submitted"
+        )
+        self.placement = placement
+        self.path = path
+
+
+# Async page for an order another client already has working (KAN-112). Gets
+# the executor's OrderPlacedElsewhere and the submit path's name.
+SubmittedElsewhereHandler = Callable[[Any, str], Awaitable[None]]
+
+
+@dataclass
+class KillProbe:
+    """One kill's shared view of the idempotency probe (KAN-112).
+
+    ``process_kill`` sells position after position, serially, each moments
+    after cancelling that position's protective stop, and it never retries. So
+    a kill liquidation is submitted even when IB does not answer whether an
+    order already exists — and after the first probe IB leaves unanswered,
+    the rest of this kill's sells skip it instead of each waiting out the same
+    bound (30 s per position against a hung Gateway). Every skipped or
+    unanswered probe still checks this session's own order state first.
+
+    What remains: a blind sell doubles an order for the same liquidation id
+    that a previous process placed (it crashed before the in-process map or
+    the ledger had it) when connect's best-effort open-order sync did not
+    cache it either, or one another client holds — while IB is not answering.
+    """
+
+    unanswered: bool = False
 
 
 @dataclass
@@ -84,6 +151,129 @@ class OrderManager:
         self._cancel_ack_backoff = CANCEL_ACK_BACKOFF_SECONDS
         self._restore_backoff = RESTORE_UNAVAILABLE_BACKOFF_SECONDS
 
+        # KAN-112: who to page when another client already has the order, and
+        # the recommendations already paged — every retry pass meets the same
+        # foreign order again, and the operator needs one page, not one per
+        # pass.
+        self._submitted_elsewhere_handler: SubmittedElsewhereHandler | None = None
+        self._submitted_elsewhere_paged: set[str] = set()
+
+    def set_submitted_elsewhere_handler(
+        self, handler: SubmittedElsewhereHandler | None
+    ) -> None:
+        """Wire the page for an order another IB client already has working."""
+        self._submitted_elsewhere_handler = handler
+
+    def forget_submitted_elsewhere(self, recommendation_id: str) -> None:
+        """The episode is over (intent resolved or abandoned): a new one pages."""
+        self._submitted_elsewhere_paged.discard(recommendation_id)
+
+    async def _existing_order(
+        self,
+        recommendation_id: str,
+        path: str,
+        *,
+        kill: KillProbe | None = None,
+    ) -> str | None:
+        """The idempotency probe every submit path runs before placing.
+
+        Returns the broker order id to adopt, or None when IB answered that
+        nothing exists under this ref (submit). Raises
+        :class:`OrderPlacedElsewhereError` when another client has one working
+        (paged once here) and :class:`SubmissionDeferredError` when IB did not
+        answer — including when it is not connected at all.
+
+        ``kill`` is the kill path's exception (KAN-112) — see
+        :class:`KillProbe`. On no answer it falls back to this session's own
+        order state (:meth:`IBExecutor.find_own_order_by_ref`) and otherwise
+        returns None, so the caller submits; a definite answer that another
+        client holds the order still blocks it.
+        """
+        from services.execution.ib_executor import (
+            BrokerStateUnavailableError,
+            OrderPlacedElsewhere,
+        )
+
+        if kill is not None and kill.unanswered:
+            self._logger.critical(
+                "IB did not answer this kill's idempotency probe; skipping it "
+                "for the rest of the kill",
+                recommendation_id=recommendation_id,
+                path=path,
+            )
+            return self._own_order_from_local_state(recommendation_id)
+        try:
+            found = await self._executor.find_order_by_ref(recommendation_id)
+        except BrokerStateUnavailableError as exc:
+            if kill is not None:
+                kill.unanswered = True
+                self._logger.critical(
+                    "IB did not answer the idempotency probe; submitting the "
+                    "kill liquidation unless this session already holds it",
+                    recommendation_id=recommendation_id,
+                    path=path,
+                    reason=str(exc),
+                )
+                return self._own_order_from_local_state(recommendation_id)
+            # Info, not warning: the runner throttles the per-order warning,
+            # and this repeats on every retry pass.
+            self._logger.info(
+                "IB did not answer the idempotency probe; not submitting "
+                "this pass",
+                recommendation_id=recommendation_id,
+                path=path,
+                reason=str(exc),
+            )
+            raise SubmissionDeferredError(recommendation_id, str(exc)) from exc
+        if isinstance(found, OrderPlacedElsewhere):
+            await self._page_submitted_elsewhere(found, path)
+            raise OrderPlacedElsewhereError(found, path)
+        # Any other answer ends a submitted-elsewhere episode for this ref.
+        self._submitted_elsewhere_paged.discard(recommendation_id)
+        if isinstance(found, (str, int)):
+            self._recovered.add(recommendation_id)
+            return str(found)
+        return None
+
+    def _own_order_from_local_state(self, recommendation_id: str) -> str | None:
+        finder = getattr(type(self._executor), "find_own_order_by_ref", None)
+        if finder is None:
+            return None
+        found = finder(self._executor, recommendation_id)
+        if isinstance(found, (str, int)):
+            self._logger.warning(
+                "Kill liquidation already placed by this session; adopting it",
+                recommendation_id=recommendation_id,
+                order_id=str(found),
+            )
+            self._recovered.add(recommendation_id)
+            return str(found)
+        return None
+
+    async def _page_submitted_elsewhere(self, placement: Any, path: str) -> None:
+        """Page once per episode; a dead alert path never unblocks it."""
+        first = placement.recommendation_id not in self._submitted_elsewhere_paged
+        log = self._logger.error if first else self._logger.info
+        log(
+            "Order not submitted: another IB client already has one working "
+            "for this recommendation",
+            recommendation_id=placement.recommendation_id,
+            other_order_id=placement.order_id,
+            other_client_id=placement.client_id,
+            path=path,
+        )
+        if self._submitted_elsewhere_handler is None or not first:
+            return
+        try:
+            await self._submitted_elsewhere_handler(placement, path)
+        except Exception:
+            self._logger.exception(
+                "Failed to page an order submitted elsewhere",
+                recommendation_id=placement.recommendation_id,
+            )
+            return
+        self._submitted_elsewhere_paged.add(placement.recommendation_id)
+
     async def submit_entry(
         self,
         ticker: str,
@@ -114,10 +304,9 @@ class OrderManager:
             )
             return self._submitted[recommendation_id]
 
-        recovered = await self._executor.find_order_by_ref(recommendation_id)
-        if isinstance(recovered, (str, int)):
-            order_id = str(recovered)
-            self._recovered.add(recommendation_id)
+        recovered = await self._existing_order(recommendation_id, "entry")
+        if recovered is not None:
+            order_id = recovered
         else:
             order_id = await self._executor.submit_limit_order(
                 ticker,
@@ -159,11 +348,17 @@ class OrderManager:
         ticker: str,
         quantity: int,
         recommendation_id: str,
+        *,
+        kill: KillProbe | None = None,
     ) -> str:
         """Submit a market exit order.
 
         Idempotent: if the recommendation_id has already been submitted,
         returns the existing order ID without submitting again.
+
+        ``kill`` marks the kill switch's own liquidation (``process_kill``),
+        shared across that kill's sells: it submits even when IB does not
+        answer the idempotency probe — see :class:`KillProbe`.
 
         Args:
             ticker: The stock ticker symbol.
@@ -182,10 +377,13 @@ class OrderManager:
             )
             return self._submitted[recommendation_id]
 
-        recovered = await self._executor.find_order_by_ref(recommendation_id)
-        if isinstance(recovered, (str, int)):
-            order_id = str(recovered)
-            self._recovered.add(recommendation_id)
+        recovered = await self._existing_order(
+            recommendation_id,
+            "kill_exit" if kill is not None else "exit",
+            kill=kill,
+        )
+        if recovered is not None:
+            order_id = recovered
         else:
             order_id = await self._executor.submit_market_order(
                 ticker, quantity, recommendation_id=recommendation_id
@@ -250,10 +448,9 @@ class OrderManager:
             )
             return self._submitted[recommendation_id]
 
-        recovered = await self._executor.find_order_by_ref(recommendation_id)
-        if isinstance(recovered, (str, int)):
-            order_id = str(recovered)
-            self._recovered.add(recommendation_id)
+        recovered = await self._existing_order(recommendation_id, "stop")
+        if recovered is not None:
+            order_id = recovered
         else:
             order_id = await self._executor.submit_stop_order(
                 ticker,
