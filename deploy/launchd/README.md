@@ -18,6 +18,7 @@ host. The **live** copies are deployed outside the repo:
 | `local.algo-pipeline-report.plist` | `~/Library/LaunchAgents/local.algo-pipeline-report.plist` |
 | `run_earnings_refresh.sh` | `~/ibc/run_earnings_refresh.sh` (chmod +x) — 04:45 SGT **daily** Alpha Vantage earnings refresh (KAN-110) |
 | `local.algo-earnings-refresh.plist` | `~/Library/LaunchAgents/local.algo-earnings-refresh.plist` |
+| `local.algo-earnings-topup.plist` | `~/Library/LaunchAgents/local.algo-earnings-topup.plist` — 05:05 SGT daily `run_earnings_refresh.sh --top-up` |
 
 ### The schedule, and why it is 05:15 (KAN-104)
 
@@ -31,7 +32,8 @@ chain now starts at 05:15, after the close in both seasons:
 
 | Job | Slot (SGT) | Days | ET under EDT / EST | Healthy duration |
 |---|---|---|---|---|
-| `local.algo-earnings-refresh` | 04:45 | daily | 16:45 / 15:45 | ~5 min free tier (bounded at 25 min → ends by 05:10) |
+| `local.algo-earnings-refresh` | 04:45 | daily | 16:45 / 15:45 | ~4 min free tier (bounded at 15 min → ends by 05:00) |
+| `local.algo-earnings-topup` | 05:05 | daily | 17:05 / 16:05 | <1 min (bounded at 8 min → ends by 05:13) |
 | `local.algo-paper-trading` | 05:15 | Tue–Sat | 17:15 / 16:15 | 6–9 min (bounded at 3h) |
 | `local.algo-divergence-monitor` | 05:45 | Tue–Sat | 17:45 / 16:45 | seconds |
 | `local.algo-pipeline-report` | 05:52 | Tue–Sat | 17:52 / 16:52 | seconds |
@@ -177,7 +179,7 @@ enforces it: a new wrapper with neither reddens the suite.
 | `run_backtest_refresh.sh` | `ALGO_DEADMAN_REFRESH_URL` | exit 0 only. Every abort path (missing snapshot, gateway down, timeout, failed backtest) routes through `refresh_exit()`, so a new early exit cannot become a healthy beat by omission. |
 | `run_db_backup.sh` | `ALGO_DEADMAN_BACKUP_URL` | a verified, readable dump exists |
 | `run_evidence_digest.sh` | `ALGO_DEADMAN_DIGEST_URL` | the digest was **delivered** (pinged from `scripts/ops/evidence_digest.py`, which is the only thing that knows the send succeeded) |
-| `run_earnings_refresh.sh` | `ALGO_DEADMAN_EARNINGS_URL` | exit 0 only: `earnings.json`'s `fetched_at` was advanced. INCOMPLETE (3) and FAILED (2) save progress, Telegram, and do not ping. |
+| `run_earnings_refresh.sh` | `ALGO_DEADMAN_EARNINGS_URL` | the 04:45 full run, exit 0 only: `earnings.json`'s `fetched_at` was advanced. INCOMPLETE (3), FAILED (2), lock held (75) and timeout (124) do not ping. The 05:05 `--top-up` run never pings (it cannot advance `fetched_at`); its failures Telegram. |
 | `run_pipeline_report.sh` | — | **is** a dead-man: its whole output is a daily message, so a missed run shows up as a missing report. The jobs it reports on carry their own checks. |
 | `gateway_watchdog.sh` | — | `StartInterval`, so it has no slot to miss; a dead watchdog surfaces as an unreachable Gateway in the paper run and the refresh, both of which alert and both of which ping. The host-wide case belongs to `DEADMAN_WATCHDOG_URL`. |
 
@@ -385,7 +387,7 @@ canonical` line if it was launched from a drifted copy.
 | `run_backtest_refresh.sh` | weekly backtest refresh, Tue 06:30 |
 | `run_db_backup.sh` | daily paper-DB backup |
 | `run_divergence.sh` | daily divergence monitor, 05:45 |
-| `run_earnings_refresh.sh` | daily earnings refresh, 04:45 |
+| `run_earnings_refresh.sh` | daily earnings refresh, 04:45, and its top-up, 05:05 |
 | `run_evidence_digest.sh` | evidence digest |
 | `run_paper.sh` | daily paper trading run, 05:15 |
 | `run_pipeline_report.sh` | daily pipeline report, 05:52 |
@@ -787,34 +789,50 @@ chain strictly sequential, and the 6h bound ends by 12:30, ahead of the
 
 ## Daily earnings refresh (KAN-110)
 
-Runs `run_earnings_refresh.sh` at **04:45 SGT every day, weekends included**
-— `scripts/fetch_earnings.py --universe pit` against Alpha Vantage, merged
-atomically into `data.cache_dir/earnings.json` (plus `earnings_calendar.json`
-and `earnings_fetch_state.json` beside it). KAN-109 degrades `earnings_drift`
-once `earnings.json` is 2 days old, so a Tue–Sat job would degrade it every
-Tuesday. The slot is the US afternoon of the session the 05:15 paper run
-prices (16:45 EDT / 15:45 EST): that session's pre-market actuals reach the
-paper run on their report date, and the previous evening's post-market ones
-are a day old. Full rationale in the wrapper header.
+Two jobs, one wrapper, **every day, weekends included**:
+
+| Job | Slot (SGT) | Runs | Requests (free tier) |
+|---|---|---|---|
+| `local.algo-earnings-refresh` | 04:45 | `scripts/fetch_earnings.py --universe pit` | 1 calendar + ≤16 EARNINGS |
+| `local.algo-earnings-topup` | 05:05 | `scripts/fetch_earnings.py --top-up` | ≤4 EARNINGS, no calendar |
+
+Both merge atomically into `data.cache_dir/earnings.json` (plus
+`earnings_calendar.json` and `earnings_fetch_state.json` beside it). KAN-109
+degrades `earnings_drift` once `earnings.json` is 2 days old, so a Tue–Sat job
+would degrade it every Tuesday. 04:45 is the US afternoon (16:45 EDT / 15:45
+EST) of the session the 05:15 paper run prices: that session's pre-market
+actuals reach the paper run on their report date. Its after-market reports
+(~16:05 ET) are what the 05:05 top-up (17:05 EDT) is for; under EST it is too
+early, so those enter a session late and Friday after-market reports are lost
+— an expected divergence, documented in
+[`portfolio-2026-05.md`](../../docs/strategies/portfolio-2026-05.md#expected-divergence-earnings_drift-after-market-reports-kan-110).
+Only the 04:45 run can advance `fetched_at` or ping the dead-man. Full
+rationale in the wrapper header.
 
 - **Key:** `ALPHAVANTAGE_API_KEY` in the keychain (service `algo-poc`; source
   of truth `op://Personal/AlphaVantage/credential`). A *job credential*:
   `secrets.sh --check` lists it under its own heading without failing on it,
   `--import` prompts for it, `--export`/`--env-file` never emit it. Missing →
   the job aborts with ❌ + `ALERTS.log`.
-- **Budget (free tier, 25 requests/day):** 1 calendar call + up to 20
-  EARNINGS calls, 13 s apart (`data.earnings.refresh` in
-  `config/default.yaml`). A paid plan is a config change: raise
-  `calls_per_run`, lower `min_interval_seconds`.
-- **Exit codes / Telegram:** 0 = current, dead-man pinged (⚠️ only if a live
-  ticker has no Alpha Vantage data); 3 = INCOMPLETE ⚠️ (budget ran out first —
-  expected for the first ~5 days of a fresh cache); 2 = FAILED ❌ (rate limit
-  or refusal; progress saved); 124 = timed out ⏱️; 1 = could not run ❌. Only
-  0 advances `fetched_at` and pings.
-- **Logs:** `~/ibc/logs/earnings_refresh_YYYYMMDD.log` (pruned after 30 days),
-  launchd stdout/stderr to `~/ibc/logs/earnings-refresh-launchd.log`.
-- **By hand:** `.venv/bin/python scripts/fetch_earnings.py --dry-run` prints the
-  plan without a request; the script reads the key from the keychain itself.
+- **Budget (free tier, 25 requests/day):** 17 + 4 = 21 a day, 13 s apart,
+  retries included (`data.earnings.refresh` in `config/default.yaml`). A paid
+  plan is a config change: raise `calls_per_run`, lower
+  `min_interval_seconds`.
+- **Failures:** a transport error is retried once, then that ticker is
+  skipped; 3 in a row stop the run. A live ticker Alpha Vantage refuses
+  (`Error Message`) on 3 consecutive days stops gating freshness and is
+  Telegrammed every run (`LIVE_REFUSED`) until mapped in `symbol_overrides`.
+- **Exit codes / Telegram (04:45):** 0 = current, dead-man pinged (⚠️ only for
+  `LIVE_NO_DATA` / `LIVE_REFUSED`); 3 = INCOMPLETE ⚠️ (budget ran out first —
+  expected for the first ~7 days of a fresh cache); 2 = FAILED ❌; 75 = lock
+  held ⚠️; 124 = timed out ⏱️ (progress saved); 1 = could not run ❌. Only 0
+  advances `fetched_at` and pings. **05:05:** 0 and 75 are silent; 1, 2 and
+  124 Telegram; never pings.
+- **Logs:** `~/ibc/logs/earnings_refresh_YYYYMMDD.log` (both runs, pruned after
+  30 days), launchd stdout/stderr to `~/ibc/logs/earnings-refresh-launchd.log`.
+- **By hand:** `.venv/bin/python scripts/fetch_earnings.py --dry-run [--top-up]`
+  prints the plan without a request; the script reads the key from the
+  keychain itself.
 
 ## Daily paper-DB backup
 

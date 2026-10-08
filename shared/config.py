@@ -299,15 +299,24 @@ class FundamentalsCacheConfig(BaseModel):
 class EarningsRefreshConfig(BaseModel):
     """How ``scripts/fetch_earnings.py`` spends its Alpha Vantage quota (KAN-110).
 
-    The defaults fit the FREE tier: 25 requests a day. One run is one
-    EARNINGS_CALENDAR call plus at most ``calls_per_run`` EARNINGS calls, so
-    21 a day, leaving 4 for a hand-run. A paid tier is a config change only:
-    raise ``calls_per_run`` (e.g. 1000) and lower ``min_interval_seconds`` to
-    the plan's per-minute limit (75/min -> 0.9).
+    The defaults fit the FREE tier: 25 requests a day. The 04:45 full run is
+    one EARNINGS_CALENDAR call plus at most ``calls_per_run`` EARNINGS
+    requests (16 -> 17), and the 05:05 top-up at most ``topup_calls`` (4):
+    21 a day, leaving 4 for a hand-run. Retries spend from the same budgets.
+    A paid tier is a config change only: raise ``calls_per_run`` (e.g. 1000)
+    and lower ``min_interval_seconds`` to the plan's per-minute limit
+    (75/min -> 0.9).
     """
 
-    #: EARNINGS calls per run, after the one calendar call.
-    calls_per_run: int = Field(default=20, ge=0)
+    #: EARNINGS requests per full run, after the one calendar call.
+    calls_per_run: int = Field(default=16, ge=0)
+    #: EARNINGS requests per 05:05 top-up run (no calendar call).
+    topup_calls: int = Field(default=4, ge=0)
+    #: The top-up asks reports dated today or within this many days before.
+    topup_recent_days: int = Field(default=1, ge=0)
+    #: The top-up re-asks a reporter the full run asked this long ago. Shorter
+    #: than the 20 min between the slots, so the 04:45 asks are eligible.
+    topup_refetch_minutes: float = Field(default=10.0, ge=0)
     #: Minimum spacing between any two requests. The free tier also limits
     #: bursts; 13 s keeps a run under 5 a minute.
     min_interval_seconds: float = Field(default=13.0, ge=0)
@@ -322,6 +331,13 @@ class EarningsRefreshConfig(BaseModel):
     #: not yet have, counts as current (it was asked); it is asked again on
     #: the next daily run. Also the floor for the stalest-first top-up.
     refetch_after_hours: float = Field(default=20.0, ge=0)
+    #: A live ticker Alpha Vantage refuses ("Error Message") on this many
+    #: consecutive days is excluded from the freshness gate and alerted on
+    #: every run (LIVE_REFUSED), instead of holding the sleeve degraded forever.
+    refusal_exclude_after_days: int = Field(default=3, ge=1)
+    #: Transport/malformed failures (each already retried once) in a row
+    #: before the run stops; a single one only skips that ticker.
+    max_consecutive_errors: int = Field(default=3, ge=1)
     calendar_horizon: Literal["3month", "6month", "12month"] = "3month"
     #: Calendar entries are kept this many days after their report date, so a
     #: report that has dropped off Alpha Vantage's forward-looking calendar is

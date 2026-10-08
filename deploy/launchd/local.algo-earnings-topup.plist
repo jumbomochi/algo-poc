@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Disabled</key>
+	<false/>
+	<key>Label</key>
+	<string>local.algo-earnings-topup</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/huiliang/ibc/run_earnings_refresh.sh</string>
+		<string>--top-up</string>
+	</array>
+	<key>StandardErrorPath</key>
+	<string>/Users/huiliang/ibc/logs/earnings-refresh-launchd.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/huiliang/ibc/logs/earnings-refresh-launchd.log</string>
+	<!-- 05:05 SGT EVERY day (KAN-110 review). The top-up: at most 4 Alpha
+	     Vantage requests, no calendar call, for live tickers whose report is
+	     dated today/yesterday (ET) and still lacks an actual — chiefly the
+	     after-market report of the session the 05:15 paper run prices, which
+	     the 04:45 run is too early for. 05:05 is 17:05 EDT (an hour after a
+	     16:05 release) and 16:05 EST (too early: in EST months these still
+	     enter a day late). Bounded at 8 min, so it ends before 05:15. Never
+	     moves fetched_at, never pings the dead-man. A separate plist, not a
+	     second StartCalendarInterval on local.algo-earnings-refresh, because
+	     launchd passes both slots the same arguments. -->
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>5</integer>
+		<key>Minute</key>
+		<integer>5</integer>
+	</dict>
+</dict>
+</plist>

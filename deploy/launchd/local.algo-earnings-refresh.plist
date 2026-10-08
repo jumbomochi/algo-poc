@@ -21,7 +21,9 @@
 	     prices, so that session's pre-market actuals reach the paper run on
 	     their report date, and the previous evening's post-market actuals are
 	     a day old. Ahead of the whole KAN-104 chain, and it uses neither IB nor
-	     the database. Rationale in full: run_earnings_refresh.sh header. -->
+	     the database. Bounded at 15 min, so it ends before the 05:05 top-up
+	     (local.algo-earnings-topup), which catches the after-market reports
+	     04:45 is too early for. Rationale in full: run_earnings_refresh.sh. -->
 	<key>StartCalendarInterval</key>
 	<dict>
 		<key>Hour</key>

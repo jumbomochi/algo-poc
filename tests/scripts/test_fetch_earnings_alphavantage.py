@@ -119,6 +119,7 @@ def _client(transport, sleep=None) -> fe.AlphaVantageClient:
 
 
 def _run(tmp_path, av, *, live, universe=None, budget=20, now=NOW, **kw):
+    kw.setdefault("termination", fe._Termination())
     return fe.run_refresh(
         client=_client(av),
         cache_dir=tmp_path,
@@ -243,8 +244,10 @@ def test_the_shipped_config_carries_the_verified_renames():
 
     cfg = load_config("config/default.yaml").data.earnings.refresh
     assert cfg.symbol_overrides == {"MMC": "MRSH", "FI": "FISV"}
-    # Free tier: one calendar call + the budget must leave headroom under 25/day.
-    assert cfg.calls_per_run + 1 <= 22
+    # Free tier: the 04:45 run (calendar + budget) and the 05:05 top-up together
+    # must leave headroom under 25 requests/day.
+    assert cfg.calls_per_run + 1 + cfg.topup_calls <= 21
+    assert cfg.topup_calls >= 1
     assert cfg.min_interval_seconds >= 12
 
 
@@ -529,7 +532,9 @@ def test_termination_mid_run_saves_progress(tmp_path):
 
     av = FakeAV(raise_on={"B": terminate})
     result = _run(tmp_path, av, live=["A", "B", "C"])
-    assert result.exit_code == 2 and "terminated" in result.stopped
+    # 124, the wrapper's timeout code: a kill is not "Alpha Vantage refused".
+    assert result.exit_code == 124 and result.status == "TERMINATED"
+    assert "terminated" in result.stopped
     assert set(_doc(tmp_path).data) == {"A"}
     assert _doc(tmp_path).fetched_at is None
 
@@ -681,3 +686,293 @@ def test_the_recorded_mrsh_payload_serves_mmc():
     assert rows[-1]["earnings_date"] == "2026-07-21"
     assert rows[-1]["timing"] == "bmo"
     assert rows[-1]["surprise_pct"] == 2.78
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups (PR #236)
+# ---------------------------------------------------------------------------
+
+
+def test_a_sigterm_during_the_persist_step_waits_for_the_write(tmp_path, monkeypatch):
+    """The kill lands while earnings.json is being written: the write
+    completes, the run reports 124, and it never crashes with exit 1."""
+    term = fe._Termination()
+    real_write = fe.write_cache_document
+    hits = []
+
+    def write_then_signal(path, *args, **kwargs):
+        if Path(path).name == EARNINGS_FILE:
+            term.handle(15, None)  # shielded: recorded, not raised
+            hits.append(path)
+        return real_write(path, *args, **kwargs)
+
+    monkeypatch.setattr(fe, "write_cache_document", write_then_signal)
+    result = _run(tmp_path, FakeAV(), live=["A", "B"], termination=term)
+    assert hits, "the persist step never ran"
+    assert result.exit_code == 124 and result.status == "TERMINATED"
+    doc = _doc(tmp_path)
+    assert set(doc.data) == {"A", "B"}
+    assert json.loads((tmp_path / EARNINGS_STATE_FILE).read_text())["tickers"]["B"]["status"] == "ok"
+
+
+def test_a_real_sigterm_exits_124_with_progress_saved(tmp_path):
+    """End to end in a subprocess: SIGTERM mid-run (what lib/bounded.sh sends
+    on timeout) must come out as 124, not 2 and never a dead-man ping."""
+    import os
+    import signal as _signal
+    import subprocess
+    import sys
+    import textwrap
+
+    ready = tmp_path / "ready"
+    driver = tmp_path / "driver.py"
+    driver.write_text(textwrap.dedent(f"""
+        import json, sys, time, urllib.parse
+        sys.path.insert(0, {str(Path.cwd())!r})
+        from scripts import fetch_earnings as fe
+        from pathlib import Path
+
+        def transport(url, timeout):
+            q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(url).query))
+            if q["function"] == "EARNINGS_CALENDAR":
+                return b"symbol,name,reportDate,fiscalDateEnding,estimate,currency,timeOfTheDay\\n"
+            if q["symbol"] == "B":
+                Path({str(ready)!r}).write_text("x")
+                time.sleep(60)
+            return json.dumps({{"symbol": q["symbol"], "quarterlyEarnings": [
+                {{"fiscalDateEnding": "2026-06-30", "reportedDate": "2026-07-20",
+                  "reportedEPS": "2", "estimatedEPS": "1.9", "reportTime": "pre-market"}}]}}).encode()
+
+        sys.exit(fe.main(["--tickers", "A,B,C", "--cache-dir", {str(tmp_path / "cache")!r},
+                          "--min-interval", "0"], transport=transport,
+                         env={{"ALPHAVANTAGE_API_KEY": "K"}}))
+    """))
+    proc = subprocess.Popen([sys.executable, str(driver)], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+    import time as _time
+    deadline = _time.monotonic() + 30
+    while not ready.exists():
+        assert proc.poll() is None, proc.communicate()
+        assert _time.monotonic() < deadline, "driver never reached ticker B"
+        _time.sleep(0.05)
+    os.kill(proc.pid, _signal.SIGTERM)
+    out, err = proc.communicate(timeout=30)
+    assert proc.returncode == 124, out + err
+    assert "status=TERMINATED" in out
+    doc = read_cache_document(tmp_path / "cache" / EARNINGS_FILE)
+    assert set(doc.data) == {"A"} and doc.fetched_at is None
+
+
+def test_main_reports_124_when_terminated_before_the_run(tmp_path, monkeypatch, capsys):
+    def killed(**kwargs):
+        raise fe.Terminated()
+
+    monkeypatch.setattr(fe, "run_refresh", killed)
+    rc = fe.main(["--tickers", "A", "--cache-dir", str(tmp_path)],
+                 transport=lambda url, t: b"", env={fe.API_KEY_VAR: KEY})
+    assert rc == 124
+    assert "status=TERMINATED" in capsys.readouterr().out
+
+
+def test_lock_held_is_a_skip_not_an_error(tmp_path, capsys):
+    with fe._CacheLock(tmp_path):
+        rc = fe.main(["--tickers", "A", "--cache-dir", str(tmp_path), "--top-up"],
+                     transport=lambda url, t: pytest.fail("made a request"),
+                     env={fe.API_KEY_VAR: KEY})
+    assert rc == 75
+    assert "status=SKIPPED" in capsys.readouterr().out
+
+
+# --- refusals ---------------------------------------------------------------
+
+REFUSED = json.dumps({"Error Message": "Invalid API call."}).encode()
+
+
+def test_a_live_ticker_refused_three_days_running_stops_blocking_the_stamp(tmp_path):
+    live = ["A", "BAD"]
+    for day in range(2):
+        result = _run(tmp_path, FakeAV(earnings={"BAD": REFUSED}), live=live,
+                      now=NOW + timedelta(days=day))
+        assert result.status == "FAILED", day
+        assert _doc(tmp_path).fetched_at is None
+        assert not any(m.startswith("LIVE_REFUSED") for m in result.messages)
+    third = NOW + timedelta(days=2)
+    result = _run(tmp_path, FakeAV(earnings={"BAD": REFUSED}), live=live, now=third)
+    assert result.status == "CURRENT" and result.exit_code == 0
+    assert _doc(tmp_path).fetched_at == third
+    [alert] = [m for m in result.messages if m.startswith("LIVE_REFUSED: ")]
+    assert "BAD" in alert and "symbol_overrides" in alert
+    # Still excluded, still asked once a day, and still alerted every run.
+    av = FakeAV(earnings={"BAD": REFUSED})
+    result = _run(tmp_path, av, live=live, now=third + timedelta(days=1))
+    assert result.status == "CURRENT" and "BAD" in av.symbols()
+    assert any(m.startswith("LIVE_REFUSED: ") for m in result.messages)
+
+
+def test_refusals_count_days_not_calls_and_a_success_resets_them(tmp_path):
+    live = ["A", "BAD"]
+    for hours in (0, 1, 2, 3):  # four runs, one US day
+        _run(tmp_path, FakeAV(earnings={"BAD": REFUSED}), live=live,
+             now=NOW + timedelta(hours=hours))
+    state = json.loads((tmp_path / EARNINGS_STATE_FILE).read_text())["tickers"]["BAD"]
+    assert state["refusal_streak"] == 1
+    _run(tmp_path, FakeAV(earnings={"BAD": REFUSED}), live=live, now=NOW + timedelta(days=1))
+    _run(tmp_path, FakeAV(), live=live, now=NOW + timedelta(days=2))  # AV relents
+    state = json.loads((tmp_path / EARNINGS_STATE_FILE).read_text())["tickers"]["BAD"]
+    assert state["refusal_streak"] == 0
+
+
+# --- transport errors -------------------------------------------------------
+
+
+class Flaky:
+    """Fails the first ``failures`` requests for each listed symbol."""
+
+    def __init__(self, inner: FakeAV, failures: dict[str, int]):
+        self.inner = inner
+        self.left = dict(failures)
+
+    def __call__(self, url, timeout):
+        params = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(url).query))
+        symbol = params.get("symbol")
+        if self.left.get(symbol, 0) > 0:
+            self.left[symbol] -= 1
+            self.inner.requests.append(params)
+            raise OSError(f"HTTP Error 503: Service Unavailable for {url}")
+        return self.inner(url, timeout)
+
+
+def test_a_transient_transport_error_is_retried_once(tmp_path):
+    av = FakeAV()
+    result = fe.run_refresh(
+        client=_client(Flaky(av, {"B": 1})), cache_dir=tmp_path, live=["A", "B", "C"],
+        universe=["A", "B", "C"], budget=20, now=lambda: NOW, log=lambda l: None,
+        termination=fe._Termination(),
+    )
+    assert result.status == "CURRENT"
+    assert av.symbols() == ["A", "B", "B", "C"]
+
+
+def test_a_persistent_error_skips_the_ticker_and_the_run_carries_on(tmp_path):
+    av = FakeAV()
+    result = fe.run_refresh(
+        client=_client(Flaky(av, {"B": 2})), cache_dir=tmp_path, live=["A", "B", "C"],
+        universe=["A", "B", "C"], budget=20, now=lambda: NOW, log=lambda l: None,
+        termination=fe._Termination(),
+    )
+    assert result.fetched == ["A", "C"] and result.errored == ["B"]
+    assert result.stopped is None
+    assert result.status == "FAILED"  # a live ticker could not be fetched
+    assert set(_doc(tmp_path).data) == {"A", "C"}
+
+
+def test_consecutive_errors_stop_the_run(tmp_path):
+    av = FakeAV()
+    result = fe.run_refresh(
+        client=_client(Flaky(av, {"B": 2, "C": 2, "D": 2})), cache_dir=tmp_path,
+        live=["A", "B", "C", "D", "E"], universe=["A", "B", "C", "D", "E"], budget=20,
+        now=lambda: NOW, log=lambda l: None, termination=fe._Termination(),
+        max_consecutive_errors=3,
+    )
+    assert result.errored == ["B", "C", "D"]
+    assert "consecutive" in result.stopped
+    assert "E" not in av.symbols()
+    assert result.exit_code == 2
+
+
+def test_retries_spend_the_budget(tmp_path):
+    av = FakeAV()
+    result = fe.run_refresh(
+        client=_client(Flaky(av, {"A": 1})), cache_dir=tmp_path, live=["A", "B", "C"],
+        universe=["A", "B", "C"], budget=3, now=lambda: NOW, log=lambda l: None,
+        termination=fe._Termination(),
+    )
+    assert av.symbols() == ["A", "A", "B"]
+    assert result.status == "INCOMPLETE"
+
+
+# --- the 05:05 top-up -------------------------------------------------------
+
+
+def _seed_current(tmp_path, live, calendar_rows):
+    """A 04:45 full run that asked every reporter before AV had the actual."""
+    morning = datetime(2026, 10, 9, 20, 45, tzinfo=timezone.utc)  # 04:45 SGT Sat = 16:45 EDT Fri
+    _run(tmp_path, FakeAV(), live=live, now=morning - timedelta(days=1))
+    _run(tmp_path, FakeAV(calendar=_calendar_body(calendar_rows)), live=live, now=morning)
+    doc = _doc(tmp_path)
+    assert doc.fetched_at == morning
+    return morning
+
+
+def test_the_top_up_fetches_todays_reporters_and_never_moves_fetched_at(tmp_path):
+    live = ["A", "B", "C", "D"]
+    morning = _seed_current(tmp_path, live, [
+        ("A", "2026-10-09", "post-market"),   # Friday after-market, today in ET
+        ("B", "2026-10-08", "post-market"),   # yesterday
+        ("C", "2026-10-05", "pre-market"),    # outside the top-up's window
+    ])
+    topup_at = morning + timedelta(minutes=20)  # 05:05 SGT
+    fresh = {"A": [_quarter("2026-10-09", "3.0", "2.0", fiscal="2026-09-30", timing="post-market")]}
+    av = FakeAV(earnings=fresh)
+    result = _run(tmp_path, av, live=live, budget=4, now=topup_at, top_up=True,
+                  recent_days=1, refetch_after_hours=10 / 60)
+    assert [r["function"] for r in av.requests] == ["EARNINGS", "EARNINGS"], "no calendar call"
+    assert av.symbols() == ["A", "B"], "newest report first, C is out of the window"
+    assert result.status == "TOPUP" and result.exit_code == 0
+    doc = _doc(tmp_path)
+    assert doc.fetched_at == morning, "the top-up must never move fetched_at"
+    assert doc.data["A"][-1]["surprise_pct"] == 50.0
+    lookup = fe.build_earnings_lookup(doc.data)
+    assert lookup("A", date(2026, 10, 9))["surprise_pct"] == 50.0
+
+
+def test_the_top_up_is_capped_and_skips_a_ticker_asked_minutes_ago(tmp_path):
+    live = [f"T{i}" for i in range(6)]
+    morning = _seed_current(tmp_path, live, [(t, "2026-10-09", "post-market") for t in live])
+    av = FakeAV()
+    _run(tmp_path, av, live=live, budget=4, now=morning + timedelta(minutes=20),
+         top_up=True, recent_days=1, refetch_after_hours=10 / 60)
+    assert av.symbols() == ["T5", "T4", "T3", "T2"]
+    # Five minutes later the four just asked are not due; the other two are.
+    av = FakeAV()
+    _run(tmp_path, av, live=live, budget=4, now=morning + timedelta(minutes=25),
+         top_up=True, recent_days=1, refetch_after_hours=10 / 60)
+    assert av.symbols() == ["T1", "T0"]
+
+
+def test_the_top_up_with_nothing_due_makes_no_request(tmp_path):
+    live = ["A"]
+    morning = _seed_current(tmp_path, live, [])
+    av = FakeAV()
+    result = _run(tmp_path, av, live=live, budget=4, now=morning + timedelta(minutes=20),
+                  top_up=True, recent_days=1, refetch_after_hours=10 / 60)
+    assert av.requests == [] and result.exit_code == 0
+
+
+def test_the_top_up_without_a_stored_calendar_fails_without_requests(tmp_path):
+    av = FakeAV()
+    result = _run(tmp_path, av, live=["A"], top_up=True)
+    assert av.requests == [] and result.exit_code == 2
+    assert "calendar" in result.stopped
+
+
+def test_the_shipped_top_up_config_reaches_the_04_45_asks():
+    from shared.config import load_config
+
+    cfg = load_config("config/default.yaml").data.earnings.refresh
+    # The slots are 20 min apart; the full run's asks must be eligible again.
+    assert cfg.topup_refetch_minutes < 20
+    assert cfg.topup_recent_days >= 1
+
+
+# --- source ----------------------------------------------------------------
+
+
+def test_source_is_truthful_on_a_mixed_cache(tmp_path):
+    legacy = {"Z": [{"earnings_date": "2025-01-01", "actual_eps": 1.0,
+                     "estimate_eps": 1.0, "surprise_pct": 0.0}]}
+    (tmp_path / EARNINGS_FILE).write_text(json.dumps(legacy))
+    _run(tmp_path, FakeAV(), live=["A"])
+    assert _doc(tmp_path).source == "alphavantage+yfinance-legacy"
+    _run(tmp_path, FakeAV(), live=["A", "Z"], now=NOW + timedelta(days=1))
+    assert _doc(tmp_path).source == "alphavantage"

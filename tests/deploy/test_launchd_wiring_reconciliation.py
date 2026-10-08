@@ -36,6 +36,7 @@ ALL_JOBS = [
     "local.algo-db-backup",
     "local.algo-divergence-monitor",
     "local.algo-earnings-refresh",
+    "local.algo-earnings-topup",
     "local.algo-evidence-digest",
     "local.algo-gateway-watchdog",
     "local.algo-paper-trading",

@@ -444,6 +444,14 @@ the artifact `config.data_degraded`). The periods in which these sleeves'
 evidence was produced from missing or stale caches are on record in
 `shared/data_gaps.py`.
 
+Since KAN-110 the earnings cache is refreshed from Alpha Vantage at 04:45 SGT
+daily, with a 05:05 top-up. After-market reports often miss the 05:15 paper
+run of their own session, so live `earnings_drift` enters them a session
+later than the backtest, and Friday after-market reports are lost in EST
+months (always) and in EDT months whenever Alpha Vantage has not published by
+17:05 ET. This is an expected divergence; see
+[`strategies/portfolio-2026-05.md`](strategies/portfolio-2026-05.md#expected-divergence-earnings_drift-after-market-reports-kan-110).
+
 ### Universe Registry
 
 Each strategy defines its own ticker universe via `UNIVERSE_REGISTRY`. Bar data is fetched once for the union of all universes. Currently defined universes:

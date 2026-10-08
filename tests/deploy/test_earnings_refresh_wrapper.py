@@ -24,6 +24,7 @@ import pytest
 DEPLOY_DIR = Path("deploy/launchd")
 WRAPPER = DEPLOY_DIR / "run_earnings_refresh.sh"
 PLIST = DEPLOY_DIR / "local.algo-earnings-refresh.plist"
+TOPUP_PLIST = DEPLOY_DIR / "local.algo-earnings-topup.plist"
 PING_URL = "https://hc.example.test/ping/earnings-1234"
 AV_KEY = "STUBAVKEY987654"
 
@@ -37,7 +38,8 @@ def _exec(path: Path, body: str) -> Path:
     return path
 
 
-def _drive(tmp_path: Path, *, exit_code: int, output: str = "", av_key: bool = True):
+def _drive(tmp_path: Path, *, exit_code: int, output: str = "", av_key: bool = True,
+           args: tuple[str, ...] = ()):
     tree = tmp_path / "algo-dir"
     shutil.copytree(DEPLOY_DIR, tree / "deploy" / "launchd")
     argv_log = tmp_path / "python-argv.log"
@@ -80,7 +82,7 @@ def _drive(tmp_path: Path, *, exit_code: int, output: str = "", av_key: bool = T
         "ALGO_BOUNDED_POLL_SECONDS": "1",
     }
     result = subprocess.run(
-        ["/bin/bash", str(tree / "deploy" / "launchd" / WRAPPER.name)],
+        ["/bin/bash", str(tree / "deploy" / "launchd" / WRAPPER.name), *args],
         capture_output=True, text=True, timeout=120, env=env,
     )
     logs = list((home / "ibc" / "logs").glob("earnings_refresh_*.log"))
@@ -129,7 +131,8 @@ def test_a_current_run_with_a_live_ticker_without_data_warns_but_still_pings(tmp
 
 @pytest.mark.parametrize(
     "code, marker",
-    [(3, "INCOMPLETE"), (2, "FAILED"), (1, "could not run"), (7, "could not run")],
+    [(3, "INCOMPLETE"), (2, "FAILED"), (1, "could not run"), (7, "could not run"),
+     (75, "SKIPPED"), (124, "TIMED OUT")],
 )
 def test_every_other_outcome_alerts_and_withholds_the_ping(tmp_path, code, marker):
     summary = f"EARNINGS_REFRESH status=X calls=4 stopped='limit: Note: ...'"
@@ -188,12 +191,20 @@ def test_an_earlier_runs_summary_is_not_reported_as_this_runs(tmp_path):
     assert "no summary line" in sends[0]
 
 
-def test_the_wrapper_is_bounded_so_it_cannot_run_into_the_paper_run():
+def _default(text: str, var: str) -> int:
+    return int(text.split(f"{var}:-", 1)[1].split("}", 1)[0])
+
+
+def test_both_runs_are_bounded_so_neither_reaches_the_paper_run():
     text = WRAPPER.read_text()
     assert 'algo_run_bounded "$EARNINGS_TIMEOUT"' in text
-    default = int(text.split('ALGO_EARNINGS_TIMEOUT_SECONDS:-', 1)[1].split('}', 1)[0])
-    # 04:45 + timeout + the bounded helper's 20 s kill grace must end before 05:15.
-    assert default + 20 < 30 * 60
+    grace = 20  # lib/bounded.sh's kill grace
+    full = _default(text, "ALGO_EARNINGS_TIMEOUT_SECONDS")
+    topup = _default(text, "ALGO_EARNINGS_TOPUP_TIMEOUT_SECONDS")
+    # 04:45 + full must end before the 05:05 top-up starts...
+    assert full + grace < 20 * 60
+    # ...and 05:05 + top-up before the 05:15 paper run.
+    assert topup + grace < 10 * 60
 
 
 # ---------------------------------------------------------------------------
@@ -281,3 +292,88 @@ def test_check_reports_the_key_without_failing_on_its_absence(tmp_path):
     absent = _check(tmp_path, with_key=False)
     assert absent.returncode == 0, absent.stdout
     assert "ABSENT  ALPHAVANTAGE_API_KEY" in absent.stdout
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups (PR #236)
+# ---------------------------------------------------------------------------
+
+
+def test_a_timeout_is_reported_as_a_timeout_and_never_pings(tmp_path):
+    """The fetcher exits 124 on SIGTERM; before the fix it exited 2 and this
+    branch was dead, so a timeout read as 'Alpha Vantage refused'."""
+    run = _drive(tmp_path, exit_code=124, output="EARNINGS_REFRESH mode=full status=TERMINATED")
+    assert run["rc"] == 124
+    assert _pings(run) == []
+    [message] = _telegrams(run)
+    assert "TIMED OUT" in message and "FAILED" not in message
+
+
+def test_live_refused_is_alerted_even_on_a_current_run(tmp_path):
+    output = ("LIVE_REFUSED: Alpha Vantage has refused BAD on 3+ consecutive days; "
+              "map it in data.earnings.refresh.symbol_overrides\n" + CURRENT)
+    run = _drive(tmp_path, exit_code=0, output=output)
+    assert run["rc"] == 0 and len(_pings(run)) == 1
+    [message] = _telegrams(run)
+    assert "BAD" in message and "symbol_overrides" in message
+
+
+TOPUP_OK = "EARNINGS_REFRESH mode=top-up status=TOPUP calls=2 fetched=2"
+
+
+def test_the_top_up_runs_the_fetcher_in_top_up_mode_and_never_pings(tmp_path):
+    run = _drive(tmp_path, exit_code=0, output=TOPUP_OK, args=("--top-up",))
+    assert run["rc"] == 0, run["log"] + run["stderr"]
+    assert "scripts/fetch_earnings.py --top-up" in run["argv"]
+    assert "--universe" not in run["argv"]
+    assert _pings(run) == [] and _telegrams(run) == []
+    assert "earnings top-up OK" in run["log"]
+    assert "top-up runs never ping" in run["log"]
+
+
+def test_a_top_up_that_finds_the_lock_held_is_silent(tmp_path):
+    run = _drive(tmp_path, exit_code=75, output="EARNINGS_REFRESH mode=top-up status=SKIPPED",
+                 args=("--top-up",))
+    assert run["rc"] == 75
+    assert _telegrams(run) == [] and _pings(run) == []
+    assert "SKIPPED" in run["log"]
+
+
+@pytest.mark.parametrize("code, marker", [(2, "FAILED"), (124, "TIMED OUT"), (1, "could not run")])
+def test_a_failing_top_up_alerts_but_never_pings(tmp_path, code, marker):
+    run = _drive(tmp_path, exit_code=code, output="EARNINGS_REFRESH mode=top-up status=X",
+                 args=("--top-up",))
+    assert run["rc"] == code
+    assert _pings(run) == []
+    [message] = _telegrams(run)
+    assert "top-up" in message and marker in message
+
+
+def test_the_top_up_job_runs_daily_at_05_05_with_the_flag():
+    data = plistlib.loads(TOPUP_PLIST.read_bytes())
+    assert data["Label"] == "local.algo-earnings-topup"
+    assert data["ProgramArguments"] == ["/Users/huiliang/ibc/run_earnings_refresh.sh", "--top-up"]
+    [slot] = _slots(TOPUP_PLIST)
+    assert "Weekday" not in slot
+    assert (slot["Hour"], slot["Minute"]) == (5, 5)
+    paper = _slots(DEPLOY_DIR / "local.algo-paper-trading.plist")
+    assert all((5, 5) < (p["Hour"], p["Minute"]) for p in paper)
+
+
+def test_the_documented_daily_budget_fits_the_free_tier():
+    """Full (1 calendar + calls_per_run) plus the top-up, with headroom."""
+    from shared.config import load_config
+
+    cfg = load_config("config/default.yaml").data.earnings.refresh
+    assert 1 + cfg.calls_per_run + cfg.topup_calls <= 21
+
+
+@pytest.mark.parametrize(
+    "doc",
+    ["docs/strategy.md", "docs/strategies/portfolio-2026-05.md",
+     "docs/operations/divergence-monitor.md"],
+)
+def test_the_after_market_divergence_is_documented(doc):
+    text = Path(doc).read_text()
+    assert "KAN-110" in text
+    assert "after-market" in text and "Friday" in text

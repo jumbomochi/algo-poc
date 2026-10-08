@@ -55,6 +55,7 @@ PLISTS = (
     DEPLOY_DIR / "local.algo-db-backup.plist",
     DEPLOY_DIR / "local.algo-divergence-monitor.plist",
     DEPLOY_DIR / "local.algo-earnings-refresh.plist",
+    DEPLOY_DIR / "local.algo-earnings-topup.plist",
     DEPLOY_DIR / "local.algo-evidence-digest.plist",
     DEPLOY_DIR / "local.algo-gateway-watchdog.plist",
     PAPER_PLIST,
