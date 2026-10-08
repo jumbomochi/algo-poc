@@ -9,6 +9,7 @@ Entry point for operational documentation.
 - `container-deploy.md` — Putting merged code into the risk/execution containers: build, `--force-recreate`, image-hash proof, retag rollback, cold-reboot check (KAN-17)
 - `divergence-monitor.md` — Daily live-vs-backtest divergence check (scripts/divergence_monitor.py)
 - `backtest-baseline.md` — Regenerating the headline backtest: point-in-time universe, next-open fills, real costs
+- `sleeve-cash.md` — What caps a buy since KAN-111 (the sleeve's ledger cash), why deploying new capital needs an operator sleeve-cash top-up (no tool yet), and where the daily report shows it
 - `api-security.md` — TLS, secrets, auth lockout, dependency scanning, schema/model integrity (T9)
 - `dependency-lockfile.md` — Regenerating the lockfiles, why each `uv pip compile` flag exists, upgrade procedure, version-ceiling policy (KAN-36)
 - `drill-evidence-isolation.md` — The portfolio exclusion contract: which readers must exclude `__drill__`/`_`-prefixed portfolios, and how to run a tagged drill (KAN-24)

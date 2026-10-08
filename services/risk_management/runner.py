@@ -13,8 +13,10 @@ from services.risk_management.correlation import CorrelationMonitor
 from services.risk_management.engine import PortfolioState, RiskEngine
 from services.risk_management.funding import (
     FundingDecision,
+    SleeveCashDecision,
     check_settled_usd_funding,
     estimate_commission_usd,
+    size_to_sleeve_cash,
 )
 from services.risk_management.kill_switch import KillSwitch
 from services.risk_management.passive_monitor import PassiveBreachMonitor
@@ -27,7 +29,13 @@ from shared.liquidation import (
     load_liquidation_targets,
 )
 from shared.logging import get_logger
-from shared.models import CapitalSnapshot, OrderIntent, OrderStatus, Position
+from shared.models import (
+    CapitalSnapshot,
+    OrderIntent,
+    OrderStatus,
+    PortfolioConfig,
+    Position,
+)
 from shared.order_ledger import (
     TERMINAL_STATUSES,
     ConflictingOrderIntent,
@@ -589,6 +597,48 @@ class RiskServiceRunner:
                     "reason": entry_decision.reason,
                 }
 
+            # KAN-111 defence in depth. run_paper already caps every buy at
+            # its sleeve's ledger cash; a buy that still does not fit here
+            # means that cap was bypassed or the book moved underneath it. It
+            # would fill at IB and the projector would refuse the fill, so it
+            # is refused now, and paged as the upstream defect it is.
+            sleeve_cash = self._check_sleeve_cash(
+                intent, quantity=float(quantity), price=price
+            )
+            if sleeve_cash is not None and (
+                not sleeve_cash.approved or sleeve_cash.downsized
+            ):
+                reason = (
+                    "sleeve cash would be overdrawn: "
+                    f"have ${sleeve_cash.available_usd:,.2f}, "
+                    f"need ${sleeve_cash.required_usd:,.2f}"
+                    if math.isfinite(sleeve_cash.available_usd)
+                    else sleeve_cash.reason
+                )
+                self._persist_risk_rejection(rec.recommendation_id, reason)
+                self._logger.error(
+                    "Sleeve cash rejected buy",
+                    ticker=rec.ticker,
+                    portfolio=intent.portfolio,
+                    reason=reason,
+                )
+                await self._publish_alert(
+                    event_type="sleeve_cash_rejection",
+                    priority="high",
+                    message=(
+                        f"Rejected buy {rec.ticker} [{intent.portfolio}]: "
+                        f"{reason}. run_paper should never emit this (KAN-111)."
+                    ),
+                    context={
+                        "ticker": rec.ticker,
+                        "portfolio": intent.portfolio,
+                        "recommendation_id": rec.recommendation_id,
+                        "available_usd": _finite_or_none(sleeve_cash.available_usd),
+                        "required_usd": _finite_or_none(sleeve_cash.required_usd),
+                    },
+                )
+                return
+
         elif rec.action == "sell":
             # Sleeve exits carry their own account/sleeve-scoped quantity.
             quantity = float(intent.requested_quantity)
@@ -885,6 +935,52 @@ class RiskServiceRunner:
         except OrderIntentNotFound:
             self._order_ledger.session.rollback()
             return 0.0
+
+    def _check_sleeve_cash(
+        self, intent: OrderIntent, *, quantity: float, price: float
+    ) -> SleeveCashDecision | None:
+        """Whether the sleeve's ledger cash can pay for this buy (KAN-111).
+
+        The same rule run_paper sizes by, against the same cash the fill
+        projector refuses to overdraw, net of the sleeve's other open buys
+        (notional plus commission). None for an intent with no sleeve, which
+        no projector cash row governs. A sleeve with no ``portfolio_configs``
+        row fails closed: the projector would refuse its fill too.
+        """
+        if not intent.portfolio:
+            return None
+        session = self._order_ledger.session
+        try:
+            cash = session.scalar(
+                select(PortfolioConfig.cash).where(
+                    PortfolioConfig.portfolio == intent.portfolio
+                )
+            )
+            committed = self._order_ledger.active_buy_reservations_for_account(
+                intent.account_id,
+                portfolio=intent.portfolio,
+                exclude_recommendation_id=intent.recommendation_id,
+                commission_per_share=(
+                    self._config.currency.commission_per_share_usd
+                ),
+                minimum_commission=self._config.currency.minimum_commission_usd,
+            )
+        except (TypeError, ValueError):
+            cash, committed = None, math.nan
+        finally:
+            session.rollback()
+        return size_to_sleeve_cash(
+            quantity=quantity,
+            price=price,
+            sleeve_cash_usd=cash,
+            committed_usd=committed,
+            per_share=self._config.currency.commission_per_share_usd,
+            minimum=self._config.currency.minimum_commission_usd,
+            buffer_bps=self._config.currency.sleeve_cash_buffer_bps,
+            # Only "does the order as approved fit" is asked here; whole-share
+            # rounding happens downstream and can only shrink the order.
+            whole_shares=False,
+        )
 
     def _check_settled_usd_funding(
         self, intent: OrderIntent, *, quantity: float, price: float
@@ -2269,3 +2365,8 @@ if __name__ == "__main__":
             session.close()
 
     asyncio.run(main())
+
+
+def _finite_or_none(value: float) -> float | None:
+    """Alert context is JSON; an unusable sleeve-cash figure travels as null."""
+    return value if math.isfinite(value) else None

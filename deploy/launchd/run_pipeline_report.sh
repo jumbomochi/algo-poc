@@ -213,8 +213,16 @@ fi
 # A read failure degrades to a named marker, never to a reassuring
 # "halt: clear" we cannot substantiate: absence of evidence is not evidence
 # that nothing is halted.
+# KAN-111: buys the paper run skipped or downsized for want of sleeve cash.
+# Counted from the log (run_paper prints them; nothing durable records them),
+# as a field beside the DB facts, not as a headline. Same grep -c convention
+# as the gate-activity block above.
+CASH_SKIPPED=$(grep -c 'insufficient sleeve cash' "$PAPER_LOG" 2>/dev/null || true)
+CASH_DOWNSIZED=$(grep -c '  CAP  ' "$PAPER_LOG" 2>/dev/null || true)
 SUMMARY=$("$VENV" "$ALGO_DIR/scripts/ops/pipeline_report_summary.py" \
               --since "$SINCE" --mode "${ALGO_MODE:-paper}" \
+              --cash-skipped "${CASH_SKIPPED:-0}" \
+              --cash-downsized "${CASH_DOWNSIZED:-0}" \
               2>>"$LOG_FILE") || SUMMARY=""
 [ -n "$SUMMARY" ] || SUMMARY="⚠️ halt/fills/rejections UNKNOWN (DB read failed)"
 DIV=$(grep -oE "Divergence monitor OK|BREACH|hard error" \

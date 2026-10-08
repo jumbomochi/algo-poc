@@ -8,6 +8,11 @@ from typing import Any, Callable
 from backtest.metrics import BacktestMetrics
 from backtest.simulator import SimulatedExecutor
 from research.shadow import CandidateObserver
+from services.risk_management.funding import (
+    DEFAULT_SLEEVE_CASH_BUFFER_BPS,
+    size_to_sleeve_cash,
+    sleeve_buy_cost_usd,
+)
 from shared.universe import MembershipCalendar
 
 
@@ -35,6 +40,12 @@ class BacktestResult:
     # round-trips only, so without this a position that never exited leaves no
     # trace — and any per-trade cost statistic silently drops it.
     open_positions: list[dict] = field(default_factory=list)
+    # KAN-111: entries the sleeve's own cash could not fully pay for —
+    # ``downsized`` were cut to fit, ``skipped`` could not afford the smallest
+    # order. Non-zero only for a sleeve whose sizing outruns its cash.
+    sleeve_cash: dict = field(
+        default_factory=lambda: {"downsized": 0, "skipped": 0}
+    )
 
 
 class BacktestRunner:
@@ -52,6 +63,17 @@ class BacktestRunner:
     taken on the close trade at that same day's low (entries) or that same
     day's open (exits) — findings 4.2 and 4.3 of the 2026-08-06 review.
 
+    **Entries are funded from cash (KAN-111).** After the risk engine approves
+    an entry it is capped at the cash the sleeve holds when it decides, net of
+    the entries it has already queued that session, with
+    ``services.risk_management.funding.size_to_sleeve_cash`` — the function the
+    paper run uses, so live, the rolling shadow and the backtest size alike.
+    Cash raised by exits decided the same session does not count: live books
+    sell proceeds only when the sell fills, and the buy can fill first. Before
+    this the sim could run a sleeve's cash negative up to the risk engine's
+    150% exposure limit — free, interest-less leverage that live can never
+    take, because the fill projector refuses any fill that overdraws a sleeve.
+
     Usage:
         runner = BacktestRunner(executor=executor, initial_capital=100_000)
         result = runner.run(bars_by_ticker, signals_fn, risk_engine)
@@ -64,6 +86,7 @@ class BacktestRunner:
         *,
         whole_shares: bool = False,
         skip_ledger: Any = None,
+        cash_buffer_bps: float = DEFAULT_SLEEVE_CASH_BUFFER_BPS,
     ) -> None:
         self.executor = executor
         self.initial_capital = initial_capital
@@ -75,6 +98,12 @@ class BacktestRunner:
         # -share lots that no broker would fill.
         self.whole_shares = whole_shares
         self.skip_ledger = skip_ledger
+        # Live's ``currency.sleeve_cash_buffer_bps``. The sim fills a limit buy
+        # at up to ``limit * (1 + slippage)``, so the buffer it applies is never
+        # below that ticker's slippage — otherwise a funded entry could still
+        # take cash below zero here. At the defaults (25 bps buffer, slippage
+        # 10-25 bps) the two are the same number.
+        self.cash_buffer_bps = float(cash_buffer_bps)
 
     def run(
         self,
@@ -119,6 +148,7 @@ class BacktestRunner:
             BacktestResult with trades, portfolio_values, and metrics.
         """
         cash = self.initial_capital
+        cash_limited = {"downsized": 0, "skipped": 0}
         positions: dict[str, list[_Lot]] = {}
         trades: list[dict] = []
         portfolio_values: list[float] = [self.initial_capital]
@@ -368,10 +398,40 @@ class BacktestRunner:
                             continue
                         order_quantity = truncated
 
+                    cost_model = self.executor.cost_model
+                    buffer_bps = max(
+                        self.cash_buffer_bps, cost_model.slippage_bps_for(ticker)
+                    )
+                    funding = size_to_sleeve_cash(
+                        quantity=order_quantity,
+                        price=limit_price,
+                        sleeve_cash_usd=cash,
+                        committed_usd=sum(
+                            order.cash_cost for order in pending_entries.values()
+                        ),
+                        per_share=cost_model.commission_per_share,
+                        minimum=cost_model.commission_minimum,
+                        buffer_bps=buffer_bps,
+                        whole_shares=self.whole_shares,
+                    )
+                    if not funding.approved:
+                        cash_limited["skipped"] += 1
+                        continue
+                    if funding.downsized:
+                        cash_limited["downsized"] += 1
+                        order_quantity = funding.quantity
+
                     pending_entries[ticker] = _PendingEntry(
                         limit_price=limit_price,
                         quantity=order_quantity,
                         entry_signals=signal.get("signals", {}),
+                        cash_cost=sleeve_buy_cost_usd(
+                            order_quantity,
+                            limit_price,
+                            per_share=cost_model.commission_per_share,
+                            minimum=cost_model.commission_minimum,
+                            buffer_bps=buffer_bps,
+                        ),
                     )
 
             # End of day: compute portfolio value and update peak prices
@@ -422,6 +482,7 @@ class BacktestRunner:
             metrics=metrics,
             shadow_candidates=shadow_candidates,
             open_positions=open_positions,
+            sleeve_cash=cash_limited,
         )
 
 
@@ -432,6 +493,9 @@ class _PendingEntry:
     limit_price: float
     quantity: float
     entry_signals: dict = field(default_factory=dict)
+    #: Worst-case cash this entry can take when it fills (KAN-111): notional
+    #: at the limit grown by the slippage buffer, plus commission.
+    cash_cost: float = 0.0
 
     @property
     def notional(self) -> float:

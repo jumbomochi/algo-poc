@@ -33,6 +33,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping
 
+from services.risk_management.funding import DEFAULT_SLEEVE_CASH_BUFFER_BPS
+
 #: Prefix so a reader of an evidence row can tell a rolling-shadow identity from
 #: a pinned-artifact one at a glance. The two mean different things and must
 #: never be mistakable.
@@ -50,6 +52,16 @@ _DIGEST_CHARS = 16
 #: verdict after the switch files under a new ``baseline_id``, and
 #: ``breach_streak`` treats the run-date-keyed rows as history.
 SHADOW_DATING_VERSION = "session_date"
+
+#: How the replay funds its entries (KAN-111). ``sleeve_cash``: an entry is
+#: capped at the sleeve's own cash, net of entries already queued that session,
+#: and same-session sell proceeds do not count — exactly what the paper run and
+#: the fill projector allow. Before it the replay could run a sleeve's cash
+#: negative up to the risk engine's 150% exposure limit, which live never can,
+#: so the curves it drew are a different model. The version and the buffer both
+#: enter the fingerprint, and every verdict after the switch files under a new
+#: ``baseline_id``.
+SHADOW_FUNDING_VERSION = "sleeve_cash"
 
 
 @dataclass(frozen=True)
@@ -95,7 +107,12 @@ class ShadowArtifact:
     data_degraded: dict[str, str] = field(default_factory=dict)
 
 
-def shadow_id_for(portfolios: Mapping[str, Any], *, whole_shares: bool = False) -> str:
+def shadow_id_for(
+    portfolios: Mapping[str, Any],
+    *,
+    whole_shares: bool = False,
+    cash_buffer_bps: float = DEFAULT_SLEEVE_CASH_BUFFER_BPS,
+) -> str:
     """Stable identity for the model that produced a shadow.
 
     Derived from each sleeve's name and its ``shadow_params`` — the parameters
@@ -109,6 +126,10 @@ def shadow_id_for(portfolios: Mapping[str, Any], *, whole_shares: bool = False) 
     :data:`SHADOW_DATING_VERSION` always enters it (KAN-103). That changed
     every id on purpose: the verdicts filed before it compared live one
     session off its shadow, and must not share a streak with ones that do not.
+
+    :data:`SHADOW_FUNDING_VERSION` and ``cash_buffer_bps`` always enter it
+    (KAN-111), for the same reason: a replay that funds entries from the
+    sleeve's cash is a different model from one that could borrow to 150%.
 
     Raises:
         ValueError: A sleeve exposes no ``shadow_params``. Defaulting to an
@@ -137,6 +158,9 @@ def shadow_id_for(portfolios: Mapping[str, Any], *, whole_shares: bool = False) 
     if whole_shares:
         fingerprint.append(("__sizing__", "whole_shares"))
     fingerprint.append(("__dating__", SHADOW_DATING_VERSION))
+    fingerprint.append(
+        ("__funding__", f"{SHADOW_FUNDING_VERSION}@{float(cash_buffer_bps):g}bps")
+    )
     digest = hashlib.sha256(
         json.dumps(fingerprint, sort_keys=True).encode()
     ).hexdigest()[:_DIGEST_CHARS]

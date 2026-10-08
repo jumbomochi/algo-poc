@@ -223,6 +223,10 @@ class CurrencyConfig(BaseModel):
     minimum_settled_usd_reserve: float = Field(default=0.0, ge=0.0)
     commission_per_share_usd: float = Field(default=0.005, ge=0.0)
     minimum_commission_usd: float = Field(default=1.0, ge=0.0)
+    # KAN-111: headroom on a buy's limit notional when it is sized against its
+    # sleeve's ledger cash. See config/default.yaml and
+    # services.risk_management.funding.DEFAULT_SLEEVE_CASH_BUFFER_BPS.
+    sleeve_cash_buffer_bps: float = Field(default=25.0, ge=0.0)
 
 
 class DivergenceConfig(BaseModel):

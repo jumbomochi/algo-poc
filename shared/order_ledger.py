@@ -402,7 +402,14 @@ class OrderLedger:
         commission_per_share: float,
         minimum_commission: float,
         exclude_recommendation_id: str | None = None,
+        portfolio: str | None = None,
     ) -> float:
+        """Unfilled buy notional at the limit plus estimated commission.
+
+        ``portfolio`` narrows it to one sleeve: what that sleeve's ledger cash
+        is already committed to (KAN-111). Covers the same orders either way —
+        active ones and proposals already published to risk.
+        """
         per_share = self._nonnegative_finite(
             commission_per_share, "commission_per_share"
         )
@@ -425,6 +432,8 @@ class OrderLedger:
             statement = statement.where(
                 OrderIntent.recommendation_id != exclude_recommendation_id
             )
+        if portfolio is not None:
+            statement = statement.where(OrderIntent.portfolio == portfolio)
         total = 0.0
         for intent in self.session.scalars(statement):
             requested = self._nonnegative_finite(

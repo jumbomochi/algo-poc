@@ -105,6 +105,7 @@ def harness(monkeypatch, tmp_path):
     monkeypatch.setattr(run_paper, "build_portfolios", lambda **kw: {})
     monkeypatch.setattr(run_paper, "build_sell_availability", lambda *a: {})
     monkeypatch.setattr(run_paper, "account_buy_commitments_after_snapshot", lambda *a, **kw: 0.0)
+    monkeypatch.setattr(run_paper, "sleeve_buy_commitments", lambda *a, **kw: {})
     monkeypatch.setattr(run_paper, "run_daily", capture_run_daily)
     monkeypatch.setattr(run_paper, "produce_shadow_artifact", capture_shadow)
     monkeypatch.setattr(run_paper, "live_equity_by_sleeve", lambda state: {})
@@ -191,6 +192,26 @@ def test_fresh_caches_behave_as_before(harness, capsys):
     out = capsys.readouterr().out
     assert "DATA-DEGRADED" not in out
     assert "Data cache: fundamentals cache ok" in out
+
+
+def test_main_sizes_buys_and_the_shadow_by_the_configured_sleeve_cash_rule(
+    harness, monkeypatch
+):
+    """KAN-111 wiring (this harness is the one that drives ``main``): the
+    run's buys and the shadow's replay use the same buffer, the account's
+    fractional setting, and each sleeve's open-order commitments."""
+    _write_fresh(harness.cache_dir)
+    monkeypatch.setattr(
+        run_paper, "sleeve_buy_commitments",
+        lambda session, account_id, names, **kw: {"momentum": 123.0},
+    )
+
+    assert run_paper.main() == 0
+
+    assert harness.run_daily["sleeve_buy_commitments_usd"] == {"momentum": 123.0}
+    assert harness.run_daily["sleeve_cash_buffer_bps"] == 25.0
+    assert harness.run_daily["fractional_orders"] is False
+    assert harness.shadow["cash_buffer_bps"] == 25.0
 
 
 def test_a_tagged_drill_run_is_not_paged_about_sleeves_it_does_not_trade(harness, monkeypatch):

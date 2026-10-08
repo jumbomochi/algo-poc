@@ -2600,6 +2600,8 @@ def save_multi_portfolio_results(
                 name, dict(EMPTY_SKIP_LEDGER)
             ),
             "entry_signals_sized": (entry_signals_sized or {}).get(name, 0),
+            # KAN-111: entries the sleeve's cash could not fully fund.
+            "sleeve_cash": result.sleeve_cash,
         }
 
     payload = {
@@ -3194,6 +3196,12 @@ def main():
             for alert in risk_alerts:
                 icon = "!!" if alert["level"] == "critical" else " >"
                 print(f"    {icon} [{alert['level'].upper()}] {alert['message']}")
+
+    print("\n  Entries limited by sleeve cash (KAN-111):")
+    for name, result in results.items():
+        limited = result.sleeve_cash
+        print(f"    {name:<20} downsized {limited['downsized']:>5}  "
+              f"skipped {limited['skipped']:>5}")
 
     if args.whole_shares:
         print("\n  Unfillable signals (budget < 1 share):")

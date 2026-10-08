@@ -54,6 +54,8 @@ from shared.models.order_ledger import (  # noqa: E402
     OrderIntent,
     OrderStatus,
 )
+from shared.models.portfolio_config import PortfolioConfig  # noqa: E402
+from shared.universe import is_excluded_portfolio  # noqa: E402
 
 # Telegram rejects a body over 4096 chars with HTTP 400, and the wrapper's
 # fire-and-forget send discards curl's status — so an over-long message is
@@ -110,6 +112,17 @@ class RunFacts:
     #: it never checked (tests, ad-hoc tooling) gets no data field rather than
     #: a false "unknown".
     data_checked: bool = False
+    # KAN-111. ``(sleeve, ledger cash, capital)`` per graded sleeve, from
+    # ``portfolio_configs``. Since KAN-111 every buy is capped at that cash, so
+    # a sleeve whose cash is a sliver of its capital buys nothing however
+    # large the account's NAV budget — and deploying new capital adds no
+    # buying power until an operator tops the cash up. Shown so that reads as
+    # what it is rather than as a quiet market.
+    sleeve_cash: tuple[tuple[str, float, float], ...] = ()
+    # KAN-111. Buys the paper run skipped / downsized for want of sleeve cash,
+    # counted from its log by the wrapper. ``None`` = not supplied (omitted).
+    cash_skipped: int | None = None
+    cash_downsized: int | None = None
 
 
 #: How far back of ``since`` the recovered-fill count reaches. One day: the
@@ -195,6 +208,18 @@ def collect_facts(
         .where(OHLCVDaily.ingested_at >= since)
     ) or 0
 
+    sleeve_cash = tuple(
+        (name, float(cash), float(capital))
+        for name, cash, capital in session.execute(
+            select(
+                PortfolioConfig.portfolio,
+                PortfolioConfig.cash,
+                PortfolioConfig.capital,
+            ).order_by(PortfolioConfig.portfolio)
+        ).all()
+        if not is_excluded_portfolio(name)
+    )
+
     return RunFacts(
         halt_active=halt is not None,
         halt_source=halt.source if halt else None,
@@ -205,6 +230,7 @@ def collect_facts(
         capture_written=int(captured),
         capture_expected=int(capture_expected),
         fills_recovered=int(fills_recovered),
+        sleeve_cash=sleeve_cash,
     )
 
 
@@ -257,6 +283,17 @@ def render_summary(facts: RunFacts) -> str:
             # disagree about the universe, which silently disables the
             # shortfall alarm above — as bad as a shortfall, so as loud.
             line += f" ⚠ over {-short}, universe drift"
+
+    if facts.cash_skipped is not None:
+        line += (
+            f" · cash-capped buys: {facts.cash_skipped} skipped"
+            f" / {facts.cash_downsized or 0} downsized"
+        )
+    if facts.sleeve_cash:
+        line += " · sleeve cash/capital: " + ", ".join(
+            f"{name} ${cash:,.0f}/${capital:,.0f}"
+            for name, cash, capital in facts.sleeve_cash
+        )
 
     return line
 
@@ -343,6 +380,18 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="size of the capture universe; defaults to universe.capture_source",
     )
+    parser.add_argument(
+        "--cash-skipped",
+        type=int,
+        default=None,
+        help="buys the paper run skipped for insufficient sleeve cash (KAN-111)",
+    )
+    parser.add_argument(
+        "--cash-downsized",
+        type=int,
+        default=None,
+        help="buys the paper run downsized to sleeve cash (KAN-111)",
+    )
     args = parser.parse_args(argv)
 
     if not args.database_url:
@@ -372,7 +421,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{_redact(type(exc).__name__)}: {_redact(str(exc))}", file=sys.stderr)
         return 1
 
-    print(render_summary(replace(facts, data_degraded=_data_degraded(), data_checked=True)))
+    print(render_summary(replace(
+        facts,
+        data_degraded=_data_degraded(),
+        data_checked=True,
+        cash_skipped=args.cash_skipped,
+        cash_downsized=args.cash_downsized,
+    )))
     return 0
 
 

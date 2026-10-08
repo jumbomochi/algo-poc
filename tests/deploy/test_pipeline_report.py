@@ -342,6 +342,55 @@ def test_writing_more_than_expected_is_flagged_as_drift(session):
 
 
 # ---------------------------------------------------------------------------
+# KAN-111: sleeve cash, which since KAN-111 caps every buy
+# ---------------------------------------------------------------------------
+
+def _sleeve(session, name, *, cash, capital):
+    from shared.models.portfolio_config import PortfolioConfig
+
+    session.add(PortfolioConfig(
+        portfolio=name, capital=capital, cash=cash,
+        created_at=DURING, updated_at=DURING,
+    ))
+    session.commit()
+
+
+def test_sleeve_ledger_cash_is_shown_against_capital(session):
+    _sleeve(session, "thematic_momentum", cash=24.83, capital=14_100.0)
+    _sleeve(session, "momentum", cash=9_876.4, capital=23_080.0)
+    _sleeve(session, "__drill__", cash=500.0, capital=500.0)
+
+    summary = render_summary(_facts(session))
+
+    assert (
+        "sleeve cash/capital: momentum $9,876/$23,080, "
+        "thematic_momentum $25/$14,100"
+    ) in summary
+    assert "__drill__" not in summary
+
+
+def test_cash_capped_buys_are_counted_when_supplied(session):
+    from dataclasses import replace
+
+    facts = _facts(session)
+    assert "cash-capped" not in render_summary(facts)
+    summary = render_summary(replace(facts, cash_skipped=2, cash_downsized=1))
+    assert "cash-capped buys: 2 skipped / 1 downsized" in summary
+
+
+def test_cli_passes_the_cash_capped_counts_through(tmp_path):
+    db = tmp_path / "report.db"
+    engine = create_engine(f"sqlite:///{db}")
+    Base.metadata.create_all(engine)
+    with Session(engine) as s:
+        _sleeve(s, "momentum", cash=100.0, capital=23_080.0)
+    res = _run_cli(db, "--cash-skipped", "3", "--cash-downsized", "0")
+    assert res.returncode == 0, res.stderr
+    assert "cash-capped buys: 3 skipped / 0 downsized" in res.stdout
+    assert "momentum $100/$23,080" in res.stdout
+
+
+# ---------------------------------------------------------------------------
 # The CLI
 # ---------------------------------------------------------------------------
 

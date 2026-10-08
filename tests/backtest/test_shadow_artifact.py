@@ -209,3 +209,48 @@ def test_whole_share_sizing_is_a_different_model() -> None:
     whole = shadow_id_for(roster, whole_shares=True)
     assert whole.startswith("shadow:")
     assert whole != shadow_id_for(roster)
+
+
+# ---------------------------------------------------------------------------
+# KAN-111: a replay funded from cash is a different model
+# ---------------------------------------------------------------------------
+
+
+def _pre_kan111_id(portfolios, *, whole_shares=False) -> str:
+    """``shadow_id_for`` exactly as it was before the funding version."""
+    import hashlib
+
+    from backtest.shadow_artifact import SHADOW_DATING_VERSION, SHADOW_ID_PREFIX
+
+    fingerprint = sorted(
+        (name, json.dumps(s.shadow_params, sort_keys=True, default=str))
+        for name, s in portfolios.items()
+    )
+    if whole_shares:
+        fingerprint.append(("__sizing__", "whole_shares"))
+    fingerprint.append(("__dating__", SHADOW_DATING_VERSION))
+    digest = hashlib.sha256(
+        json.dumps(fingerprint, sort_keys=True).encode()
+    ).hexdigest()[:16]
+    return f"{SHADOW_ID_PREFIX}{digest}"
+
+
+@pytest.mark.parametrize("whole_shares", [False, True])
+def test_cash_funded_shadow_files_under_a_new_baseline_id(whole_shares) -> None:
+    """Verdicts graded against a replay that could borrow to 150% must not
+    share a breach streak with ones graded against a cash-funded replay."""
+    from backtest.shadow_artifact import SHADOW_FUNDING_VERSION
+
+    roster = _roster()
+    new = shadow_id_for(roster, whole_shares=whole_shares)
+
+    assert new != _pre_kan111_id(roster, whole_shares=whole_shares)
+    assert new == shadow_id_for(roster, whole_shares=whole_shares)
+    assert SHADOW_FUNDING_VERSION == "sleeve_cash"
+
+
+def test_the_cash_buffer_is_part_of_the_model() -> None:
+    roster = _roster()
+
+    assert shadow_id_for(roster) == shadow_id_for(roster, cash_buffer_bps=25.0)
+    assert shadow_id_for(roster) != shadow_id_for(roster, cash_buffer_bps=50.0)

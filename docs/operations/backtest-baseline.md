@@ -26,6 +26,7 @@ results so downstream tools can check it:
 | Universe coverage | ≥ 95% of membership-days priceable | A point-in-time member whose bars cannot be pulled is silently skipped, and the skipped names are disproportionately the delistings. |
 | Fundamentals | available 45 days after period-end (or the row's `filing_date`) | A quarter ending 31 March is not public on 31 March. |
 | Share sizing | fractional, unless `--whole-shares` | Live truncates to whole shares and refuses the order at zero; the backtest does not, so the two disagree by default. See below. |
+| Entry funding | from the sleeve's own cash (KAN-111) | After risk approval an entry is capped at the cash the sleeve holds when it decides, net of entries already queued that session, its commission and a 25 bps buffer — `size_to_sleeve_cash`, the function the paper run uses. Same-session exit proceeds do not count. Before KAN-111 a sleeve's cash could go negative up to its exposure limit; live it cannot, because the fill projector refuses any fill that overdraws a sleeve. |
 
 `config.fill_model`, `config.commission_minimum`,
 `config.slippage_bps_by_ticker`, `config.point_in_time_universe` and
@@ -282,6 +283,40 @@ pins"; this is the mechanism half of that.
 > Its quality_value and earnings_drift coverage is also partial
 > (fundamentals only from 2024-08-14, earnings from 2020); both facts are on
 > record in `shared/data_gaps.py`, and the artifact itself is unchanged.
+
+> **KAN-111: neither pin reproduces — the backtest no longer borrows.** Every
+> artifact before KAN-111 let a sleeve's cash go negative up to its risk
+> engine's exposure limit, with no interest charged. Reconstructed from the
+> pinned artifact's own trades, momentum's cash bottomed at **−100.8%** of its
+> capital (negative on 1,127 of 2,510 sessions) and thematic_momentum's at
+> −34.0% (260 sessions); live can do neither. Re-running the pin's config
+> (`--bars-from-json` on the pin, PIT universe, 2026-10-08 caches) with entries
+> funded from cash:
+>
+> | sleeve | total return before → after | Sharpe | max DD | trades | entries downsized / skipped |
+> |---|---|---|---|---|---|
+> | momentum | 179.66% → 160.15% | 0.61 → 0.63 | 23.52% → 19.04% | 679 → 619 | 130 / 89 |
+> | sector_rotation | 71.51% → 71.37% | 0.54 → 0.54 | 21.99% → 22.00% | 113 → 118 | 25 / 8 |
+> | thematic_momentum | 129.63% → 112.11% | 0.69 → 0.63 | 36.90% → 40.12% | 708 → 696 | 28 / 20 |
+> | quality_value | 15.63% → 15.60% | 0.30 → 0.30 | 17.90% → 17.89% | 76 → 75 | 10 / 11 |
+> | earnings_drift | 40.41% → 40.48% | 0.53 → 0.53 | 14.34% → 14.33% | 576 → 569 | 84 / 281 |
+> | tail_risk_hedge | unchanged (−19.91%) | | | | 0 / 0 |
+> | **aggregate** | **78.36% → 71.38%** | 0.70 → 0.70 | 11.39% → 10.88% | | |
+>
+> The Rung-0 pin's config (momentum, $3,700, whole shares) goes 113.03% →
+> 114.56%, Sharpe 0.50 → 0.54, max DD 25.37% → 19.90%, 623 → 559 trades.
+> Both pinned artifacts are unchanged on disk; a re-pin is a separate,
+> deliberate decision. Each artifact now carries `sleeve_cash` per sleeve
+> (`{"downsized": n, "skipped": n}`), and the rolling shadow — which replays
+> through the same runner — files its verdicts under a new `baseline_id`
+> (`SHADOW_FUNDING_VERSION` in `backtest/shadow_artifact.py`).
+>
+> **From the KAN-111 release the weekly Tuesday refresh produces
+> cash-constrained numbers.** They are not comparable with the 2026-09-15 pin
+> (momentum 179.66% → 160.15%, aggregate 78.36% → 71.38% on the same bars), so
+> a refresh that "drops" against the pin is the model change, not a decay.
+> **A re-pin decision is outstanding**: until it is made, the pin of record is
+> a leveraged-sim artifact the code can no longer produce.
 
 ### Where the pin lives, and what enforces it
 
