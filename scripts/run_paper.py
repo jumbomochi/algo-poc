@@ -87,8 +87,11 @@ from backtest.shadow_artifact import dump_shadow, shadow_id_for
 from backtest.shadow_series import build_shadow_series
 from services.risk_management.engine import RiskEngine
 from services.risk_management.funding import (
+    DEFAULT_SLEEVE_CASH_BUFFER_BPS,
     check_settled_usd_funding,
     estimate_commission_usd,
+    size_to_sleeve_cash,
+    sleeve_buy_cost_usd,
 )
 from shared.order_ledger import OrderLedger
 from shared.capital import CapitalBudget, calculate_capital_budget
@@ -180,6 +183,7 @@ def produce_shadow_artifact(
     bars_session: date | None = None,
     priced_at: datetime | None = None,
     data_degraded: Mapping[str, str] | None = None,
+    cash_buffer_bps: float = DEFAULT_SLEEVE_CASH_BUFFER_BPS,
 ):
     """Replay every sleeve over its rolling window and write the artifact.
 
@@ -208,6 +212,11 @@ def produce_shadow_artifact(
     The fingerprint still covers every sleeve: being degraded is a data
     condition, not a model change, and must not restart the epoch.
 
+    ``cash_buffer_bps``: the paper run's ``currency.sleeve_cash_buffer_bps``.
+    The replay funds entries from its own cash with the same rule the paper
+    run sizes buys by (KAN-111), so the buffer is part of the model and of its
+    fingerprint.
+
     Returns the path written. Raises on failure: the caller decides whether a
     shadow failure is worth stopping the paper run for, and at 05:15 it is not.
     """
@@ -229,6 +238,7 @@ def produce_shadow_artifact(
         live_equity=live_equity,
         window_sessions=window_sessions,
         whole_shares=whole_shares,
+        cash_buffer_bps=cash_buffer_bps,
     )
     # The session this shadow speaks for is the last US session LIVE valued
     # (live is keyed by session_date since KAN-103), not today's wall-clock
@@ -238,7 +248,11 @@ def produce_shadow_artifact(
     dump_shadow(
         output_path,
         series=series,
-        shadow_id=shadow_id_for(shadow_portfolios, whole_shares=whole_shares),
+        shadow_id=shadow_id_for(
+            shadow_portfolios,
+            whole_shares=whole_shares,
+            cash_buffer_bps=cash_buffer_bps,
+        ),
         window_sessions=window_sessions,
         session_date=max(graded_sessions) if graded_sessions else date.today(),
         # The wall-clock date of THIS run, not the session it covers. The
@@ -326,6 +340,15 @@ def build_portfolios(
     definitions remain in scripts/run_backtest.py for future revival but are
     no longer instantiated here. See docs/strategies/mean-reversion-failure-
     analysis.md for revival conditions.
+
+    **Effective exposure limit (KAN-111).** Each sleeve's ``RiskEngine`` keeps
+    the ``total_exposure_limit_pct`` it always had (momentum 150,
+    thematic_momentum 120, the rest 100), measured against the sleeve's NAV
+    budget. None of the sleeves can borrow: the fill projector refuses any fill
+    that takes the sleeve's ledger cash below zero, and ``run_daily`` caps
+    every buy at that cash. So the binding limit is the ledger cash, about 100%
+    of the sleeve's equity, and a limit above 100 cannot bind. The numbers are
+    left as they are so this change alters nothing but the cash cap.
     """
     portfolios = {}
     contexts = portfolio_contexts or {}
@@ -779,6 +802,36 @@ def account_buy_commitments_after_snapshot(
         return float("nan")
 
 
+def sleeve_buy_commitments(
+    session: Session,
+    account_id: str,
+    portfolio_names: list[str],
+    *,
+    commission_per_share: float,
+    minimum_commission: float,
+) -> dict[str, float]:
+    """What each sleeve's ledger cash is already committed to (KAN-111).
+
+    Unfilled notional of its open buy orders at their limits, plus their
+    estimated commission — the same set of orders the account-level settled
+    cash check counts. NaN for a sleeve whose ledger rows are unusable, which
+    ``size_to_sleeve_cash`` refuses: a buy is never sized against a guess.
+    """
+    ledger = OrderLedger(session)
+    out: dict[str, float] = {}
+    for name in portfolio_names:
+        try:
+            out[name] = ledger.active_buy_reservations_for_account(
+                account_id,
+                portfolio=name,
+                commission_per_share=commission_per_share,
+                minimum_commission=minimum_commission,
+            )
+        except (TypeError, ValueError):
+            out[name] = float("nan")
+    return out
+
+
 def print_status(state: PaperTradingState) -> None:
     """Print current paper trading status."""
     print("\n" + "=" * 60)
@@ -861,6 +914,9 @@ def run_daily(
     record_aggregate: bool = True,
     capital: CapitalBudget | None = None,
     priced_at: datetime | None = None,
+    sleeve_buy_commitments_usd: Mapping[str, float] | None = None,
+    sleeve_cash_buffer_bps: float = DEFAULT_SLEEVE_CASH_BUFFER_BPS,
+    fractional_orders: bool = False,
 ) -> list[dict]:
     """Run one daily cycle: generate signals for all portfolios.
 
@@ -887,6 +943,22 @@ def run_daily(
     with the reason, and so are its exits whose reason is a judgement made
     from the cache (:data:`DATA_DRIVEN_EXIT_REASONS`). Risk exits — trailing
     stops, time exits — are processed exactly as before.
+
+    **Sleeve cash (KAN-111).** After risk approval every buy is capped at the
+    sleeve's ledger cash (``state.get_cash`` — the ``portfolio_configs.cash``
+    the fill projector refuses to overdraw) minus ``sleeve_buy_commitments_usd``
+    (its open buy orders, notional plus commission; falls back to
+    ``reservations_by_portfolio`` for a bare harness), minus the buys this run
+    has already accepted for it, minus the order's own estimated commission,
+    with ``sleeve_cash_buffer_bps`` of headroom on its limit notional. A buy
+    that does not fit is downsized — to whole shares unless
+    ``fractional_orders`` — or skipped with ``insufficient sleeve cash``.
+
+    Sell proceeds from this run do NOT fund this run's buys. The projector
+    credits a sale only when it fills, and the paired buy can fill first, so a
+    rotation into a fully invested sleeve waits for the run after the sale
+    settles in the book. The backtest and the shadow replay size by the same
+    rule (``backtest.runner.BacktestRunner``).
     """
     signals_generated: list[dict] = []
     degraded = dict(data_degraded or {})
@@ -903,6 +975,9 @@ def run_daily(
         else {}
     )
     accepted_buy_notional: dict[str, float] = {}
+    # Worst-case cash each sleeve's accepted buys can take (KAN-111): limit
+    # notional plus buffer plus commission, per sleeve_buy_cost_usd.
+    accepted_buy_cash_cost: dict[str, float] = {}
     accepted_account_buy_reservations_usd = 0.0
     remaining_sell_quantity = dict(sell_availability or {})
     today = date.today()
@@ -999,6 +1074,8 @@ def run_daily(
                     # is the exposure basis. Durable PaperTradingState cash may
                     # reflect an older initialization amount and must not shrink
                     # a $1m broker account back to the historical $100k seed.
+                    # It still caps what the buy may spend (KAN-111, below):
+                    # the projector books fills against that cash, not the NAV.
                     nav = float(pc.capital)
                     portfolio_state = SimplePortfolioState(
                         nav=nav,
@@ -1051,9 +1128,72 @@ def run_daily(
                         qty = decision.adjusted_quantity
                         signal["quantity"] = qty
 
+                    # KAN-111: the risk engine sizes against the NAV budget and
+                    # never sees cash; the projector refuses a fill that
+                    # overdraws the sleeve. Cap at what the sleeve can pay.
+                    committed = (sleeve_buy_commitments_usd or {}).get(name)
+                    if committed is None:
+                        committed = float(
+                            (reservations_by_portfolio or {}).get(name, 0.0)
+                        )
+                    cash_decision = size_to_sleeve_cash(
+                        quantity=qty,
+                        price=price,
+                        sleeve_cash_usd=state.get_cash(name),
+                        committed_usd=(
+                            committed + accepted_buy_cash_cost.get(name, 0.0)
+                        ),
+                        per_share=commission_per_share_usd,
+                        minimum=minimum_commission_usd,
+                        buffer_bps=sleeve_cash_buffer_bps,
+                        whole_shares=not fractional_orders,
+                    )
+                    if not cash_decision.approved:
+                        logger.info(
+                            "Buy skipped: sleeve cash",
+                            portfolio=name,
+                            ticker=ticker,
+                            quantity=qty,
+                            limit_price=price,
+                            available_usd=cash_decision.available_usd,
+                            required_usd=cash_decision.required_usd,
+                        )
+                        print(
+                            f"  SKIP {ticker:>6s}  {qty:>8.4f} @ "
+                            f"${price:>8.2f}  [{name}] ({cash_decision.reason})"
+                        )
+                        continue
+                    if cash_decision.downsized:
+                        logger.info(
+                            "Buy downsized: sleeve cash",
+                            portfolio=name,
+                            ticker=ticker,
+                            requested=qty,
+                            quantity=cash_decision.quantity,
+                            limit_price=price,
+                            available_usd=cash_decision.available_usd,
+                            required_usd=cash_decision.required_usd,
+                        )
+                        print(
+                            f"  CAP  {ticker:>6s}  {qty:>8.4f} -> "
+                            f"{cash_decision.quantity:.4f}  [{name}] "
+                            f"({cash_decision.reason})"
+                        )
+                        qty = cash_decision.quantity
+                        signal["quantity"] = qty
+
                     signals_generated.append(signal)
                     accepted_buy_notional[name] = (
                         accepted_buy_notional.get(name, 0.0) + qty * price
+                    )
+                    accepted_buy_cash_cost[name] = accepted_buy_cash_cost.get(
+                        name, 0.0
+                    ) + sleeve_buy_cost_usd(
+                        qty,
+                        price,
+                        per_share=commission_per_share_usd,
+                        minimum=minimum_commission_usd,
+                        buffer_bps=sleeve_cash_buffer_bps,
                     )
                     accepted_account_buy_reservations_usd += (
                         qty * price
@@ -2182,6 +2322,13 @@ def main() -> int | None:
             commission_per_share=_config.currency.commission_per_share_usd,
             minimum_commission=_config.currency.minimum_commission_usd,
         )
+        sleeve_commitments = sleeve_buy_commitments(
+            session,
+            broker_snapshot.account_id,
+            list(portfolios),
+            commission_per_share=_config.currency.commission_per_share_usd,
+            minimum_commission=_config.currency.minimum_commission_usd,
+        )
         signals = run_daily(
             state,
             portfolios,
@@ -2204,6 +2351,9 @@ def main() -> int | None:
             record_aggregate=portfolio_tag is None,
             capital=preparation.capital,
             priced_at=fetch_started_at,
+            sleeve_buy_commitments_usd=sleeve_commitments,
+            sleeve_cash_buffer_bps=_config.currency.sleeve_cash_buffer_bps,
+            fractional_orders=_config.execution.fractional_orders,
         )
         if args.publish and signals:
             contracts = resolve_contract_details_from_ib(
@@ -2281,6 +2431,7 @@ def main() -> int | None:
                     bars_session=bars_session,
                     priced_at=fetch_started_at,
                     data_degraded=data_degraded,
+                    cash_buffer_bps=_config.currency.sleeve_cash_buffer_bps,
                 )
                 print(f"  Shadow series written to {shadow_path}")
             except Exception:

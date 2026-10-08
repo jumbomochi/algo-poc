@@ -39,6 +39,7 @@ from typing import Any, Callable
 from backtest.costs import CostModel
 from backtest.runner import BacktestRunner
 from backtest.simulator import SimulatedExecutor
+from services.risk_management.funding import DEFAULT_SLEEVE_CASH_BUFFER_BPS
 
 
 def replay_window(
@@ -50,6 +51,7 @@ def replay_window(
     window_start: date,
     cost_model: CostModel | None = None,
     whole_shares: bool = False,
+    cash_buffer_bps: float = DEFAULT_SLEEVE_CASH_BUFFER_BPS,
 ) -> dict[date, float]:
     """Return ``{session: equity}`` for the model's own run over the window.
 
@@ -66,6 +68,9 @@ def replay_window(
         cost_model: Fill costs. Defaults to the repo's standard model, which is
             what the live sleeves are charged against.
         whole_shares: Truncate fractional sizing, as live execution does.
+        cash_buffer_bps: Live's ``currency.sleeve_cash_buffer_bps``. Entries
+            are funded from the replay's own cash exactly as the paper run
+            funds them (KAN-111; see ``BacktestRunner``).
 
     Returns:
         Equity by session for ``window_start`` onward. Empty when no session
@@ -79,6 +84,7 @@ def replay_window(
         SimulatedExecutor(cost_model or CostModel()),
         initial_capital=seed_nav,
         whole_shares=whole_shares,
+        cash_buffer_bps=cash_buffer_bps,
     )
     result = runner.run(
         bars_by_ticker,
@@ -106,6 +112,7 @@ def build_shadow_series(
     window_sessions: int,
     cost_model: CostModel | None = None,
     whole_shares: bool = False,
+    cash_buffer_bps: float = DEFAULT_SLEEVE_CASH_BUFFER_BPS,
 ) -> dict[str, dict[date, float]]:
     """Replay every sleeve over its rolling window.
 
@@ -149,6 +156,7 @@ def build_shadow_series(
             window_start=window_start,
             cost_model=cost_model,
             whole_shares=whole_shares,
+            cash_buffer_bps=cash_buffer_bps,
         )
         # Live is the authority on which sessions are gradeable: the replay can
         # only produce a curve for sessions its bars cover, and the monitor

@@ -284,6 +284,9 @@ class TestEntryGate:
         portfolio = build_portfolio(buy_fn)["test_sleeve"]
         portfolio.risk_engine.position_entry_limit_pct = 100.0
         bars = {f"T{i:02d}": make_bars() for i in range(20)}
+        # Ample ledger cash, so the exposure limit is what binds here; the
+        # sleeve-cash cap (KAN-111) has its own tests.
+        state._update_cash("test_sleeve", 90_000.0)
 
         signals = run_daily(state, {"test_sleeve": portfolio}, bars)
 
@@ -296,10 +299,31 @@ class TestEntryGate:
 
         portfolio = build_portfolio(large_account_fn)["test_sleeve"]
         portfolio.capital = 1_000_000.0
+        # The NAV budget sets the exposure headroom; the ledger cash (KAN-111)
+        # must also be able to pay, so give it the cash a $1m sleeve holds.
+        state._update_cash("test_sleeve", 990_000.0)
 
         signals = run_daily(state, {"test_sleeve": portfolio}, {"AAPL": make_bars()})
 
         assert signals[0]["quantity"] == pytest.approx(1_000.0)
+
+    def test_nav_budget_above_ledger_cash_is_capped_at_the_cash(self, state):
+        """KAN-111: a budget the ledger cash cannot fund is not a licence to
+        buy — the projector would refuse the fill. 10,000 cash buys 99 shares
+        at 100 with the 25 bps buffer (99 * 100.25 + 1 = 9,925.75; 100 would
+        need 10,026), in whole shares since the account trades no fractions."""
+
+        def large_account_fn(ticker, bars):
+            return {"action": "buy", "limit_price": 100.0, "quantity": 1_000.0}
+
+        portfolio = build_portfolio(large_account_fn)["test_sleeve"]
+        portfolio.capital = 1_000_000.0
+
+        signals = run_daily(state, {"test_sleeve": portfolio}, {"AAPL": make_bars()})
+
+        [signal] = signals
+        assert signal["quantity"] == 99.0
+        assert signal["quantity"] * 100.0 * 1.0025 + 1.0 <= 10_000.0
 
     def test_oversized_buy_cannot_overdraw_cash(self, state):
         """A signal demanding 2x the sleeve's capital must be constrained."""

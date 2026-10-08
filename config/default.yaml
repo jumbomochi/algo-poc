@@ -17,6 +17,15 @@ currency:
   minimum_settled_usd_reserve: 0.0
   commission_per_share_usd: 0.005
   minimum_commission_usd: 1.0
+  # KAN-111: every buy is capped at its sleeve's ledger cash (the cash the fill
+  # projector refuses to overdraw), net of open buy orders, this run's accepted
+  # buys and the order's estimated commission, less this buffer on the limit
+  # notional. A DAY limit buy never fills above its limit live (execution only
+  # cancels, it never reprices up), so 25 bps covers IB fee pass-throughs over
+  # the commission estimate, and equals the backtest's dearest slippage tier so
+  # the shadow/backtest — which size with the same rule — can never overdraw
+  # either. Changing it changes the shadow's baseline_id.
+  sleeve_cash_buffer_bps: 25.0
 
 universe:
   # sleeves = union universe of the active sleeves (ingest exactly what the
@@ -81,7 +90,15 @@ ml_model:
 risk:
   position_entry_limit_pct: 5.0      # % of NAV
   sector_concentration_pct: 20.0      # % of NAV
-  total_exposure_limit_pct: 150.0     # % of NAV (margin)
+  # % of NAV. Account-level margin headroom, as the risk service applies it.
+  # NOT the binding limit for a sleeve: sleeves hold no margin — the fill
+  # projector refuses any fill that takes a sleeve's cash below zero — so since
+  # KAN-111 a sleeve's effective exposure limit is its ledger cash (about 100%
+  # of its equity), enforced by the cash cap in run_paper / the risk service /
+  # the backtest. The sleeves' own limits (run_paper.build_portfolios: momentum
+  # 150, thematic_momentum 120, the rest 100) are left as they were: above 100
+  # they cannot bind, because cash binds first.
+  total_exposure_limit_pct: 150.0
   stop_loss_trailing_pct: 15.0        # trailing stop %
   drawdown_pause_pct: 10.0            # pause new buys
   drawdown_circuit_breaker_pct: 20.0  # liquidate all

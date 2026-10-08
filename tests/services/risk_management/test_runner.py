@@ -18,6 +18,7 @@ from shared.models import (
     ExecutionFill,
     OrderIntent,
     OrderStatus,
+    PortfolioConfig,
     Position,
 )
 from shared.order_ledger import OrderLedger
@@ -2360,6 +2361,17 @@ class TestDurableRiskLifecycle:
                 captured_at=datetime.now(timezone.utc),
             )
         )
+        # Every production sleeve has its ledger cash row; the KAN-111 sleeve
+        # cash check fails closed without one, as the fill projector would.
+        session.add(
+            PortfolioConfig(
+                portfolio="momentum",
+                capital=100_000,
+                cash=100_000,
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
         session.commit()
         value = RiskServiceRunner(
             config=mock_config,
@@ -2611,6 +2623,105 @@ class TestDurableRiskLifecycle:
         await runner.process_recommendation(make_durable_buy_recommendation())
 
         assert ledger.get("rec-risk").status == OrderStatus.APPROVED.value
+
+    # ------------------------------------------------ KAN-111 sleeve cash
+
+    @staticmethod
+    def _set_sleeve_cash(session, cash: float) -> None:
+        row = session.scalar(
+            select(PortfolioConfig).where(PortfolioConfig.portfolio == "momentum")
+        )
+        row.cash = cash
+        session.commit()
+
+    @staticmethod
+    def _alerts(mock_redis, event_type):
+        return [
+            call.args[1]
+            for call in mock_redis.publish.call_args_list
+            if call.args[0] == "stream:alerts"
+            and call.args[1]["event_type"] == event_type
+        ]
+
+    @pytest.mark.asyncio
+    async def test_buy_its_sleeve_cash_cannot_pay_for_is_refused_and_paged(
+        self, durable_runner, mock_redis
+    ):
+        """The 2026-10-07 shape: a fully invested sleeve, a buy the risk
+        engine's NAV limits are happy with, and a fill the projector refuses."""
+        runner, ledger, session = durable_runner
+        self._set_sleeve_cash(session, 24.83)
+
+        await runner.process_recommendation(make_durable_buy_recommendation())
+
+        intent = ledger.get("rec-risk")
+        assert intent.status == OrderStatus.RISK_REJECTED.value
+        assert "sleeve cash would be overdrawn" in intent.reason
+        assert "have $24.83" in intent.reason
+        session.rollback()
+        assert _approved_orders(mock_redis) == []
+        [alert] = self._alerts(mock_redis, "sleeve_cash_rejection")
+        assert alert["priority"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_sleeve_cash_counts_the_sleeves_other_open_buys(
+        self, durable_runner, mock_redis
+    ):
+        # 10 @ 100 needs 1,000 * 1.0025 + 1 = 1,003.50; 1,900 pays for it alone.
+        runner, ledger, session = durable_runner
+        self._set_sleeve_cash(session, 1_900)
+        ledger.create_intent(
+            make_buy_intent_proposal(
+                "prior-buy", quantity=10, price=100, portfolio="momentum"
+            )
+        )
+        ledger.transition("prior-buy", OrderStatus.APPROVED)
+        session.commit()
+
+        await runner.process_recommendation(make_durable_buy_recommendation())
+
+        intent = ledger.get("rec-risk")
+        assert intent.status == OrderStatus.RISK_REJECTED.value
+        # 1,900 - (1,000 + 1 commission) committed to the open buy.
+        assert "have $899.00" in intent.reason
+        session.rollback()
+
+    @pytest.mark.asyncio
+    async def test_another_sleeves_open_buys_do_not_spend_this_sleeves_cash(
+        self, durable_runner, mock_redis
+    ):
+        runner, ledger, session = durable_runner
+        self._set_sleeve_cash(session, 1_900)
+        ledger.create_intent(
+            make_buy_intent_proposal("prior-buy", quantity=10, price=100)
+        )
+        ledger.transition("prior-buy", OrderStatus.APPROVED)
+        session.commit()
+
+        await runner.process_recommendation(make_durable_buy_recommendation())
+
+        assert ledger.get("rec-risk").status == OrderStatus.APPROVED.value
+        session.rollback()
+        assert self._alerts(mock_redis, "sleeve_cash_rejection") == []
+
+    @pytest.mark.asyncio
+    async def test_sleeve_without_a_cash_row_fails_closed(
+        self, durable_runner, mock_redis
+    ):
+        runner, ledger, session = durable_runner
+        session.delete(
+            session.scalar(
+                select(PortfolioConfig).where(PortfolioConfig.portfolio == "momentum")
+            )
+        )
+        session.commit()
+
+        await runner.process_recommendation(make_durable_buy_recommendation())
+
+        intent = ledger.get("rec-risk")
+        assert intent.status == OrderStatus.RISK_REJECTED.value
+        assert intent.reason == "sleeve cash or order data unusable"
+        session.rollback()
 
     @pytest.mark.asyncio
     async def test_active_order_commissions_can_make_second_buy_unaffordable(
