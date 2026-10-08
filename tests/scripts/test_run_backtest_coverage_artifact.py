@@ -64,6 +64,9 @@ def _run(tmp_path: Path, monkeypatch, *, priced: dict[str, list[date]]) -> dict:
         "--output-dir", str(out_dir),
         "--years", "2",
         "--capital", "100000",
+        # No fundamentals/earnings cache exists here; coverage is the subject,
+        # so the KAN-109 escape hatch is taken explicitly.
+        "--allow-degraded-data",
     ])
     run_backtest.main()
 

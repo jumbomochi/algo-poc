@@ -32,6 +32,7 @@ from typing import Any
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
+from shared.data_gaps import data_gaps_in
 from shared.evidence_store import equity_series, max_drawdown_pct
 from shared.models.alerts import AlertRecord
 from shared.models.equity_snapshot import EquitySnapshot
@@ -428,16 +429,49 @@ class PostgresGateDataSource:
             )
         newest = candidates[-1]
         try:
-            metrics = json.loads(newest.read_text())["aggregate"]["metrics"]
+            payload = json.loads(newest.read_text())
+            metrics = payload["aggregate"]["metrics"]
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise GateDataUnavailable(
                 f"{newest.name} has no readable aggregate metrics block: {exc}"
             ) from exc
+        # KAN-109: run_backtest marks an artifact it was told to produce on
+        # missing or stale fundamentals/earnings. Its aggregate includes
+        # sleeves that could not trade as designed, so it is not evidence.
+        degraded = (payload.get("config") or {}).get("data_degraded") or {}
+        if degraded:
+            raise GateDataUnavailable(
+                f"{newest.name} was run on missing or stale data for "
+                f"{', '.join(sorted(degraded))} (config.data_degraded, "
+                "KAN-109); its metrics are not evidence about the book"
+            )
         return {
             "sharpe": float(metrics["sharpe_ratio"]),
             "max_drawdown": float(metrics["max_drawdown"]),
             "win_rate": float(metrics["win_rate"]),
         }
+
+    # -- context: registered data gaps (KAN-109) ----------------------------
+
+    def get_data_gap_notes(self) -> list[str]:
+        """Registered data gaps overlapping the paper window, one line each.
+
+        Not a gate and never a number: the register classifies periods whose
+        sleeve evidence came from missing or stale fundamentals/earnings
+        (``shared/data_gaps.py``) so the gate report does not present those
+        periods' figures without saying so. Read nothing from the database —
+        the window start is the explicit ``paper_start`` when given, else the
+        earliest snapshot, and an unreadable clock simply means every gap is
+        listed.
+        """
+        try:
+            start = self.get_paper_start_date().date()
+        except GateDataUnavailable:
+            start = date.min
+        return [
+            gap.describe()
+            for gap in data_gaps_in(start, self._now().date())
+        ]
 
     # -- shared predicates --------------------------------------------------
 

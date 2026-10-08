@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import sys
 import time
@@ -101,8 +102,15 @@ def _context_exit_quantity(
         0.0,
     )
     return uncovered if uncovered > 0 else None
-from scripts.fetch_fundamentals import load_fundamentals_cache, build_fundamentals_lookup, SECTOR_MAP
-from scripts.fetch_earnings import load_earnings_cache, build_earnings_lookup
+from scripts.fetch_fundamentals import build_fundamentals_lookup, SECTOR_MAP
+from scripts.fetch_earnings import build_earnings_lookup
+from shared.data_cache import (
+    EARNINGS_WINDOW_DAYS,
+    DataCaches,
+    assess_data_health,
+    configured_data_config,
+    load_data_caches,
+)
 from scripts.train_signal_model import assert_ml_filter_out_of_sample
 from services.signal_generation.technical import (
     SupportProximitySignal,
@@ -141,6 +149,104 @@ SLEEVE_ALLOCATIONS: dict[str, float] = {
     "earnings_drift": 0.1923,
     "tail_risk_hedge": 0.1283,
 }
+
+
+#: run_backtest refused because a sleeve it would run reads a missing or stale
+#: fundamentals/earnings cache and ``--allow-degraded-data`` was not passed
+#: (KAN-109). Distinct from 1 (no bars) and 2 (bad arguments).
+EXIT_DATA_DEGRADED = 3
+
+#: The stable token run_backtest_refresh.sh greps to say the artifact it just
+#: wrote is marked, rather than announcing a clean refresh.
+DATA_DEGRADED_TOKEN = "DATA_DEGRADED_ARTIFACT"
+
+
+def load_backtest_caches(
+    *,
+    sleeves: Sequence[str],
+    bars_by_ticker: dict[str, list[dict]],
+    allow_degraded: bool,
+    cache_dir: str | None = None,
+    config: object | None = None,
+) -> tuple[DataCaches, dict[str, str]]:
+    """Load the caches from ``data.cache_dir`` and judge them for this run.
+
+    Freshness is judged as of the close of the newest bar, not today: a
+    backtest ending on a past session is fully served by a cache fetched after
+    it. Returns ``(caches, {sleeve: reason})`` for every sleeve in ``sleeves``
+    whose cache is missing or stale, and prints the outcome either way. The
+    caller refuses on a non-empty result unless ``allow_degraded``.
+
+    Before KAN-109 this printed one WARNING line and ran on, so the weekly
+    refresh produced baselines in which quality_value and earnings_drift never
+    traded, and nothing downstream could tell.
+    """
+    if config is None:
+        config = configured_data_config()
+    caches = load_data_caches(
+        cache_dir if cache_dir is not None else config.cache_dir
+    )
+    newest = max(
+        (_bar_day(bars[-1]["date"]) for bars in bars_by_ticker.values() if bars),
+        default=date.today(),
+    )
+    as_of = datetime.combine(newest, datetime.max.time(), tzinfo=timezone.utc)
+    health = assess_data_health(caches, as_of=as_of, config=config)
+    for verdict in health.verdicts.values():
+        rows = len(caches.document(verdict.cache).data)
+        print(f"  {verdict.describe()} — {rows} tickers, {verdict.path}")
+    degraded = health.degraded_sleeves(sleeves)
+    if not degraded:
+        return caches, degraded
+
+    detail = "; ".join(f"{s}: {r}" for s, r in sorted(degraded.items()))
+    if allow_degraded:
+        print(
+            f"  WARNING: {DATA_DEGRADED_TOKEN}: {','.join(sorted(degraded))} "
+            f"— run on missing or stale data as of {newest} "
+            f"(--allow-degraded-data). The artifact is marked config."
+            f"data_degraded and is not evidence about these sleeves: {detail}"
+        )
+    else:
+        print(
+            f"ERROR: refusing to backtest {', '.join(sorted(degraded))} on "
+            f"missing or stale data as of {newest}: {detail}. Refresh the "
+            f"cache(s), drop the sleeve(s) with --sleeves, or pass "
+            f"--allow-degraded-data to write an artifact marked as degraded "
+            f"(KAN-109)."
+        )
+    return caches, degraded
+
+
+def absent_cache_sleeves(
+    sleeves: Sequence[str], cache_dir: str | None = None
+) -> dict[str, str]:
+    """``{sleeve: reason}`` for sleeves whose cache file is missing,
+    unreadable or empty — knowable before any bar is fetched."""
+    from shared.data_cache import SLEEVE_CACHE
+
+    caches = load_data_caches(cache_dir)
+    out: dict[str, str] = {}
+    for sleeve in sleeves:
+        cache = SLEEVE_CACHE.get(sleeve)
+        if cache is None:
+            continue
+        doc = caches.document(cache)
+        if not doc.exists:
+            out[sleeve] = f"{cache} cache MISSING at {doc.path}"
+        elif doc.error:
+            out[sleeve] = f"{cache} cache UNREADABLE at {doc.path}: {doc.error}"
+        elif not doc.data:
+            out[sleeve] = f"{cache} cache EMPTY at {doc.path}"
+    return out
+
+
+def _bar_day(value: object) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value)[:10])
 
 
 def sleeve_capital_fractions(selected: Sequence[str] | None) -> dict[str, float]:
@@ -1785,6 +1891,13 @@ def make_earnings_drift_signals_fn(
             return None
 
         surprise = event.get("surprise_pct", 0.0)
+        # A scheduled announcement with no reported EPS carries a NaN surprise,
+        # and ``nan < threshold`` is False — so before KAN-109 every such row
+        # passed the threshold and became an entry: 36 of them in the pinned
+        # baseline, 2026-04-13..06-22, from the stale 2026-03-26 cache. No
+        # reported surprise is no event.
+        if surprise is None or not math.isfinite(surprise):
+            return None
         if surprise < surprise_threshold_pct:
             return None
 
@@ -2587,6 +2700,14 @@ def main():
     parser.add_argument("--start-date", type=str, default=None,
                         help="Only open new trades on or after this date (YYYY-MM-DD). "
                              "Earlier data is still used for indicator warm-up.")
+    parser.add_argument(
+        "--allow-degraded-data",
+        action="store_true",
+        help="Run quality_value / earnings_drift even when their fundamentals "
+             "or earnings cache is missing or stale (KAN-109). The artifact is "
+             "marked config.data_degraded. Without it such a run exits "
+             f"{EXIT_DATA_DEGRADED}.",
+    )
     parser.add_argument("--bars-from-json", type=str, default=None,
                         help="Path to a prior backtest results JSON. Skips the IB fetch "
                              "and loads the cached bars from that file. Useful when IB "
@@ -2673,6 +2794,19 @@ def main():
         )
     print()
 
+    # A cache that is not there at all cannot become fresh during the fetch,
+    # and the IB pull is hours (the point-in-time universe). Refuse before it.
+    # Staleness is judged after the fetch, against the newest bar.
+    absent = absent_cache_sleeves(list(fractions))
+    if absent and not args.allow_degraded_data:
+        print(
+            "ERROR: refusing to backtest "
+            + "; ".join(f"{s}: {r}" for s, r in sorted(absent.items()))
+            + ". Fetch the cache(s), drop the sleeve(s) with --sleeves, or "
+            "pass --allow-degraded-data (KAN-109)."
+        )
+        sys.exit(EXIT_DATA_DEGRADED)
+
     # 1. Fetch data from IB
     # NOTE: mean_reversion and short_term_mr removed 2026-05-26 — see
     # docs/strategies/mean-reversion-failure-analysis.md
@@ -2740,21 +2874,20 @@ def main():
                 + ", ".join(f"{t} ({d}d)" for t, d in worst)
             )
 
-    # Load cached fundamentals and earnings data
-    fundamentals_cache = load_fundamentals_cache("data/cache/fundamentals.json")
-    earnings_cache = load_earnings_cache("data/cache/earnings.json")
-    fundamentals_lookup = build_fundamentals_lookup(fundamentals_cache)
-    earnings_lookup = build_earnings_lookup(earnings_cache, window_days=2)
-
-    if fundamentals_cache:
-        print(f"  Loaded fundamentals for {len(fundamentals_cache)} tickers")
-    else:
-        print("  WARNING: No fundamentals cache found. Run: python scripts/fetch_fundamentals.py")
-
-    if earnings_cache:
-        print(f"  Loaded earnings for {len(earnings_cache)} tickers")
-    else:
-        print("  WARNING: No earnings cache found. Run: python scripts/fetch_earnings.py")
+    # Load cached fundamentals and earnings data (KAN-109): from data.cache_dir,
+    # judged fresh as of the last bar, and refused when a sleeve this run
+    # trades would otherwise be backtested on missing or stale data.
+    caches, data_degraded = load_backtest_caches(
+        sleeves=list(fractions),
+        bars_by_ticker=bars_by_ticker,
+        allow_degraded=args.allow_degraded_data,
+    )
+    if data_degraded and not args.allow_degraded_data:
+        sys.exit(EXIT_DATA_DEGRADED)
+    fundamentals_lookup = build_fundamentals_lookup(caches.fundamentals.data)
+    earnings_lookup = build_earnings_lookup(
+        caches.earnings.data, window_days=EARNINGS_WINDOW_DAYS
+    )
 
     # Compute market regime for regime-dependent strategies
     regime_by_date = compute_regime_by_date(bars_by_ticker)
@@ -3090,6 +3223,11 @@ def main():
         # --bars-from-json.
         fetch=summarise_fetch(requested=all_tickers, bars_by_ticker=bars_by_ticker),
     )
+    if data_degraded:
+        # KAN-109. Present only when degraded, like coverage and fetch: a
+        # clean run carries no key, so an absent key never reads as unknown.
+        # The go-live gate refuses an artifact that carries it.
+        base_config["data_degraded"] = dict(sorted(data_degraded.items()))
     if args.ml_filter:
         base_config["ml_filter"] = {
             "model": args.ml_filter,

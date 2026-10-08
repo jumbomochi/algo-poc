@@ -273,6 +273,16 @@ recording that it had changed, and no way afterwards to say which baseline had
 judged a given session. D16 requires the Rung-0 baseline to have "its own monitor
 pins"; this is the mechanism half of that.
 
+> **KAN-109: the pin cannot be reproduced trade-for-trade.** The pinned
+> `backtest_multi_20260915_102125.json` contains 36 earnings_drift trades
+> entered 2026-04-13..2026-06-22 on a NaN earnings surprise — scheduled
+> announcements the stale 2026-03-26 cache held with no reported EPS, which
+> passed the 5% threshold because `nan < 5.0` is false. That entry is now
+> refused, so re-running the pin's config no longer produces those trades.
+> Its quality_value and earnings_drift coverage is also partial
+> (fundamentals only from 2024-08-14, earnings from 2020); both facts are on
+> record in `shared/data_gaps.py`, and the artifact itself is unchanged.
+
 ### Where the pin lives, and what enforces it
 
 ```yaml

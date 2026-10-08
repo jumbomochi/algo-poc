@@ -66,6 +66,12 @@ from services.notifications.channels import (  # noqa: E402
     TelegramChannel,
 )
 from shared.absent_sessions import absent_sessions_in  # noqa: E402
+from shared.data_cache import (  # noqa: E402
+    assess_data_health,
+    configured_data_config,
+    load_data_caches,
+)
+from shared.data_gaps import DataGap, data_gaps_in  # noqa: E402
 from shared.evidence_store import (  # noqa: E402
     EXCLUDED_PORTFOLIO_PREFIX,
     _passing_drill_types,
@@ -207,6 +213,14 @@ class DigestSnapshot:
     #: missing epoch is the normal state before Rung 0, while a failed epoch
     #: query is not, and they must never produce the same line.
     failed: frozenset[str] = field(default_factory=frozenset)
+    #: KAN-109: sleeve -> why its fundamentals/earnings cache is missing or
+    #: stale right now. ``None`` when the check could not run (or was not
+    #: wired); ``{}`` when every cache is fresh.
+    data_degraded: dict[str, str] | None = None
+    #: KAN-109: registered data gaps (``shared/data_gaps.py``) overlapping the
+    #: reported week, so the week's verdicts for those sleeves are not read as
+    #: strategy results.
+    data_gaps: list[DataGap] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +294,39 @@ def _absent_line(blind: BlindReport | None) -> list[str]:
     return [
         f"◻️ ABSENT (accepted) — {count} of {blind.total_sessions} {noun} "
         f"a recorded cause ({days})"
+    ]
+
+
+#: Telegram is a summary; the full reason is in the paper run's log.
+_DEGRADED_REASON_CHARS = 90
+
+
+def _data_degraded_line(degraded: dict[str, str] | None) -> list[str]:
+    """Sleeves that cannot enter today because their data is bad (KAN-109).
+
+    Loud, because the symptom is silence: a sleeve with no data simply never
+    signals, which reads as a quiet market in every other line here.
+    """
+    if not degraded:
+        return []
+    parts = []
+    for sleeve, reason in sorted(degraded.items()):
+        if len(reason) > _DEGRADED_REASON_CHARS:
+            reason = reason[: _DEGRADED_REASON_CHARS - 1] + "…"
+        parts.append(f"{sleeve} ({reason})")
+    return [
+        "📉 DATA-DEGRADED — no new entries from: " + "; ".join(parts)
+    ]
+
+
+def _data_gap_line(gaps: list[DataGap]) -> list[str]:
+    """The register's view of the week: which sleeves' evidence it covers."""
+    if not gaps:
+        return []
+    return [
+        "◻️ DATA GAP (on record, KAN-109) — "
+        + ", ".join(f"{gap.sleeve} {gap.kind} {gap.period()}" for gap in gaps)
+        + ": not strategy evidence"
     ]
 
 
@@ -396,7 +443,9 @@ def render_digest(snapshot: DigestSnapshot) -> str:
         *_blind_line(snapshot.blind),
         *_partial_line(snapshot.partial),
         *_missing_line(snapshot.missing),
+        *_data_degraded_line(snapshot.data_degraded),
         *_absent_line(snapshot.blind),
+        *_data_gap_line(snapshot.data_gaps),
         *_epoch_lines(snapshot.epoch, snapshot.failed),
         *_equity_lines(snapshot.equity, snapshot.sleeves),
         _tail_line(snapshot),
@@ -432,6 +481,9 @@ class Sources:
     partial: Callable[[], object] | None = None
     #: Optional for the same reason as ``partial``.
     unstamped: Callable[[], object] | None = None
+    #: KAN-109, optional for the same reason.
+    data_degraded: Callable[[], object] | None = None
+    data_gaps: Callable[[], object] | None = None
 
 
 def collect_snapshot(
@@ -470,6 +522,14 @@ def collect_snapshot(
         _read("unstamped", sources.unstamped, None)
         if sources.unstamped is not None else None
     )
+    data_degraded = (
+        _read("data", sources.data_degraded, None)
+        if sources.data_degraded is not None else None
+    )
+    data_gaps = (
+        _read("data_gaps", sources.data_gaps, [])
+        if sources.data_gaps is not None else []
+    )
 
     return DigestSnapshot(
         as_of=as_of,
@@ -485,6 +545,8 @@ def collect_snapshot(
         drills_due=drills,
         missing=sorted(missing),
         failed=frozenset(failed),
+        data_degraded=data_degraded,
+        data_gaps=list(data_gaps or []),
     )
 
 
@@ -925,7 +987,32 @@ def build_sources(
         unstamped=lambda: unstamped_snapshots(
             session, start=window_start, end=as_of + timedelta(days=1)
         ),
+        data_degraded=data_degraded_source(),
+        data_gaps=lambda: data_gaps_in(window_start, as_of),
     )
+
+
+def data_degraded_source(
+    *, now: Callable[[], datetime] | None = None, cache_dir: str | None = None
+) -> Callable[[], dict[str, str]]:
+    """Which sleeves the caches degrade right now (KAN-109).
+
+    Judged here from the cache files themselves, with the paper run's own
+    thresholds, rather than from the paper log: the digest must report the
+    condition even in a week the paper run never logged it.
+    """
+
+    def _read() -> dict[str, str]:
+        config = configured_data_config()
+        caches = load_data_caches(
+            cache_dir if cache_dir is not None else config.cache_dir
+        )
+        moment = (now or (lambda: datetime.now(timezone.utc)))()
+        return assess_data_health(
+            caches, as_of=moment, config=config
+        ).degraded_sleeves()
+
+    return _read
 
 
 def _awaited(redis_factory, make_source) -> Callable[[], object]:

@@ -62,6 +62,7 @@ from scripts.paper_state import PaperTradingState
 from sqlalchemy import select
 
 from shared.config import load_config
+from shared.data_gaps import data_gaps_in, describe_gaps
 from shared.models import GateEpoch
 from shared.models.evidence import DivergenceDaily
 from shared.evidence_store import unstamped_snapshots
@@ -705,6 +706,61 @@ def apply_shadow_comparability(
     return report
 
 
+def apply_data_degraded(
+    report: PortfolioDivergenceReport,
+    reason: str,
+    *,
+    session: date | None = None,
+) -> PortfolioDivergenceReport:
+    """Record a sleeve the producing run marked data-degraded as ungraded.
+
+    KAN-109. The 05:15 run placed no new entries for this sleeve and did not
+    replay its shadow, because the fundamentals/earnings cache it decides on
+    was missing or stale. Grading it would score a book that could not act
+    against a replay of data it never had, so it is NO_DATA — the same
+    "ran, could not judge" verdict the evidence store already pauses on — and
+    the reason goes FIRST in the notes, which is the line the exit-5 alert
+    quotes.
+
+    ``session`` is the session the shadow speaks for. The sleeve has no curve,
+    so there is no aligned session to date the verdict by, and an undated
+    report is not persisted at all — which would make "the run said this
+    sleeve's data was bad" indistinguishable from "the monitor wrote nothing".
+    Dated by the shadow's session, it is recorded as the NO_DATA it is.
+    """
+    if report.window_end is None and session is not None:
+        report.window_end = session
+    report.status = "NO_DATA"
+    report.baseline_comparable = False
+    report.notes.insert(
+        0,
+        f"data-degraded (KAN-109): {reason} — not graded; the paper run "
+        "placed no new entries for this sleeve and did not replay its shadow",
+    )
+    return report
+
+
+def note_data_gaps(
+    report: PortfolioDivergenceReport,
+    live: dict[date, float],
+    *,
+    window_sessions: int,
+) -> PortfolioDivergenceReport:
+    """Name any registered data gap (``shared/data_gaps.py``) the graded
+    window overlaps, so a verdict from inside it is not read as a strategy
+    result. Classifies only: the status is untouched."""
+    start, end = report.window_start, report.window_end
+    if start is None or end is None:
+        sessions = sorted(live)[-window_sessions:]
+        if not sessions:
+            return report
+        start, end = sessions[0], sessions[-1]
+    gaps = data_gaps_in(start, end, sleeves={report.portfolio})
+    if gaps:
+        report.notes.append(describe_gaps(gaps))
+    return report
+
+
 # Generous for two INSERTs, and short next to the job's window. The verdict
 # reaches the operator only once this process exits — the launchd wrapper sends
 # the Telegram message from the exit code — so a write blocked on a lock would
@@ -1294,7 +1350,15 @@ def main() -> int:
             threshold=args.threshold,
             execution_model=execution_model,
         )
-        if args.shadow:
+        degraded_reason = (
+            shadow_artifact.data_degraded.get(name)
+            if shadow_artifact is not None else None
+        )
+        if degraded_reason is not None:
+            report = apply_data_degraded(
+                report, degraded_reason, session=shadow_artifact.session_date
+            )
+        elif args.shadow:
             report = apply_shadow_comparability(
                 report,
                 SleeveComparability(
@@ -1315,6 +1379,7 @@ def main() -> int:
                     overlapping_sessions=len(set(live) & set(model_series)),
                 ),
             )
+        note_data_gaps(report, live, window_sessions=args.window)
         reports.append(report)
 
     # Everything scored so far is a real sleeve. The aggregate is appended

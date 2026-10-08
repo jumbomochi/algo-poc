@@ -108,7 +108,7 @@ def harness(monkeypatch):
     monkeypatch.setattr(run_paper, "get_union_universe", lambda sleeves: ["AAA", "BBB"])
     monkeypatch.setattr(run_paper, "fetch_bars_from_ib", fake_fetch)
     # The first thing the run does with the bars after the guard.
-    monkeypatch.setattr(run_paper, "load_fundamentals_cache", priced)
+    monkeypatch.setattr(run_paper, "load_data_caches", priced)
     monkeypatch.setattr(
         sys, "argv", ["run_paper.py", "--db-url", "sqlite://", "--redis-url", "redis://x"]
     )

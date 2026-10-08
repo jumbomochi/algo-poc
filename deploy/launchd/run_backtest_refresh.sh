@@ -268,9 +268,17 @@ REFRESH_TIMEOUT="${ALGO_REFRESH_TIMEOUT_SECONDS:-21600}"   # 6h
 #
 # Output is streamed, not buffered: an operator greps this log live for
 # "[473/826]" while the job runs.
+#
+# --allow-degraded-data (KAN-109): without it run_backtest.py now REFUSES (exit
+# 3) whenever the fundamentals or earnings cache is missing or stale, which
+# would turn every Tuesday into a failed refresh until fresh caches exist and
+# leave the operator nothing to re-pin. With it the run completes, the artifact
+# is marked config.data_degraded (the go-live gate refuses such an artifact),
+# and the success message below says so instead of announcing a clean baseline.
 algo_run_bounded "$REFRESH_TIMEOUT" \
     "$VENV" scripts/run_backtest.py --years 10 --capital 100000 \
-    --universe-snapshots "$MEMBERSHIP_SNAPSHOT" >> "$LOG_FILE" 2>&1
+    --universe-snapshots "$MEMBERSHIP_SNAPSHOT" --allow-degraded-data \
+    >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
 
 # 124 is the helper's timeout code, and one run_backtest.py cannot produce
@@ -287,7 +295,17 @@ if [ "$EXIT_CODE" -eq 0 ]; then
     NEWEST=$(ls -t "$ALGO_DIR"/output/backtest_multi_*.json 2>/dev/null | head -1)
     SUMMARY=$(grep -A6 "AGGREGATE" "$LOG_FILE" | grep -E "Total Return|Sharpe|Max Drawdown" | head -3 | tr -s ' ' | tr '\n' ' ')
     echo "$(ts): refresh OK -> $NEWEST" >> "$LOG_FILE"
-    telegram "✅ Weekly backtest refreshed: $(basename "${NEWEST:-unknown}") — ${SUMMARY:-see log}. Divergence monitor baseline is now current."
+    # run_backtest.py prints DATA_DEGRADED_ARTIFACT when it ran a sleeve on a
+    # missing or stale cache (KAN-109). Such an artifact must not be announced
+    # as a current baseline, or it is the one an operator re-pins.
+    DEGRADED=$(grep -oE "DATA_DEGRADED_ARTIFACT: [a-z_,]+" "$LOG_FILE" | tail -1 \
+               | sed 's/^DATA_DEGRADED_ARTIFACT: //')
+    if [ -n "$DEGRADED" ]; then
+        echo "$(ts): artifact is DATA-DEGRADED for: $DEGRADED (config.data_degraded)" >> "$LOG_FILE"
+        telegram "⚠️ Weekly backtest refreshed DATA-DEGRADED: $(basename "${NEWEST:-unknown}") ran $DEGRADED on a missing or stale fundamentals/earnings cache, and is marked config.data_degraded — do NOT pin it as a baseline. ${SUMMARY:-see log}. Refresh data/cache (KAN-109/KAN-110)."
+    else
+        telegram "✅ Weekly backtest refreshed: $(basename "${NEWEST:-unknown}") — ${SUMMARY:-see log}. Divergence monitor baseline is now current."
+    fi
     # Prune baselines older than 90 days (~64MB each) — except the pinned one.
     # See "WHY THE PRUNE HAS TO KNOW ABOUT THE PIN" in the header. Resolved here
     # rather than at the top of the script so a resolver failure cannot touch the

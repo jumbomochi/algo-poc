@@ -39,7 +39,10 @@ def _run(tmp_path: Path, monkeypatch, *extra: str) -> Path:
     monkeypatch.setattr(run_backtest.sys, "argv", [
         "run_backtest.py", "--bars-from-json", str(bars),
         "--universe-snapshots", str(snapshots), "--output-dir", str(out_dir),
-        "--years", "2", *extra,
+        "--years", "2",
+        # No fundamentals/earnings cache exists here; these tests are about
+        # allocation, so they take the KAN-109 escape hatch explicitly.
+        "--allow-degraded-data", *extra,
     ])
     run_backtest.main()
     return out_dir

@@ -33,6 +33,7 @@ from scripts.fetch_fundamentals import (
     build_fundamentals_lookup,
     load_fundamentals_cache,
 )
+from shared.data_cache import FUNDAMENTALS, cache_path
 from scripts.run_backtest import (
     PortfolioConfig,
     compute_aggregate_metrics,
@@ -343,7 +344,8 @@ def main() -> None:
     parser.add_argument(
         "--fundamentals",
         type=Path,
-        default=Path("data/cache/fundamentals.json"),
+        default=None,
+        help="Default: fundamentals.json in data.cache_dir (KAN-109).",
     )
     parser.add_argument("--capital", type=float, default=100_000.0)
     parser.add_argument("--score-margin", type=float, default=0.25)
@@ -361,6 +363,8 @@ def main() -> None:
     args = parser.parse_args()
 
     bars = load_cached_bars(args.bars_from_json)
+    if args.fundamentals is None:
+        args.fundamentals = cache_path(FUNDAMENTALS)
     fundamentals_cache = load_fundamentals_cache(str(args.fundamentals))
     if not fundamentals_cache:
         parser.error(f"No fundamentals found in {args.fundamentals}")

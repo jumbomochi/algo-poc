@@ -265,6 +265,64 @@ class DivergenceConfig(BaseModel):
     live_history_from: date | None = None
 
 
+class FundamentalsCacheConfig(BaseModel):
+    """When ``fundamentals.json`` stops being fit to trade quality_value on.
+
+    Two independent questions (KAN-109). ``max_fetch_age_days`` asks whether
+    the refresh job is alive; the period check asks whether the cache still
+    holds the newest quarter a fresh fetch would have. The second is the one
+    that matters to the sleeve, and the only one a cache without
+    ``fetched_at`` can still be judged on.
+    """
+
+    #: A weekly refresh may miss one run; two missed is a broken job.
+    max_fetch_age_days: float = Field(default=14.0, gt=0)
+    #: The longest calendar quarter (92 days) plus 75 days for the filing that
+    #: reports the NEXT period. 75, not the lookup's 45-day 10-Q lag, because
+    #: the fourth quarter has no 10-Q: it arrives with the 10-K, due 60 days
+    #: after year-end for large accelerated filers and 75 for accelerated
+    #: ones. With 45 (a 137-day bound) a perfectly fresh mid-February cache —
+    #: most calendar-FY tickers still at 09-30 because their 10-K is not out —
+    #: read STALE every year (PR #235 review). Past 167 days a newer period is
+    #: available to any fresh fetch even across a fiscal year-end, so a ticker
+    #: still older is serving superseded figures. The cost is lag: a cache
+    #: that misses an ordinary quarter is caught ~30 days later than the 10-Q
+    #: deadline alone would allow.
+    max_period_age_days: int = Field(default=167, gt=0)
+    #: Share of tickers allowed to be past ``max_period_age_days`` before the
+    #: whole cache is stale. 20% is the "no ROE / D/E / margin for >=20% of the
+    #: universe" bound in docs/operations/sleeve-kill-criteria.md; below it a
+    #: late filer or two must not take the sleeve out.
+    max_stale_ticker_fraction: float = Field(default=0.20, ge=0.0, le=1.0)
+
+
+class EarningsCacheConfig(BaseModel):
+    """When ``earnings.json`` stops being fit to trade earnings_drift on."""
+
+    #: The sleeve enters within the lookup window (2 days) of an announcement.
+    #: A cache fetched longer ago than that cannot hold the announcements that
+    #: are still tradeable today, so every day past it is entries silently
+    #: missed rather than declined. A refresh must therefore run daily.
+    max_fetch_age_days: float = Field(default=2.0, gt=0)
+
+
+class DataConfig(BaseModel):
+    """Where the fundamentals/earnings caches live, and when they are stale.
+
+    ``cache_dir`` is resolved against the repository root when relative — not
+    the working directory — so the paper run, the backtest refresh and the
+    fetchers agree on one location whichever directory they start in. Before
+    KAN-109 each opened ``data/cache/...`` relative to its cwd, and nothing
+    noticed when the deploy clone (KAN-72) had no caches at all.
+    """
+
+    cache_dir: str = "data/cache"
+    fundamentals: FundamentalsCacheConfig = Field(
+        default_factory=FundamentalsCacheConfig
+    )
+    earnings: EarningsCacheConfig = Field(default_factory=EarningsCacheConfig)
+
+
 class ResearchConfig(BaseModel):
     shadow_enabled: bool = False
     factor_ids: list[str] = Field(
@@ -297,6 +355,7 @@ class AppConfig(BaseModel):
     currency: CurrencyConfig = Field(default_factory=CurrencyConfig)
     research: ResearchConfig = Field(default_factory=ResearchConfig)
     divergence: DivergenceConfig = Field(default_factory=DivergenceConfig)
+    data: DataConfig = Field(default_factory=DataConfig)
 
     @model_validator(mode="after")
     def validate_live_currency_safety(self) -> AppConfig:
@@ -315,6 +374,7 @@ ENV_MAP: dict[str, str] = {
     "ALGO_REDIS_URL": "redis.url",
     "ALGO_IB_HOST": "ib.host",  # containers set this to host.docker.internal
     "ALGO_IB_ACCOUNT_ID": "ib.account_id",
+    "ALGO_DATA_CACHE_DIR": "data.cache_dir",
 }
 
 

@@ -68,11 +68,16 @@ from scripts.run_backtest import (
     summarise_fetch,
 )
 from scripts.fetch_fundamentals import (
-    load_fundamentals_cache,
     build_fundamentals_lookup,
     SECTOR_MAP,
 )
-from scripts.fetch_earnings import load_earnings_cache, build_earnings_lookup
+from scripts.fetch_earnings import build_earnings_lookup
+from shared.data_cache import (
+    EARNINGS_WINDOW_DAYS,
+    DataHealth,
+    assess_data_health,
+    load_data_caches,
+)
 from backtest._portfolio_state import SimplePortfolioState
 from backtest.portfolio_context import PortfolioContext
 from backtest.ranked_selection import ReplacementPolicy
@@ -124,6 +129,13 @@ CAPITAL_ALLOCATIONS = {
 }
 
 
+#: Exit reasons a sleeve derives from its fundamentals/earnings data rather
+#: than from price. A data-degraded sleeve (KAN-109) must not act on them:
+#: quality_value's rank replacement sells a holding for a better-ranked name,
+#: ranked on the cache that is missing or stale.
+DATA_DRIVEN_EXIT_REASONS = frozenset({"rank_replacement"})
+
+
 #: Sessions the shadow replays. Taken from the monitor's own default so the two
 #: cannot drift: producing fewer than the monitor compares would silently
 #: shorten every window. A wider ad-hoc ``--window`` still works — the monitor
@@ -167,6 +179,7 @@ def produce_shadow_artifact(
     whole_shares: bool = False,
     bars_session: date | None = None,
     priced_at: datetime | None = None,
+    data_degraded: Mapping[str, str] | None = None,
 ):
     """Replay every sleeve over its rolling window and write the artifact.
 
@@ -187,9 +200,18 @@ def produce_shadow_artifact(
     the bars cover and the instant their fetch started — so the monitor can
     refuse a curve priced before its session closed.
 
+    ``data_degraded``: sleeves whose fundamentals/earnings cache is missing or
+    stale (KAN-109). They are NOT replayed — a replay on that data would trade
+    entries the model never had the information for, or none it should have —
+    and the artifact names them with the reason, so the monitor records each
+    as ungraded (NO_DATA) instead of grading a curve built from bad inputs.
+    The fingerprint still covers every sleeve: being degraded is a data
+    condition, not a model change, and must not restart the epoch.
+
     Returns the path written. Raises on failure: the caller decides whether a
     shadow failure is worth stopping the paper run for, and at 05:15 it is not.
     """
+    degraded = dict(data_degraded or {})
     shadow_portfolios = build_portfolios(
         capital=capital,
         bars_by_ticker=bars_by_ticker,
@@ -199,7 +221,10 @@ def produce_shadow_artifact(
         portfolio_contexts=None,
     )
     series = build_shadow_series(
-        portfolios=shadow_portfolios,
+        portfolios={
+            name: sleeve for name, sleeve in shadow_portfolios.items()
+            if name not in degraded
+        },
         bars_by_ticker=bars_by_ticker,
         live_equity=live_equity,
         window_sessions=window_sessions,
@@ -222,6 +247,7 @@ def produce_shadow_artifact(
         produced_on=date.today(),
         bars_session=bars_session,
         priced_at=priced_at,
+        data_degraded=degraded,
     )
     return output_path
 
@@ -823,6 +849,7 @@ def run_daily(
     *,
     reconciliation: ReconciliationResult | None = None,
     entries_disabled: bool = False,
+    data_degraded: Mapping[str, str] | None = None,
     reservations_by_portfolio: Mapping[str, float] | None = None,
     sell_availability: Mapping[str, float] | None = None,
     settled_cash_trading: float | None,
@@ -854,8 +881,15 @@ def run_daily(
     ``priced_at`` is the instant the bar fetch started (KAN-104). It is the
     ``session_date`` stamp's fallback instant when there is no budget to
     supply ``valuation_at`` (KAN-103).
+
+    ``data_degraded`` maps a sleeve to why its fundamentals/earnings cache
+    cannot be trusted (KAN-109). That sleeve's buys are skipped and printed
+    with the reason, and so are its exits whose reason is a judgement made
+    from the cache (:data:`DATA_DRIVEN_EXIT_REASONS`). Risk exits — trailing
+    stops, time exits — are processed exactly as before.
     """
     signals_generated: list[dict] = []
+    degraded = dict(data_degraded or {})
     currency_context: dict[str, Any] = (
         {
             "base_currency": capital.base_currency,
@@ -903,6 +937,12 @@ def run_daily(
                 qty = signal.get("quantity", 0)
 
                 if action == "buy":
+                    if name in degraded:
+                        print(
+                            f"  SKIP {ticker:>6s}  {qty:>8.4f} @ "
+                            f"${price:>8.2f}  [{name}] (data-degraded)"
+                        )
+                        continue
                     if entries_disabled or (
                         reconciliation is not None
                         and not reconciliation.entries_allowed
@@ -1027,6 +1067,21 @@ def run_daily(
                         f"  BUY  {ticker:>6s}  {qty:>8.4f} @ ${price:>8.2f}  [{name}]"
                     )
                 elif action == "sell":
+                    if (
+                        name in degraded
+                        and signal.get("exit_reason") in DATA_DRIVEN_EXIT_REASONS
+                    ):
+                        # A rank replacement sells to make room for a better-
+                        # ranked name, by a ranking built on the untrusted
+                        # cache — and the paired buy is skipped above, so it
+                        # would sell a holding and buy nothing. Risk exits
+                        # (trailing stop, time exit) do not read the cache
+                        # and still run.
+                        print(
+                            f"  SKIP {ticker:>6s}  [{name}] (data-degraded: "
+                            f"{signal['exit_reason']} exit ranks on the cache)"
+                        )
+                        continue
                     if sell_availability is not None:
                         uncovered = max(
                             0.0, float(remaining_sell_quantity.get(ticker, 0.0))
@@ -1723,6 +1778,52 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def report_data_health(
+    health: DataHealth, *, sleeves: list[str], redis_url: str
+) -> dict[str, str]:
+    """Print each cache's state, and page once if any listed sleeve is degraded.
+
+    Returns ``{sleeve: reason}`` for the listed sleeves whose cache is missing
+    or stale. Printed every run, healthy or not: a line that appears only on a
+    bad day teaches the reader that its absence means fine. The alert is
+    best-effort, like every alert here; the console line and the daily report
+    (``scripts/ops/pipeline_report_summary.py``) carry it regardless.
+    """
+    for verdict in health.verdicts.values():
+        print(f"  Data cache: {verdict.describe()}")
+    degraded = health.degraded_sleeves(sleeves)
+    if not degraded:
+        return degraded
+    for sleeve, reason in sorted(degraded.items()):
+        print(
+            f"  DATA-DEGRADED: {sleeve} — {reason}. No new entries from this "
+            f"sleeve today; risk exits still run, rank replacements are held; "
+            f"its shadow is not graded."
+        )
+    emit_alert_best_effort(
+        redis_url,
+        event_type="sleeve_data_degraded",
+        priority="high",
+        message="run_paper.py: " + (health.alert_message(sleeves) or ""),
+        context={
+            "script": "run_paper.py",
+            "sleeves": sorted(degraded),
+            "caches": {
+                v.cache: {
+                    "path": str(v.path),
+                    "fresh": v.fresh,
+                    "fetched_at": v.fetched_at.isoformat() if v.fetched_at else None,
+                    "age_days": round(v.age_days, 2) if v.age_days is not None else None,
+                    "problems": v.problems,
+                }
+                for v in health.verdicts.values()
+            },
+        },
+        label="data-degraded",
+    )
+    return degraded
+
+
 def refuse_unclosed_session(
     problem: UnclosedSession, *, redis_url: str, stage: str
 ) -> int:
@@ -1981,11 +2082,22 @@ def main() -> int | None:
                 unclosed, redis_url=args.redis_url, stage="newest bar unclosed"
             )
 
-    # Load caches
-    fundamentals_cache = load_fundamentals_cache("data/cache/fundamentals.json")
-    earnings_cache = load_earnings_cache("data/cache/earnings.json")
-    fundamentals_lookup = build_fundamentals_lookup(fundamentals_cache)
-    earnings_lookup = build_earnings_lookup(earnings_cache, window_days=2)
+    # Load caches from data.cache_dir and judge them (KAN-109). Before this a
+    # missing file loaded as {} in silence, and from 2026-09-24 quality_value
+    # and earnings_drift ran with no data at all. A sleeve whose cache is
+    # missing or stale is DATA-DEGRADED: one alert, no new entries, exits
+    # still run, and its shadow is not graded.
+    caches = load_data_caches(_config.data.cache_dir)
+    fundamentals_lookup = build_fundamentals_lookup(caches.fundamentals.data)
+    earnings_lookup = build_earnings_lookup(
+        caches.earnings.data, window_days=EARNINGS_WINDOW_DAYS
+    )
+    data_degraded = report_data_health(
+        assess_data_health(caches, as_of=fetch_started_at, config=_config.data),
+        # A tagged run trades the drill sleeve alone, which reads no cache.
+        sleeves=[] if portfolio_tag is not None else list(CAPITAL_ALLOCATIONS),
+        redis_url=args.redis_url,
+    )
 
     # Compute regime
     regime_by_date = compute_regime_by_date(bars_by_ticker)
@@ -1994,6 +2106,10 @@ def main() -> int | None:
     # creation so restarts preserve strategy exit state.
     # A tagged run hydrates and trades the tag alone: the graded sleeves are
     # untouched by construction, not by filtering downstream.
+    # Bound on both branches: the ML-shadow write below reads it, and a tagged
+    # run used to reach that read with the name unbound (UnboundLocalError
+    # after the run's own commit). Found by KAN-109's tagged-run test.
+    ml_shadow_records: list[dict] = []
     if portfolio_tag is not None:
         portfolio_contexts = build_portfolio_contexts(
             state,
@@ -2021,7 +2137,6 @@ def main() -> int | None:
         # ML shadow: score entries, suppress nothing, record the verdict.
         # The trained model would suppress ~80% of buys, so it observes against
         # the live book before anything acts on it.
-        ml_shadow_records: list[dict] = []
         ml_shadow = None
         if args.ml_shadow_model:
             loaded = load_ml_shadow_model(args.ml_shadow_model)
@@ -2073,6 +2188,7 @@ def main() -> int | None:
             bars_by_ticker,
             reconciliation=preparation.reconciliation,
             entries_disabled=entries_disabled,
+            data_degraded=data_degraded,
             reservations_by_portfolio=reservations,
             sell_availability=sell_availability,
             settled_cash_trading=preparation.capital.settled_cash_trading,
@@ -2164,6 +2280,7 @@ def main() -> int | None:
                     window_sessions=SHADOW_WINDOW_SESSIONS,
                     bars_session=bars_session,
                     priced_at=fetch_started_at,
+                    data_degraded=data_degraded,
                 )
                 print(f"  Shadow series written to {shadow_path}")
             except Exception:
@@ -2194,6 +2311,13 @@ def main() -> int | None:
         print(f"\n{len(signals)} signals generated")
     else:
         print("\nNo signals generated today")
+    if data_degraded:
+        # Repeated at the end so the daily report's tail of this log carries
+        # it: "No signals generated today" alone reads as a quiet market.
+        print(
+            "DATA-DEGRADED this run (no new entries): "
+            + ", ".join(sorted(data_degraded))
+        )
     print("\nState committed to database")
 
     # Bridge to the service pipeline: publish the same signals as

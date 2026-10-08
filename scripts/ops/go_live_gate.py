@@ -21,6 +21,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from scripts.ops.gate_data_source import GateDataUnavailable, PostgresGateDataSource
+from shared.data_gaps import KNOWN_DATA_GAPS
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +346,11 @@ def exit_code(results: list[GateResult]) -> int:
 
 
 def render_text(
-    results: list[GateResult], *, mode: str, evaluated_at: datetime
+    results: list[GateResult],
+    *,
+    mode: str,
+    evaluated_at: datetime,
+    data_gaps: list[str] | tuple[str, ...] = (),
 ) -> str:
     """Human-readable report: one line per gate, verdict last."""
     width = max((len(r.name) for r in results), default=0)
@@ -363,11 +368,20 @@ def render_text(
         lines.append("NOT READY for live — blocked by: " + ", ".join(failed))
     else:
         lines.append("READY for live — all gates pass.")
+    if data_gaps:
+        # KAN-109. Context, not a gate: the periods whose sleeve evidence came
+        # from missing or stale data, so the figures above are read knowing it.
+        lines += ["", "Data gaps on record (shared/data_gaps.py):"]
+        lines += [f"  - {gap}" for gap in data_gaps]
     return "\n".join(lines)
 
 
 def render_json(
-    results: list[GateResult], *, mode: str, evaluated_at: datetime
+    results: list[GateResult],
+    *,
+    mode: str,
+    evaluated_at: datetime,
+    data_gaps: list[str] | tuple[str, ...] = (),
 ) -> str:
     """Machine-readable report, for the gate-day review record."""
     return json.dumps(
@@ -384,6 +398,7 @@ def render_json(
                 }
                 for r in results
             ],
+            "data_gaps": list(data_gaps),
         },
         indent=2,
         sort_keys=False,
@@ -451,22 +466,27 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
         with sessionmaker(bind=engine)() as session:
-            results = evaluate(
-                GoLiveGateChecker(
-                    PostgresGateDataSource(
-                        session,
-                        mode=args.mode,
-                        output_dir=args.output_dir,
-                        paper_start=args.paper_start,
-                    )
-                ),
-                session=session,
+            source = PostgresGateDataSource(
+                session,
+                mode=args.mode,
+                output_dir=args.output_dir,
+                paper_start=args.paper_start,
             )
+            results = evaluate(GoLiveGateChecker(source), session=session)
+            try:
+                data_gaps = source.get_data_gap_notes()
+            except SQLAlchemyError:
+                session.rollback()
+                data_gaps = [gap.describe() for gap in KNOWN_DATA_GAPS]
     finally:
         engine.dispose()
 
     render = render_json if args.json else render_text
-    print(render(results, mode=args.mode, evaluated_at=evaluated_at))
+    print(
+        render(
+            results, mode=args.mode, evaluated_at=evaluated_at, data_gaps=data_gaps
+        )
+    )
     return exit_code(results)
 
 

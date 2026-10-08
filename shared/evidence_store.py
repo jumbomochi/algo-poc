@@ -50,6 +50,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from shared.absent_sessions import absent_session, absent_sessions_in
+from shared.data_gaps import data_gaps_in, describe_gaps
 from shared.models.equity_snapshot import EquitySnapshot
 from shared.models.evidence import (
     DivergenceDaily,
@@ -828,6 +829,17 @@ def epoch_progress(
             "safety bound: "
             + "; ".join(entry.describe() for entry in absent)
             + ". The reasoning is in shared/absent_sessions.py."
+        )
+    # KAN-109: sessions whose sleeve evidence was produced from missing or
+    # stale fundamentals/earnings. Reported, never scored — the register
+    # classifies, exactly as the absence register above does.
+    gaps = data_gaps_in(start, effective_as_of, sleeves=set(sleeves))
+    if gaps:
+        blocking.append(
+            describe_gaps(gaps)[:1].upper()
+            + describe_gaps(gaps)[1:]
+            + " They change no criterion here: a NO_DATA verdict inside one "
+            "pauses that sleeve's streak like any other."
         )
     # The session in flight is excluded: at 05:52 the day's own divergence row
     # may legitimately not be written yet, and reporting it as unaccounted-for
