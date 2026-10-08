@@ -40,7 +40,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from glob import glob
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -61,6 +61,11 @@ from backtest.divergence import (
 from scripts.paper_state import PaperTradingState
 from sqlalchemy import select
 
+from shared.capital_flows import (
+    CapitalFlow,
+    flow_adjusted_by_session,
+    flows_by_portfolio,
+)
 from shared.config import load_config
 from shared.data_gaps import data_gaps_in, describe_gaps
 from shared.models import GateEpoch
@@ -413,8 +418,18 @@ def load_backtest_execution_model(backtest_path: str) -> ExecutionModel:
     return execution_model_from_backtest_config(data.get("config"))
 
 
-def load_live_equity_series(state: PaperTradingState, portfolio: str) -> dict[date, float]:
+def load_live_equity_series(
+    state: PaperTradingState,
+    portfolio: str,
+    flows: Sequence[CapitalFlow] = (),
+) -> dict[date, float]:
     """Live equity by the US session each snapshot valued (KAN-103).
+
+    ``flows`` are the sleeve's recorded capital flows (KAN-113). When there
+    are any, the series is flow-adjusted — every step's return is the
+    time-weighted one, anchored so the newest value is the real equity — so a
+    credit or transfer is never graded as performance
+    (``shared/capital_flows.py``). With none, the series is the raw equity.
 
     Keyed by ``equity_snapshots.session_date``, never by ``date``: ``date`` is
     the SGT run date, and keying by it graded live's Monday close against the
@@ -435,6 +450,13 @@ def load_live_equity_series(state: PaperTradingState, portfolio: str) -> dict[da
             "A partial-bar run writes NULL; history needs "
             "scripts/ops/backfill_snapshot_sessions.py --apply."
         )
+    if flows:
+        print(
+            f"  ℹ '{portfolio}': {len(flows)} recorded capital flow(s) "
+            f"(net {sum(f.amount for f in flows):+,.2f} USD) — live returns "
+            "are flow-adjusted (time-weighted); the flows are not performance."
+        )
+        return flow_adjusted_by_session(rows, flows)
     return equity_by_session(rows)
 
 
@@ -1228,6 +1250,9 @@ def main() -> int:
         return EXIT_ERROR
 
     portfolios = state.get_portfolio_names()
+    # Credits and transfers between sleeves (KAN-113): removed from every
+    # live return below, so a top-up is never graded as performance.
+    flows_by_sleeve = flows_by_portfolio(state.capital_flows())
 
     # Checked on the FULL live set, before --portfolio narrows it: --portfolio
     # limits what is scored, never what is compared, so an ad-hoc scoped run
@@ -1319,7 +1344,9 @@ def main() -> int:
                 f"docs/operations/drill-evidence-isolation.md)."
             )
             continue
-        live = load_live_equity_series(state, name)
+        live = load_live_equity_series(
+            state, name, flows=flows_by_sleeve.get(name, ())
+        )
         # Drop live history from before the boundary BEFORE aligning, so the
         # window is built only from admissible sessions (KAN-83). Applied here
         # rather than inside build_report because the aggregate is summed from

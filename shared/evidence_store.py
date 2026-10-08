@@ -50,6 +50,12 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from shared.absent_sessions import absent_session, absent_sessions_in
+from shared.capital_flows import (
+    flow_adjust,
+    flows_by_portfolio,
+    included_flow,
+    recorded_flows,
+)
 from shared.data_gaps import data_gaps_in, describe_gaps
 from shared.models.equity_snapshot import EquitySnapshot
 from shared.models.evidence import (
@@ -84,6 +90,7 @@ __all__ = [
     "current_epoch_state",
     "epoch_progress",
     "equity_series",
+    "included_flows_by_session",
     "max_drawdown_pct",
     "scoring_floor_for",
 ]
@@ -672,6 +679,7 @@ def equity_series(
     start: date,
     end: date,
     excluded_prefix: str = EXCLUDED_PORTFOLIO_PREFIX,
+    flow_adjusted: bool = True,
 ) -> list[tuple[date, float, float]]:
     """Per-session ``(session, summed equity, summed market value)``, ascending.
 
@@ -684,18 +692,60 @@ def equity_series(
 
     Public because the go-live gate's drawdown check reads the same series
     (KAN-42): two callers, one definition of what the account was worth.
+
+    The equity is **flow-adjusted** (KAN-113): a recorded capital flow —
+    a sleeve-cash credit — is removed, so every step's return is the
+    time-weighted one and a deposit can neither read as a gain nor lift the
+    drawdown peak over a loss. The newest value is the real summed equity;
+    earlier values are rescaled (``shared.capital_flows.flow_adjust``). With no
+    recorded flows the series is the raw sum, unchanged. Market value is never
+    adjusted: it is an exposure fact, not a return. ``flow_adjusted=False``
+    gives the raw sums.
     """
     by_session = session_snapshots(
         session, start=start, end=end, excluded_prefix=excluded_prefix
     )
+    equity = {
+        day: sum(float(row.equity or 0.0) for row in rows.values())
+        for day, rows in by_session.items()
+    }
+    if flow_adjusted:
+        included = included_flows_by_session(session, by_session, excluded_prefix)
+        if included is not None:
+            equity = flow_adjust(equity, included)
     return [
         (
             day,
-            sum(float(row.equity or 0.0) for row in rows.values()),
+            equity[day],
             sum(float(row.market_value or 0.0) for row in rows.values()),
         )
         for day, rows in sorted(by_session.items())
     ]
+
+
+def included_flows_by_session(
+    session: Session,
+    by_session: dict[date, dict[str, EquitySnapshot]],
+    excluded_prefix: str,
+) -> dict[date, float] | None:
+    """Net recorded flow inside each session's summed equity (KAN-113).
+
+    ``by_session`` is :func:`session_snapshots` output. ``None`` when no flow
+    is recorded for a graded portfolio, so callers can skip the arithmetic.
+    """
+    flows = flows_by_portfolio(
+        flow for flow in recorded_flows(session)
+        if not flow.portfolio.startswith(excluded_prefix)
+    )
+    if not flows:
+        return None
+    return {
+        day: sum(
+            included_flow(flows.get(portfolio, ()), row.created_at)
+            for portfolio, row in rows.items()
+        )
+        for day, rows in by_session.items()
+    }
 
 
 def max_drawdown_pct(rows: Sequence[tuple[date, float, float]]) -> float:

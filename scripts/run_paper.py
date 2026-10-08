@@ -95,6 +95,7 @@ from services.risk_management.funding import (
 )
 from shared.order_ledger import OrderLedger
 from shared.capital import CapitalBudget, calculate_capital_budget
+from shared.capital_flows import flow_free_since, flows_by_portfolio
 from shared.broker_state import BrokerAccountSnapshot
 from shared.models import CapitalSnapshot, OrderIntent, OrderStatus
 from shared.observability import DEFAULT_TRADING_METRICS
@@ -158,12 +159,28 @@ def live_equity_by_sleeve(state: PaperTradingState) -> dict[str, dict[date, floa
     evidence path uses (``docs/operations/drill-evidence-isolation.md``): the
     "_aggregate" rollup is derived rather than graded, and a drill's book is not
     the graded book.
+
+    A sleeve with a recorded capital flow (KAN-113) is trimmed to the sessions
+    after its newest flow (``shared.capital_flows.flow_free_since``): the
+    shadow is seeded at live's NAV on its window's first session and replays
+    with no flows, so a window that spanned a credit would grade a sleeve with
+    more cash to spend against a shadow without it. The window restarts at the
+    first snapshot that includes the flow and grows back to full length.
     """
+    flows = flows_by_portfolio(state.capital_flows())
     out: dict[str, dict[date, float]] = {}
     for name in state.get_portfolio_names():
         if is_excluded_portfolio(name):
             continue
-        curve = equity_by_session(state.get_equity_history(name))
+        rows = state.get_equity_history(name)
+        curve = equity_by_session(rows)
+        sleeve_flows = flows.get(name)
+        if sleeve_flows:
+            start = flow_free_since(rows, sleeve_flows)
+            curve = {
+                session: value for session, value in curve.items()
+                if start is not None and session >= start
+            }
         if curve:
             out[name] = curve
     return out

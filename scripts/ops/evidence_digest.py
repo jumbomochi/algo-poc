@@ -71,6 +71,7 @@ from shared.data_cache import (  # noqa: E402
     configured_data_config,
     load_data_caches,
 )
+from shared.capital_flows import flow_adjust  # noqa: E402
 from shared.data_gaps import DataGap, data_gaps_in  # noqa: E402
 from shared.evidence_store import (  # noqa: E402
     EXCLUDED_PORTFOLIO_PREFIX,
@@ -80,6 +81,7 @@ from shared.evidence_store import (  # noqa: E402
     breach_streak,
     UnstampedSnapshots,
     epoch_progress,
+    included_flows_by_session,
     session_snapshots,
     unstamped_snapshots,
 )
@@ -175,7 +177,10 @@ class SleeveLine:
 class EquityLine:
     latest: float
     currency: str
+    #: Flow-adjusted (KAN-113): a sleeve-cash credit is not a gain.
     change_pct: float
+    #: Net capital flows recorded inside the week, excluded from change_pct.
+    flows: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -350,6 +355,8 @@ def _equity_lines(equity: EquityLine | None, sleeves: list[SleeveLine]) -> list[
             change = "no change"
         else:
             change = f"{equity.change_pct:+.1f}% wk"
+        if abs(equity.flows) >= 0.005:
+            change += f", excl. {equity.flows:+,.2f} capital flows"
         lines = [f"Equity {equity.latest:,.2f} {equity.currency} ({change})"]
 
     if not sleeves:
@@ -722,6 +729,10 @@ def equity_source(
     is computed by ``epoch_progress``, and this line never second-guesses it.
     Summed across sleeves and excluding synthetic portfolios, the same shape
     every other equity reader in the repo uses.
+
+    ``latest`` is the real balance; ``change_pct`` is flow-adjusted from
+    ``equity_series`` (KAN-113), so a sleeve-cash credit during the week is
+    named as a flow instead of read as a gain.
     """
 
     def _read() -> EquityLine | None:
@@ -735,15 +746,31 @@ def equity_source(
             return None
 
         days = sorted(by_session)
-        first = sum(float(r.equity or 0.0) for r in by_session[days[0]].values())
+        first_raw = sum(
+            float(r.equity or 0.0) for r in by_session[days[0]].values()
+        )
         latest_rows = by_session[days[-1]].values()
         last = sum(float(r.equity or 0.0) for r in latest_rows)
         currency = max(
             (r.trading_currency for r in latest_rows if r.trading_currency),
             default="USD",
         )
+        included = included_flows_by_session(
+            session, by_session, excluded_prefix
+        )
+        if included is None:
+            first, flows = first_raw, 0.0
+        else:
+            raw = {
+                day: sum(float(r.equity or 0.0) for r in rows.values())
+                for day, rows in by_session.items()
+            }
+            first = flow_adjust(raw, included)[days[0]]
+            flows = included[days[-1]] - included[days[0]]
         change = (last - first) / first * 100.0 if first else 0.0
-        return EquityLine(latest=last, currency=currency, change_pct=change)
+        return EquityLine(
+            latest=last, currency=currency, change_pct=change, flows=flows,
+        )
 
     return _read
 
