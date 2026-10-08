@@ -44,7 +44,9 @@ from typing import Any, Iterable, Mapping
 __all__ = [
     "CACHE_FORMAT_VERSION",
     "EARNINGS",
+    "EARNINGS_CALENDAR_FILE",
     "EARNINGS_FILE",
+    "EARNINGS_STATE_FILE",
     "EARNINGS_WINDOW_DAYS",
     "FUNDAMENTALS",
     "FUNDAMENTALS_FILE",
@@ -63,6 +65,7 @@ __all__ = [
     "read_cache_document",
     "resolve_cache_dir",
     "write_cache_document",
+    "write_json_atomic",
 ]
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -75,6 +78,13 @@ FUNDAMENTALS = "fundamentals"
 EARNINGS = "earnings"
 FUNDAMENTALS_FILE = "fundamentals.json"
 EARNINGS_FILE = "earnings.json"
+#: Upcoming (and recently passed) report dates from Alpha Vantage's
+#: EARNINGS_CALENDAR, written by scripts/fetch_earnings.py (KAN-110). Not read
+#: by any lookup: it tells the refresh whom to re-fetch, and the operator what
+#: is coming.
+EARNINGS_CALENDAR_FILE = "earnings_calendar.json"
+#: Per-ticker fetch bookkeeping for the incremental earnings refresh (KAN-110).
+EARNINGS_STATE_FILE = "earnings_fetch_state.json"
 _FILES = {FUNDAMENTALS: FUNDAMENTALS_FILE, EARNINGS: EARNINGS_FILE}
 
 #: Days after an announcement that ``build_earnings_lookup`` still returns it.
@@ -215,32 +225,73 @@ def read_cache_document(path: str | os.PathLike[str]) -> CacheDocument:
     )
 
 
+def write_json_atomic(path: str | os.PathLike[str], payload: Any) -> None:
+    """Write ``payload`` as JSON so a reader sees the old file or the new one.
+
+    Written to a temporary file in the same directory, flushed to disk, then
+    renamed over ``path`` (``os.replace`` is atomic on one filesystem). A
+    failure part-way — a full disk, a kill from the job's timeout — leaves the
+    previous file untouched instead of truncated: the paper run reads these
+    caches at 05:15 and a torn file would read as UNREADABLE (KAN-110).
+    """
+    import tempfile
+
+    path = Path(path)
+    os.makedirs(path.parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        # mkstemp creates 0600; keep the mode a plain open() would have given.
+        umask = os.umask(0)
+        os.umask(umask)
+        os.chmod(tmp, 0o666 & ~umask)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def write_cache_document(
     path: str | os.PathLike[str],
     data: Mapping[str, list[dict]],
     *,
     fetched_at: datetime | None = None,
     source: str | None = None,
+    fetch_time_unknown: bool = False,
 ) -> None:
     """Write rows in the current envelope, stamped with when they were fetched.
 
     ``fetched_at`` defaults to now. Callers that fetch for minutes should pass
     the instant the fetch STARTED: rows fetched at the start are the oldest in
     the file, and the stamp has to describe the oldest.
+
+    ``fetch_time_unknown=True`` writes ``fetched_at: null`` — rows worth
+    keeping whose currency nobody can vouch for (an incremental refresh that
+    has not yet completed a full pass, KAN-110). The freshness check reads
+    that as stale, which is the point.
+
+    The write is atomic (:func:`write_json_atomic`).
     """
-    moment = fetched_at or datetime.now(timezone.utc)
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
+    if fetch_time_unknown:
+        stamp = None
+    else:
+        moment = fetched_at or datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        stamp = moment.astimezone(timezone.utc).isoformat()
     payload = {
         "format_version": CACHE_FORMAT_VERSION,
-        "fetched_at": moment.astimezone(timezone.utc).isoformat(),
+        "fetched_at": stamp,
         "source": source,
         "tickers": dict(data),
     }
-    path = Path(path)
-    os.makedirs(path.parent, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(payload, f, indent=2)
+    write_json_atomic(path, payload)
 
 
 @dataclass(frozen=True)

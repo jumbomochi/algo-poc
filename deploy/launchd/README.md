@@ -16,6 +16,8 @@ host. The **live** copies are deployed outside the repo:
 | `local.algo-db-backup.plist` | `~/Library/LaunchAgents/local.algo-db-backup.plist` |
 | `run_pipeline_report.sh` | `~/ibc/run_pipeline_report.sh` (chmod +x) — 05:52 SGT Tue–Sat pipeline report + Telegram heartbeat |
 | `local.algo-pipeline-report.plist` | `~/Library/LaunchAgents/local.algo-pipeline-report.plist` |
+| `run_earnings_refresh.sh` | `~/ibc/run_earnings_refresh.sh` (chmod +x) — 04:45 SGT **daily** Alpha Vantage earnings refresh (KAN-110) |
+| `local.algo-earnings-refresh.plist` | `~/Library/LaunchAgents/local.algo-earnings-refresh.plist` |
 
 ### The schedule, and why it is 05:15 (KAN-104)
 
@@ -29,6 +31,7 @@ chain now starts at 05:15, after the close in both seasons:
 
 | Job | Slot (SGT) | Days | ET under EDT / EST | Healthy duration |
 |---|---|---|---|---|
+| `local.algo-earnings-refresh` | 04:45 | daily | 16:45 / 15:45 | ~5 min free tier (bounded at 25 min → ends by 05:10) |
 | `local.algo-paper-trading` | 05:15 | Tue–Sat | 17:15 / 16:15 | 6–9 min (bounded at 3h) |
 | `local.algo-divergence-monitor` | 05:45 | Tue–Sat | 17:45 / 16:45 | seconds |
 | `local.algo-pipeline-report` | 05:52 | Tue–Sat | 17:52 / 16:52 | seconds |
@@ -117,8 +120,8 @@ the way the hand-copied wrappers did. `deadman.sh` (below) and
 The dead-man ping URLs are **optional** accounts
 (`$ALGO_OPTIONAL_SECRET_NAMES`): `DEADMAN_WATCHDOG_URL`,
 `ALGO_DEADMAN_PAPER_URL`, `ALGO_DEADMAN_DIVERGENCE_URL`,
-`ALGO_DEADMAN_REFRESH_URL`, `ALGO_DEADMAN_BACKUP_URL` and
-`ALGO_DEADMAN_DIGEST_URL`. `--import` prompts for them and `--check` reports
+`ALGO_DEADMAN_REFRESH_URL`, `ALGO_DEADMAN_BACKUP_URL`,
+`ALGO_DEADMAN_DIGEST_URL` and `ALGO_DEADMAN_EARNINGS_URL`. `--import` prompts for them and `--check` reports
 them, but their absence does not make `--check` exit non-zero — that status
 means "the stack cannot authenticate", which is a different problem from "no
 external check is watching this host".
@@ -174,12 +177,14 @@ enforces it: a new wrapper with neither reddens the suite.
 | `run_backtest_refresh.sh` | `ALGO_DEADMAN_REFRESH_URL` | exit 0 only. Every abort path (missing snapshot, gateway down, timeout, failed backtest) routes through `refresh_exit()`, so a new early exit cannot become a healthy beat by omission. |
 | `run_db_backup.sh` | `ALGO_DEADMAN_BACKUP_URL` | a verified, readable dump exists |
 | `run_evidence_digest.sh` | `ALGO_DEADMAN_DIGEST_URL` | the digest was **delivered** (pinged from `scripts/ops/evidence_digest.py`, which is the only thing that knows the send succeeded) |
+| `run_earnings_refresh.sh` | `ALGO_DEADMAN_EARNINGS_URL` | exit 0 only: `earnings.json`'s `fetched_at` was advanced. INCOMPLETE (3) and FAILED (2) save progress, Telegram, and do not ping. |
 | `run_pipeline_report.sh` | — | **is** a dead-man: its whole output is a daily message, so a missed run shows up as a missing report. The jobs it reports on carry their own checks. |
 | `gateway_watchdog.sh` | — | `StartInterval`, so it has no slot to miss; a dead watchdog surfaces as an unreachable Gateway in the paper run and the refresh, both of which alert and both of which ping. The host-wide case belongs to `DEADMAN_WATCHDOG_URL`. |
 
 Give each check a cron matching its plist rather than a flat period, in
 **Asia/Singapore**: `15 5 * * 2-6` (paper), `45 5 * * 2-6` (divergence),
-`15 6 * * *` (backup), `30 6 * * 2` (refresh), `0 8 * * 1` (digest). The paper
+`15 6 * * *` (backup), `30 6 * * 2` (refresh), `0 8 * * 1` (digest),
+`45 4 * * *` (earnings). The paper
 run and the divergence monitor are Tue–Sat, so a flat ~26 h period pages every
 Sunday and stays red all Monday. A check that has **never been pinged** does not
 alert at all — it needs one successful check-in to arm.
@@ -380,6 +385,7 @@ canonical` line if it was launched from a drifted copy.
 | `run_backtest_refresh.sh` | weekly backtest refresh, Tue 06:30 |
 | `run_db_backup.sh` | daily paper-DB backup |
 | `run_divergence.sh` | daily divergence monitor, 05:45 |
+| `run_earnings_refresh.sh` | daily earnings refresh, 04:45 |
 | `run_evidence_digest.sh` | evidence digest |
 | `run_paper.sh` | daily paper trading run, 05:15 |
 | `run_pipeline_report.sh` | daily pipeline report, 05:52 |
@@ -778,6 +784,37 @@ chain strictly sequential, and the 6h bound ends by 12:30, ahead of the
 - **Logs:** `~/ibc/logs/backtest_refresh_YYYYMMDD.log` (pruned after 90 days).
 - **Pruning:** baseline JSONs older than 90 days are deleted (~64 MB each;
   only the newest is ever used).
+
+## Daily earnings refresh (KAN-110)
+
+Runs `run_earnings_refresh.sh` at **04:45 SGT every day, weekends included**
+— `scripts/fetch_earnings.py --universe pit` against Alpha Vantage, merged
+atomically into `data.cache_dir/earnings.json` (plus `earnings_calendar.json`
+and `earnings_fetch_state.json` beside it). KAN-109 degrades `earnings_drift`
+once `earnings.json` is 2 days old, so a Tue–Sat job would degrade it every
+Tuesday. The slot is the US afternoon of the session the 05:15 paper run
+prices (16:45 EDT / 15:45 EST): that session's pre-market actuals reach the
+paper run on their report date, and the previous evening's post-market ones
+are a day old. Full rationale in the wrapper header.
+
+- **Key:** `ALPHAVANTAGE_API_KEY` in the keychain (service `algo-poc`; source
+  of truth `op://Personal/AlphaVantage/credential`). A *job credential*:
+  `secrets.sh --check` lists it under its own heading without failing on it,
+  `--import` prompts for it, `--export`/`--env-file` never emit it. Missing →
+  the job aborts with ❌ + `ALERTS.log`.
+- **Budget (free tier, 25 requests/day):** 1 calendar call + up to 20
+  EARNINGS calls, 13 s apart (`data.earnings.refresh` in
+  `config/default.yaml`). A paid plan is a config change: raise
+  `calls_per_run`, lower `min_interval_seconds`.
+- **Exit codes / Telegram:** 0 = current, dead-man pinged (⚠️ only if a live
+  ticker has no Alpha Vantage data); 3 = INCOMPLETE ⚠️ (budget ran out first —
+  expected for the first ~5 days of a fresh cache); 2 = FAILED ❌ (rate limit
+  or refusal; progress saved); 124 = timed out ⏱️; 1 = could not run ❌. Only
+  0 advances `fetched_at` and pings.
+- **Logs:** `~/ibc/logs/earnings_refresh_YYYYMMDD.log` (pruned after 30 days),
+  launchd stdout/stderr to `~/ibc/logs/earnings-refresh-launchd.log`.
+- **By hand:** `.venv/bin/python scripts/fetch_earnings.py --dry-run` prints the
+  plan without a request; the script reads the key from the keychain itself.
 
 ## Daily paper-DB backup
 

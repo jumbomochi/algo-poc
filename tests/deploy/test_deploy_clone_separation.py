@@ -79,6 +79,7 @@ def test_there_are_wrappers_to_check() -> None:
         "gateway_watchdog.sh",
         "run_db_backup.sh",
         "run_evidence_digest.sh",
+        "run_earnings_refresh.sh",
     }, f"wrappers with an ALGO_DIR default: {sorted(names)}"
 
 

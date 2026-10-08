@@ -344,7 +344,7 @@ Supporting infrastructure:
 | `services/risk_management/engine.py` | Risk engine (position limits, sector concentration, max lots) |
 | `backtest/runner.py` | Backtest engine (daily bar replay, order simulation, P&L tracking) |
 | `scripts/fetch_fundamentals.py` | Fundamentals data cache (yfinance fetcher, point-in-time lookup) |
-| `scripts/fetch_earnings.py` | Earnings data cache (yfinance fetcher, event window lookup) |
+| `scripts/fetch_earnings.py` | Earnings data cache (Alpha Vantage incremental refresh, event window lookup; KAN-110) |
 | `scripts/visualize_backtest.py` | Plotly HTML report generation (single + multi-portfolio) |
 | `scripts/run_paper.py` | Daily paper trading runner (reuses backtest signal functions) |
 | `scripts/paper_state.py` | Paper trading state persistence (positions, trades, cash per portfolio) |
@@ -431,7 +431,7 @@ Quality value and earnings drift require cached data from `data.cache_dir` in
 To populate:
 ```bash
 python scripts/fetch_fundamentals.py  # Fetches quarterly financials from yfinance
-python scripts/fetch_earnings.py      # Fetches earnings dates/surprises from yfinance
+python scripts/fetch_earnings.py      # Refreshes earnings dates/surprises from Alpha Vantage (KAN-110)
 ```
 The fetchers stamp each file with `fetched_at` (KAN-109). A missing cache, one
 with no `fetched_at`, or one stale by the `data.fundamentals` / `data.earnings`

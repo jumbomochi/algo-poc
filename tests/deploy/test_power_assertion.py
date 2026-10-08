@@ -53,6 +53,7 @@ LONG_RUNNING = [
     "run_backtest_refresh.sh",
     "run_db_backup.sh",
     "run_evidence_digest.sh",
+    "run_earnings_refresh.sh",
 ]
 
 

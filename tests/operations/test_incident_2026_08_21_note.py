@@ -219,7 +219,9 @@ def test_note_names_every_dead_man_switch_the_loader_declares() -> None:
         f"{NOTE.name} does not name these dead-man switches: {missing}. "
         "The loader declares them, so the note's roster is incomplete."
     )
-    assert len(roster) == 6, (
-        f"the dead-man roster is now {len(roster)} entries ({roster}), not 6 — "
-        f'{NOTE.name} says "all six" and must be updated'
+    # Six at the time of the incident; KAN-110 added the earnings refresh's,
+    # and the note records that as a later addition.
+    assert len(roster) == 7, (
+        f"the dead-man roster is now {len(roster)} entries ({roster}), not 7 — "
+        f'{NOTE.name} says "all six" (plus KAN-110\'s seventh) and must be updated'
     )

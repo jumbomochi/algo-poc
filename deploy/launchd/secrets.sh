@@ -105,7 +105,21 @@ ALGO_SECRET_NAMES="${ALGO_SECRET_NAMES:-POSTGRES_PASSWORD REDIS_PASSWORD TELEGRA
 #   ALGO_DEADMAN_BACKUP_URL     — run_db_backup.sh, on a verified dump (KAN-56)
 #   ALGO_DEADMAN_DIGEST_URL     — scripts/ops/evidence_digest.py, on a
 #                                 *delivered* digest (KAN-29)
-ALGO_OPTIONAL_SECRET_NAMES="${ALGO_OPTIONAL_SECRET_NAMES:-DEADMAN_WATCHDOG_URL ALGO_DEADMAN_PAPER_URL ALGO_DEADMAN_DIVERGENCE_URL ALGO_DEADMAN_REFRESH_URL ALGO_DEADMAN_BACKUP_URL ALGO_DEADMAN_DIGEST_URL}"
+#   ALGO_DEADMAN_EARNINGS_URL   — run_earnings_refresh.sh, when earnings.json's
+#                                 fetched_at was advanced (KAN-110)
+ALGO_OPTIONAL_SECRET_NAMES="${ALGO_OPTIONAL_SECRET_NAMES:-DEADMAN_WATCHDOG_URL ALGO_DEADMAN_PAPER_URL ALGO_DEADMAN_DIVERGENCE_URL ALGO_DEADMAN_REFRESH_URL ALGO_DEADMAN_BACKUP_URL ALGO_DEADMAN_DIGEST_URL ALGO_DEADMAN_EARNINGS_URL}"
+
+# KAN-110: credentials ONE job needs, not the stack. The earnings refresh
+# cannot run without ALPHAVANTAGE_API_KEY (source of truth: 1Password
+# op://Personal/AlphaVantage/credential), but nothing else reads it, so:
+#   * --check reports it under its own heading and does NOT exit non-zero on
+#     its absence — that status keeps meaning "the stack cannot authenticate";
+#     the job itself aborts loudly (Telegram + ALERTS.log) without it;
+#   * --import prompts for it;
+#   * --export / --env-file do NOT emit it: docker compose has no use for a
+#     network credential, and scripts/fetch_earnings.py reads the keychain
+#     itself when run by hand.
+ALGO_JOB_SECRET_NAMES="${ALGO_JOB_SECRET_NAMES:-ALPHAVANTAGE_API_KEY}"
 
 # Human-readable reason the last lookup failed. Callers log this verbatim; it
 # names the operator action, which is the whole point of separating the failure
@@ -404,6 +418,17 @@ _algo_cli_check() {
             fi
         done
     fi
+    # Per-job credentials: reported, never fatal. See $ALGO_JOB_SECRET_NAMES.
+    if [ -n "$ALGO_JOB_SECRET_NAMES" ]; then
+        echo "job credentials (a missing one stops only its own job, which alerts):"
+        for name in $ALGO_JOB_SECRET_NAMES; do
+            if algo_secret "$name" >/dev/null 2>&1; then
+                echo "  OK      $name"
+            else
+                echo "  ABSENT  $name — its job aborts until imported: $0 --import"
+            fi
+        done
+    fi
     return $rc
 }
 
@@ -412,7 +437,7 @@ _algo_cli_import() {
     echo "Importing into keychain service '$ALGO_KEYCHAIN_SERVICE' (login keychain)."
     echo "Values are read by \`security\` itself — not via argv, not into history."
     echo ""
-    for name in $ALGO_SECRET_NAMES $ALGO_OPTIONAL_SECRET_NAMES; do
+    for name in $ALGO_SECRET_NAMES $ALGO_OPTIONAL_SECRET_NAMES $ALGO_JOB_SECRET_NAMES; do
         _algo_keychain_put_interactive "$name" || echo "  (skipped $name)" >&2
     done
     echo ""

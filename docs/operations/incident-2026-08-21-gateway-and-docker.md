@@ -388,6 +388,11 @@ happened was follow-up, because both mechanisms designed to catch it are inert:
   ([KAN-65](https://huiliang.atlassian.net/browse/KAN-65), and see
   `dead-man-switches.md`)
 
+  *Later:* the roster has since grown to seven —
+  [KAN-110](https://huiliang.atlassian.net/browse/KAN-110) added
+  `ALGO_DEADMAN_EARNINGS_URL` for the daily earnings refresh. The six above are
+  the ones that existed at the time of this incident.
+
 So the gap was found by hand-querying `equity_snapshots` during an unrelated
 incident. That is the real finding: **the evidence record can be wrong for days
 and still look fine.**
