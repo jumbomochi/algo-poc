@@ -29,6 +29,7 @@ from scripts.fetch_fundamentals import (  # noqa: E402
     load_fundamentals_cache,
     build_fundamentals_lookup,
 )
+from shared.data_cache import FUNDAMENTALS, cache_path  # noqa: E402
 
 NEAR_MISS_SHOW = 6  # how many names below the cutoff to display
 
@@ -141,7 +142,7 @@ def main():
 
     # --- quality_value: fundamentals composite, top 15 ---
     fundamentals = build_fundamentals_lookup(
-        load_fundamentals_cache("data/cache/fundamentals.json")
+        load_fundamentals_cache(str(cache_path(FUNDAMENTALS)))
     )
     qv_universe = UNIVERSE_REGISTRY["quality_value"]
     qv_scores = []

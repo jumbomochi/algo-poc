@@ -426,12 +426,22 @@ The backtest runs eight independent portfolios:
 
 Each strategy has independent capital, signal function, and risk engine. Strategies never compete for capital.
 
-Quality value and earnings drift require cached data from `data/cache/`. To populate:
+Quality value and earnings drift require cached data from `data.cache_dir` in
+`config/default.yaml` (default `data/cache/`, resolved against the repo root).
+To populate:
 ```bash
 python scripts/fetch_fundamentals.py  # Fetches quarterly financials from yfinance
 python scripts/fetch_earnings.py      # Fetches earnings dates/surprises from yfinance
 ```
-If cache files are missing, these strategies will produce no signals (graceful degradation).
+The fetchers stamp each file with `fetched_at` (KAN-109). A missing cache, one
+with no `fetched_at`, or one stale by the `data.fundamentals` / `data.earnings`
+thresholds makes the dependent sleeve **data-degraded** — this is not a quiet
+degradation any more: the paper run alerts once, the sleeve places no new
+entries (exits still run), its shadow is recorded ungraded (NO_DATA), and
+`run_backtest.py` refuses unless `--allow-degraded-data` is passed (which marks
+the artifact `config.data_degraded`). The periods in which these sleeves'
+evidence was produced from missing or stale caches are on record in
+`shared/data_gaps.py`.
 
 ### Universe Registry
 

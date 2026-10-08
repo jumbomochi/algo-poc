@@ -2,23 +2,41 @@
 """Fetch and cache historical fundamentals data from yfinance.
 
 Usage:
-    python scripts/fetch_fundamentals.py [--tickers AAPL,MSFT,...] [--output data/cache/fundamentals.json]
+    python scripts/fetch_fundamentals.py [--tickers AAPL,MSFT,...] [--output PATH]
+
+The default output is ``fundamentals.json`` in ``data.cache_dir`` (config/default.yaml,
+resolved against the repo root), the same file the paper run and the backtest
+read. The file is written in the KAN-109 envelope, stamped with ``fetched_at``.
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 import time
-from datetime import date, timedelta
-from typing import Any, Callable
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Callable
+
+# Run by path (``python scripts/fetch_*.py``), which puts scripts/ rather than
+# the repo root on sys.path; pin the root so ``shared`` is THIS checkout's.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+
+from shared.data_cache import (  # noqa: E402
+    FUNDAMENTALS_FILE,
+    read_cache_document,
+    resolve_cache_dir,
+    write_cache_document,
+)
 
 
 # The equity sector map moved to shared/universe.py so services (risk
 # management, fill projector) can resolve sectors too. Re-exported here
 # for existing importers (run_paper.py, validate_replacement_policy.py).
-from shared.universe import SECTOR_MAP  # noqa: F401
+from shared.universe import SECTOR_MAP  # noqa: F401, E402
 
 # Calendar days after a fiscal period-end before its figures are assumed to be
 # public. yfinance's quarterly statements carry the period-end only, so this
@@ -30,19 +48,30 @@ from shared.universe import SECTOR_MAP  # noqa: F401
 DEFAULT_FILING_LAG_DAYS = 45
 
 
-def save_fundamentals_cache(data: dict[str, list[dict]], path: str) -> None:
-    """Save fundamentals data to JSON file."""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+def save_fundamentals_cache(
+    data: dict[str, list[dict]],
+    path: str,
+    *,
+    fetched_at: datetime | None = None,
+    source: str | None = None,
+) -> None:
+    """Save fundamentals rows, stamped with when they were fetched (KAN-109).
+
+    ``fetched_at`` defaults to now; pass the instant the fetch STARTED.
+    """
+    write_cache_document(path, data, fetched_at=fetched_at, source=source)
 
 
 def load_fundamentals_cache(path: str) -> dict[str, list[dict]]:
-    """Load fundamentals data from JSON file. Returns empty dict if file missing."""
-    if not os.path.exists(path):
-        return {}
-    with open(path) as f:
-        return json.load(f)
+    """Load fundamentals rows. Returns empty dict if file missing.
+
+    Reads both the KAN-109 envelope and the legacy bare ``{ticker: rows}``
+    mapping, and returns only the rows, so the lookup builders never see the
+    metadata. Use :func:`shared.data_cache.read_cache_document` for the fetch
+    time and whether the file was there at all — this function cannot tell a
+    missing cache from an empty one, which is how KAN-109 went unnoticed.
+    """
+    return read_cache_document(path).data
 
 
 def build_fundamentals_lookup(
@@ -105,10 +134,14 @@ def _as_date(value: date | str) -> date:
 
 def fetch_fundamentals_from_yfinance(
     tickers: list[str],
-    output_path: str = "data/cache/fundamentals.json",
+    output_path: str | None = None,
 ) -> dict[str, list[dict]]:
     """Fetch quarterly fundamentals from yfinance and save to cache."""
     import yfinance as yf
+
+    if output_path is None:
+        output_path = str(resolve_cache_dir() / FUNDAMENTALS_FILE)
+    fetched_at = datetime.now(timezone.utc)
 
     cache: dict[str, list[dict]] = {}
 
@@ -169,7 +202,7 @@ def fetch_fundamentals_from_yfinance(
 
         time.sleep(0.3)
 
-    save_fundamentals_cache(cache, output_path)
+    save_fundamentals_cache(cache, output_path, fetched_at=fetched_at, source="yfinance")
     print(f"\nSaved {len(cache)} tickers to {output_path}")
     return cache
 
@@ -178,8 +211,8 @@ def main():
     parser = argparse.ArgumentParser(description="Fetch fundamentals data from yfinance")
     parser.add_argument("--tickers", type=str, default=None,
                         help="Comma-separated tickers (default: SP500_TOP100)")
-    parser.add_argument("--output", default="data/cache/fundamentals.json",
-                        help="Output JSON path")
+    parser.add_argument("--output", default=None,
+                        help="Output JSON path (default: fundamentals.json in data.cache_dir)")
     args = parser.parse_args()
 
     if args.tickers:

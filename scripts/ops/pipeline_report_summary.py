@@ -32,7 +32,7 @@ import argparse
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -99,6 +99,17 @@ class RunFacts:
     # upstream problem, and the only way to notice the rate rising is to see
     # the rate when it is normal.
     fills_recovered: int = 0
+    # KAN-109. Sleeve -> why its fundamentals/earnings cache is missing or
+    # stale, judged from the cache files with the paper run's own thresholds.
+    # ``None`` = the check could not run (rendered as unknown, never as ok);
+    # ``{}`` = every cache fresh. Without it, a sleeve with no data reads as a
+    # quiet market here — fills 0, rejections 0 — which is how 2026-09-24
+    # onwards went unnoticed for twelve days.
+    data_degraded: dict[str, str] | None = None
+    #: Whether the cache check was attempted at all. A caller rendering facts
+    #: it never checked (tests, ad-hoc tooling) gets no data field rather than
+    #: a false "unknown".
+    data_checked: bool = False
 
 
 #: How far back of ``since`` the recovered-fill count reaches. One day: the
@@ -218,6 +229,17 @@ def render_summary(facts: RunFacts) -> str:
         f" / broker {facts.submission_failed}"
     )
 
+    if not facts.data_checked:
+        pass
+    elif facts.data_degraded is None:
+        line += " · data: unknown ⚠"
+    elif facts.data_degraded:
+        line += " · 📉 data-degraded (no entries): " + ", ".join(
+            sorted(facts.data_degraded)
+        )
+    else:
+        line += " · data: ok"
+
     # Omitted entirely when capture is disabled (expected 0): a permanent "0/0"
     # is noise, and a field the operator learns to skip is worse than no field.
     # A negative expected means the universe could not be resolved — reported
@@ -266,6 +288,35 @@ def _capture_expected() -> int:
             file=sys.stderr,
         )
         return -1
+
+
+def _data_degraded() -> dict[str, str] | None:
+    """Sleeves the caches degrade right now, or ``None`` if unknowable.
+
+    Read from the caches rather than the paper log so it is authoritative and
+    goes live with a pull. A failure degrades this one field to "unknown" — it
+    must never cost the operator the halt and fill lines.
+    """
+    try:
+        from shared.data_cache import (
+            assess_data_health,
+            configured_data_config,
+            load_data_caches,
+        )
+
+        config = configured_data_config(_REPO_ROOT)
+        return assess_data_health(
+            load_data_caches(config.cache_dir),
+            as_of=datetime.now().astimezone(),
+            config=config,
+        ).degraded_sleeves()
+    except Exception as exc:  # noqa: BLE001 — must not sink the digest
+        print(
+            f"data cache check unavailable: "
+            f"{_redact(type(exc).__name__)}: {_redact(str(exc))}",
+            file=sys.stderr,
+        )
+        return None
 
 
 def _local_midnight() -> datetime:
@@ -321,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{_redact(type(exc).__name__)}: {_redact(str(exc))}", file=sys.stderr)
         return 1
 
-    print(render_summary(facts))
+    print(render_summary(replace(facts, data_degraded=_data_degraded(), data_checked=True)))
     return 0
 
 

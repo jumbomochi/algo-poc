@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping
@@ -88,6 +88,11 @@ class ShadowArtifact:
     #: which the monitor reports and grades as before.
     bars_session: date | None = None
     priced_at: datetime | None = None
+    #: KAN-109: sleeves the producing run did not replay because their
+    #: fundamentals/earnings cache was missing or stale, with the reason. The
+    #: monitor records each as NO_DATA with that reason instead of grading it.
+    #: Empty on artifacts written before the field existed.
+    data_degraded: dict[str, str] = field(default_factory=dict)
 
 
 def shadow_id_for(portfolios: Mapping[str, Any], *, whole_shares: bool = False) -> str:
@@ -148,6 +153,7 @@ def dump_shadow(
     produced_on: date,
     bars_session: date | None = None,
     priced_at: datetime | None = None,
+    data_degraded: Mapping[str, str] | None = None,
 ) -> None:
     """Write the shadow artifact.
 
@@ -165,6 +171,7 @@ def dump_shadow(
         "produced_on": produced_on.isoformat(),
         "bars_session": bars_session.isoformat() if bars_session else None,
         "priced_at": priced_at.isoformat() if priced_at else None,
+        "data_degraded": dict(sorted((data_degraded or {}).items())),
         "series": {
             sleeve: {session.isoformat(): value for session, value in curve.items()}
             for sleeve, curve in series.items()
@@ -208,4 +215,7 @@ def load_shadow(path: str | Path) -> ShadowArtifact:
             datetime.fromisoformat(raw["priced_at"])
             if raw.get("priced_at") else None
         ),
+        data_degraded={
+            str(k): str(v) for k, v in (raw.get("data_degraded") or {}).items()
+        },
     )

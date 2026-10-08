@@ -190,3 +190,22 @@ divergence:
   # Inclusive: names the first ADMISSIBLE session. Superseded by an open
   # gate_epochs row once epoch v2 starts (KAN-33).
   live_history_from: 2026-08-01
+
+data:
+  # Fundamentals / earnings caches read by quality_value and earnings_drift
+  # (KAN-109). Relative paths resolve against the repository root, NOT the
+  # working directory, so the paper run, the weekly backtest refresh and the
+  # fetchers all read and write one location. The caches are gitignored: the
+  # deploy clone (KAN-72) started with an empty data/cache/ on 2026-09-24 and
+  # both sleeves ran with no data, silently, until this check existed.
+  cache_dir: data/cache
+  # A missing cache, or one stale by either rule below, marks the dependent
+  # sleeve DATA-DEGRADED for the run: one alert, no new entries from that
+  # sleeve (exits still run), and its shadow is not graded. A cache written
+  # before fetched_at existed has an unknown age and counts as stale.
+  fundamentals:
+    max_fetch_age_days: 14         # weekly refresh, one miss tolerated
+    max_period_age_days: 137       # longest quarter (92d) + 45d filing lag
+    max_stale_ticker_fraction: 0.2 # sleeve-kill-criteria.md's 20% bound
+  earnings:
+    max_fetch_age_days: 2          # = the lookup window: refresh daily

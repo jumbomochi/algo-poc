@@ -70,7 +70,8 @@ def test_the_wrapper_honours_the_test_overrides():
 
 def _drive(tmp_path, *, snapshot=True, gateway=True, backtest_exit=0,
            backtest_sleep=0, timeout_seconds=600, curl_exit=0,
-           deadman_url=DEADMAN_URL, pin=None, resolve_pin=True):
+           deadman_url=DEADMAN_URL, pin=None, resolve_pin=True,
+           backtest_output=""):
     """Run the wrapper with everything it reaches out to stubbed.
 
     ``ALGO_DIR`` points at a scratch tree that *symlinks* the repo's ``deploy``
@@ -147,6 +148,7 @@ esac
 sleep {backtest_sleep}
 echo "AGGREGATE"
 echo "  Total Return: 42.0%"
+{backtest_output}
 touch {algo_dir}/output/backtest_multi_20260817_000000.json
 exit {backtest_exit}
 """)
@@ -210,6 +212,35 @@ def test_a_healthy_refresh_still_reports_success(tmp_path):
     assert len(sends) == 1, sends
     assert "Weekly backtest refreshed" in sends[0]
     assert "refresh OK" in log
+    assert "DATA-DEGRADED" not in sends[0]
+
+
+# ---------------------------------------------------------------------------
+# KAN-109: a degraded artifact is produced, marked, and announced as such
+# ---------------------------------------------------------------------------
+
+def test_the_refresh_passes_the_degraded_data_escape_hatch(tmp_path):
+    """Without it run_backtest refuses (exit 3) on a missing cache, and every
+    Tuesday becomes a failed refresh until KAN-110 delivers fresh caches."""
+    _, _, invocations, _, _ = _drive(tmp_path)
+    assert "--allow-degraded-data" in invocations[0].splitlines()
+
+
+def test_a_degraded_artifact_is_not_announced_as_a_current_baseline(tmp_path):
+    result, sends, _, log, _ = _drive(
+        tmp_path,
+        backtest_output=(
+            'echo "  WARNING: DATA_DEGRADED_ARTIFACT: earnings_drift,quality_value '
+            '— run on missing or stale data as of 2026-10-05"'
+        ),
+    )
+    assert result.returncode == 0
+    [send] = sends
+    assert "DATA-DEGRADED" in send
+    assert "earnings_drift,quality_value" in send
+    assert "do NOT pin" in send
+    assert "baseline is now current" not in send
+    assert "artifact is DATA-DEGRADED for: earnings_drift,quality_value" in log
 
 
 # ---------------------------------------------------------------------------
