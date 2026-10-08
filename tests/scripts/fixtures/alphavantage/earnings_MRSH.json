@@ -1,0 +1,78 @@
+{
+    "symbol": "MRSH",
+    "annualEarnings": [
+        {
+            "fiscalDateEnding": "2026-09-30",
+            "reportedEPS": "6.25"
+        },
+        {
+            "fiscalDateEnding": "2025-12-31",
+            "reportedEPS": "9.75"
+        }
+    ],
+    "quarterlyEarnings": [
+        {
+            "fiscalDateEnding": "2026-06-30",
+            "reportedDate": "2026-07-21",
+            "reportedEPS": "2.96",
+            "estimatedEPS": "2.88",
+            "surprise": "0.08",
+            "surprisePercentage": "2.7778",
+            "reportTime": "pre-market"
+        },
+        {
+            "fiscalDateEnding": "2026-03-31",
+            "reportedDate": "2026-04-16",
+            "reportedEPS": "3.29",
+            "estimatedEPS": "3.22",
+            "surprise": "0.07",
+            "surprisePercentage": "2.1739",
+            "reportTime": "pre-market"
+        },
+        {
+            "fiscalDateEnding": "2025-12-31",
+            "reportedDate": "2026-01-29",
+            "reportedEPS": "2.12",
+            "estimatedEPS": "1.97",
+            "surprise": "0.15",
+            "surprisePercentage": "7.6142",
+            "reportTime": "pre-market"
+        },
+        {
+            "fiscalDateEnding": "2025-09-30",
+            "reportedDate": "2025-10-16",
+            "reportedEPS": "1.85",
+            "estimatedEPS": "1.78",
+            "surprise": "0.07",
+            "surprisePercentage": "3.9326",
+            "reportTime": "pre-market"
+        },
+        {
+            "fiscalDateEnding": "2025-06-30",
+            "reportedDate": "2025-07-17",
+            "reportedEPS": "2.72",
+            "estimatedEPS": "2.66",
+            "surprise": "0.06",
+            "surprisePercentage": "2.2556",
+            "reportTime": "pre-market"
+        },
+        {
+            "fiscalDateEnding": "2025-03-31",
+            "reportedDate": "2025-04-17",
+            "reportedEPS": "3.06",
+            "estimatedEPS": "3",
+            "surprise": "0.06",
+            "surprisePercentage": "2",
+            "reportTime": "pre-market"
+        },
+        {
+            "fiscalDateEnding": "2004-12-31",
+            "reportedDate": "2005-03-01",
+            "reportedEPS": "-1.2908",
+            "estimatedEPS": "None",
+            "surprise": "0",
+            "surprisePercentage": "None",
+            "reportTime": "pre-market"
+        }
+    ]
+}

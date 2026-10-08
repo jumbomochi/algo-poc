@@ -25,6 +25,7 @@ has to detect anything. The absence of a message is the message.
 | `ALGO_DEADMAN_REFRESH_URL` | `deploy/launchd/run_backtest_refresh.sh`, on a **successful** run only | once a week (~Tue 06:30–12:30 SGT) | the weekly baseline refresh did not happen — as on 2026-08-11, when the host booted after the calendar slot and launchd did not re-fire it |
 | `ALGO_DEADMAN_BACKUP_URL` | `deploy/launchd/run_db_backup.sh`, on a **verified** dump | once a day (~06:16 SGT) | the RPO ≤ 1 day promise quietly stopped being kept |
 | `ALGO_DEADMAN_DIGEST_URL` | `scripts/ops/evidence_digest.py`, on a **delivered** digest | once a week (Mon ~08:00 SGT) | the weekly evidence digest was not sent |
+| `ALGO_DEADMAN_EARNINGS_URL` | `deploy/launchd/run_earnings_refresh.sh`, only when `earnings.json`'s `fetched_at` was **advanced** (exit 0) | once a day (~04:50 SGT, every day) | the Alpha Vantage earnings refresh stopped keeping the cache current — KAN-109 degrades `earnings_drift` once the last advance is 2 days old, and this pages ~22 h before that (KAN-110). The 05:05 top-up run (`local.algo-earnings-topup`) never pings: it cannot advance `fetched_at`. |
 
 Two jobs deliberately have no switch, and say so in their own headers:
 `run_pipeline_report.sh` (its only output *is* a daily message, so a missed run
@@ -63,6 +64,7 @@ in SGT, because the launchd slots are.
 | Backtest refresh | `ALGO_DEADMAN_REFRESH_URL` | `30 6 * * 2` | 12 h | Weekly (Tue 06:30 SGT, after the daily chain — KAN-104), and the run itself can take hours against ~830 point-in-time tickers, so the grace is generous enough that a merely slow run does not page. |
 | DB backup | `ALGO_DEADMAN_BACKUP_URL` | `15 6 * * *` | 2 h | Daily at 06:15 (05:15 until KAN-104 put the paper run there) — this one really is every day, weekends included. |
 | Evidence digest | `ALGO_DEADMAN_DIGEST_URL` | `0 8 * * 1` | 12 h | Weekly (Mon 08:00 SGT). Prefer the cron over a plain "8 days": an 8-day period lets a missed Monday stay invisible for over a week, which is the failure KAN-64 existed to close. |
+| Earnings refresh | `ALGO_DEADMAN_EARNINGS_URL` | `45 4 * * *` | 2 h | Daily **including weekends** (KAN-110): the cache must stay within 2 days of fetch age, so the job runs every day. It pings only when the 04:45 run made the cache current (an INCOMPLETE, FAILED or timed-out run alerts on Telegram itself and withholds the ping). Timeline: last ping day 0 ~04:50 → day 1's run misses → the check pages at **day 1 ~06:45**, and the sleeve degrades at the **day 2 05:15** paper run (fetch age just over 2 days) unless day 2's run succeeds — ~22 h to act. A 20 h grace would page at day 2 ~00:45, only ~4.5 h before the degraded run, which is why it is 2 h. The run is ~4 min and bounded at 15, so 2 h never pages a merely slow run. It cannot arm until the first complete run, i.e. after the initial backfill of the live universe (~7 days on the free tier). |
 
 The cron is the **expected check-in time**, and every wrapper waits on a port or
 a container before it pings, so the ping lands a few minutes after the slot. The
@@ -174,6 +176,10 @@ outcome onto that, once, in one place:
   exit 2, where nothing could be judged, stays silent.
 - `run_db_backup.sh` pings only after `pg_restore --list` has read the archive
   back. A dump that exists but cannot be restored is not a backup.
+- `run_earnings_refresh.sh` pings only on exit 0, the one outcome in which
+  `scripts/fetch_earnings.py` advanced `earnings.json`'s `fetched_at`. A run
+  that fetched rows but could not make the live universe current (budget,
+  rate limit) saved its progress and is still not a healthy beat.
 
 The ping is also **incapable of failing the run**: every function in
 `deploy/launchd/deadman.sh` returns 0, and the outcome is written to the day's

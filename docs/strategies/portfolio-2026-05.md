@@ -92,6 +92,30 @@ epistemic humility* for the limits of this comparison.
 
 ---
 
+## Expected divergence: `earnings_drift` after-market reports (KAN-110)
+
+The backtest enters on the report date `t`: it decides on `close[t]` with the
+surprise of a report dated `t` and fills at `open[t+1]`. For a pre-market
+report live does the same. For an **after-market** report (~16:05 ET) it often
+cannot, because the actual has to be in `earnings.json` before the 05:15 SGT
+paper run that prices session `t`:
+
+| Report | Reaches the paper run for session `t` when | Otherwise |
+|---|---|---|
+| pre-market on `t` | always — the 04:45 SGT refresh (16:45 EDT / 15:45 EST) has it | — |
+| after-market on `t`, Mon–Thu | EDT only, and only if Alpha Vantage has published it by the 05:05 SGT top-up (17:05 ET) | entered **one session late**: decided on `close[t+1]`, filled at `open[t+2]` |
+| after-market on a **Friday** | EDT only, same condition | **never entered**: the next paper run (Tuesday SGT) prices Monday, `t+3` calendar days, outside the lookup's 0..+2 window |
+
+Under EST (early November to mid-March) 05:05 SGT is 16:05 ET, so the top-up
+is too early for every after-market report: all of them enter a session late
+and Friday after-market reports are lost, every week of those months. This is
+a known, explained divergence for `earnings_drift`, not a fault: the live
+sleeve trades fewer and later after-market events than the backtest credits
+it with. When reading its divergence, expect live to lag the backtest on
+those entries (different entry price, and missing Friday names), concentrated
+in earnings season. Closing it would need an as-of re-run of the missed
+session (KAN-67) or a later paper-run slot; neither is in scope.
+
 ## What was dropped on 2026-05-26
 
 | Sleeve | Old weight | Final return | Why dropped |

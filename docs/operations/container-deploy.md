@@ -283,7 +283,7 @@ does not.
 2. Log in (the login keychain unlocks on login; launchd jobs and Docker Desktop
    both need it) and wait ~3 minutes for the stack to settle.
 3. Check all three layers — expect **8 long-running containers** (all
-   healthy), **7 launchd jobs**, and zero drift. (`ml-model` and
+   healthy), **9 launchd jobs**, and zero drift. (`ml-model` and
    `signal-generation` were demoted in KAN-35; if they still appear, they are
    orphans from before that deploy — see `docs/decisions/ml-path-2026-09.md`.)
 

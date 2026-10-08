@@ -547,7 +547,7 @@ python scripts/run_backtest.py \
 
 # 2. Refresh fundamentals / earnings caches if the universe changed.
 python scripts/fetch_fundamentals.py
-python scripts/fetch_earnings.py
+python scripts/fetch_earnings.py --universe pit   # Alpha Vantage, budgeted: see KAN-110
 
 # 3. Iterate without touching IB again, reusing the bars from step 1.
 python scripts/run_backtest.py \

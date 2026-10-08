@@ -332,6 +332,16 @@ Or use the JSON output as a Grafana data source for richer alerting.
    by the execution layer (`services/execution`) on each fill. If it's
    defaulting to 0, the `Slip bps` column will be misleadingly low. Verify
    by spot-checking a recent fill against the IB execution report.
+5. **`earnings_drift` after-market reports are entered late, or not at all
+   (KAN-110).** The backtest enters on the report date; live can only enter
+   once the actual is in `earnings.json` before the 05:15 SGT paper run. An
+   after-market report (~16:05 ET) makes it only via the 05:05 SGT top-up,
+   and only under EDT when Alpha Vantage has published by 17:05 ET. Otherwise
+   it is entered a session late, and a **Friday** after-market report is never
+   entered (Tuesday's run is at lookup offset 3). Under EST this applies to
+   every after-market report. A lagging `earnings_drift` in earnings season is
+   therefore expected, not a breach of the strategy; see
+   [portfolio-2026-05.md](../strategies/portfolio-2026-05.md#expected-divergence-earnings_drift-after-market-reports-kan-110).
 
 ---
 

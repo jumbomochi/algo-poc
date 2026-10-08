@@ -224,7 +224,7 @@ rather than an error. Check the cache's freshness, not just its existence.
 |---|---|
 | Divergence | `BREACH` for 10 consecutive sessions against the epoch manifest's baseline id |
 | Drawdown | sleeve equity decline exceeds **9.69%** |
-| Signal staleness | **the yfinance earnings feed** (`scripts/fetch_earnings.py` → `data/cache/earnings.json`) failing to refresh, or carrying no announcement within the last 5 sessions during a reporting season, for **more than 5 consecutive** sessions. The sleeve enters within 2 days of an announcement, so a missing calendar produces *no trades* rather than bad trades — silence is the failure mode |
+| Signal staleness | **the Alpha Vantage earnings feed** (`scripts/fetch_earnings.py`, daily via `local.algo-earnings-refresh` → `data/cache/earnings.json`) failing to refresh, or carrying no announcement within the last 5 sessions during a reporting season, for **more than 5 consecutive** sessions. The sleeve enters within 2 days of an announcement, so a missing calendar produces *no trades* rather than bad trades — silence is the failure mode |
 | Safety incident | any halt, unattributed order, or silent failure traced to this sleeve |
 
 **Demotion:** one stage. Re-promotion via the pipeline.

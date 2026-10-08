@@ -332,6 +332,7 @@ def test_the_wrapper_list_is_not_silently_empty() -> None:
         "run_db_backup.sh",
         "run_pipeline_report.sh",
         "run_evidence_digest.sh",
+        "run_earnings_refresh.sh",
         "gateway_watchdog.sh",
     }, names
 
@@ -349,7 +350,12 @@ def test_every_wrapper_either_pings_or_records_why_not(wrapper: Path) -> None:
 
 @pytest.mark.parametrize(
     "wrapper",
-    ["run_backtest_refresh.sh", "run_divergence.sh", "run_db_backup.sh"],
+    [
+        "run_backtest_refresh.sh",
+        "run_divergence.sh",
+        "run_db_backup.sh",
+        "run_earnings_refresh.sh",
+    ],
 )
 def test_the_newly_wired_wrappers_source_deadman_by_path(wrapper: str) -> None:
     """Same rule as secrets.sh and telegram.sh: a copy under ~/ibc would never

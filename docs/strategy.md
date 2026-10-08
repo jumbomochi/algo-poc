@@ -344,7 +344,7 @@ Supporting infrastructure:
 | `services/risk_management/engine.py` | Risk engine (position limits, sector concentration, max lots) |
 | `backtest/runner.py` | Backtest engine (daily bar replay, order simulation, P&L tracking) |
 | `scripts/fetch_fundamentals.py` | Fundamentals data cache (yfinance fetcher, point-in-time lookup) |
-| `scripts/fetch_earnings.py` | Earnings data cache (yfinance fetcher, event window lookup) |
+| `scripts/fetch_earnings.py` | Earnings data cache (Alpha Vantage incremental refresh, event window lookup; KAN-110) |
 | `scripts/visualize_backtest.py` | Plotly HTML report generation (single + multi-portfolio) |
 | `scripts/run_paper.py` | Daily paper trading runner (reuses backtest signal functions) |
 | `scripts/paper_state.py` | Paper trading state persistence (positions, trades, cash per portfolio) |
@@ -431,7 +431,7 @@ Quality value and earnings drift require cached data from `data.cache_dir` in
 To populate:
 ```bash
 python scripts/fetch_fundamentals.py  # Fetches quarterly financials from yfinance
-python scripts/fetch_earnings.py      # Fetches earnings dates/surprises from yfinance
+python scripts/fetch_earnings.py      # Refreshes earnings dates/surprises from Alpha Vantage (KAN-110)
 ```
 The fetchers stamp each file with `fetched_at` (KAN-109). A missing cache, one
 with no `fetched_at`, or one stale by the `data.fundamentals` / `data.earnings`
@@ -443,6 +443,14 @@ its shadow is recorded ungraded (NO_DATA), and
 the artifact `config.data_degraded`). The periods in which these sleeves'
 evidence was produced from missing or stale caches are on record in
 `shared/data_gaps.py`.
+
+Since KAN-110 the earnings cache is refreshed from Alpha Vantage at 04:45 SGT
+daily, with a 05:05 top-up. After-market reports often miss the 05:15 paper
+run of their own session, so live `earnings_drift` enters them a session
+later than the backtest, and Friday after-market reports are lost in EST
+months (always) and in EDT months whenever Alpha Vantage has not published by
+17:05 ET. This is an expected divergence; see
+[`strategies/portfolio-2026-05.md`](strategies/portfolio-2026-05.md#expected-divergence-earnings_drift-after-market-reports-kan-110).
 
 ### Universe Registry
 

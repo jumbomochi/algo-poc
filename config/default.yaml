@@ -210,3 +210,24 @@ data:
     max_stale_ticker_fraction: 0.2 # sleeve-kill-criteria.md's 20% bound
   earnings:
     max_fetch_age_days: 2          # = the lookup window: refresh daily
+    # Alpha Vantage refresh (KAN-110, scripts/fetch_earnings.py): a full run
+    # at 04:45 SGT and a top-up at 05:05 (local.algo-earnings-refresh /
+    # local.algo-earnings-topup), every day. Sized for the FREE tier (25
+    # requests/day): 1 calendar + 16 EARNINGS at 04:45, at most 4 at 05:05 —
+    # 21, leaving 4 for a hand-run. For a paid plan raise calls_per_run and
+    # drop min_interval_seconds to the plan's per-minute limit (75/min -> 0.9).
+    refresh:
+      calls_per_run: 16
+      topup_calls: 4
+      topup_recent_days: 1
+      topup_refetch_minutes: 10
+      min_interval_seconds: 13
+      refusal_exclude_after_days: 3
+      max_consecutive_errors: 3
+      recent_days: 4
+      refetch_after_hours: 20
+      calendar_horizon: 3month
+      calendar_retain_days: 14
+      symbol_overrides:            # universe ticker -> AV symbol (renamed)
+        MMC: MRSH
+        FI: FISV

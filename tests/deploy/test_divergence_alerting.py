@@ -360,6 +360,7 @@ WRAPPERS = (
     DEPLOY_DIR / "run_pipeline_report.sh",
     DEPLOY_DIR / "run_db_backup.sh",
     DEPLOY_DIR / "run_backtest_refresh.sh",
+    DEPLOY_DIR / "run_earnings_refresh.sh",
     DEPLOY_DIR / "gateway_watchdog.sh",
 )
 

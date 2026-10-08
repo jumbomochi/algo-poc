@@ -56,6 +56,7 @@ SWITCH_TO_PLIST = {
     "ALGO_DEADMAN_REFRESH_URL": "local.algo-backtest-refresh",
     "ALGO_DEADMAN_BACKUP_URL": "local.algo-db-backup",
     "ALGO_DEADMAN_DIGEST_URL": "local.algo-evidence-digest",
+    "ALGO_DEADMAN_EARNINGS_URL": "local.algo-earnings-refresh",
 }
 
 
