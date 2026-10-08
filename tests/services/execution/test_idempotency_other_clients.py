@@ -1161,6 +1161,52 @@ class TestADeferredBuyExpiresWithItsSession:
         assert h.acked(msg)
         assert h.runner._deferred_messages == {}
 
+    async def test_a_buy_replayed_at_startup_after_the_close_is_never_placed(
+        self, session
+    ):
+        """Left unacked before a restart, replayed after its session closed,
+        with IB answering: the replay path applies the same age test."""
+        h = Harness(session)
+        order = h.approve(BUY_REC, AAPL, "buy")
+        msg = h.message(order)
+        h.redis.drain_pending = AsyncMock(side_effect=[[msg], []])
+        h.now = SESSION_CLOSE + timedelta(hours=8)
+
+        await h.runner.setup()
+
+        assert h.gw.placed == []
+        assert h.gw.open_requests == 0
+        intent = h.ledger.get(BUY_REC)
+        assert intent.status == OrderStatus.SUBMISSION_FAILED.value
+        assert intent.reason == DEFERRED_PAST_SESSION_REASON
+        h.session.rollback()
+        assert h.acked(msg)
+        h.redis.send_to_dead_letter.assert_not_awaited()
+        assert h.runner._deferred_messages == {}
+
+    async def test_a_buy_replayed_within_its_session_is_placed(self, session):
+        h = Harness(session)
+        order = h.approve(BUY_REC, AAPL, "buy")
+        msg = h.message(order)
+        h.redis.drain_pending = AsyncMock(side_effect=[[msg], []])
+
+        await h.runner.setup()
+
+        assert h.placed_refs() == [BUY_REC]
+        assert h.acked(msg)
+
+    async def test_an_exit_replayed_days_later_is_still_placed(self, session):
+        h = Harness(session)
+        order = h.approve(SELL_REC, MSFT, "sell")
+        msg = h.message(order)
+        h.redis.drain_pending = AsyncMock(side_effect=[[msg], []])
+        h.now = SESSION_CLOSE + timedelta(days=3)
+
+        await h.runner.setup()
+
+        assert h.placed_refs() == [SELL_REC]
+        assert h.acked(msg)
+
     async def test_before_the_close_it_is_still_placed(self, session):
         h = Harness(session)
         order = h.approve(BUY_REC, AAPL, "buy")

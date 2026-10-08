@@ -397,6 +397,22 @@ class ExecutionServiceRunner:
         for msg in pending_orders:
             try:
                 order = ApprovedOrderMessage.from_stream_dict(msg.data)
+                # A BUY left unacked before the restart gets the same age test
+                # as one in the deferred queue (KAN-112): replayed after its
+                # session closed, it is failed and acked, never placed.
+                if await self._expire_stale_deferred_buy(
+                    DeferredMessage(
+                        message_id=str(msg.message_id),
+                        stream=APPROVED_ORDERS_STREAM,
+                        msg=msg,
+                        parser=ApprovedOrderMessage.from_stream_dict,
+                        handler=self.process_approved_order,
+                        recommendation_id=order.recommendation_id,
+                        kind="replay",
+                        due_at=0.0,
+                    )
+                ):
+                    continue
                 await self.process_approved_order(order)
                 await self._redis.ack(
                     APPROVED_ORDERS_STREAM, CONSUMER_GROUP, msg.message_id
@@ -1811,6 +1827,10 @@ class ExecutionServiceRunner:
     async def _expire_stale_deferred_buy(self, record: DeferredMessage) -> bool:
         """Terminalize a deferred BUY whose session has closed (KAN-112).
 
+        Also run on every BUY the startup PEL replay hands back (``kind``
+        ``"replay"``, never queued), which an unacked message is just as
+        exposed to.
+
         A BUY is sized and priced for one session — the next to close after
         it was approved. Placed after that, it would be a stale-priced entry
         nobody decided on. Exits are never expired: getting out stays right.
@@ -1855,7 +1875,7 @@ class ExecutionServiceRunner:
             )
         self._settle_deferred(record.message_id)
         self._logger.warning(
-            "Deferred buy expired: the session it was sized for has closed",
+            "Unsubmitted buy expired: the session it was sized for has closed",
             recommendation_id=record.recommendation_id,
             ticker=order.ticker,
             session_close=close.isoformat(),

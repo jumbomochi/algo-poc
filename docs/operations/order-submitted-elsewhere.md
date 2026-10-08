@@ -59,6 +59,22 @@ client id, the ticker, the side and the submit path (`entry`, `exit`,
      `reconcile_paper.py` flow, as for any fill booked outside execution.
 3. A held **BUY** also expires with its session (see above), so a blocked
    entry cannot hold a reservation forever.
+4. **When a blocked BUY expires** (log line `Unsubmitted buy expired`,
+   intent `SUBMISSION_FAILED` / `deferred past session`), execution stops
+   watching it, but **the other client's order may still be working**. Our
+   intent is finished; theirs is not. Look the order up at IB (order id and
+   client id from the `order_submitted_elsewhere` page, or search by the
+   `orderRef`):
+   - still working and unwanted: cancel it at IB, from the client that
+     placed it or in TWS. Nothing in execution will cancel it for you: it
+     never tracked that order, and the halt sweep and cancel paths only
+     reach execution's own client;
+   - still working and wanted, or already filled: execution will never book
+     its fills. Reconcile the position as in step 2 (`reconciliation_status.py`,
+     then the `reconcile_paper.py` flow).
+
+   The same applies to a BUY replayed from the PEL after a restart once its
+   session has closed: it is failed and acked the same way, before any probe.
 
 ### Caveats
 - **A changed `ib.client_id` makes our own orders look foreign.** "Ours"
