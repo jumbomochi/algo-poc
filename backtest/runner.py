@@ -46,6 +46,12 @@ class BacktestResult:
     sleeve_cash: dict = field(
         default_factory=lambda: {"downsized": 0, "skipped": 0}
     )
+    # KAN-113: the cash injections actually applied, by the session they were
+    # applied on (``run(cash_flows=...)``). Empty for every run without flows.
+    # A withdrawal larger than the replay's cash is clamped, so this can differ
+    # from what was asked; ``portfolio_values`` (and so ``metrics``) include
+    # these steps — callers that compare returns remove them.
+    cash_flows_applied: dict = field(default_factory=dict)
 
 
 class BacktestRunner:
@@ -116,6 +122,7 @@ class BacktestRunner:
         portfolio_name: str = "",
         membership: MembershipCalendar | None = None,
         delisting_stale_sessions: int = DELISTING_STALE_SESSIONS,
+        cash_flows: dict | None = None,
     ) -> BacktestResult:
         """Run a backtest over the provided bar data.
 
@@ -143,12 +150,26 @@ class BacktestRunner:
                 print no bar before the position is written off at its last
                 close with ``exit_reason: "delisted"``. See
                 ``DELISTING_STALE_SESSIONS``.
+            cash_flows: KAN-113. ``{session: signed USD}`` cash injected into
+                (or, negative, withdrawn from) the book, so a replay can carry
+                the capital flows the live sleeve received. Applied on the
+                first replayed session on or after the key, after that
+                session's fills and before its decisions: the cash sizes the
+                entries decided at that session's close (KAN-111's cash cap
+                sees it) and is in that session's end-of-day value — the same
+                session a live snapshot first includes the flow. A withdrawal
+                larger than the cash on hand is clamped to that cash (never
+                below zero): the replay cannot sell to fund it. The applied
+                amounts are in ``BacktestResult.cash_flows_applied``. ``None``
+                or empty leaves the run exactly as without it.
 
         Returns:
             BacktestResult with trades, portfolio_values, and metrics.
         """
         cash = self.initial_capital
         cash_limited = {"downsized": 0, "skipped": 0}
+        pending_flows = sorted((cash_flows or {}).items())
+        flows_applied: dict = {}
         positions: dict[str, list[_Lot]] = {}
         trades: list[dict] = []
         portfolio_values: list[float] = [self.initial_capital]
@@ -324,6 +345,17 @@ class BacktestRunner:
                     if ticker in positions and ticker not in pending_exits:
                         pending_exits[ticker] = "universe_removal"
 
+            # --- Phase 2b': capital flows (KAN-113), before today's decisions. ---
+            while pending_flows and pending_flows[0][0] <= current_date:
+                _, amount = pending_flows.pop(0)
+                amount = float(amount)
+                if amount < 0:
+                    amount = -min(-amount, max(cash, 0.0))
+                cash += amount
+                flows_applied[current_date] = (
+                    flows_applied.get(current_date, 0.0) + amount
+                )
+
             # --- Phase 2c: decide, using bars up to and including today's close. ---
             for ticker in bars_by_ticker:
                 if ticker not in traded_today or ticker in non_members:
@@ -483,6 +515,7 @@ class BacktestRunner:
             shadow_candidates=shadow_candidates,
             open_positions=open_positions,
             sleeve_cash=cash_limited,
+            cash_flows_applied=flows_applied,
         )
 
 

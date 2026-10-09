@@ -15,6 +15,7 @@ from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy.orm import Session
 
 from backtest.portfolio_context import HeldPosition, PendingOrder, PortfolioContext
+from shared.capital_flows import CapitalFlow, recorded_flows
 from shared.models.portfolio import Position, Trade
 from shared.models.equity_snapshot import EquitySnapshot
 from shared.models.portfolio_config import PortfolioConfig
@@ -661,7 +662,21 @@ class PaperTradingState:
                 "equity": s.equity,
                 "cash": s.cash,
                 "market_value": s.market_value,
+                # When the row was written: a capital flow committed before
+                # this instant is inside its cash (KAN-113,
+                # shared/capital_flows.py).
+                "created_at": s.created_at,
                 **{name: getattr(s, name) for name in CURRENCY_COLUMNS},
             }
             for s in rows
         ]
+
+    def capital_flows(self, portfolio: str | None = None) -> list[CapitalFlow]:
+        """Recorded capital flows (credits, transfers), oldest first (KAN-113).
+
+        Empty when ``capital_adjustments`` does not exist or holds nothing.
+        """
+        return recorded_flows(
+            self._session,
+            portfolios=None if portfolio is None else [portfolio],
+        )

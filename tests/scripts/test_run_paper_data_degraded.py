@@ -109,6 +109,9 @@ def harness(monkeypatch, tmp_path):
     monkeypatch.setattr(run_paper, "run_daily", capture_run_daily)
     monkeypatch.setattr(run_paper, "produce_shadow_artifact", capture_shadow)
     monkeypatch.setattr(run_paper, "live_equity_by_sleeve", lambda state: {})
+    monkeypatch.setattr(
+        run_paper, "capital_flow_steps_by_sleeve", lambda state: {}
+    )
     monkeypatch.setattr(sys, "argv", [
         "run_paper.py", "--db-url", "sqlite://", "--redis-url", "redis://x",
         "--ml-shadow-model", "", "--shadow-output-dir", str(tmp_path),

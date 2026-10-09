@@ -88,7 +88,12 @@ def established_paper_state(state: PaperTradingState) -> dict:
         "cash": state.get_cash(portfolio),
         "positions": state.get_positions(portfolio),
         "trades": state.get_trades(portfolio),
-        "equity_history": state.get_equity_history(portfolio),
+        # created_at is when the row was written, not what it says (KAN-113
+        # added it for flow attribution); two runs never share it.
+        "equity_history": [
+            {key: value for key, value in row.items() if key != "created_at"}
+            for row in state.get_equity_history(portfolio)
+        ],
     }
 
 

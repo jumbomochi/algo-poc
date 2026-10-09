@@ -71,8 +71,14 @@ from shared.data_cache import (  # noqa: E402
     configured_data_config,
     load_data_caches,
 )
+from shared.capital_flows import (  # noqa: E402
+    CapitalFlow,
+    flow_adjust,
+    recorded_flows,
+)
 from shared.data_gaps import DataGap, data_gaps_in  # noqa: E402
 from shared.evidence_store import (  # noqa: E402
+    DEFAULT_WINDOW_SESSIONS,
     EXCLUDED_PORTFOLIO_PREFIX,
     _passing_drill_types,
     _resolve_calendar,
@@ -80,6 +86,7 @@ from shared.evidence_store import (  # noqa: E402
     breach_streak,
     UnstampedSnapshots,
     epoch_progress,
+    included_flows_by_session,
     session_snapshots,
     unstamped_snapshots,
 )
@@ -175,7 +182,10 @@ class SleeveLine:
 class EquityLine:
     latest: float
     currency: str
+    #: Flow-adjusted (KAN-113): a sleeve-cash credit is not a gain.
     change_pct: float
+    #: Net capital flows recorded inside the week, excluded from change_pct.
+    flows: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -221,6 +231,10 @@ class DigestSnapshot:
     #: reported week, so the week's verdicts for those sleeves are not read as
     #: strategy results.
     data_gaps: list[DataGap] = field(default_factory=list)
+    #: KAN-113: capital flows recorded inside the divergence window ending
+    #: ``as_of``. Every verdict whose window spans one was graded on
+    #: flow-adjusted returns; this names them so a step is not read as drift.
+    capital_flows: list[CapitalFlow] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +344,21 @@ def _data_gap_line(gaps: list[DataGap]) -> list[str]:
     ]
 
 
+def _capital_flow_line(flows: list[CapitalFlow]) -> list[str]:
+    """KAN-113: flows the divergence windows span, graded flow-adjusted."""
+    if not flows:
+        return []
+    return [
+        "📥 CAPITAL FLOW (KAN-113) in the divergence window — "
+        + ", ".join(
+            f"{flow.portfolio} {flow.amount:+,.2f} on {flow.at.date().isoformat()}"
+            for flow in flows
+        )
+        + ": verdicts graded on flow-adjusted returns, windows and BREACH "
+        "streaks unchanged; not performance"
+    ]
+
+
 def _unstamped_line(unstamped: UnstampedSnapshots | None) -> list[str]:
     if unstamped is None or not unstamped.alarming:
         return []
@@ -350,6 +379,8 @@ def _equity_lines(equity: EquityLine | None, sleeves: list[SleeveLine]) -> list[
             change = "no change"
         else:
             change = f"{equity.change_pct:+.1f}% wk"
+        if abs(equity.flows) >= 0.005:
+            change += f", excl. {equity.flows:+,.2f} capital flows"
         lines = [f"Equity {equity.latest:,.2f} {equity.currency} ({change})"]
 
     if not sleeves:
@@ -446,6 +477,7 @@ def render_digest(snapshot: DigestSnapshot) -> str:
         *_data_degraded_line(snapshot.data_degraded),
         *_absent_line(snapshot.blind),
         *_data_gap_line(snapshot.data_gaps),
+        *_capital_flow_line(snapshot.capital_flows),
         *_epoch_lines(snapshot.epoch, snapshot.failed),
         *_equity_lines(snapshot.equity, snapshot.sleeves),
         _tail_line(snapshot),
@@ -484,6 +516,8 @@ class Sources:
     #: KAN-109, optional for the same reason.
     data_degraded: Callable[[], object] | None = None
     data_gaps: Callable[[], object] | None = None
+    #: KAN-113, optional for the same reason.
+    capital_flows: Callable[[], object] | None = None
 
 
 def collect_snapshot(
@@ -530,6 +564,10 @@ def collect_snapshot(
         _read("data_gaps", sources.data_gaps, [])
         if sources.data_gaps is not None else []
     )
+    capital_flows = (
+        _read("capital_flows", sources.capital_flows, [])
+        if sources.capital_flows is not None else []
+    )
 
     return DigestSnapshot(
         as_of=as_of,
@@ -547,6 +585,7 @@ def collect_snapshot(
         failed=frozenset(failed),
         data_degraded=data_degraded,
         data_gaps=list(data_gaps or []),
+        capital_flows=list(capital_flows or []),
     )
 
 
@@ -722,6 +761,10 @@ def equity_source(
     is computed by ``epoch_progress``, and this line never second-guesses it.
     Summed across sleeves and excluding synthetic portfolios, the same shape
     every other equity reader in the repo uses.
+
+    ``latest`` is the real balance; ``change_pct`` is flow-adjusted from
+    ``equity_series`` (KAN-113), so a sleeve-cash credit during the week is
+    named as a flow instead of read as a gain.
     """
 
     def _read() -> EquityLine | None:
@@ -735,15 +778,31 @@ def equity_source(
             return None
 
         days = sorted(by_session)
-        first = sum(float(r.equity or 0.0) for r in by_session[days[0]].values())
+        first_raw = sum(
+            float(r.equity or 0.0) for r in by_session[days[0]].values()
+        )
         latest_rows = by_session[days[-1]].values()
         last = sum(float(r.equity or 0.0) for r in latest_rows)
         currency = max(
             (r.trading_currency for r in latest_rows if r.trading_currency),
             default="USD",
         )
+        included = included_flows_by_session(
+            session, by_session, excluded_prefix
+        )
+        if included is None:
+            first, flows = first_raw, 0.0
+        else:
+            raw = {
+                day: sum(float(r.equity or 0.0) for r in rows.values())
+                for day, rows in by_session.items()
+            }
+            first = flow_adjust(raw, included)[days[0]]
+            flows = included[days[-1]] - included[days[0]]
         change = (last - first) / first * 100.0 if first else 0.0
-        return EquityLine(latest=last, currency=currency, change_pct=change)
+        return EquityLine(
+            latest=last, currency=currency, change_pct=change, flows=flows,
+        )
 
     return _read
 
@@ -989,7 +1048,33 @@ def build_sources(
         ),
         data_degraded=data_degraded_source(),
         data_gaps=lambda: data_gaps_in(window_start, as_of),
+        capital_flows=capital_flows_source(
+            session, as_of=as_of, calendar=resolved
+        ),
     )
+
+
+def capital_flows_source(
+    session, *, as_of: date, calendar, window_sessions: int = DEFAULT_WINDOW_SESSIONS,
+) -> Callable[[], list[CapitalFlow]]:
+    """Graded-sleeve capital flows inside the divergence window ending
+    ``as_of`` (KAN-113): the flows some verdict this week was graded across."""
+
+    def _read() -> list[CapitalFlow]:
+        sessions = calendar.trading_sessions(
+            as_of - timedelta(days=window_sessions * 2 + 14), as_of
+        )
+        if not sessions:
+            return []
+        start = sessions[-window_sessions:][0]
+        since = datetime.combine(start, time.min, tzinfo=timezone.utc)
+        return [
+            flow for flow in recorded_flows(session)
+            if flow.at >= since
+            and not flow.portfolio.startswith(EXCLUDED_PORTFOLIO_PREFIX)
+        ]
+
+    return _read
 
 
 def data_degraded_source(
