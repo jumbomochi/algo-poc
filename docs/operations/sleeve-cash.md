@@ -47,8 +47,10 @@ transfer moves both from source to destination.
 
 ### Procedure
 
-From the deploy clone, outside 04:00–07:00 SGT (the paper run reads cash and
-writes snapshots then; the tool refuses in that window). `python` alone
+From the deploy clone, outside 04:00–07:00 SGT and not within 15 minutes of
+a paper run's snapshot write (the run reads cash and then writes snapshots;
+`--apply` refuses in either case, and re-checks both at the moment of the
+write). `python` alone
 imports another checkout, so set `PYTHONPATH`; the database comes from
 `ALGO_DATABASE_URL`.
 
@@ -79,7 +81,13 @@ It refuses (exit 1, nothing written) when:
   sleeve's cash plus open positions at their last marks — exceeds
   `capital.paper.max_deployable_usd`, or today's deployable capital as
   `shared.capital.calculate_capital_budget` computes it from the broker
-  snapshot (the paper run's own definition);
+  snapshot (the paper run's own definition). The remedy is printed: raise
+  `capital.paper.max_deployable_usd` first, or move existing cash with
+  `--from/--to`. The dry run prints **contributed capital** (the sum of the
+  `capital` column) beside the marked figure, so the gap between them — the
+  book's profit and loss — is visible. On 2026-10-09 the book was already
+  marked above $100,000 by profit alone, so any credit needed the cap raised
+  first;
 - (credit/allocate) IB does not back it: the account's USD cash
   (`TotalCashBalance`) less `currency.minimum_settled_usd_reserve` must cover
   every sleeve's ledger cash after the credit. The snapshot is read-only, on
@@ -91,13 +99,26 @@ It refuses (exit 1, nothing written) when:
 - an identical flow (same mode, sleeves and amounts) was recorded in the last
   24 hours — pass `--allow-repeat` only if a second one is really meant.
 
+Two timing checks — inside 04:00–07:00 SGT, or an equity snapshot written in
+the last 15 minutes (a late or manual paper run) — are `[WARN]` in a plain dry
+run, so you can preview at any hour, and refusals with `--apply`. A credit
+that takes a sleeve above its share of deployable capital (deployable ×
+`CAPITAL_ALLOCATIONS` weight) is a `[WARN]`, not a refusal: re-weighting a
+sleeve on purpose is what `--portfolio` is for.
+
 `--apply` additionally needs `--account`, an interactive TTY, a writable
 artifact directory (checked before anything is written) and the exact phrase.
 It is one transaction: `SELECT … FOR UPDATE` on the affected
 `portfolio_config` rows (the projector's lock), a refusal if any sleeve's cash
-moved since the dry run (a fill landed — re-run the dry run), the update, and
-one `capital_adjustments` row per leg. Any failure rolls all of it back. After
-commit the book is re-read and compared with the plan, and an audit artifact
+moved since the dry run (a fill landed — re-run the dry run), the timing
+checks again and the broker snapshot's age (at most 5 minutes) judged at the
+moment of the write — so typing the phrase late is caught — then the update
+and one `capital_adjustments` row per leg, stamped with the database clock
+(`clock_timestamp()`) just before the commit. Any failure rolls all of it
+back. After commit the book is re-read and compared with the plan: `capital`
+and the flow rows must match exactly; a `cash` difference is reported as
+"may be a fill that landed after commit" (the projector moves cash too) rather
+than as a failure. An audit artifact
 `topup-sleeve-cash-<UTC stamp>.json` is written under `output/reconciliation`
 (never overwriting an existing file) with the plan, every check, the broker
 evidence or the skip, the result and the verification.
@@ -120,13 +141,26 @@ and the readers remove it (`shared/capital_flows.py`):
 - **Weekly digest**: the balance is real; the week's change is flow-adjusted
   and the line says `excl. +5,000.00 capital flows`.
 - **Risk service `peak_nav`** (circuit breaker): flow-adjusted against
-  today's NAV. Needs a `risk_management` image rebuild to take effect.
-- **Rolling shadow** (the KAN-105 seeding question): the shadow is seeded at
-  live's NAV on its window's first session and replays with no flows, so its
-  window **never spans a flow** — `live_equity_by_sleeve` trims the seed
-  curve to the sessions after the sleeve's newest flow. A credited sleeve's
-  divergence window restarts at the first snapshot that includes the credit
-  and grows back to full length ("Only N overlapping days" meanwhile).
+  today's NAV. Needs a `risk-management` image rebuild to take effect
+  (`docs/operations/container-deploy.md`).
+- **Rolling shadow** (the KAN-105 seeding question): the shadow is seeded
+  from the **flow-adjusted** live curve (`live_equity_by_sleeve`), the same
+  curve the monitor grades against, so both start level in today's capital
+  and a window that spans a flow is graded **in full**. The verdict carries a
+  note: `capital flow(s) inside this window (KAN-113): momentum +5,000.00 USD
+  valued from <session> …`, on the sleeve and on AGGREGATE. The weekly digest
+  adds a `📥 CAPITAL FLOW (KAN-113)` line while a flow is inside the
+  30-session divergence window.
+
+**A flow does not pause or reset anything.** The window never shrinks, so
+AGGREGATE (which intersects sessions across sleeves) does not collapse after
+an `--allocate`; the credited sleeve is graded every session, so a credit
+neither turns sessions into NO_DATA (which would pause the epoch's scored
+session count and the BREACH streak) nor produces a short-window OK that
+would clear a running BREACH streak. A sleeve in BREACH before a credit is
+still in BREACH after it unless its flow-adjusted returns say otherwise.
+(Starting the shadow window after the flow was rejected for exactly this: it
+collapses the window, and AGGREGATE with it, to one session.)
 
 `equity_snapshots` is never rewritten; the adjustment happens in the reader,
 every time, from the recorded rows. A flow is attributed to a snapshot by

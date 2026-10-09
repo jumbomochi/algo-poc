@@ -71,9 +71,14 @@ from shared.data_cache import (  # noqa: E402
     configured_data_config,
     load_data_caches,
 )
-from shared.capital_flows import flow_adjust  # noqa: E402
+from shared.capital_flows import (  # noqa: E402
+    CapitalFlow,
+    flow_adjust,
+    recorded_flows,
+)
 from shared.data_gaps import DataGap, data_gaps_in  # noqa: E402
 from shared.evidence_store import (  # noqa: E402
+    DEFAULT_WINDOW_SESSIONS,
     EXCLUDED_PORTFOLIO_PREFIX,
     _passing_drill_types,
     _resolve_calendar,
@@ -226,6 +231,10 @@ class DigestSnapshot:
     #: reported week, so the week's verdicts for those sleeves are not read as
     #: strategy results.
     data_gaps: list[DataGap] = field(default_factory=list)
+    #: KAN-113: capital flows recorded inside the divergence window ending
+    #: ``as_of``. Every verdict whose window spans one was graded on
+    #: flow-adjusted returns; this names them so a step is not read as drift.
+    capital_flows: list[CapitalFlow] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +341,21 @@ def _data_gap_line(gaps: list[DataGap]) -> list[str]:
         "◻️ DATA GAP (on record, KAN-109) — "
         + ", ".join(f"{gap.sleeve} {gap.kind} {gap.period()}" for gap in gaps)
         + ": not strategy evidence"
+    ]
+
+
+def _capital_flow_line(flows: list[CapitalFlow]) -> list[str]:
+    """KAN-113: flows the divergence windows span, graded flow-adjusted."""
+    if not flows:
+        return []
+    return [
+        "📥 CAPITAL FLOW (KAN-113) in the divergence window — "
+        + ", ".join(
+            f"{flow.portfolio} {flow.amount:+,.2f} on {flow.at.date().isoformat()}"
+            for flow in flows
+        )
+        + ": verdicts graded on flow-adjusted returns, windows and BREACH "
+        "streaks unchanged; not performance"
     ]
 
 
@@ -453,6 +477,7 @@ def render_digest(snapshot: DigestSnapshot) -> str:
         *_data_degraded_line(snapshot.data_degraded),
         *_absent_line(snapshot.blind),
         *_data_gap_line(snapshot.data_gaps),
+        *_capital_flow_line(snapshot.capital_flows),
         *_epoch_lines(snapshot.epoch, snapshot.failed),
         *_equity_lines(snapshot.equity, snapshot.sleeves),
         _tail_line(snapshot),
@@ -491,6 +516,8 @@ class Sources:
     #: KAN-109, optional for the same reason.
     data_degraded: Callable[[], object] | None = None
     data_gaps: Callable[[], object] | None = None
+    #: KAN-113, optional for the same reason.
+    capital_flows: Callable[[], object] | None = None
 
 
 def collect_snapshot(
@@ -537,6 +564,10 @@ def collect_snapshot(
         _read("data_gaps", sources.data_gaps, [])
         if sources.data_gaps is not None else []
     )
+    capital_flows = (
+        _read("capital_flows", sources.capital_flows, [])
+        if sources.capital_flows is not None else []
+    )
 
     return DigestSnapshot(
         as_of=as_of,
@@ -554,6 +585,7 @@ def collect_snapshot(
         failed=frozenset(failed),
         data_degraded=data_degraded,
         data_gaps=list(data_gaps or []),
+        capital_flows=list(capital_flows or []),
     )
 
 
@@ -1016,7 +1048,33 @@ def build_sources(
         ),
         data_degraded=data_degraded_source(),
         data_gaps=lambda: data_gaps_in(window_start, as_of),
+        capital_flows=capital_flows_source(
+            session, as_of=as_of, calendar=resolved
+        ),
     )
+
+
+def capital_flows_source(
+    session, *, as_of: date, calendar, window_sessions: int = DEFAULT_WINDOW_SESSIONS,
+) -> Callable[[], list[CapitalFlow]]:
+    """Graded-sleeve capital flows inside the divergence window ending
+    ``as_of`` (KAN-113): the flows some verdict this week was graded across."""
+
+    def _read() -> list[CapitalFlow]:
+        sessions = calendar.trading_sessions(
+            as_of - timedelta(days=window_sessions * 2 + 14), as_of
+        )
+        if not sessions:
+            return []
+        start = sessions[-window_sessions:][0]
+        since = datetime.combine(start, time.min, tzinfo=timezone.utc)
+        return [
+            flow for flow in recorded_flows(session)
+            if flow.at >= since
+            and not flow.portfolio.startswith(EXCLUDED_PORTFOLIO_PREFIX)
+        ]
+
+    return _read
 
 
 def data_degraded_source(

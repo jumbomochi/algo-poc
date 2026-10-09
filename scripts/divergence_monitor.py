@@ -63,7 +63,9 @@ from sqlalchemy import select
 
 from shared.capital_flows import (
     CapitalFlow,
+    describe_flow_steps,
     flow_adjusted_by_session,
+    flow_steps,
     flows_by_portfolio,
 )
 from shared.config import load_config
@@ -783,6 +785,24 @@ def note_data_gaps(
     return report
 
 
+def note_capital_flows(
+    report: PortfolioDivergenceReport,
+    steps: Iterable[tuple[str, date, float]],
+) -> PortfolioDivergenceReport:
+    """Name any capital flow (KAN-113) inside the graded window.
+
+    Classifies only: the window is graded in full on flow-adjusted returns,
+    so the status is untouched — a credit neither restarts the window nor
+    pauses or clears a BREACH streak.
+    """
+    note = describe_flow_steps(
+        steps, start=report.window_start, end=report.window_end
+    )
+    if note is not None:
+        report.notes.append(note)
+    return report
+
+
 # Generous for two INSERTs, and short next to the job's window. The verdict
 # reaches the operator only once this process exits — the launchd wrapper sends
 # the Telegram message from the exit code — so a write blocked on a lock would
@@ -1253,6 +1273,7 @@ def main() -> int:
     # Credits and transfers between sleeves (KAN-113): removed from every
     # live return below, so a top-up is never graded as performance.
     flows_by_sleeve = flows_by_portfolio(state.capital_flows())
+    flow_steps_by_sleeve: dict[str, list[tuple[str, date, float]]] = {}
 
     # Checked on the FULL live set, before --portfolio narrows it: --portfolio
     # limits what is scored, never what is compared, so an ad-hoc scoped run
@@ -1407,6 +1428,14 @@ def main() -> int:
                 ),
             )
         note_data_gaps(report, live, window_sessions=args.window)
+        if name in flows_by_sleeve:
+            flow_steps_by_sleeve[name] = [
+                (name, session_date, amount)
+                for session_date, amount in flow_steps(
+                    state.get_equity_history(name), flows_by_sleeve[name]
+                )
+            ]
+            note_capital_flows(report, flow_steps_by_sleeve[name])
         reports.append(report)
 
     # Everything scored so far is a real sleeve. The aggregate is appended
@@ -1461,6 +1490,10 @@ def main() -> int:
                 f"({', '.join(ungraded)}). The figures above are still the "
                 "arithmetic over every sleeve, so the gap stays visible."
             )
+        note_capital_flows(agg_report, [
+            step for name in comparable
+            for step in flow_steps_by_sleeve.get(name, ())
+        ])
         reports.append(agg_report)
 
     # --- Output ---

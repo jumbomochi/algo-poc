@@ -518,15 +518,152 @@ def test_a_bad_amount_is_refused(tmp_path, capsys, amount):
     assert _state(engine) == before
 
 
-def test_the_paper_run_window_is_refused(tmp_path, capsys, monkeypatch):
-    url, _ = _book(tmp_path)
-    # 04:30 SGT.
-    monkeypatch.setattr(
-        tool, "_now", lambda: datetime(2026, 10, 8, 20, 30, tzinfo=timezone.utc)
-    )
-    assert _cli(url, tmp_path, "--portfolio", "momentum",
-                "--amount-usd", "10", "--skip-broker-check") == 1
+#: 04:30 SGT, inside the paper run.
+IN_RUN = datetime(2026, 10, 8, 20, 30, tzinfo=timezone.utc)
+
+
+def test_the_paper_run_window_warns_in_a_dry_run_and_refuses_apply(
+    tmp_path, capsys, monkeypatch
+):
+    url, engine = _book(tmp_path)
+    before = _state(engine)
+    monkeypatch.setattr(tool, "_now", lambda: IN_RUN)
+    args = ("--portfolio", "momentum", "--amount-usd", "10",
+            "--skip-broker-check")
+
+    # The preview still runs, and says what --apply would do.
+    assert _cli(url, tmp_path, *args) == 0
+    out = capsys.readouterr().out
+    assert "[WARN] outside the paper-run window -- WARNING:" in out
+    assert "--apply would refuse now" in out
+
+    asked = _confirm(monkeypatch)
+    assert _cli(url, tmp_path, *args, "--apply") == 1
     _refused(capsys, "outside the paper-run window")
+    assert asked == []
+    assert _state(engine) == before
+
+
+def _plan(session, **kwargs):
+    defaults = dict(
+        kind="credit", amounts=[("momentum", 1_000.0)], account=ACCOUNT,
+        config=_config(), broker_snapshot=_snapshot(), now=NOW,
+        for_apply=True,
+    )
+    defaults.update(kwargs)
+    return plan_topup(session, **defaults)
+
+
+def test_the_window_is_judged_again_at_the_write(tmp_path):
+    """Planned at 03:58 SGT, phrase typed at 04:03: refused under the lock."""
+    _, engine = _book(tmp_path)
+    planned_at = datetime(2026, 10, 8, 19, 58, tzinfo=timezone.utc)
+    with Session(engine) as session:
+        plan = _plan(session, now=planned_at,
+                     broker_snapshot=_snapshot(at=planned_at))
+        assert not plan.problems
+    before = _state(engine)
+    with Session(engine) as session:
+        with pytest.raises(TopupRefusedError, match="04:00-07:00 SGT"):
+            apply_topup(
+                session, plan, confirm=CONFIRMATION, operator="t", note="t",
+                now=planned_at + timedelta(minutes=5),
+            )
+    assert _state(engine) == before
+
+
+def _snapshot_row(engine, written):
+    from shared.models import EquitySnapshot
+
+    with Session(engine) as session:
+        session.add(EquitySnapshot(
+            portfolio="momentum", date=date(2026, 10, 9),
+            session_date=date(2026, 10, 8), equity=20_000.0, cash=2_000.0,
+            market_value=18_000.0, created_at=written,
+        ))
+        session.commit()
+
+
+def test_a_snapshot_in_the_last_15_minutes_warns_then_refuses(
+    tmp_path, capsys, monkeypatch
+):
+    """A late or manual paper run is writing: a flow now could be misfiled."""
+    url, engine = _book(tmp_path)
+    _snapshot_row(engine, NOW - timedelta(minutes=10))
+    before = _state(engine)
+
+    assert _cli(url, tmp_path, "--portfolio", "momentum",
+                "--amount-usd", "10") == 0
+    assert "[WARN] no snapshot in the last 15 minutes" in (
+        capsys.readouterr().out
+    )
+    _confirm(monkeypatch)
+    assert _cli(url, tmp_path, "--portfolio", "momentum",
+                "--amount-usd", "10", "--apply") == 1
+    _refused(capsys, "no snapshot in the last 15 minutes")
+    assert _state(engine) == before
+
+
+def test_a_snapshot_written_after_the_plan_is_caught_at_the_write(tmp_path):
+    _, engine = _book(tmp_path)
+    with Session(engine) as session:
+        plan = _plan(session)
+    _snapshot_row(engine, NOW + timedelta(minutes=1))
+    with Session(engine) as session:
+        with pytest.raises(TopupRefusedError, match="paper run"):
+            apply_topup(session, plan, confirm=CONFIRMATION, operator="t",
+                        note="t", now=NOW + timedelta(minutes=2))
+
+
+def test_a_stale_broker_snapshot_is_refused_at_the_write(tmp_path):
+    _, engine = _book(tmp_path)
+    with Session(engine) as session:
+        plan = _plan(session)
+    before = _state(engine)
+    with Session(engine) as session:
+        with pytest.raises(TopupRefusedError, match="minutes old"):
+            apply_topup(session, plan, confirm=CONFIRMATION, operator="t",
+                        note="t", now=NOW + timedelta(minutes=6))
+    assert _state(engine) == before
+    # Inside the limit it goes through.
+    with Session(engine) as session:
+        apply_topup(session, plan, confirm=CONFIRMATION, operator="t",
+                    note="t", now=NOW + timedelta(minutes=4))
+    assert _cash(engine, "momentum")[0] == 3_000.0
+
+
+def test_the_flow_is_stamped_at_the_write_not_at_the_prompt(
+    tmp_path, monkeypatch
+):
+    """No ``now``: the stamp is taken under the lock, after the checks
+    (the database clock on Postgres; the process clock on sqlite)."""
+    _, engine = _book(tmp_path)
+    with Session(engine) as session:
+        plan = _plan(session)
+    written = NOW + timedelta(minutes=3)
+    monkeypatch.setattr(tool, "_now", lambda: written)
+    with Session(engine) as session:
+        applied = apply_topup(session, plan, confirm=CONFIRMATION,
+                              operator="t", note="t")
+    with Session(engine) as session:
+        [flow] = recorded_flows(session)
+    assert flow.at == written
+    assert applied.applied_at == written.isoformat()
+
+
+def test_the_database_clock_is_used_on_postgres():
+    seen = []
+
+    class Fake:
+        def get_bind(self):
+            return type("B", (), {"dialect": type("D", (), {"name": "postgresql"})})()
+
+        def scalar(self, statement):
+            seen.append(str(statement))
+            return datetime(2026, 10, 9, 14, 0, tzinfo=timezone(timedelta(hours=8)))
+
+    assert tool._db_now(Fake()) == NOW
+    assert seen == ["SELECT clock_timestamp()"]
 
 
 def test_one_mode_at_a_time(tmp_path):
@@ -651,8 +788,31 @@ def test_verify_flags_a_book_that_moved_after_the_commit(tmp_path):
         session.commit()
     with Session(engine) as session:
         result = tool.verify(session, applied, plan)
-    assert any("momentum cash" in p for p in result.problems)
+    # The projector moves cash too: a fill after the commit is not a failure,
+    # but the line says what it may be.
+    assert result.problems == ()
+    assert any(
+        "momentum cash" in line and "may be a fill that landed after commit"
+        in line for line in result.lines
+    )
+    # capital is this tool's alone: a mismatch there IS a problem.
+    with Session(engine) as session:
+        row = session.scalar(select(PortfolioConfig).where(
+            PortfolioConfig.portfolio == "momentum"
+        ))
+        row.capital = 1.0
+        session.commit()
+    with Session(engine) as session:
+        result = tool.verify(session, applied, plan)
+    assert any("momentum capital" in p for p in result.problems)
     assert not any("capital_adjustments" in p for p in result.problems)
+    # ...and so are the flow rows.
+    with Session(engine) as session:
+        session.execute(CapitalAdjustment.__table__.delete())
+        session.commit()
+    with Session(engine) as session:
+        result = tool.verify(session, applied, plan)
+    assert any("capital_adjustments" in p for p in result.problems)
 
 
 def test_the_flow_timestamp_is_the_commit_instant(tmp_path):
@@ -708,7 +868,6 @@ def test_an_applied_credit_reads_as_a_flow_not_a_return(tmp_path, monkeypatch):
         for session_date, equity, written in (
             (date(2026, 10, 7), 20_000.0, NOW - timedelta(days=1, hours=10)),
             (date(2026, 10, 8), 19_000.0, NOW - timedelta(hours=10)),
-            (date(2026, 10, 9), 24_000.0, NOW + timedelta(hours=14)),
         ):
             session.add(EquitySnapshot(
                 portfolio="momentum", date=session_date + timedelta(days=1),
@@ -719,6 +878,14 @@ def test_an_applied_credit_reads_as_a_flow_not_a_return(tmp_path, monkeypatch):
     _confirm(monkeypatch)
     assert _cli(url, tmp_path, "--portfolio", "momentum",
                 "--amount-usd", "5000", "--apply") == 0
+    # Tomorrow's paper run values the credited sleeve.
+    with Session(engine) as session:
+        session.add(EquitySnapshot(
+            portfolio="momentum", date=date(2026, 10, 10),
+            session_date=date(2026, 10, 9), equity=24_000.0, cash=24_000.0,
+            market_value=0.0, created_at=NOW + timedelta(hours=14),
+        ))
+        session.commit()
 
     with Session(engine) as session:
         rows = equity_series(
@@ -728,3 +895,43 @@ def test_an_applied_credit_reads_as_a_flow_not_a_return(tmp_path, monkeypatch):
     assert values[-1] == 24_000.0
     assert values[2] / values[1] == pytest.approx(1.0)
     assert max_drawdown_pct(rows) == pytest.approx(5.0)
+
+
+# --------------------------------------------------------------------------
+# max_deployable: marks-based, with the remedy and the contributed figure.
+# --------------------------------------------------------------------------
+
+
+def test_the_max_deployable_refusal_names_the_remedy(tmp_path, capsys):
+    url, _ = _book(tmp_path)
+    assert _cli(url, tmp_path, "--portfolio", "momentum",
+                "--amount-usd", "51001") == 1
+    out = _refused(capsys, "within max_deployable_usd")
+    assert "raise capital.paper.max_deployable_usd first" in out
+    assert "--from/--to instead" in out
+    # Contributed 49,000 + 51,001 beside the marked 49,000 + 51,001.
+    assert "at the marks (contributed $100,001.00)" in out
+
+
+def test_contributed_capital_is_printed_beside_the_marks(tmp_path, capsys):
+    url, _ = _book(tmp_path)
+    assert _cli(url, tmp_path, "--portfolio", "momentum",
+                "--amount-usd", "100") == 0
+    out = capsys.readouterr().out
+    # capital column: 20,000 + 15,000 + 14,000 (the drill excluded).
+    assert "contributed capital (sum of portfolio_config.capital): " \
+        "$49,000.00 -> $49,100.00" in out
+    assert "marks vs contributed: +0.00" in out
+
+
+def test_a_credit_past_the_sleeves_share_is_a_warning(
+    tmp_path, capsys, monkeypatch
+):
+    url, _ = _book(tmp_path)
+    # Deployable 100,000 x thematic's 0.2 = 20,000; it is worth 14,000.
+    assert _cli(url, tmp_path, "--portfolio", "thematic_momentum",
+                "--amount-usd", "7000") == 0
+    out = capsys.readouterr().out
+    assert "[WARN] within each sleeve's share -- WARNING: thematic_momentum " \
+        "would be worth $21,000.00" in out
+    assert "above its 20.00% share $20,000.00" in out

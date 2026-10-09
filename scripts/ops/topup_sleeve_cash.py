@@ -47,8 +47,17 @@ WHAT IT CHECKS (every one is printed, ok or FAIL)
   transfer cannot strand an order that is already working;
 * not a repeat: an identical flow (same mode, sleeves and amounts) recorded
   in the last 24 hours is refused unless ``--allow-repeat``;
-* outside the paper-run window (04:00-07:00 SGT), so a snapshot cannot read
-  half of a flow.
+* outside the paper-run window (04:00-07:00 SGT), and no equity snapshot
+  written in the last 15 minutes (a late or manual paper run), so a snapshot
+  cannot read half of a flow. In a plain dry run these two are WARNINGs, so
+  the operator can preview at any hour; with ``--apply`` they refuse, and
+  they are judged again under the lock at the moment of the write.
+
+A credit whose sleeve would be worth more than its share of deployable
+capital (``deployable x CAPITAL_ALLOCATIONS weight``) is a WARNING, not a
+refusal: re-weighting a sleeve on purpose is what ``--portfolio`` is for. The
+dry run also prints contributed capital (the ``capital`` column) beside the
+marked figure, so profit is visible as the gap between them.
 
 DRY RUN (default)
 -----------------
@@ -63,9 +72,12 @@ Needs ``--account``, an interactive TTY, a writable artifact directory
 CASH``. Then ONE transaction: ``SELECT ... FOR UPDATE`` on the affected
 ``portfolio_config`` rows (the projector's lock, taken in name order), a
 refusal if any sleeve's cash moved since the plan, the transfer reservation
-check again under the lock, the cash/capital update, and one
-``capital_adjustments`` row per leg — the flow record (see
-``shared/capital_flows.py``). Any exception rolls all of it back and is
+check again under the lock, the timing guards and the broker snapshot's
+age (at most 5 minutes) judged at the moment of the write, the cash/capital
+update, and one ``capital_adjustments`` row per leg — the flow record (see
+``shared/capital_flows.py``), stamped with the database clock
+(``clock_timestamp()``) after the locks and checks, immediately before the
+commit. Any exception rolls all of it back and is
 recorded. After commit the book is re-read and compared with the plan, and an
 audit artifact is written under ``output/reconciliation`` (relocated out of a
 linked worktree by ``durable_artifact_dir``; an existing file is never
@@ -76,8 +88,10 @@ EVIDENCE
 The ``capital_adjustments`` rows are what keep the credit from reading as a
 return: the divergence monitor, the epoch report / go-live gate drawdown, the
 weekly digest and the risk service's ``peak_nav`` all use flow-adjusted
-(time-weighted) equity, and the rolling shadow never seeds a window across a
-flow. ``equity_snapshots`` is never rewritten.
+(time-weighted) equity, and the rolling shadow is seeded from the same
+flow-adjusted curve, so a window that spans a flow is graded in full: no
+window restarts, no AGGREGATE collapse, and a BREACH streak neither resets
+nor pauses. ``equity_snapshots`` is never rewritten.
 
 Usage (dry run first, always; ``python`` alone imports from another checkout,
 so set ``PYTHONPATH``; the database comes from ``ALGO_DATABASE_URL`` or
@@ -123,6 +137,7 @@ from shared.capital_flows import CapitalFlow, recorded_flows  # noqa: E402
 from shared.config import load_config  # noqa: E402
 from shared.models import (  # noqa: E402
     CapitalAdjustment,
+    EquitySnapshot,
     PortfolioConfig,
     Position,
 )
@@ -151,6 +166,19 @@ REPEAT_WINDOW = timedelta(hours=24)
 SGT = ZoneInfo("Asia/Singapore")
 PAPER_RUN_WINDOW_SGT = (time(4, 0), time(7, 0))
 
+#: A snapshot written this recently means a paper run (scheduled, late or
+#: manual) may still be writing: a flow now could land between its cash read
+#: and its snapshot write.
+RECENT_SNAPSHOT_GUARD = timedelta(minutes=15)
+
+#: The broker evidence a credit is approved on must be this fresh at apply.
+MAX_BROKER_SNAPSHOT_AGE = timedelta(minutes=5)
+
+MAX_DEPLOYABLE_REMEDY = (
+    "raise capital.paper.max_deployable_usd first (config/default.yaml), or "
+    "move existing cash with --from/--to instead"
+)
+
 #: ``reason`` prefix of every row this tool writes; the repeat check parses it.
 REASON_PREFIX = "KAN-113"
 _REASON_RE = re.compile(rf"^{REASON_PREFIX} (\w+) flow ([0-9a-f]+):")
@@ -172,6 +200,9 @@ class Check:
     name: str
     ok: bool
     detail: str = ""
+    #: Passed, but the operator must read it. A dry-run timing check that
+    #: ``--apply`` would refuse is one of these, so the preview still runs.
+    warning: bool = False
 
 
 @dataclass(frozen=True)
@@ -250,6 +281,19 @@ class TopupPlan:
     @property
     def graded_capital_after(self) -> float:
         return self.graded_capital_before + self.net_amount
+
+    @property
+    def contributed_capital_before(self) -> float:
+        """Sum of ``portfolio_config.capital`` over graded sleeves: what was
+        put in, as opposed to what it is worth at the marks."""
+        return sum(
+            row.capital for row in self.sleeves
+            if not is_excluded_portfolio(row.portfolio)
+        )
+
+    @property
+    def contributed_capital_after(self) -> float:
+        return self.contributed_capital_before + self.net_amount
 
     @property
     def ledger_cash_before(self) -> float:
@@ -413,8 +457,15 @@ def plan_topup(
     skip_broker_check: bool = False,
     allow_repeat: bool = False,
     now: datetime | None = None,
+    for_apply: bool = False,
 ) -> TopupPlan:
-    """Work out the flow and every check. Issues SELECTs only, takes no locks."""
+    """Work out the flow and every check. Issues SELECTs only, takes no locks.
+
+    ``for_apply``: the timing checks (paper-run window, a snapshot written in
+    the last 15 minutes) FAIL when the plan is about to be applied and are
+    WARNINGs in a plain dry run, so the operator can preview at any hour.
+    ``apply_topup`` re-checks both under the lock regardless.
+    """
     now = now or datetime.now(timezone.utc)
     capital_mode = config.capital.paper
     currency = config.currency
@@ -522,7 +573,10 @@ def plan_topup(
                 "within max_deployable_usd", ok,
                 "" if ok else (
                     f"graded ledger capital after the credit would be "
-                    f"${after:,.2f}, above max_deployable_usd ${cap:,.2f}"
+                    f"${after:,.2f} at the marks (contributed "
+                    f"${draft.contributed_capital_after:,.2f}), above "
+                    f"max_deployable_usd ${cap:,.2f}; "
+                    f"{MAX_DEPLOYABLE_REMEDY}"
                 ),
             ))
 
@@ -598,9 +652,20 @@ def plan_topup(
                         f"graded ledger capital after the credit would be "
                         f"${draft.graded_capital_after:,.2f}, above today's "
                         f"deployable capital ${deployable:,.2f} "
-                        "(min(NAV x deployment_fraction, max_deployable_usd))"
+                        "(min(NAV x deployment_fraction, max_deployable_usd)); "
+                        f"{MAX_DEPLOYABLE_REMEDY}"
                     ),
                 ))
+
+    if kind != TRANSFER:
+        checks.extend(_budget_warnings(
+            legs,
+            base=(
+                broker.deployable_capital
+                if broker is not None and broker.deployable_capital is not None
+                else capital_mode.max_deployable_usd
+            ),
+        ))
 
     on_record = recorded_flows(session)
     recent = _flow_groups(on_record, since=now - REPEAT_WINDOW)
@@ -626,14 +691,19 @@ def plan_topup(
             ),
         ))
 
-    running = in_paper_run_window(now)
-    checks.append(Check(
-        "outside the paper-run window", not running,
-        "" if not running else (
-            "it is 04:00-07:00 SGT, when the paper run reads sleeve cash and "
-            "writes snapshots; apply after it finishes"
-        ),
-    ))
+    timing = dict(timing_problems(session, now))
+    for name in TIMING_CHECKS:
+        problem = timing.get(name)
+        if problem is None:
+            checks.append(Check(name, True))
+        elif for_apply:
+            checks.append(Check(name, False, problem))
+        else:
+            checks.append(Check(
+                name, True,
+                f"WARNING: {problem}; --apply would refuse now",
+                warning=True,
+            ))
 
     recent_rows = tuple(
         {
@@ -654,6 +724,69 @@ def plan_topup(
         flows_on_record=len(on_record),
         flows_on_record_net=sum(flow.amount for flow in on_record),
     )
+
+
+def _budget_warnings(legs: Sequence[Leg], *, base: float | None) -> list[Check]:
+    """WARN when a credit takes a sleeve past its share of deployable capital.
+
+    Not a refusal: a deliberate re-weighting is a legitimate use of
+    ``--portfolio``. But a sleeve worth more than ``base x weight`` at the
+    marks is larger than the paper run's own sizing basis for it.
+    """
+    if base is None or not legs:
+        return []
+    weights = capital_allocations()
+    over = []
+    for leg in legs:
+        weight = weights.get(leg.portfolio)
+        if weight is None or leg.amount <= 0:
+            continue
+        worth = leg.cash_after + leg.market_value
+        budget = base * weight
+        if worth > budget + _EPS:
+            over.append(
+                f"{leg.portfolio} would be worth ${worth:,.2f} at the marks, "
+                f"above its {weight:.2%} share ${budget:,.2f}"
+            )
+    if not over:
+        return []
+    return [Check(
+        "within each sleeve's share", True,
+        "WARNING: " + "; ".join(over), warning=True,
+    )]
+
+
+TIMING_CHECKS = (
+    "outside the paper-run window",
+    "no snapshot in the last 15 minutes",
+)
+
+
+def timing_problems(session: Session, now: datetime) -> list[tuple[str, str]]:
+    """``(check name, problem)`` for each reason this is a bad moment to write.
+
+    The paper run reads sleeve cash and then writes its snapshot; a flow that
+    commits between the two is filed as inside a row whose cash never saw it.
+    """
+    problems: list[tuple[str, str]] = []
+    if in_paper_run_window(now):
+        problems.append((
+            "outside the paper-run window",
+            "it is 04:00-07:00 SGT, when the paper run reads sleeve cash and "
+            "writes snapshots; apply after it finishes",
+        ))
+    newest = session.scalar(select(func.max(EquitySnapshot.created_at)))
+    if newest is not None:
+        if newest.tzinfo is None:
+            newest = newest.replace(tzinfo=timezone.utc)
+        if newest >= now - RECENT_SNAPSHOT_GUARD:
+            problems.append((
+                "no snapshot in the last 15 minutes",
+                f"an equity snapshot was written at {_iso(newest)}: a paper "
+                "run (scheduled, late or manual) may still be running; wait "
+                "until it has finished",
+            ))
+    return problems
 
 
 # --------------------------------------------------------------------------
@@ -702,6 +835,14 @@ def apply_topup(
     refusal, not a recalculation: the operator approved the numbers printed,
     and the post-apply check compares against them. Any exception leaves the
     ``with`` and rolls back the cash, the capital and the flow rows together.
+
+    The flow's timestamp is taken AFTER the locks are held and every check
+    has passed, immediately before the write and the commit, from the
+    database clock (``clock_timestamp()``) on Postgres. The timing guards
+    (paper-run window, a snapshot in the last 15 minutes) and the broker
+    snapshot's age are judged at that same instant, because the operator may
+    have typed the phrase minutes after the dry run. ``now`` overrides the
+    clock (tests).
     """
     if confirm != CONFIRMATION:
         raise TopupRefusedError(
@@ -718,7 +859,6 @@ def apply_topup(
     if session.in_transaction():
         session.rollback()
 
-    applied_at = now or datetime.now(timezone.utc)
     flow_id = uuid4().hex[:12]
     reason = reason_for(plan.kind, flow_id, note)
     names = sorted(leg.portfolio for leg in plan.legs)
@@ -759,6 +899,19 @@ def apply_topup(
                         f"${reserved:,.2f} of open buy reservations (they "
                         "grew since the dry run). Nothing was written."
                     )
+        applied_at = now or _db_now(session)
+        for _, problem in timing_problems(session, applied_at):
+            raise TopupRefusedError(f"{problem}. Nothing was written.")
+        if plan.broker is not None:
+            age = applied_at - datetime.fromisoformat(plan.broker.captured_at)
+            if age > MAX_BROKER_SNAPSHOT_AGE:
+                raise TopupRefusedError(
+                    f"the broker snapshot the credit was approved on is "
+                    f"{age.total_seconds() / 60:.1f} minutes old (limit "
+                    f"{MAX_BROKER_SNAPSHOT_AGE.total_seconds() / 60:.0f}); "
+                    "re-run the dry run and apply straight after it. "
+                    "Nothing was written."
+                )
         for leg in plan.legs:
             row = rows[leg.portfolio]
             cash_before, capital_before = float(row.cash), float(row.capital)
@@ -792,6 +945,21 @@ def apply_topup(
     )
 
 
+def _db_now(session: Session) -> datetime:
+    """The database's wall clock, as UTC; the process clock off Postgres.
+
+    ``clock_timestamp()`` (not ``now()``, which is the transaction start) so
+    the stamp is the moment of the write, on the same clock that will judge
+    the next snapshot's ``created_at`` against it.
+    """
+    if session.get_bind().dialect.name == "postgresql":
+        value = session.scalar(text("SELECT clock_timestamp()"))
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    return _now()
+
+
 def _discard(session: Session) -> None:
     """Best-effort rollback on a session whose connection may be gone."""
     try:
@@ -809,7 +977,14 @@ class Verification:
 def verify(
     session: Session, applied: AppliedTopup, plan: TopupPlan
 ) -> Verification:
-    """Re-read the book and compare it with what the plan predicted."""
+    """Re-read the book and compare it with what the plan predicted.
+
+    ``capital`` and the flow rows are this tool's alone, so a mismatch there
+    is a problem. ``cash`` is also moved by the projector: a fill on the
+    sleeve between the commit and this re-read changes it legitimately, so a
+    cash mismatch is reported, labelled as possibly that, and not counted as
+    a failure.
+    """
     lines: list[str] = []
     problems: list[str] = []
     planned = {leg.portfolio: leg for leg in plan.legs}
@@ -830,11 +1005,17 @@ def verify(
                     actual, want, rel_tol=0, abs_tol=_EPS
                 )
                 shown = "missing" if actual is None else f"{actual:,.6f}"
+                fill_may_explain = label == "cash" and actual is not None
+                flag = (
+                    "" if ok
+                    else "  MISMATCH (may be a fill that landed after commit)"
+                    if fill_may_explain else "  MISMATCH"
+                )
                 lines.append(
                     f"  {leg.portfolio} {label} {shown} (planned {want:,.6f})"
-                    f"{'' if ok else '  MISMATCH'}"
+                    f"{flag}"
                 )
-                if not ok:
+                if not ok and not fill_may_explain:
                     problems.append(
                         f"{leg.portfolio} {label} is {shown}, the plan "
                         f"predicted {want:,.6f}"
@@ -918,6 +1099,13 @@ def render(plan: TopupPlan) -> str:
         f"{_money(plan.graded_capital_before)} -> "
         f"{_money(plan.graded_capital_after)}   max_deployable_usd {cap}"
     )
+    gap = plan.graded_capital_before - plan.contributed_capital_before
+    lines.append(
+        f"  contributed capital (sum of portfolio_config.capital): "
+        f"{_money(plan.contributed_capital_before)} -> "
+        f"{_money(plan.contributed_capital_after)}   marks vs contributed: "
+        f"{gap:+,.2f} (profit and loss so far)"
+    )
     lines.append(
         f"  ledger cash, all sleeves: {_money(plan.ledger_cash_before)} -> "
         f"{_money(plan.ledger_cash_after)}"
@@ -956,7 +1144,7 @@ def render(plan: TopupPlan) -> str:
     lines.append("")
     lines.append("  pre-checks:")
     for check in plan.checks:
-        mark = "ok  " if check.ok else "FAIL"
+        mark = "FAIL" if not check.ok else "WARN" if check.warning else "ok  "
         suffix = f" -- {check.detail}" if check.detail else ""
         lines.append(f"    [{mark}] {check.name}{suffix}")
     return "\n".join(lines)
@@ -1000,12 +1188,13 @@ def ensure_writable(directory: Path) -> Path:
 FLOW_NOTE = (
     "This is a capital flow, not a return. It is recorded in "
     "capital_adjustments (one signed row per sleeve leg, created_at = the "
-    "commit instant), and shared/capital_flows.py removes it from equity "
-    "readers: the divergence monitor, the epoch report and go-live gate "
-    "drawdown, the weekly digest's change and the risk service's peak_nav use "
-    "time-weighted, flow-adjusted equity. The rolling shadow never seeds a "
-    "window across a flow, so each credited sleeve's divergence window "
-    "restarts at the first snapshot after it. equity_snapshots is not "
+    "database clock at the write, just before commit), and "
+    "shared/capital_flows.py removes it from equity readers: the divergence "
+    "monitor, the epoch report and go-live gate drawdown, the weekly digest's "
+    "change and the risk service's peak_nav use time-weighted, flow-adjusted "
+    "equity. The rolling shadow is seeded from the same flow-adjusted curve, "
+    "so divergence windows spanning the flow are graded in full (a note names "
+    "it) and BREACH streaks carry across it. equity_snapshots is not "
     "rewritten."
 )
 
@@ -1040,6 +1229,8 @@ def build_artifact(
             "net_amount": plan.net_amount,
             "graded_capital_before": plan.graded_capital_before,
             "graded_capital_after": plan.graded_capital_after,
+            "contributed_capital_before": plan.contributed_capital_before,
+            "contributed_capital_after": plan.contributed_capital_after,
             "ledger_cash_before": plan.ledger_cash_before,
             "ledger_cash_after": plan.ledger_cash_after,
             "max_deployable_usd": plan.max_deployable_usd,
@@ -1249,6 +1440,7 @@ def _run(args: argparse.Namespace, kind: str) -> int:
             skip_broker_check=args.skip_broker_check,
             allow_repeat=args.allow_repeat,
             now=now,
+            for_apply=args.apply,
         )
         session.rollback()
         print(render(plan))
@@ -1289,7 +1481,7 @@ def _run(args: argparse.Namespace, kind: str) -> int:
             try:
                 applied = apply_topup(
                     session, plan, confirm=answer.strip(),
-                    operator=operator, note=args.note, now=attempted_at,
+                    operator=operator, note=args.note,
                 )
             except BaseException as exc:
                 failure = f"{type(exc).__name__}: {exc}"

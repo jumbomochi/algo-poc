@@ -16,16 +16,19 @@ In ``capital_adjustments`` — the table the durable-ledger design created for
 exactly this ("explicit funding and withdrawal events by sleeve",
 docs/superpowers/specs/2026-07-18-durable-paper-ledger-design.md §6.3), which
 nothing wrote until now. One row per sleeve leg, signed (a transfer is two
-rows that sum to zero), ``created_at`` = the instant the cash change
-committed. The tool writes the rows in the SAME transaction as the cash, so a
-flow is recorded if and only if it happened. No migration is needed: the
-table has existed since the durable ledger shipped.
+rows that sum to zero), ``created_at`` = the database clock
+(``clock_timestamp()``) taken under the row locks after every check, just
+before the commit. The tool writes the rows in the SAME transaction as the
+cash, so a flow is recorded if and only if it happened. No migration is
+needed: the table has existed since the durable ledger shipped.
 
 WHICH SNAPSHOT A FLOW IS IN
 ---------------------------
 An ``equity_snapshots`` row valued its sleeve at the cash it read when it was
-written, so a flow is *included* in a row exactly when the flow committed
-before the row's ``created_at``. That is decided per row, not per date, so a
+written, so a flow is *included* in a row exactly when the flow's
+``created_at`` precedes the row's. The microseconds between the stamp and the
+commit cannot be misfiled because the tool refuses to write during the paper
+run's window or within 15 minutes of any snapshot write. That is decided per row, not per date, so a
 catch-up run that re-values an old session after a flow is attributed
 correctly (the step into and out of it carries the flow both ways).
 
@@ -45,16 +48,29 @@ rescaled into today's capital — so:
 THE SHADOW (the KAN-105 seeding question)
 -----------------------------------------
 The rolling shadow is seeded at live's NAV on its window's first session and
-then replays with no flows. A window that spans a flow would seed the shadow
-with the pre-flow NAV and grade it against a sleeve that later had more cash
-to spend (KAN-111 caps buys at that cash), which is a capacity difference,
-not drift. The rule is the simplest correct one: **the shadow's window never
-spans a flow.** :func:`flow_free_since` gives the first session after the
-newest flow step, and ``scripts/run_paper.py::live_equity_by_sleeve`` trims
-the live curve it seeds from to that session onward. The cost is a shorter
-window — "Only N overlapping days" — for up to one window length after a
-flow, which is honest: a sleeve whose capital just changed has that much
-flow-free history and no more.
+then replays with no flows. It is seeded from the **flow-adjusted** live
+curve (``scripts/run_paper.py::live_equity_by_sleeve``), and the monitor
+grades it against the same flow-adjusted curve, so both sides start level and
+both are measured in today's capital. A window that spans a flow is graded in
+full, like any other window:
+
+* the window never shrinks, so the AGGREGATE (which intersects sessions
+  across sleeves) never collapses after an ``--allocate``;
+* the sleeve gets a graded verdict every session, so a credit can neither
+  reset a running BREACH streak (a 2-session window would read OK) nor turn
+  sessions into NO_DATA and pause the epoch clock;
+* the verdict carries a note naming the flow (:func:`flow_steps`,
+  :func:`describe_flow_steps`).
+
+Seeding the shadow larger than live was before the flow changes nothing a
+return measures: the shadow is a counterfactual book that starts in cash at
+the window's first session with no live positions, so its sizing scales with
+its seed (whole-share rounding and the commission floor aside).
+
+The rejected alternative was to start the window after the flow. It is exact
+but it collapses the window to one session — NO_DATA, then a 2-session OK
+that clears a BREACH streak — and the aggregate with it for up to a window
+length. That masks exactly the drift the monitor exists to catch.
 
 WHAT THIS DOES NOT DO
 ---------------------
@@ -78,7 +94,8 @@ __all__ = [
     "CapitalFlow",
     "flow_adjust",
     "flow_adjusted_by_session",
-    "flow_free_since",
+    "describe_flow_steps",
+    "flow_steps",
     "flows_by_portfolio",
     "included_flow",
     "recorded_flows",
@@ -247,24 +264,53 @@ def flow_adjusted_by_session(
     return flow_adjust(values, included)
 
 
-def flow_free_since(
+def flow_steps(
     rows: Iterable[Mapping[str, Any]], flows: Iterable[CapitalFlow]
-) -> date | None:
-    """First session from which the series holds no flow step, or None.
+) -> list[tuple[date, float]]:
+    """``(session, net flow)`` for each session whose value took in a flow.
 
-    Every session on or after the returned one includes the same flows, so a
-    window starting there never spans a flow. ``None`` for an empty series.
+    The session is the first one valued after the flow, i.e. where the step
+    happens in the series. Empty with no flows or no rows.
     """
     record = rows_of_record(rows)
-    if not record:
-        return None
     flows = list(flows)
+    if not record or not flows:
+        return []
     sessions = sorted(record)
-    if not flows:
-        return sessions[0]
     included = [included_flow(flows, record[s][1]) for s in sessions]
-    start = sessions[0]
-    for index in range(1, len(sessions)):
-        if abs(included[index] - included[index - 1]) >= _EPS:
-            start = sessions[index]
-    return start
+    return [
+        (sessions[index], included[index] - included[index - 1])
+        for index in range(1, len(sessions))
+        if abs(included[index] - included[index - 1]) >= _EPS
+    ]
+
+
+def describe_flow_steps(
+    steps: Iterable[tuple[str, date, float]],
+    *,
+    start: date | None,
+    end: date | None,
+) -> str | None:
+    """A verdict note for the flows inside ``(start, end]``, or None.
+
+    ``steps`` are ``(sleeve, session, amount)``. A step ON ``start`` is not
+    inside: the window's first value already includes it.
+    """
+    if start is None or end is None:
+        return None
+    inside = sorted(
+        (session, sleeve, amount) for sleeve, session, amount in steps
+        if start < session <= end
+    )
+    if not inside:
+        return None
+    named = ", ".join(
+        f"{sleeve} {amount:+,.2f} USD valued from {session.isoformat()}"
+        for session, sleeve, amount in inside
+    )
+    return (
+        f"capital flow(s) inside this window (KAN-113): {named}. Live returns "
+        "are flow-adjusted (time-weighted) and the shadow is seeded at the "
+        "flow-adjusted NAV, so the window is graded in full; the flow is not "
+        "performance."
+    )
