@@ -47,30 +47,36 @@ rescaled into today's capital — so:
 
 THE SHADOW (the KAN-105 seeding question)
 -----------------------------------------
-The rolling shadow is seeded at live's NAV on its window's first session and
-then replays with no flows. It is seeded from the **flow-adjusted** live
-curve (``scripts/run_paper.py::live_equity_by_sleeve``), and the monitor
-grades it against the same flow-adjusted curve, so both sides start level and
-both are measured in today's capital. A window that spans a flow is graded in
-full, like any other window:
+The rolling shadow is seeded at live's RAW NAV on its window's first session
+— what live actually held — and every flow inside the window is replayed
+into it as a cash injection on the session it enters live's series
+(:func:`flow_steps`; ``BacktestRunner.run(cash_flows=...)``). The shadow's
+capacity therefore matches live's: positions taken before the flow were sized
+on the pre-flow capital on both sides, and the credit becomes available to
+size from the same session on (KAN-111's cash cap sees it). Both curves are
+then compared on the flow-adjusted (time-weighted) basis. So:
 
-* the window never shrinks, so the AGGREGATE (which intersects sessions
-  across sleeves) never collapses after an ``--allocate``;
-* the sleeve gets a graded verdict every session, so a credit can neither
-  reset a running BREACH streak (a 2-session window would read OK) nor turn
-  sessions into NO_DATA and pause the epoch clock;
-* the verdict carries a note naming the flow (:func:`flow_steps`,
-  :func:`describe_flow_steps`).
+* a window that spans a flow is graded in full — it never shrinks, the
+  AGGREGATE (which intersects sessions across sleeves) never collapses after
+  an ``--allocate``, and a credit can neither turn sessions into NO_DATA nor
+  produce a short-window OK that clears a running BREACH streak;
+* the verdict carries a note naming the flow (:func:`describe_flow_steps`);
+* a window with no flow inside it is replayed exactly as before, and the
+  shadow fingerprint does not change: a flow is a fact about the book, not a
+  model change.
 
-Seeding the shadow larger than live was before the flow changes nothing a
-return measures: the shadow is a counterfactual book that starts in cash at
-the window's first session with no live positions, so its sizing scales with
-its seed (whole-share rounding and the commission floor aside).
+Two rejected alternatives: starting the window after the flow (exact, but it
+collapses the window and the AGGREGATE to one session for up to a window
+length), and seeding at the flow-adjusted NAV (it runs the whole window on
+the post-flow capital, so idle credited cash on the live side reads as
+drift: a +20% credit into a +5% rally is roughly a 20% relative divergence,
+the BREACH threshold).
 
-The rejected alternative was to start the window after the flow. It is exact
-but it collapses the window to one session — NO_DATA, then a 2-session OK
-that clears a BREACH streak — and the aggregate with it for up to a window
-length. That masks exactly the drift the monitor exists to catch.
+A withdrawal the shadow's own cash cannot cover (a transfer out of a sleeve
+whose counterfactual book is more invested than live's) is clamped to the
+shadow's cash: the replay cannot sell to fund it. The clamped amount is what
+the shadow's curve is adjusted by, so its returns stay correct; its capacity
+then exceeds live's by the shortfall, until the replay's own exits free cash.
 
 WHAT THIS DOES NOT DO
 ---------------------
@@ -309,8 +315,8 @@ def describe_flow_steps(
         for session, sleeve, amount in inside
     )
     return (
-        f"capital flow(s) inside this window (KAN-113): {named}. Live returns "
-        "are flow-adjusted (time-weighted) and the shadow is seeded at the "
-        "flow-adjusted NAV, so the window is graded in full; the flow is not "
-        "performance."
+        f"capital flow(s) inside this window (KAN-113): {named}. The shadow "
+        "received the same cash on the same session, and both sides are "
+        "compared on flow-adjusted (time-weighted) returns, so the window is "
+        "graded in full; the flow is not performance."
     )

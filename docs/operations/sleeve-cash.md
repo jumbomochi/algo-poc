@@ -143,11 +143,21 @@ and the readers remove it (`shared/capital_flows.py`):
 - **Risk service `peak_nav`** (circuit breaker): flow-adjusted against
   today's NAV. Needs a `risk-management` image rebuild to take effect
   (`docs/operations/container-deploy.md`).
-- **Rolling shadow** (the KAN-105 seeding question): the shadow is seeded
-  from the **flow-adjusted** live curve (`live_equity_by_sleeve`), the same
-  curve the monitor grades against, so both start level in today's capital
-  and a window that spans a flow is graded **in full**. The verdict carries a
-  note: `capital flow(s) inside this window (KAN-113): momentum +5,000.00 USD
+- **Rolling shadow** (the KAN-105 seeding question): the shadow is seeded at
+  live's **raw** NAV on its window's first session — what live actually held
+  — and **receives the same cash on the same session** (the first session
+  whose snapshot includes the flow; a transfer injects into both sleeves, one
+  negative). So its capacity matches live's: positions taken before the flow
+  were sized on the old capital on both sides, the credit is available to
+  size from the same session on (KAN-111's cash cap sees it), and if the
+  strategy leaves it idle it is idle on both sides. Both sides are compared
+  on flow-adjusted (time-weighted) returns, and a window that spans a flow is
+  graded **in full**. A withdrawal larger than the shadow's own cash (its
+  counterfactual book may be more invested than live's) is clamped to that
+  cash — the replay cannot sell to fund it — and the shadow's curve is
+  adjusted by what it actually took. A window with no flow inside it is
+  replayed byte-for-byte as before, and the shadow fingerprint does not
+  change. The verdict carries a note: `capital flow(s) inside this window (KAN-113): momentum +5,000.00 USD
   valued from <session> …`, on the sleeve and on AGGREGATE. The weekly digest
   adds a `📥 CAPITAL FLOW (KAN-113)` line while a flow is inside the
   30-session divergence window.
@@ -159,8 +169,12 @@ neither turns sessions into NO_DATA (which would pause the epoch's scored
 session count and the BREACH streak) nor produces a short-window OK that
 would clear a running BREACH streak. A sleeve in BREACH before a credit is
 still in BREACH after it unless its flow-adjusted returns say otherwise.
-(Starting the shadow window after the flow was rejected for exactly this: it
-collapses the window, and AGGREGATE with it, to one session.)
+Two alternatives were rejected. Starting the shadow window after the flow
+collapses the window, and AGGREGATE with it, to one session. Seeding the
+shadow at the flow-adjusted (rescaled) NAV runs the whole window on the
+post-flow capital, so live's idle credited cash reads as drift: a credit worth
+20% of the book followed by a +15% rally shows as about 20% relative
+divergence (the BREACH threshold) from a deposit alone.
 
 `equity_snapshots` is never rewritten; the adjustment happens in the reader,
 every time, from the recorded rows. A flow is attributed to a snapshot by

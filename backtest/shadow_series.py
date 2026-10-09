@@ -27,6 +27,20 @@ momentum lookback needs history the window does not contain, and this is what
 Without it the shadow would open positions live never held and the curves would
 diverge for a reason that is purely an artifact of the replay.
 
+**Capital flows (KAN-113) are replayed, not rescaled.** When the operator
+credits or transfers sleeve cash inside the window, the shadow is seeded at
+live's RAW NAV on the window's first session — what live actually had — and
+receives the same cash on the same session live's snapshots first include it
+(``shared.capital_flows.flow_steps``). Its capacity therefore matches live's:
+the pre-flow book is sized on the pre-flow capital, the credit becomes
+available to size from that session on (KAN-111's cash cap sees it), and if
+the strategy does not deploy it, it sits idle on both sides. Both curves are
+then compared on the flow-adjusted (time-weighted) basis: the shadow's curve
+is returned with its own applied flows removed, exactly as the monitor removes
+live's. Seeding at a rescaled NAV instead ran the whole window on the larger
+capital and manufactured divergence of the size of the credit times the move.
+A window with no flow inside it is replayed exactly as before.
+
 The function is deliberately dependency-light: the caller supplies the built
 ``signals_fn`` and ``risk_engine``, so this module never has to know the sleeve
 roster and cannot drift away from how ``scripts/run_paper.py`` configures them.
@@ -34,12 +48,14 @@ roster and cannot drift away from how ``scripts/run_paper.py`` configures them.
 from __future__ import annotations
 
 from datetime import date
+from collections.abc import Mapping
 from typing import Any, Callable
 
 from backtest.costs import CostModel
 from backtest.runner import BacktestRunner
 from backtest.simulator import SimulatedExecutor
 from services.risk_management.funding import DEFAULT_SLEEVE_CASH_BUFFER_BPS
+from shared.capital_flows import flow_adjust
 
 
 def replay_window(
@@ -52,6 +68,7 @@ def replay_window(
     cost_model: CostModel | None = None,
     whole_shares: bool = False,
     cash_buffer_bps: float = DEFAULT_SLEEVE_CASH_BUFFER_BPS,
+    cash_flows: Mapping[date, float] | None = None,
 ) -> dict[date, float]:
     """Return ``{session: equity}`` for the model's own run over the window.
 
@@ -71,6 +88,14 @@ def replay_window(
         cash_buffer_bps: Live's ``currency.sleeve_cash_buffer_bps``. Entries
             are funded from the replay's own cash exactly as the paper run
             funds them (KAN-111; see ``BacktestRunner``).
+        cash_flows: KAN-113. ``{session: signed USD}`` — the sleeve's recorded
+            capital flows, keyed by the session whose value first includes
+            each. Only flows strictly after ``window_start`` are replayed (one
+            on ``window_start`` is already in ``seed_nav``). When any is
+            applied, the returned curve is flow-adjusted (time-weighted,
+            anchored at its last session), the basis the monitor grades live
+            on. A withdrawal the replay's cash cannot cover is clamped by
+            ``BacktestRunner`` (it cannot sell to fund it).
 
     Returns:
         Equity by session for ``window_start`` onward. Empty when no session
@@ -86,22 +111,47 @@ def replay_window(
         whole_shares=whole_shares,
         cash_buffer_bps=cash_buffer_bps,
     )
-    result = runner.run(
-        bars_by_ticker,
-        signals_fn,
-        risk_engine,
-        trade_start_date=window_start,
-    )
+    inside = {
+        session: float(amount)
+        for session, amount in (cash_flows or {}).items()
+        if session > window_start and amount
+    }
+    if inside:
+        result = runner.run(
+            bars_by_ticker,
+            signals_fn,
+            risk_engine,
+            trade_start_date=window_start,
+            cash_flows=inside,
+        )
+    else:
+        # Exactly the pre-KAN-113 call: a window without flows is unchanged.
+        result = runner.run(
+            bars_by_ticker,
+            signals_fn,
+            risk_engine,
+            trade_start_date=window_start,
+        )
 
     # ``portfolio_values`` carries pre-day-0 capital at index 0, so element
     # i+1 is the end-of-day value for ``dates[i]`` — the same alignment
     # ``load_backtest_equity_series`` applies to the artifact.
     end_of_day = result.portfolio_values[1:]
-    return {
+    curve = {
         session: value
         for session, value in zip(result.dates, end_of_day)
         if session >= window_start
     }
+    if not result.cash_flows_applied:
+        return curve
+    running = 0.0
+    included: dict[date, float] = {}
+    applied = sorted(result.cash_flows_applied.items())
+    for session in sorted(curve):
+        while applied and applied[0][0] <= session:
+            running += applied.pop(0)[1]
+        included[session] = running
+    return flow_adjust(curve, included)
 
 
 def build_shadow_series(
@@ -113,6 +163,7 @@ def build_shadow_series(
     cost_model: CostModel | None = None,
     whole_shares: bool = False,
     cash_buffer_bps: float = DEFAULT_SLEEVE_CASH_BUFFER_BPS,
+    cash_flows: Mapping[str, Mapping[date, float]] | None = None,
 ) -> dict[str, dict[date, float]]:
     """Replay every sleeve over its rolling window.
 
@@ -124,8 +175,13 @@ def build_shadow_series(
         bars_by_ticker: The union of bars the 05:15 run already fetched. Each
             sleeve's ``signals_fn`` scopes itself to its own universe.
         live_equity: Sleeve name -> live NAV by session, from
-            ``equity_snapshots``.
+            ``equity_snapshots`` — RAW, not flow-adjusted: the seed is what
+            live actually held on the window's first session.
         window_sessions: Comparison window length.
+        cash_flows: KAN-113. Sleeve name -> ``{session: signed USD}`` of its
+            recorded capital flows (``capital_flow_steps_by_sleeve`` in
+            scripts/run_paper.py); replayed into the shadow on the same
+            sessions (see :func:`replay_window`).
 
     Returns:
         Sleeve name -> ``{session: equity}``. A sleeve with no live history is
@@ -157,6 +213,7 @@ def build_shadow_series(
             cost_model=cost_model,
             whole_shares=whole_shares,
             cash_buffer_bps=cash_buffer_bps,
+            cash_flows=(cash_flows or {}).get(name),
         )
         # Live is the authority on which sessions are gradeable: the replay can
         # only produce a curve for sessions its bars cover, and the monitor

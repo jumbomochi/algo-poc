@@ -28,7 +28,7 @@ from backtest.divergence import build_report, window_return
 from scripts.divergence_monitor import load_live_equity_series
 from scripts.ops.evidence_digest import _equity_lines, equity_source
 from scripts.paper_state import PaperTradingState
-from scripts.run_paper import live_equity_by_sleeve
+from scripts.run_paper import capital_flow_steps_by_sleeve, live_equity_by_sleeve
 from shared.capital_flows import (
     CapitalFlow,
     flow_adjust,
@@ -290,19 +290,18 @@ def test_the_risk_services_peak_nav_keeps_the_drawdown(db):
     assert load_portfolio_state(db)["peak_nav"] == 14_800.0
 
 
-def test_the_shadow_is_seeded_from_the_flow_adjusted_curve(db):
-    """The full window survives the flow: the shadow seeds at the
-    flow-adjusted NAV, the same curve the monitor grades against."""
-    curve = live_equity_by_sleeve(PaperTradingState(db))["momentum"]
-    assert sorted(curve) == SESSIONS
-    values = [curve[d] for d in SESSIONS]
-    assert values[3:] == RAW[3:]
-    assert window_return(values) == pytest.approx(FLOW_FREE_RETURN)
-    assert values[3] / values[2] == pytest.approx(1.0)
+def test_the_shadow_seeds_raw_and_replays_the_flow(db):
+    """The full window survives the flow. The seed curve is RAW (what live
+    held) and the flow is handed to the shadow on the session it enters."""
+    state = PaperTradingState(db)
+    curve = live_equity_by_sleeve(state)["momentum"]
+    assert [curve[d] for d in SESSIONS] == RAW
+    assert capital_flow_steps_by_sleeve(state) == {
+        "momentum": {SESSIONS[3]: CREDIT}
+    }
 
     db.execute(CapitalAdjustment.__table__.delete())
-    raw = live_equity_by_sleeve(PaperTradingState(db))["momentum"]
-    assert [raw[d] for d in SESSIONS] == RAW
+    assert capital_flow_steps_by_sleeve(PaperTradingState(db)) == {}
 
 
 def test_flows_on_a_synthetic_portfolio_never_reach_the_graded_readers(db):
@@ -361,3 +360,25 @@ def test_the_digest_names_flows_inside_the_divergence_window(db):
         sources, as_of=SESSIONS[-1], window_start=SESSIONS[0]
     )
     assert "📥 CAPITAL FLOW (KAN-113)" in render_digest(snapshot)
+
+
+def test_a_transfer_hands_the_shadow_both_legs(db):
+    db.add(PortfolioConfig(
+        portfolio="sector_rotation", capital=10_000.0, cash=10_000.0,
+        created_at=FLOW_AT, updated_at=FLOW_AT,
+    ))
+    for session_date, equity in zip(SESSIONS, [10_000.0] * 3 + [9_000.0] * 3):
+        db.add(EquitySnapshot(
+            portfolio="sector_rotation", date=session_date + timedelta(days=1),
+            session_date=session_date, equity=equity, cash=equity,
+            market_value=0.0, created_at=_written(session_date),
+        ))
+    db.add(CapitalAdjustment(
+        account_id="DUN551088", portfolio="sector_rotation", amount=-1_000.0,
+        reason="KAN-113 transfer flow def456: t", created_at=FLOW_AT,
+    ))
+    db.flush()
+    assert capital_flow_steps_by_sleeve(PaperTradingState(db)) == {
+        "momentum": {SESSIONS[3]: CREDIT},
+        "sector_rotation": {SESSIONS[3]: -1_000.0},
+    }

@@ -20,7 +20,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from backtest.shadow_artifact import dump_shadow
 from scripts.paper_state import PaperTradingState
-from scripts.run_paper import live_equity_by_sleeve
+from scripts.run_paper import capital_flow_steps_by_sleeve, live_equity_by_sleeve
+from shared.capital_flows import flow_adjust
 from shared.evidence_store import breach_streak
 from shared.market_calendar import MarketCalendar
 from shared.models import CapitalAdjustment
@@ -74,21 +75,30 @@ def _db(tmp_path: Path) -> str:
 
 
 def _shadow(tmp_path: Path, db_url: str, *, drift: float = 1.0) -> Path:
-    """The 05:15 run's shadow: seeded from live_equity_by_sleeve, replaying
-    the flow-free path (scaled by ``drift`` for momentum)."""
+    """The 05:15 run's shadow, under replay_window's contract: seeded at
+    live's RAW NAV, the same flows injected on the same sessions, a model
+    that earns live's flow-free return (times ``drift`` for momentum), and
+    the curve returned flow-adjusted."""
     with sessionmaker(bind=create_engine(db_url))() as s:
-        live = live_equity_by_sleeve(PaperTradingState(s))
+        state = PaperTradingState(s)
+        live = live_equity_by_sleeve(state)
+        steps = capital_flow_steps_by_sleeve(state)
     series: dict[str, dict[date, float]] = {}
     for name, curve in live.items():
         days = sorted(curve)
+        flows = steps.get(name, {})
         value = curve[days[0]]
-        series[name] = {days[0]: value}
+        raw = {days[0]: value}
+        included = {days[0]: 0.0}
         for prev, day in zip(days, days[1:]):
-            step = curve[day] / curve[prev]
+            flow = flows.get(day, 0.0)
+            step = (curve[day] - flow) / curve[prev]
             if name == "momentum":
                 step *= drift
-            value *= step
-            series[name][day] = value
+            value = value * step + flow
+            raw[day] = value
+            included[day] = included[prev] + flow
+        series[name] = flow_adjust(raw, included)
     path = tmp_path / "shadow.json"
     dump_shadow(path, series=series, shadow_id=SHADOW_ID,
                 window_sessions=WINDOW, session_date=GRADED,
@@ -114,16 +124,19 @@ def _reports(output: Path) -> dict[str, dict]:
     return {r["portfolio"]: r for r in json.loads(output.read_text())["reports"]}
 
 
-def test_the_shadow_seed_curve_keeps_its_full_length(tmp_path):
+def test_the_shadow_seeds_raw_and_is_handed_the_flow_on_its_session(tmp_path):
     db_url = _db(tmp_path)
     with sessionmaker(bind=create_engine(db_url))() as s:
-        live = live_equity_by_sleeve(PaperTradingState(s))
+        state = PaperTradingState(s)
+        live = live_equity_by_sleeve(state)
+        steps = capital_flow_steps_by_sleeve(state)
+    # Full length, and raw: the seed is what live actually held.
     assert sorted(live["momentum"]) == SESSIONS
-    days = SESSIONS
-    # The step at the flow is the flow-free 0.2%, not +40%.
-    i = days.index(FLOW_SESSION)
-    ratio = live["momentum"][days[i]] / live["momentum"][days[i - 1]]
-    assert abs(ratio - 1.002) < 1e-9
+    i = SESSIONS.index(FLOW_SESSION)
+    jump = live["momentum"][SESSIONS[i]] - live["momentum"][SESSIONS[i - 1]] * 1.002
+    assert abs(jump - CREDIT) < 1e-6
+    # The flow, on the session live's value first includes it.
+    assert steps == {"momentum": {FLOW_SESSION: CREDIT}}
 
 
 def test_a_credit_mid_window_leaves_every_window_full_and_graded(

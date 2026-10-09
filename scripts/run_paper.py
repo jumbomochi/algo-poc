@@ -95,7 +95,7 @@ from services.risk_management.funding import (
 )
 from shared.order_ledger import OrderLedger
 from shared.capital import CapitalBudget, calculate_capital_budget
-from shared.capital_flows import flow_adjusted_by_session, flows_by_portfolio
+from shared.capital_flows import flow_steps, flows_by_portfolio
 from shared.broker_state import BrokerAccountSnapshot
 from shared.models import CapitalSnapshot, OrderIntent, OrderStatus
 from shared.observability import DEFAULT_TRADING_METRICS
@@ -160,25 +160,46 @@ def live_equity_by_sleeve(state: PaperTradingState) -> dict[str, dict[date, floa
     "_aggregate" rollup is derived rather than graded, and a drill's book is not
     the graded book.
 
-    A sleeve with a recorded capital flow (KAN-113) gets its flow-adjusted
-    curve (``shared.capital_flows.flow_adjusted_by_session``): the shadow is
-    seeded at that NAV and the monitor grades against the same curve, so a
-    window spanning a credit is graded in full instead of restarting at it
-    (which collapsed the AGGREGATE and could clear a BREACH streak).
+    The curves are RAW, flows included (KAN-113): the shadow is seeded at
+    what live actually held on its window's first session, and any capital
+    flow inside the window is replayed into it on the same session
+    (:func:`capital_flow_steps_by_sleeve`), so the shadow's capacity matches
+    live's. Seeding at a flow-adjusted (rescaled) NAV instead ran the whole
+    window on the post-flow capital and manufactured divergence.
     """
-    flows = flows_by_portfolio(state.capital_flows())
     out: dict[str, dict[date, float]] = {}
     for name in state.get_portfolio_names():
         if is_excluded_portfolio(name):
             continue
-        rows = state.get_equity_history(name)
-        sleeve_flows = flows.get(name)
-        curve = (
-            flow_adjusted_by_session(rows, sleeve_flows) if sleeve_flows
-            else equity_by_session(rows)
-        )
+        curve = equity_by_session(state.get_equity_history(name))
         if curve:
             out[name] = curve
+    return out
+
+
+def capital_flow_steps_by_sleeve(
+    state: PaperTradingState,
+) -> dict[str, dict[date, float]]:
+    """``{sleeve: {session: net flow}}`` for the shadow to replay (KAN-113).
+
+    The session is the first one whose snapshot includes the flow — the same
+    rule the monitor uses to remove it from live (``flow_steps``) — so the
+    shadow receives the cash on the session live's value first shows it.
+    Empty when no flow is recorded: the shadow is then produced exactly as
+    before.
+    """
+    flows = flows_by_portfolio(state.capital_flows())
+    out: dict[str, dict[date, float]] = {}
+    for name, sleeve_flows in flows.items():
+        if is_excluded_portfolio(name):
+            continue
+        steps: dict[date, float] = {}
+        for session, amount in flow_steps(
+            state.get_equity_history(name), sleeve_flows
+        ):
+            steps[session] = steps.get(session, 0.0) + amount
+        if steps:
+            out[name] = steps
     return out
 
 
@@ -197,6 +218,7 @@ def produce_shadow_artifact(
     priced_at: datetime | None = None,
     data_degraded: Mapping[str, str] | None = None,
     cash_buffer_bps: float = DEFAULT_SLEEVE_CASH_BUFFER_BPS,
+    cash_flows: Mapping[str, Mapping[date, float]] | None = None,
 ):
     """Replay every sleeve over its rolling window and write the artifact.
 
@@ -230,6 +252,12 @@ def produce_shadow_artifact(
     run sizes buys by (KAN-111), so the buffer is part of the model and of its
     fingerprint.
 
+    ``cash_flows``: KAN-113 — each sleeve's recorded capital flows by the
+    session they enter (:func:`capital_flow_steps_by_sleeve`), replayed into
+    the shadow so its capacity matches live's. Not part of the fingerprint: a
+    flow is a fact about the book, not a model change, and a window with no
+    flow inside it is replayed exactly as without the argument.
+
     Returns the path written. Raises on failure: the caller decides whether a
     shadow failure is worth stopping the paper run for, and at 05:15 it is not.
     """
@@ -252,6 +280,7 @@ def produce_shadow_artifact(
         window_sessions=window_sessions,
         whole_shares=whole_shares,
         cash_buffer_bps=cash_buffer_bps,
+        cash_flows=cash_flows,
     )
     # The session this shadow speaks for is the last US session LIVE valued
     # (live is keyed by session_date since KAN-103), not today's wall-clock
@@ -2440,6 +2469,7 @@ def main() -> int | None:
                     fundamentals_lookup=fundamentals_lookup,
                     earnings_lookup=earnings_lookup,
                     live_equity=live_equity_by_sleeve(state),
+                    cash_flows=capital_flow_steps_by_sleeve(state),
                     window_sessions=SHADOW_WINDOW_SESSIONS,
                     bars_session=bars_session,
                     priced_at=fetch_started_at,

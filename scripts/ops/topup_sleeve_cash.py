@@ -88,10 +88,10 @@ EVIDENCE
 The ``capital_adjustments`` rows are what keep the credit from reading as a
 return: the divergence monitor, the epoch report / go-live gate drawdown, the
 weekly digest and the risk service's ``peak_nav`` all use flow-adjusted
-(time-weighted) equity, and the rolling shadow is seeded from the same
-flow-adjusted curve, so a window that spans a flow is graded in full: no
-window restarts, no AGGREGATE collapse, and a BREACH streak neither resets
-nor pauses. ``equity_snapshots`` is never rewritten.
+(time-weighted) equity, and the rolling shadow is seeded at live's raw NAV
+and receives the same cash on the same session, so its capacity matches
+live's and a window that spans a flow is graded in full: no window restarts,
+no AGGREGATE collapse, and a BREACH streak neither resets nor pauses. ``equity_snapshots`` is never rewritten.
 
 Usage (dry run first, always; ``python`` alone imports from another checkout,
 so set ``PYTHONPATH``; the database comes from ``ALGO_DATABASE_URL`` or
@@ -1192,10 +1192,10 @@ FLOW_NOTE = (
     "shared/capital_flows.py removes it from equity readers: the divergence "
     "monitor, the epoch report and go-live gate drawdown, the weekly digest's "
     "change and the risk service's peak_nav use time-weighted, flow-adjusted "
-    "equity. The rolling shadow is seeded from the same flow-adjusted curve, "
-    "so divergence windows spanning the flow are graded in full (a note names "
-    "it) and BREACH streaks carry across it. equity_snapshots is not "
-    "rewritten."
+    "equity. The rolling shadow receives the same cash on the same session, "
+    "so its capacity matches live's; divergence windows spanning the flow "
+    "are graded in full on flow-adjusted returns (a note names it) and BREACH "
+    "streaks carry across it. equity_snapshots is not rewritten."
 )
 
 
