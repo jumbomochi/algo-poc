@@ -151,8 +151,9 @@ Three layers, and confusing them is the recurring error:
   token would itself have to be stored somewhere (the reasoning is in
   `deploy/launchd/secrets.sh`'s header, KAN-16). The keychain is a *mirror*;
   1Password is still where the value lives. Re-mirror with
-  `deploy/launchd/secrets.sh --import`, and check what is present — names and
-  status only, never values — with `deploy/launchd/secrets.sh --check`.
+  `deploy/launchd/secrets.sh --import --only NAME` (empty = skip, Enter at
+  overwrite = keep, Ctrl-C writes nothing), and check what is present — names
+  and status only, never values — with `deploy/launchd/secrets.sh --check`.
 - **`.env` is a named pipe, not a file.** 1Password Environments serves it, so
   `cat .env` blocks ~60s and returns nothing, and `[ -f .env ]` is **false**.
   That combination silently disabled every alert path for two days on

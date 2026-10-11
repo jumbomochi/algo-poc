@@ -120,7 +120,7 @@ algo_deadman_ping() {
     fi
 
     if ! algo_deadman_url_for "$name"; then
-        ALGO_DEADMAN_STATUS="NOT CONFIGURED: $name is in neither the environment nor the keychain, so nothing outside this host can tell that the run happened. Import it: deploy/launchd/secrets.sh --import"
+        ALGO_DEADMAN_STATUS="NOT CONFIGURED: $name is in neither the environment nor the keychain, so nothing outside this host can tell that the run happened. Import it: deploy/launchd/secrets.sh --import --only $name"
         return 0
     fi
     url="$_ALGO_DEADMAN_URL"

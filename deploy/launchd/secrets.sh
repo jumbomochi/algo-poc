@@ -60,7 +60,10 @@
 #
 # Usage (CLI):
 #   deploy/launchd/secrets.sh --check              # presence only, no values
-#   deploy/launchd/secrets.sh --import             # interactive, argv-free
+#   deploy/launchd/secrets.sh --import             # interactive: every known name
+#   deploy/launchd/secrets.sh --import --only NAME # just NAME (repeatable)
+#     typed twice, echo off; empty = skip; existing item only on an explicit y;
+#     Ctrl-C aborts with nothing written; value never in argv (KAN-115)
 #   deploy/launchd/secrets.sh --import-from-env F  # bulk (see caveat below)
 #   eval "$(deploy/launchd/secrets.sh --export)"   # for docker compose / shells
 
@@ -181,7 +184,7 @@ _algo_secret_from_keychain() {
             ALGO_SECRETS_ERROR="login keychain is LOCKED, so '$name' cannot be read. A launchd user agent needs a logged-in GUI session; after a reboot with no login the keychain stays locked (Docker Desktop and IB Gateway would be down too). Log in, then re-run."
             ;;
         *"could not be found"*|*"-25300"*)
-            ALGO_SECRETS_ERROR="keychain service '$ALGO_KEYCHAIN_SERVICE' has no item for '$name'. Import it with: deploy/launchd/secrets.sh --import"
+            ALGO_SECRETS_ERROR="keychain service '$ALGO_KEYCHAIN_SERVICE' has no item for '$name'. Import it with: deploy/launchd/secrets.sh --import --only $name"
             ;;
         *)
             ALGO_SECRETS_ERROR="keychain lookup for '$name' failed: $(printf '%s' "$out" | tr '\n' ' ')"
@@ -280,21 +283,200 @@ algo_alert_local() {
 # CLI (only when executed directly, never when sourced)
 # ---------------------------------------------------------------------------
 
-_algo_keychain_put_interactive() {
-    # No -w VALUE, so `security` prompts and reads the secret itself: the value
-    # never appears in argv (visible to `ps`) or in shell history.
-    local name="$1"
-    printf 'Enter %s (input hidden, empty to skip): ' "$name" >&2
-    "$ALGO_SECURITY_BIN" add-generic-password \
-        -s "$ALGO_KEYCHAIN_SERVICE" -a "$name" \
-        -T "$ALGO_SECURITY_BIN" -U -w
+# --- interactive import (KAN-115) -------------------------------------------
+#
+# INCIDENT 2026-10-09 ~16:16 SGT. To add ONE dead-man URL the operator ran
+# --import. It walked every known name, printed "Enter POSTGRES_PASSWORD (input
+# hidden, empty to skip)" and then ran `security add-generic-password ... -U -w`
+# with no value, so `security` prompted for the secret itself. There was no
+# skip: pressing Enter stored an EMPTY POSTGRES_PASSWORD over the real one (-U
+# updates in place), Ctrl-C did nothing because the terminal was in password
+# mode, and every job that reads it would have failed at its next run. On top
+# of that, security's own interactive -w prompt reads into a 128-byte buffer
+# and silently truncates longer values (e.g. ~192-char API tokens).
+#
+# So the value is now read by bash, and `security` is only ever handed a
+# complete, confirmed value:
+#   * read twice from /dev/tty with echo off, and refused unless both match;
+#   * an empty entry is a real skip — nothing is called for that name;
+#   * an existing item is never replaced without an explicit "y";
+#   * every answer is collected FIRST and written only after the last prompt,
+#     so Ctrl-C (or Ctrl-D) at any prompt aborts with nothing written;
+#   * each write is read back and its length checked.
+#
+# WRITE PATH: `security -i` reads `add-generic-password ... -X <hex>` from a
+# pipe fed by the `printf` builtin. Nothing secret is ever in a process's argv
+# (unlike `-w VALUE`, see _algo_keychain_put_value), and hex sidesteps the
+# quoting rules of security's interactive tokenizer, so any byte sequence
+# round-trips. Verified against the real binary with a 209-byte value of
+# quotes, $, backticks, backslashes and spaces: stored byte-for-byte.
+#
+# Two properties of `security -i` that this code depends on:
+#   * it splits an input line somewhere past ~4 KB and runs the tail as a
+#     separate command, whose "unknown command" error ECHOES the tail. Values
+#     are therefore capped at $ALGO_IMPORT_MAX_BYTES (hex doubles it, still far
+#     below the split) and any captured stderr is redacted before printing;
+#   * its exit status is that of the last command it ran, so a failed add is
+#     visible as a non-zero exit.
+
+# NOTHING in this block runs at source time. Every launchd job sources this
+# file, so the import path only DEFINES functions here; its state
+# (_ALGO_TTY_FD, _ALGO_TTY_SAVED, the byte cap, ...) is set inside
+# _algo_cli_import. A test pins that sourcing adds no new variables.
+#
+# XTRACE: `bash -x secrets.sh --import`, or an exported SHELLOPTS=xtrace /
+# BASH_XTRACEFD, would trace every assignment and command line holding the
+# value or its hex to stderr. The import path switches tracing off on entry
+# (and the helpers that touch a value do so again, in case they are ever
+# called from elsewhere). It is never switched back on: the CLI exits after.
+
+# The value cap, in bytes. Ample for every secret here (passwords, ~192-char
+# tokens, ping URLs), and about what a terminal accepts anyway: macOS's
+# canonical-mode line limit (MAX_CANON) is 1024 bytes. $ALGO_IMPORT_MAX_BYTES
+# may LOWER it (the test suite does); anything non-numeric or larger is 1024.
+_algo_import_max_bytes() {
+    case "${ALGO_IMPORT_MAX_BYTES:-}" in
+        ''|*[!0-9]*) printf '1024' ;;
+        *) if [ "$ALGO_IMPORT_MAX_BYTES" -gt 1024 ]; then printf '1024'; else printf '%s' "$ALGO_IMPORT_MAX_BYTES"; fi ;;
+    esac
+}
+
+# Length of a value in BYTES (the unit of the cap), whatever the locale.
+_algo_byte_len() {
+    { set +x; } 2>/dev/null
+    printf '%s' "$1" | wc -c | tr -d ' '
+}
+
+# Every name --import knows about, in prompt order.
+_algo_import_known_names() {
+    printf '%s\n' $ALGO_SECRET_NAMES $ALGO_OPTIONAL_SECRET_NAMES $ALGO_JOB_SECRET_NAMES
+}
+
+_algo_is_known_secret_name() {
+    local want="$1" n
+    for n in $(_algo_import_known_names); do
+        [ "$n" = "$want" ] && return 0
+    done
+    return 1
+}
+
+# Strip anything that could be (part of) the value from security's stderr
+# before it is shown: the exact hex, and any long hex run in case a split line
+# echoed a fragment of it.
+_algo_redact_security_err() {
+    local err="$1" hex="$2"
+    [ -n "$hex" ] && err="${err//$hex/<redacted>}"
+    printf '%s' "$err" | sed -E 's/[0-9A-Fa-f]{16,}/<redacted>/g' | tr '\n' ' ' | sed 's/ *$//'
+}
+
+# _algo_keychain_put_stdin NAME VALUE -> 0 on success; on failure 1 with a
+# redacted reason in $_ALGO_PUT_ERROR. The value never reaches argv.
+_algo_keychain_put_stdin() {
+    { set +x; } 2>/dev/null
+    local name="$1" value="$2" hex err rc
+    _ALGO_PUT_ERROR=""
+    hex=$(printf '%s' "$value" | od -An -v -tx1 | tr -d ' \n')
+    err=$(printf 'add-generic-password -s %s -a %s -T %s -U -X %s\n' \
+              "$ALGO_KEYCHAIN_SERVICE" "$name" "$ALGO_SECURITY_BIN" "$hex" \
+          | "$ALGO_SECURITY_BIN" -i 2>&1 >/dev/null)
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        _ALGO_PUT_ERROR="security exited $rc: $(_algo_redact_security_err "$err" "$hex")"
+        return 1
+    fi
+    return 0
+}
+
+# _algo_keychain_item_info NAME -> sets _ALGO_ITEM_STATE to present|absent|error,
+# and for a present item _ALGO_ITEM_LEN (bytes, or "?") and _ALGO_ITEM_MDAT.
+# The value is read only to measure it; it is never printed. A locked keychain
+# is classified exactly as _algo_secret_from_keychain does, so --import refuses
+# it before the first prompt instead of discovering it at the write.
+_algo_keychain_item_info() {
+    { set +x; } 2>/dev/null
+    local name="$1" out rc v stamp
+    _ALGO_ITEM_STATE="" _ALGO_ITEM_LEN="?" _ALGO_ITEM_MDAT="unknown date" _ALGO_ITEM_ERROR=""
+    # Without -w/-g, find-generic-password prints attributes only.
+    out=$("$ALGO_SECURITY_BIN" find-generic-password -s "$ALGO_KEYCHAIN_SERVICE" -a "$name" 2>&1)
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        case "$out" in
+            *"could not be found"*|*"-25300"*) _ALGO_ITEM_STATE="absent"; return 0 ;;
+        esac
+        _ALGO_ITEM_STATE="error"
+        case "$out" in
+            *"interaction is not allowed"*|*"-25308"*)
+                _ALGO_ITEM_ERROR="login keychain is LOCKED. Unlock it (e.g. security unlock-keychain ~/Library/Keychains/login.keychain-db) and re-run."
+                ;;
+            *)
+                _ALGO_ITEM_ERROR="$(printf '%s' "$out" | tr '\n' ' ' | sed 's/ *$//')"
+                ;;
+        esac
+        return 1
+    fi
+    _ALGO_ITEM_STATE="present"
+    # "mdat"<timedate>=0x3230...  "20261009081616Z\000"
+    stamp=$(printf '%s\n' "$out" | sed -n 's/.*"mdat"<timedate>=[^"]*"\([0-9]\{14\}\)Z.*/\1/p' | head -1)
+    if [ -n "$stamp" ]; then
+        _ALGO_ITEM_MDAT="${stamp:0:4}-${stamp:4:2}-${stamp:6:2} ${stamp:8:2}:${stamp:10:2}:${stamp:12:2} UTC"
+    fi
+    if v=$("$ALGO_SECURITY_BIN" find-generic-password -w -s "$ALGO_KEYCHAIN_SERVICE" -a "$name" 2>/dev/null); then
+        _ALGO_ITEM_LEN=$(_algo_byte_len "$v")
+    fi
+    v=""
+    return 0
+}
+
+# Prompt on the terminal and read one hidden line into $_ALGO_TTY_INPUT.
+# Echo is switched off BEFORE the prompt is shown so type-ahead is not echoed
+# either. Returns non-zero on EOF (Ctrl-D) or a read error.
+_algo_tty_read_secret() {
+    { set +x; } 2>/dev/null
+    local prompt="$1" rc
+    _ALGO_TTY_INPUT=""
+    stty -echo <&"$_ALGO_TTY_FD" 2>/dev/null
+    printf '%s' "$prompt" >&"$_ALGO_TTY_FD"
+    IFS= read -rs -u "$_ALGO_TTY_FD" _ALGO_TTY_INPUT
+    rc=$?
+    [ -n "$_ALGO_TTY_SAVED" ] && stty "$_ALGO_TTY_SAVED" <&"$_ALGO_TTY_FD" 2>/dev/null
+    printf '\n' >&"$_ALGO_TTY_FD"
+    return $rc
+}
+
+# Visible y/N answer into $_ALGO_TTY_INPUT; non-zero on EOF.
+_algo_tty_read_line() {
+    _ALGO_TTY_INPUT=""
+    printf '%s' "$1" >&"$_ALGO_TTY_FD"
+    IFS= read -r -u "$_ALGO_TTY_FD" _ALGO_TTY_INPUT
+}
+
+# The EXIT trap is what puts the terminal back. It must not be the INT trap:
+# when `exit` runs from inside an interrupted `read -s`, bash's own unwind
+# restores the settings `read -s` saved — which are our echo-off ones — AFTER
+# an INT handler has run, leaving the operator's terminal silent. The EXIT trap
+# runs after that unwind.
+_algo_import_restore_tty() {
+    if [ -n "$_ALGO_TTY_SAVED" ]; then
+        stty "$_ALGO_TTY_SAVED" <&"$_ALGO_TTY_FD" 2>/dev/null
+    fi
+}
+
+_algo_import_interrupted() {
+    printf '\n' >&"$_ALGO_TTY_FD" 2>/dev/null
+    if [ "${_ALGO_IMPORT_PHASE:-}" = "write" ]; then
+        echo "Interrupted while writing — the lines above say which secrets were stored; one more may have been stored just before the interrupt — run: $0 --check" >&2
+    else
+        echo "Interrupted — import aborted, nothing was written to the keychain." >&2
+    fi
+    exit 130
 }
 
 _algo_keychain_put_value() {
     # Bulk path. CAVEAT: the value passes through argv, so it is briefly
     # visible to `ps` for other processes running as this user. Fine for a
-    # one-time migration on a single-user Mac; use --import for anything you
-    # would rather not expose even briefly.
+    # one-time migration on a single-user Mac; use --import (which feeds
+    # `security -i` through a pipe, see _algo_keychain_put_stdin) for anything
+    # you would rather not expose even briefly.
     local name="$1" value="$2"
     "$ALGO_SECURITY_BIN" add-generic-password \
         -s "$ALGO_KEYCHAIN_SERVICE" -a "$name" -w "$value" \
@@ -414,7 +596,7 @@ _algo_cli_check() {
             if algo_secret "$name" >/dev/null 2>&1; then
                 echo "  OK      $name"
             else
-                echo "  ABSENT  $name — not configured; import it with: $0 --import"
+                echo "  ABSENT  $name — not configured; import it with: $0 --import --only $name"
             fi
         done
     fi
@@ -425,23 +607,196 @@ _algo_cli_check() {
             if algo_secret "$name" >/dev/null 2>&1; then
                 echo "  OK      $name"
             else
-                echo "  ABSENT  $name — its job aborts until imported: $0 --import"
+                echo "  ABSENT  $name — its job aborts until imported: $0 --import --only $name"
             fi
         done
     fi
     return $rc
 }
 
+# Read NAME back and compare with VALUE without either reaching a trace or
+# stdout. Sets _ALGO_READBACK_BYTES; returns 0 only on an exact match.
+_algo_keychain_read_back() {
+    { set +x; } 2>/dev/null
+    local name="$1" value="$2" got
+    _ALGO_READBACK_BYTES=0
+    got=$("$ALGO_SECURITY_BIN" find-generic-password -w -s "$ALGO_KEYCHAIN_SERVICE" -a "$name" 2>/dev/null) || got=""
+    _ALGO_READBACK_BYTES=$(_algo_byte_len "$got")
+    if [ "$got" = "$value" ]; then got=""; return 0; fi
+    got=""
+    return 1
+}
+
+# --import [--only NAME]...  — see the KAN-115 block above _algo_keychain_put_stdin.
 _algo_cli_import() {
-    local name
-    echo "Importing into keychain service '$ALGO_KEYCHAIN_SERVICE' (login keychain)."
-    echo "Values are read by \`security\` itself — not via argv, not into history."
-    echo ""
-    for name in $ALGO_SECRET_NAMES $ALGO_OPTIONAL_SECRET_NAMES $ALGO_JOB_SECRET_NAMES; do
-        _algo_keychain_put_interactive "$name" || echo "  (skipped $name)" >&2
+    # First, before any value exists: no xtrace (see the XTRACE note above).
+    { set +x +v; } 2>/dev/null
+    unset BASH_XTRACEFD
+    local name only="" names n dup rc=0 bytes first i max_bytes
+    local pending_names=() pending_values=()
+    local states=() lens=() mdats=()
+    # CLI-only state; deliberately not set at source time.
+    # Fixed fd for the controlling terminal: /bin/bash on macOS is 3.2, which
+    # has no `exec {fd}<>` allocation.
+    _ALGO_TTY_FD=9
+    _ALGO_TTY_SAVED=""
+    _ALGO_IMPORT_PHASE="setup"
+    max_bytes=$(_algo_import_max_bytes)
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --only)
+                if [ -z "${2:-}" ]; then
+                    echo "usage: $0 --import [--only NAME]..." >&2
+                    return 64
+                fi
+                only="$only $2"
+                shift 2
+                ;;
+            *)
+                echo "--import: unknown argument '$1' (usage: $0 --import [--only NAME]...)" >&2
+                return 64
+                ;;
+        esac
     done
+
+    if [ -n "$only" ]; then
+        names=""
+        for n in $only; do
+            if ! _algo_is_known_secret_name "$n"; then
+                echo "--import --only: '$n' is not a secret this stack knows about; refusing." >&2
+                echo "  known: $(_algo_import_known_names | tr '\n' ' ')" >&2
+                return 64
+            fi
+            dup=0
+            for name in $names; do [ "$name" = "$n" ] && dup=1; done
+            [ "$dup" = 0 ] && names="$names $n"
+        done
+    else
+        names="$(_algo_import_known_names | tr '\n' ' ')"
+    fi
+
+    # security -i tokenizes on whitespace; these two go into its command line
+    # unquoted. Neither has a reason to contain any of these characters.
+    case "$ALGO_KEYCHAIN_SERVICE$ALGO_SECURITY_BIN" in
+        *[[:space:]\"\'\\]*)
+            echo "--import: keychain service or security binary path contains whitespace or quotes; refusing." >&2
+            return 1
+            ;;
+    esac
+
+    if ! { exec 9<>/dev/tty; } 2>/dev/null; then
+        echo "--import reads secrets from a terminal and there is none. For a file use --import-from-env FILE." >&2
+        return 1
+    fi
+    _ALGO_TTY_SAVED=$(stty -g <&"$_ALGO_TTY_FD" 2>/dev/null)
+    _ALGO_IMPORT_PHASE="prompt"
+    trap _algo_import_restore_tty EXIT
+    trap _algo_import_interrupted INT TERM
+
+    echo "Importing into keychain service '$ALGO_KEYCHAIN_SERVICE' (login keychain)."
+    echo "Each value is typed twice with echo off. Empty skips, Ctrl-C aborts — nothing"
+    echo "is written until every prompt has been answered."
+    echo "Note: a macOS keychain dialog may appear — approve it, or Ctrl-C to abort."
+    echo ""
+
+    # Phase 0: look at every item BEFORE the first prompt, so a locked keychain
+    # (or any other lookup failure) is refused up front, not found at the write.
+    i=0
+    for name in $names; do
+        if ! _algo_keychain_item_info "$name"; then
+            echo "  cannot tell whether $name is already set: $_ALGO_ITEM_ERROR" >&2
+            echo "Import aborted, nothing was written." >&2
+            return 1
+        fi
+        states[$i]="$_ALGO_ITEM_STATE"
+        lens[$i]="$_ALGO_ITEM_LEN"
+        mdats[$i]="$_ALGO_ITEM_MDAT"
+        i=$((i + 1))
+    done
+
+    # Phase 1: collect. Nothing below writes.
+    i=-1
+    for name in $names; do
+        i=$((i + 1))
+        if [ "${states[$i]}" = "present" ]; then
+            if ! _algo_tty_read_line "$name already set (${lens[$i]} bytes, modified ${mdats[$i]}); overwrite? [y/N] "; then
+                printf '\n' >&"$_ALGO_TTY_FD"
+                echo "Input closed — import aborted, nothing was written." >&2
+                return 1
+            fi
+            case "$_ALGO_TTY_INPUT" in
+                y|Y|yes|YES|Yes) ;;
+                *) echo "  kept    $name (unchanged)"; continue ;;
+            esac
+        fi
+        if ! _algo_tty_read_secret "Enter $name (input hidden, empty to skip): "; then
+            echo "Input closed — import aborted, nothing was written." >&2
+            return 1
+        fi
+        if [ -z "$_ALGO_TTY_INPUT" ]; then
+            echo "  skipped $name"
+            continue
+        fi
+        first="$_ALGO_TTY_INPUT"
+        bytes=$(_algo_byte_len "$first")
+        if [ "$bytes" -gt "$max_bytes" ]; then
+            echo "  REFUSED $name — $bytes bytes is over the $max_bytes-byte limit; not written"
+            first=""
+            rc=1
+            continue
+        fi
+        if ! _algo_tty_read_secret "Re-enter $name to confirm: "; then
+            first=""
+            echo "Input closed — import aborted, nothing was written." >&2
+            return 1
+        fi
+        if [ "$_ALGO_TTY_INPUT" != "$first" ]; then
+            echo "  REFUSED $name — the two entries did not match; not written"
+            first=""
+            _ALGO_TTY_INPUT=""
+            rc=1
+            continue
+        fi
+        pending_names[${#pending_names[@]}]="$name"
+        pending_values[${#pending_values[@]}]="$first"
+        first=""
+        _ALGO_TTY_INPUT=""
+    done
+
+    # Phase 2: write what was confirmed, then read each one back.
+    _ALGO_IMPORT_PHASE="write"
+    echo ""
+    if [ "${#pending_names[@]}" -eq 0 ]; then
+        echo "Nothing to write."
+    fi
+    i=0
+    while [ "$i" -lt "${#pending_names[@]}" ]; do
+        name="${pending_names[$i]}"
+        bytes=$(_algo_byte_len "${pending_values[$i]}")
+        if _algo_keychain_put_stdin "$name" "${pending_values[$i]}"; then
+            if _algo_keychain_read_back "$name" "${pending_values[$i]}"; then
+                echo "  stored  $name ($bytes bytes, read back intact)"
+            else
+                echo "  WARNING $name was written but does not read back as entered (wrote $bytes bytes, read $_ALGO_READBACK_BYTES). Re-run: $0 --import --only $name"
+                rc=1
+            fi
+        else
+            echo "  FAILED  $name — $_ALGO_PUT_ERROR"
+            rc=1
+        fi
+        pending_values[$i]=""
+        i=$((i + 1))
+    done
+    unset pending_values
+
+    trap - INT TERM
+    _algo_import_restore_tty
+    trap - EXIT
+    exec 9<&-
     echo ""
     echo "Done. Verify with: $0 --check"
+    return $rc
 }
 
 _algo_cli_import_from_env() {
@@ -536,7 +891,7 @@ fi
 if [ "$_algo_sourced" = "0" ]; then
     case "${1:---check}" in
         --check)           _algo_cli_check ;;
-        --import)          _algo_cli_import ;;
+        --import)          shift; _algo_cli_import "$@" ;;
         --import-from-env) _algo_cli_import_from_env "${2:?usage: $0 --import-from-env FILE}" ;;
         --export)          _algo_cli_export ;;
         --env-file)        _algo_cli_env_file ;;
