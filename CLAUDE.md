@@ -151,18 +151,16 @@ Three layers, and confusing them is the recurring error:
   token would itself have to be stored somewhere (the reasoning is in
   `deploy/launchd/secrets.sh`'s header, KAN-16). The keychain is a *mirror*;
   1Password is still where the value lives. Re-mirror with
-  `deploy/launchd/secrets.sh --import --only NAME` (repeat `--only` per name;
-  no `--only` walks every name), and check what is present — names and status
-  only, never values — with `deploy/launchd/secrets.sh --check`. `--import`
-  asks `overwrite? [y/N]` before replacing an existing item (Enter = keep),
-  treats an empty entry as a skip, and writes nothing if interrupted (KAN-115).
+  `deploy/launchd/secrets.sh --import --only NAME` (empty = skip, Enter at
+  overwrite = keep, Ctrl-C writes nothing), and check what is present — names
+  and status only, never values — with `deploy/launchd/secrets.sh --check`.
 - **`.env` is a named pipe, not a file.** 1Password Environments serves it, so
   `cat .env` blocks ~60s and returns nothing, and `[ -f .env ]` is **false**.
   That combination silently disabled every alert path for two days on
   2026-08-13/14. `secrets.sh` refuses a non-regular `.env` by name and in under
   a second; do not add a code path that reads it.
 - **Rotating a secret means both places.** Update the 1Password item, then
-  `secrets.sh --import --only NAME`, or the jobs keep using the old value until the next
+  `secrets.sh --import`, or the jobs keep using the old value until the next
   04:15 tells you otherwise.
 
 ### Piping `op read` into a tool that prompts

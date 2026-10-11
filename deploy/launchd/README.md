@@ -128,7 +128,9 @@ deploy/launchd/secrets.sh --import --only ALGO_DEADMAN_EARNINGS_URL
 refused with exit 64 before the keychain is touched. Without `--only` it walks
 every known name. For each name:
 
-- **Already set?** It asks `NAME already set (N chars, modified <date>);
+- **Every item is looked up before the first prompt.** A locked keychain, or
+  any other lookup failure, is refused up front with nothing written.
+- **Already set?** It asks `NAME already set (N bytes, modified <date>);
   overwrite? [y/N]`. Only `y`/`yes` goes on; Enter, `n` or anything else keeps
   the item untouched. The value itself is never shown.
 - **The value is typed twice**, echo off, read by the script from the terminal.
@@ -137,16 +139,19 @@ every known name. For each name:
 - **Nothing is written until the last prompt is answered.** Ctrl-C (or Ctrl-D)
   at any prompt aborts the whole import with nothing written and the terminal's
   echo restored (exit 130 for Ctrl-C).
-- Each write is **read back**: `stored NAME (N chars, read back intact)`, or a
+- Each write is **read back**: `stored NAME (N bytes, read back intact)`, or a
   `WARNING` if the keychain does not hold exactly what was typed. Lengths are
-  reported, never values.
+  reported, never values. A Ctrl-C during the writes says which secrets were
+  stored; one more may have landed just before it, so run `--check`.
 - Values are capped at 1024 bytes, which is also what a macOS terminal accepts
   on one line. There is no 128-byte limit any more.
 
 The value never appears in any process's argv: it is hex-encoded by the shell
 and piped to `security -i` as `add-generic-password … -U -X <hex>`. Replacing
-an existing item (`-U`) can make macOS raise its own keychain-access dialog;
-answer it, or the write waits.
+an existing item (`-U`), or reading one to measure it, can make macOS raise its
+own keychain-access dialog (the script says so before it starts); approve it,
+or Ctrl-C to abort. Tracing is switched off on entry, so `bash -x` or an
+exported `SHELLOPTS=xtrace` cannot print a value either.
 
 Why it changed: on 2026-10-09 the old `--import` printed "empty to skip", then
 let `security` prompt for the value itself. There was no skip, `-U` replaced

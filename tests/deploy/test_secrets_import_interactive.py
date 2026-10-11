@@ -34,6 +34,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import termios
 import textwrap
 import time
@@ -127,6 +128,10 @@ def add(args):
         return 45
     if MODE == "truncate128":
         data = data[:128]
+    if MODE == "slow_write":
+        (ROOT / "write.started").touch()
+        import time
+        time.sleep(10)
     item.write_bytes(data)
     (STORE / (acct + ".mdat")).write_text("20261011010203")
     return 0
@@ -211,14 +216,14 @@ def _env(kc: Keychain, tmp_path: Path) -> dict[str, str]:
 class Session:
     """The script running on a pty, driven like an operator at a keyboard."""
 
-    def __init__(self, args: list[str], env: dict[str, str]):
+    def __init__(self, args: list[str], env: dict[str, str], prefix: list[str] | None = None):
         # The wrapper reports the exit status and the terminal's echo state
         # AFTER secrets.sh is gone — that is the state the operator is left in.
         wrapper = '"$@"; rc=$?; echo; echo "ECHO=$(stty -a | tr " " "\\n" | grep -E "^-?echo$")"; echo "RC=$rc"'
         # Everything is prepared before the fork so the child does nothing but
         # execve (pytest-xdist workers are multi-threaded).
         bash = shutil.which("bash") or "/bin/bash"
-        argv = ["bash", "-c", wrapper, "wrapper", str(SECRETS_SH), "--import", *args]
+        argv = ["bash", "-c", wrapper, "wrapper", *(prefix or []), str(SECRETS_SH), "--import", *args]
         self.pid, self.fd = pty.fork()
         if self.pid == 0:  # child
             try:
@@ -311,7 +316,7 @@ def test_enter_at_an_existing_secret_keeps_it(kc, tmp_path):
     """The incident keystroke. Enter now means "no", and nothing is written."""
     kc.put("POSTGRES_PASSWORD", "real-pg-password")
     s = _session(kc, tmp_path, "--only", "POSTGRES_PASSWORD")
-    s.expect(r"POSTGRES_PASSWORD already set \(16 chars, modified 2026-10-09 08:16:16 UTC\); overwrite\? \[y/N\] ")
+    s.expect(r"POSTGRES_PASSWORD already set \(16 bytes, modified 2026-10-09 08:16:16 UTC\); overwrite\? \[y/N\] ")
     s.send("\n")
     assert s.finish() == 0, s.text
     assert kc.get("POSTGRES_PASSWORD") == "real-pg-password"
@@ -363,7 +368,7 @@ def test_explicit_yes_overwrites_and_reports_length_not_value(kc, tmp_path):
     s.secret(new)
     assert s.finish() == 0, s.text
     assert kc.get("POSTGRES_PASSWORD") == new
-    assert f"stored  POSTGRES_PASSWORD ({len(new)} chars, read back intact)" in s.text
+    assert f"stored  POSTGRES_PASSWORD ({len(new)} bytes, read back intact)" in s.text
     assert new not in s.text and "old-pg-password" not in s.text
 
 
@@ -496,7 +501,7 @@ def test_a_200_char_value_round_trips_intact(kc, tmp_path):
     s.secret(value)
     assert s.finish() == 0, s.text
     assert kc.get("ALPHAVANTAGE_API_KEY") == value
-    assert "stored  ALPHAVANTAGE_API_KEY (200 chars, read back intact)" in s.text
+    assert "stored  ALPHAVANTAGE_API_KEY (200 bytes, read back intact)" in s.text
 
 
 def test_mismatched_confirmation_is_refused_and_nothing_written(kc, tmp_path):
@@ -530,7 +535,7 @@ def test_value_over_the_cap_is_refused_before_security_sees_it(kc, tmp_path):
 @pytest.mark.parametrize("override", ["99999", "lots", "-5"])
 def test_value_cap_cannot_be_raised_or_broken_by_the_environment(override):
     res = subprocess.run(
-        ["bash", "-c", f'. "{SECRETS_SH}"; printf "%s" "$ALGO_IMPORT_MAX_BYTES"'],
+        ["bash", "-c", f'. "{SECRETS_SH}"; _algo_import_max_bytes'],
         env={**os.environ, "ALGO_IMPORT_MAX_BYTES": override},
         capture_output=True, text=True, timeout=15,
     )
@@ -575,7 +580,7 @@ def test_a_write_that_does_not_read_back_is_flagged(kc, tmp_path):
     s.secret(value)
     s.secret(value)
     assert s.finish() == 1, s.text
-    assert "WARNING ALPHAVANTAGE_API_KEY was written but does not read back as entered (wrote 192 chars, read 128)" in s.text
+    assert "WARNING ALPHAVANTAGE_API_KEY was written but does not read back as entered (wrote 192 bytes, read 128)" in s.text
     assert "stored  ALPHAVANTAGE_API_KEY" not in s.text
 
 
@@ -583,7 +588,8 @@ def test_a_locked_keychain_aborts_before_any_prompt(kc, tmp_path):
     kc.mode("locked")
     s = _session(kc, tmp_path, "--only", "REDIS_PASSWORD")
     assert s.finish() == 1, s.text
-    assert "cannot tell whether REDIS_PASSWORD is already set" in s.text
+    assert "cannot tell whether REDIS_PASSWORD is already set: login keychain is LOCKED" in s.text
+    assert "unlock-keychain" in s.text
     assert "Enter REDIS_PASSWORD" not in s.text
     assert kc.writes() == []
 
@@ -633,3 +639,111 @@ def test_readme_documents_only_and_the_new_import_behaviour():
     readme = (REPO / "deploy/launchd/README.md").read_text()
     assert "--import --only" in readme
     assert "overwrite? [y/N]" in readme
+
+
+def test_a_locked_keychain_is_refused_before_the_first_prompt_even_for_a_later_name(kc, tmp_path):
+    """Every item is looked up before anything is asked, so a lookup failure on
+    the SECOND name does not surface after the operator typed the first."""
+    kc.mode("locked")
+    s = _session(kc, tmp_path, "--only", "REDIS_PASSWORD", "--only", "API_KEYS")
+    assert s.finish() == 1, s.text
+    assert "Enter " not in s.text
+    assert "LOCKED" in s.text
+    assert kc.writes() == []
+
+
+def test_the_keychain_dialog_warning_comes_before_any_security_call(kc, tmp_path):
+    kc.put("REDIS_PASSWORD", "real-redis")
+    s = _session(kc, tmp_path, "--only", "REDIS_PASSWORD")
+    s.expect(r"a macOS keychain dialog may appear — approve it, or Ctrl-C to abort")
+    s.expect(r"overwrite\? \[y/N\] ")
+    s.send("\n")
+    assert s.finish() == 0, s.text
+
+
+def test_ctrl_c_during_the_write_phase_says_one_more_may_have_landed(kc, tmp_path):
+    kc.mode("slow_write")
+    s = _session(kc, tmp_path, "--only", "REDIS_PASSWORD")
+    s.secret("slow-value")
+    s.secret("slow-value")
+    deadline = time.monotonic() + 10
+    while not (kc.root / "write.started").exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    s.send("\x03")
+    assert s.finish() == 130, s.text
+    assert "one more may have been stored just before the interrupt" in s.text
+    assert "--check" in s.text
+    assert s.echo_restored
+
+
+# --- xtrace (review follow-up) ----------------------------------------------
+
+XTRACE_VALUE = "Xtrace-Leak-Probe-Value-42"
+
+
+@pytest.mark.parametrize(
+    "how",
+    ["bash -x", "SHELLOPTS=xtrace", "SHELLOPTS=xtrace + BASH_XTRACEFD=1"],
+)
+def test_xtrace_never_shows_the_value_or_its_hex(kc, tmp_path, how):
+    """`bash -x secrets.sh --import`, or an exported SHELLOPTS=xtrace, would
+    otherwise trace every assignment and command line carrying the value."""
+    kc.put("REDIS_PASSWORD", "existing-redis-secret")
+    env = _env(kc, tmp_path)
+    bash = "/bin/bash" if Path("/bin/bash").exists() else (shutil.which("bash") or "bash")
+    if how == "bash -x":
+        prefix = [bash, "-x"]
+    else:
+        prefix = ["env", "SHELLOPTS=xtrace"]
+        if "BASH_XTRACEFD" in how:
+            prefix.append("BASH_XTRACEFD=1")
+    s = Session(["--only", "REDIS_PASSWORD"], env, prefix=prefix)
+    s.expect(r"overwrite\? \[y/N\] ")
+    s.send("y\n")
+    s.secret(XTRACE_VALUE)
+    s.secret(XTRACE_VALUE)
+    assert s.finish() == 0, s.text
+    assert kc.get("REDIS_PASSWORD") == XTRACE_VALUE
+    # The trace really was on, so the assertions below are not vacuous.
+    assert re.search(r"^\++ ", s.text, re.M), "expected xtrace output before the import began"
+    for secret in (XTRACE_VALUE, "existing-redis-secret"):
+        assert secret not in s.text, f"{secret!r} leaked via xtrace:\n{s.text}"
+        assert secret.encode().hex() not in s.text.lower(), f"hex of {secret!r} leaked"
+
+
+# --- sourcing stays side-effect free (review follow-up) ---------------------
+
+
+def test_sourcing_sets_no_import_state():
+    """Every launchd job sources secrets.sh. The import path must only define
+    functions at source time: the variables sourcing creates are exactly the
+    ones it created before KAN-115."""
+    script = textwrap.dedent(
+        f"""\
+        compgen -v | sort > "$1"
+        . "{SECRETS_SH}"
+        compgen -v | sort > "$2"
+        """
+    )
+    with tempfile.TemporaryDirectory() as d:
+        before, after = Path(d) / "before", Path(d) / "after"
+        res = subprocess.run(
+            ["bash", "-c", script, "probe", str(before), str(after)],
+            capture_output=True, text=True, timeout=15,
+            env={k: v for k, v in os.environ.items() if not k.startswith(("ALGO_", "_ALGO"))},
+        )
+        assert res.returncode == 0, res
+        added = set(after.read_text().split()) - set(before.read_text().split())
+    added -= {"_", "BASH_ARGC", "BASH_ARGV", "BASH_LINENO", "BASH_SOURCE", "FUNCNAME", "PIPESTATUS"}
+    assert added == {
+        "ALGO_KEYCHAIN_SERVICE",
+        "ALGO_SECRETS_ENV_FILE",
+        "ALGO_SECURITY_BIN",
+        "ALGO_OSASCRIPT_BIN",
+        "ALGO_SECRET_NAMES",
+        "ALGO_OPTIONAL_SECRET_NAMES",
+        "ALGO_JOB_SECRET_NAMES",
+        "ALGO_SECRETS_ERROR",
+        "_ALGO_SECRET_VALUE",
+        "_algo_sourced",
+    }, sorted(added)
