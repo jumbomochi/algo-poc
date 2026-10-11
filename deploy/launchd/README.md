@@ -109,10 +109,50 @@ account = the variable name (POSTGRES_PASSWORD, REDIS_PASSWORD,
 
 ```bash
 deploy/launchd/secrets.sh --check              # presence only, never values
-deploy/launchd/secrets.sh --import             # interactive; value never hits argv
+deploy/launchd/secrets.sh --import --only NAME # one secret (repeat --only for more)
+deploy/launchd/secrets.sh --import             # every known name, one at a time
 deploy/launchd/secrets.sh --import-from-env F  # bulk from a plaintext env file
 eval "$(deploy/launchd/secrets.sh --export)"   # for docker compose / a shell
 ```
+
+### `--import` (rewritten for KAN-115)
+
+To add or rotate one secret, name it:
+
+```bash
+deploy/launchd/secrets.sh --import --only ALGO_DEADMAN_EARNINGS_URL
+```
+
+`--only` accepts only names the stack knows (`$ALGO_SECRET_NAMES`,
+`$ALGO_OPTIONAL_SECRET_NAMES`, `$ALGO_JOB_SECRET_NAMES`); anything else is
+refused with exit 64 before the keychain is touched. Without `--only` it walks
+every known name. For each name:
+
+- **Already set?** It asks `NAME already set (N chars, modified <date>);
+  overwrite? [y/N]`. Only `y`/`yes` goes on; Enter, `n` or anything else keeps
+  the item untouched. The value itself is never shown.
+- **The value is typed twice**, echo off, read by the script from the terminal.
+  Two entries that differ are refused. **Empty is a real skip**: `security` is
+  not called for that name at all.
+- **Nothing is written until the last prompt is answered.** Ctrl-C (or Ctrl-D)
+  at any prompt aborts the whole import with nothing written and the terminal's
+  echo restored (exit 130 for Ctrl-C).
+- Each write is **read back**: `stored NAME (N chars, read back intact)`, or a
+  `WARNING` if the keychain does not hold exactly what was typed. Lengths are
+  reported, never values.
+- Values are capped at 1024 bytes, which is also what a macOS terminal accepts
+  on one line. There is no 128-byte limit any more.
+
+The value never appears in any process's argv: it is hex-encoded by the shell
+and piped to `security -i` as `add-generic-password … -U -X <hex>`. Replacing
+an existing item (`-U`) can make macOS raise its own keychain-access dialog;
+answer it, or the write waits.
+
+Why it changed: on 2026-10-09 the old `--import` printed "empty to skip", then
+let `security` prompt for the value itself. There was no skip, `-U` replaced
+the item, and pressing Enter blanked the real `POSTGRES_PASSWORD`. Ctrl-C could
+not stop it, because the terminal was in password mode, and `security`'s prompt
+silently truncated values past 128 bytes.
 
 `secrets.sh` is deliberately **not** deployed to `~/ibc` — it is sourced from
 the repo so there is exactly one copy of the lookup logic and it cannot drift

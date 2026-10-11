@@ -47,7 +47,7 @@ single job kept running, which defeats the point of knowing which one stopped.
 # secrets: `secrets.sh --check` reports them, but their absence does not make
 # it exit non-zero (that status means "the stack cannot authenticate", and an
 # unconfigured dead-man switch is a different problem).
-deploy/launchd/secrets.sh --import      # prompts for each of them at the end
+deploy/launchd/secrets.sh --import --only ALGO_DEADMAN_PAPER_URL   # one at a time (repeat --only)
 deploy/launchd/secrets.sh --check       # confirm they resolve
 ```
 
