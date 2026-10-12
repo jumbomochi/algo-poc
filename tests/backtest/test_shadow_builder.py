@@ -16,7 +16,7 @@ from datetime import date, timedelta
 
 import pytest
 
-from backtest.shadow_series import build_shadow_series
+from backtest.shadow_series import build_shadow_replays, build_shadow_series
 
 
 SESSIONS = [date(2026, 1, 5) + timedelta(days=i) for i in range(60)]
@@ -196,3 +196,51 @@ def test_the_warm_up_reaches_every_sleeve_and_each_starts_level() -> None:
     assert out["sector_rotation"][window_start] == pytest.approx(33_333.0)
     # The warm book is held through the window: the rising name moves it.
     assert out["momentum"][SESSIONS[-1]] > 20_000.0
+
+
+def test_one_sleeves_replay_failure_is_isolated_and_named() -> None:
+    """KAN-105 review: an exception in one sleeve's replay used to propagate
+    and blank every sleeve's feed. It is now contained, logged and named."""
+
+    def broken(ticker, bars):
+        raise RuntimeError("signal fn defect")
+
+    live = {
+        "momentum": _live({d: 20_000.0 for d in SESSIONS}),
+        "sector_rotation": _live({d: 33_333.0 for d in SESSIONS}),
+    }
+    portfolios = {
+        "momentum": _Sleeve("momentum", broken),
+        "sector_rotation": _Sleeve("sector_rotation", _never),
+    }
+    kwargs = dict(portfolios=portfolios, bars_by_ticker={"AAA": _rising(0.01)},
+                  live_equity=live, window_sessions=10, **WARM)
+
+    replays = build_shadow_replays(**kwargs)
+    assert replays["momentum"].curve == {}
+    assert replays["momentum"].error == "RuntimeError: signal fn defect"
+    assert replays["sector_rotation"].error is None
+    assert replays["sector_rotation"].curve
+
+    # The curve-only API leaves the failed sleeve absent, as with no history.
+    assert set(build_shadow_series(**kwargs)) == {"sector_rotation"}
+
+
+def test_truncation_is_judged_per_sleeve() -> None:
+    """Each sleeve's window comes from its own live sessions: a book that
+    stopped early opens its window too early for the warm-up; the other
+    sleeve is unaffected."""
+    live = {
+        "momentum": _live({d: 20_000.0 for d in SESSIONS}),
+        "sector_rotation": _live({d: 33_333.0 for d in SESSIONS[:35]}),
+    }
+    replays = build_shadow_replays(
+        portfolios={n: _Sleeve(n, _never) for n in live},
+        bars_by_ticker={"AAA": _rising(0.01)},
+        live_equity=live,
+        window_sessions=10,
+        **WARM,
+    )
+
+    assert replays["momentum"].error is None
+    assert replays["sector_rotation"].error.startswith("ShadowWarmupTruncated: ")

@@ -189,6 +189,9 @@ def main() -> None:
                    if live_exp else None}
             pf = _portfolio(sleeve, one_year, regime_1y, lookups)
             old = _old_replay(pf, one_year, seed, ws)
+            # 0 by construction, not measured: the old replay refused every
+            # buy before ws, and a buy decided at ws's close fills at ws+1's
+            # open at the earliest, so the book holds only cash at ws's close.
             row["old"] = {**_grade(live, {d: v for d, v in old.items()
                                           if d in live}),
                           "invested_at_ws": 0.0}

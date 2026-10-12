@@ -50,6 +50,8 @@ momentum's recorded BREACH streak was an artifact of it
 * Bars too short to hold the warm-up plus :data:`SHADOW_LOOKBACK_SESSIONS` of
   indicator history raise :class:`ShadowWarmupTruncated`. A shorter warm-up
   would silently grade a different model under the same ``baseline_id``.
+  :func:`build_shadow_replays` contains the failure to that sleeve and names
+  it, so the monitor records the sleeve NO_DATA with the reason.
 
 **Capital flows (KAN-113) are replayed, not rescaled away.** When the operator
 credits or transfers sleeve cash inside the window, the shadow receives it on
@@ -62,7 +64,9 @@ the strategy does not deploy it, it sits idle on both sides. Both curves are
 then compared on the flow-adjusted (time-weighted) basis: the shadow's curve
 is returned with its own applied flows removed, exactly as the monitor removes
 live's. Flows on or before the window's first session are already inside
-live's NAV there, which the normalisation absorbs.
+live's NAV there, which the normalisation absorbs (as is one dated before the
+first session the bars hold, when they lack live's first; see
+:func:`replay_window_detail`).
 
 The function is deliberately dependency-light: the caller supplies the built
 ``signals_fn`` and ``risk_engine``, so this module never has to know the sleeve
@@ -70,6 +74,7 @@ roster and cannot drift away from how ``scripts/run_paper.py`` configures them.
 """
 from __future__ import annotations
 
+import logging
 import math
 from bisect import bisect_left
 from collections.abc import Mapping
@@ -82,6 +87,8 @@ from backtest.runner import BacktestResult, BacktestRunner, collect_sorted_dates
 from backtest.simulator import SimulatedExecutor
 from services.risk_management.funding import DEFAULT_SLEEVE_CASH_BUFFER_BPS
 from shared.capital_flows import flow_adjust
+
+logger = logging.getLogger(__name__)
 
 #: KAN-105. Sessions the replay trades before the window opens, the same for
 #: every sleeve. 160 is the smallest round N at which momentum (0.02 pp),
@@ -144,6 +151,9 @@ class WindowReplay:
     #: Market value over NAV at the window's first session's close: how
     #: invested the model's own book was when grading began.
     invested_at_start: float | None = None
+    #: Why the replay failed (``"<ExceptionType>: <message>"``), when it did;
+    #: ``curve`` is then empty. Set only by :func:`build_shadow_replays`.
+    error: str | None = None
 
 
 def _gated(
@@ -238,10 +248,23 @@ def replay_window_detail(
         )
     warm_from = sessions[warm_index]
 
+    # Only flows strictly after the ANCHOR are replayed. The anchor is
+    # window_start unless the bars lack that session; a flow dated in
+    # (window_start, anchor] then has no replayed session before the anchor's
+    # close to land on, and the scale it needs is learned at that close. It is
+    # treated as part of the opening level instead: the monitor intersects the
+    # two curves, so the first session it compares is the anchor, where live's
+    # value already contains the flow and the shadow's is the normalised
+    # opening level. Every return it grades runs from the anchor on, and a
+    # level shift before the first compared session moves none of them. What
+    # the shadow does not reproduce is the flow's share of idle cash in that
+    # one case — a sizing approximation, bounded to bars missing live's first
+    # window session. Replaying it instead raised in the runner and, before
+    # build_shadow_replays isolated sleeves, blanked every sleeve's feed.
     inside = {
         session: float(amount)
         for session, amount in (cash_flows or {}).items()
-        if session > window_start and amount
+        if session > anchor and amount
     }
     runner = BacktestRunner(
         SimulatedExecutor(cost_model or CostModel()),
@@ -333,9 +356,10 @@ def replay_window(
             funds them (KAN-111; see ``BacktestRunner``).
         cash_flows: KAN-113. ``{session: signed USD}`` — the sleeve's recorded
             capital flows, keyed by the session whose value first includes
-            each. Only flows strictly after ``window_start`` are replayed (one
-            on or before it is already in ``seed_nav``), each scaled to the
-            shadow's book (KAN-105, see the module docstring). When any is
+            each. Only flows strictly after the window's first bar session
+            are replayed (one on or before it is already in the opening
+            level), each scaled to the shadow's book (KAN-105, see the module
+            docstring). When any is
             applied, the returned curve is flow-adjusted (time-weighted,
             anchored at its last session), the basis the monitor grades live
             on. A withdrawal the replay's cash cannot cover is clamped by
@@ -382,7 +406,19 @@ def build_shadow_replays(
     warmup_sessions: int = SHADOW_WARMUP_SESSIONS,
     lookback_sessions: int = SHADOW_LOOKBACK_SESSIONS,
 ) -> dict[str, WindowReplay]:
-    """:func:`build_shadow_series`, keeping each sleeve's seeding detail."""
+    """:func:`build_shadow_series`, keeping each sleeve's seeding detail.
+
+    **A failure is isolated to its sleeve.** One sleeve's replay raising —
+    a warm-up its bars cannot hold (each sleeve's window comes from its own
+    live history, so truncation need not hit every sleeve), a flow it cannot
+    place, a defect in one signal function — is logged and returned as a
+    :class:`WindowReplay` with an empty curve and ``error`` set, and the other
+    sleeves are replayed as usual. Letting it propagate blanked all six feeds
+    for one sleeve's fault (the monitor's exit 3, "nothing could be graded").
+    The failure is not silent: the artifact names it per sleeve
+    (``replay_failed``), and the monitor records that sleeve NO_DATA with the
+    reason first, which reaches its exit-5 alert.
+    """
     out: dict[str, WindowReplay] = {}
 
     for name, sleeve in portfolios.items():
@@ -393,19 +429,26 @@ def build_shadow_replays(
         sessions = sorted(live)
         window_start = sessions[-window_sessions:][0]
 
-        replay = replay_window_detail(
-            bars_by_ticker=bars_by_ticker,
-            signals_fn=sleeve.signals_fn,
-            risk_engine=sleeve.risk_engine,
-            seed_nav=live[window_start],
-            window_start=window_start,
-            cost_model=cost_model,
-            whole_shares=whole_shares,
-            cash_buffer_bps=cash_buffer_bps,
-            cash_flows=(cash_flows or {}).get(name),
-            warmup_sessions=warmup_sessions,
-            lookback_sessions=lookback_sessions,
-        )
+        try:
+            replay = replay_window_detail(
+                bars_by_ticker=bars_by_ticker,
+                signals_fn=sleeve.signals_fn,
+                risk_engine=sleeve.risk_engine,
+                seed_nav=live[window_start],
+                window_start=window_start,
+                cost_model=cost_model,
+                whole_shares=whole_shares,
+                cash_buffer_bps=cash_buffer_bps,
+                cash_flows=(cash_flows or {}).get(name),
+                warmup_sessions=warmup_sessions,
+                lookback_sessions=lookback_sessions,
+            )
+        except Exception as exc:  # noqa: BLE001 — isolated, logged, named
+            logger.exception("Shadow replay failed for sleeve %s", name)
+            out[name] = WindowReplay(
+                curve={}, error=f"{type(exc).__name__}: {exc}"
+            )
+            continue
         # Live is the authority on which sessions are gradeable: the replay can
         # only produce a curve for sessions its bars cover, and the monitor
         # intersects the two sides anyway.
@@ -459,8 +502,8 @@ def build_shadow_series(
         so there is nothing to seed from, and a zero curve would read as a total
         loss instead of as an ungradeable sleeve.
 
-    Raises:
-        ShadowWarmupTruncated: The bars cannot hold a sleeve's warm-up.
+    A sleeve whose replay failed (see :func:`build_shadow_replays`) is absent
+    here; use :func:`build_shadow_replays` to see why.
 
     The window is derived per sleeve from *live's* sessions, never from the
     bars. Bars can run ahead of the book — a session prints but the 05:15 job
@@ -479,4 +522,6 @@ def build_shadow_series(
         warmup_sessions=warmup_sessions,
         lookback_sessions=lookback_sessions,
     )
-    return {name: replay.curve for name, replay in replays.items()}
+    return {
+        name: replay.curve for name, replay in replays.items() if replay.curve
+    }

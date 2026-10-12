@@ -169,8 +169,9 @@ def resolve_fetch_years(
     warmup + SHADOW_LOOKBACK_SESSIONS`` sessions, 2 years at the default
     N = 160 — derived, so changing ``divergence.shadow_warmup_sessions``
     cannot leave the fetch short. A shorter fetch is not silently tolerated:
-    the shadow raises ``ShadowWarmupTruncated`` and the monitor reports the
-    feed absent. A tagged run produces no shadow and fetches what the live
+    each sleeve it cannot warm up raises ``ShadowWarmupTruncated``, is named
+    in the artifact's ``replay_failed``, and is recorded NO_DATA by the
+    monitor. A tagged run produces no shadow and fetches what the live
     signals need.
 
     The deeper fetch leaves live decisions unchanged: every lookback is a
@@ -309,9 +310,12 @@ def produce_shadow_artifact(
     sessions each replay trades before its window so the window opens on the
     model's own book. Part of the fingerprint. The artifact records it, and
     each sleeve's ``warm_from`` and invested fraction at the window's start.
-    Bars too short for it raise ``ShadowWarmupTruncated`` (no artifact is
-    written; the monitor reports the feed absent) rather than grading a
-    shorter warm-up under the same ``baseline_id``.
+    A sleeve whose bars are too short for it raises ``ShadowWarmupTruncated``
+    rather than grading a shorter warm-up under the same ``baseline_id``. The
+    failure is contained to that sleeve — each sleeve's window comes from its
+    own live history, so truncation need not hit every sleeve — and named in
+    the artifact's ``replay_failed``; the monitor records the sleeve NO_DATA
+    with that reason. The other sleeves are written as usual.
 
     Returns the path written. Raises on failure: the caller decides whether a
     shadow failure is worth stopping the paper run for, and at 05:15 it is not.
@@ -339,7 +343,12 @@ def produce_shadow_artifact(
         warmup_sessions=warmup_sessions,
         lookback_sessions=lookback_sessions,
     )
-    series = {name: replay.curve for name, replay in replays.items()}
+    series = {
+        name: replay.curve for name, replay in replays.items() if replay.curve
+    }
+    replay_failed = {
+        name: replay.error for name, replay in replays.items() if replay.error
+    }
     # The session this shadow speaks for is the last US session LIVE valued
     # (live is keyed by session_date since KAN-103), not today's wall-clock
     # date: a Tuesday 04:15 run speaks for Monday, and the monitor dates its
@@ -372,7 +381,9 @@ def produce_shadow_artifact(
                 "invested_at_window_start": replay.invested_at_start,
             }
             for name, replay in replays.items()
+            if not replay.error
         },
+        replay_failed=replay_failed,
     )
     return output_path
 
@@ -2558,9 +2569,15 @@ def main() -> int | None:
                 print(f"  Shadow series written to {shadow_path}")
                 # KAN-105: the window should open on the model's warm book.
                 # A sleeve near 0% here is the symptom the warm-up fixed.
+                written = load_shadow(shadow_path)
+                for name, reason in sorted(written.replay_failed.items()):
+                    print(
+                        f"  WARNING: shadow replay failed for {name} ({reason})"
+                        " — divergence will record it NO_DATA today"
+                    )
                 invested = {
                     name: detail.get("invested_at_window_start")
-                    for name, detail in load_shadow(shadow_path).seeding.items()
+                    for name, detail in written.seeding.items()
                 }
                 if invested:
                     print("  Shadow invested at window start: " + ", ".join(

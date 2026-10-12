@@ -148,10 +148,13 @@ monitor grades against that, so `window_end` is the current session.
   function is never called before the warm-up starts. Before KAN-105 it was fed
   the pre-window bars with its buys refused, and because the sleeves record a
   lot when they *emit* a buy, every window opened in cash on a phantom book.
-  The 05:15 fetch is derived from N (2 years at 160). Bars too short for the
-  warm-up raise in the paper run, which writes no artifact, so the feed reads
-  as absent (exit 3) rather than as a shorter warm-up under the same id. The
-  artifact records `warmup_sessions` and, per sleeve, `warm_from` and
+  The 05:15 fetch is derived from N (2 years at 160). A sleeve whose bars are
+  too short for its warm-up (or whose replay fails for any other reason) gets
+  no curve, never a shorter warm-up under the same id. It is named with the
+  reason in the artifact's `replay_failed`, and the monitor records it
+  `NO_DATA` with that reason first (exit 5, or 3 if nothing is left to grade).
+  The other sleeves are graded as usual. The artifact also records
+  `warmup_sessions` and, per sleeve, `warm_from` and
   `invested_at_window_start`. See `docs/decisions/shadow-seeding-2026-10.md`.
 
 - **Mutually exclusive with `--pinned`** (exit 2). The shadow is the model

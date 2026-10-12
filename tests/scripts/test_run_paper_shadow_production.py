@@ -195,7 +195,13 @@ def test_the_artifact_records_the_warm_up_and_each_sleeves_seeding(tmp_path) -> 
     warm_from = SESSIONS[-WINDOW - 160].isoformat()
     for sleeve, detail in artifact.seeding.items():
         assert detail["warm_from"] == warm_from, sleeve
-        assert 0.0 <= detail["invested_at_window_start"] <= 1.5, sleeve
+        # The pre-KAN-105 replay opened every window at 0% by construction
+        # (buys refused before ws fill at ws+1 at the earliest). On this
+        # rising, all-bull fixture every sleeve's warm book is invested
+        # (measured 30-63%).
+        assert 0.25 <= detail["invested_at_window_start"] <= 1.0, (
+            sleeve, detail)
+    assert artifact.replay_failed == {}
 
 
 def test_a_different_warm_up_files_under_a_different_id(tmp_path) -> None:
@@ -207,13 +213,36 @@ def test_a_different_warm_up_files_under_a_different_id(tmp_path) -> None:
     assert default.shadow_id != shorter.shadow_id
 
 
-def test_bars_too_short_for_the_warm_up_raise_and_write_nothing(tmp_path) -> None:
-    """A one-year fetch cannot hold 30 + 160 + 200 sessions. The caller logs
-    the failure and the monitor reports the feed absent — never a shorter
-    warm-up under the same id."""
-    from backtest.shadow_series import ShadowWarmupTruncated
+def test_bars_too_short_for_the_warm_up_are_named_never_graded(tmp_path) -> None:
+    """A one-year fetch cannot hold 30 + 160 + 200 sessions. No sleeve gets a
+    curve — never a shorter warm-up under the same id — and each is named
+    with the reason, which the monitor records as NO_DATA (exit 3 when no
+    sleeve is left to grade)."""
+    from shared.universe import ACTIVE_SLEEVES
 
     year = {t: bars[-250:] for t, bars in _universe_bars().items()}
-    with pytest.raises(ShadowWarmupTruncated):
-        _produce(tmp_path, bars_by_ticker=year)
-    assert not (tmp_path / "shadow_20260524.json").exists()
+    artifact = load_shadow(_produce(tmp_path, bars_by_ticker=year))
+
+    assert artifact.series == {}
+    assert artifact.seeding == {}
+    assert set(artifact.replay_failed) == set(ACTIVE_SLEEVES)
+    for reason in artifact.replay_failed.values():
+        assert reason.startswith("ShadowWarmupTruncated: ")
+
+
+def test_one_sleeves_failure_does_not_blank_the_others(tmp_path) -> None:
+    """Each sleeve's window comes from its own live history, so truncation
+    can hit one sleeve alone. Before isolation one raise lost all six feeds."""
+    from shared.universe import ACTIVE_SLEEVES
+
+    live = _live_equity()
+    # Its book stopped early: its window opens 170 sessions in, too early for
+    # 160 + 200.
+    live["sector_rotation"] = {d: 10_000.0 for d in SESSIONS[:200]}
+
+    artifact = load_shadow(_produce(tmp_path, live_equity=live))
+
+    assert set(artifact.replay_failed) == {"sector_rotation"}
+    assert "ShadowWarmupTruncated" in artifact.replay_failed["sector_rotation"]
+    assert set(artifact.series) == set(ACTIVE_SLEEVES) - {"sector_rotation"}
+    assert "sector_rotation" not in artifact.seeding

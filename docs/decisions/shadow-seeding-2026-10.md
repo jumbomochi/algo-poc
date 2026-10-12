@@ -28,7 +28,8 @@ model over a window, is the "model" side the model?
   then flow-adjusted as before.
 - Bars that cannot hold the warm-up plus 200 sessions of indicator history
   raise `ShadowWarmupTruncated`. They are never silently degraded to a
-  shorter warm-up.
+  shorter warm-up. The failure is contained to the sleeve it hit, named in
+  the artifact's `replay_failed`, and recorded NO_DATA by the monitor.
 - The paper run's fetch is derived from N: 30 + N + 200 sessions, which is
   2 years at N = 160 (it was 1).
 - `divergence.shadow_warmup_sessions: 160` in `config/default.yaml`. The
@@ -183,10 +184,30 @@ basis_nav)`. It learns its own NAV at the anchor session's close and scales
 every later flow by `nav(anchor) / basis_nav` before applying it. The result
 is identical to the two-pass definition built from fresh signal functions
 (`tests/backtest/test_shadow_capital_flows.py::test_the_one_pass_replay_equals_the_two_pass_definition`).
-A flow that would apply on or before the anchor raises: its scale does not
-exist yet. Flows on or before ws are already inside live's NAV there, and the
-normalisation absorbs them. `capital_adjustments` is empty today, so no
-current window is affected.
+The runner refuses a flow that would apply on or before the anchor, because
+its scale does not exist yet. `replay_window` therefore replays only flows
+strictly after the anchor, which is the first bar session on or after ws.
+Flows on or before ws are already inside live's NAV there, and the
+normalisation absorbs them.
+
+When the bars lack live's first window session, the anchor is the next bar
+session. A flow dated in (ws, anchor] is then absorbed too. That is correct
+for what the monitor grades:
+
+- The monitor intersects the two curves, so the first session it compares is
+  the anchor.
+- Live's value there already contains the flow. The shadow's value there is
+  the normalised opening level.
+- Every return the monitor grades runs from the anchor onward, and a level
+  shift before the first compared session moves none of them.
+
+What the shadow does not reproduce, in that one case, is the flow's share of
+idle cash. That is a sizing approximation, limited to bars that are missing
+live's first window session. Replaying such a flow instead raised in the
+runner. Before `build_shadow_replays` isolated sleeves, that one raise blanked
+every sleeve's feed (found in review;
+`test_a_flow_between_live_s_first_session_and_the_bars_first_is_absorbed`).
+`capital_adjustments` is empty today, so no current window is affected.
 
 ## Data: the 2-year fetch
 
@@ -207,26 +228,30 @@ current window is affected.
   with and without a year before it, produces the identical regime and the
   identical signal from every sleeve.
 
-## When the bars are too short: raise
+## When the bars are too short: raise, contained to the sleeve
 
 `replay_window` raises `ShadowWarmupTruncated` when fewer than N + 200
-sessions precede the window. The alternative was a named `warmup_truncated`
-note in the artifact. Raising was chosen because it fits the artifact's
-existing conventions:
+sessions precede the window. A truncated warm-up must never be graded: it
+would be a different model filed under the same `baseline_id`.
 
-- `produce_shadow_artifact` is documented as "Raises on failure". The 05:15
-  run catches the exception, logs it with its message, prints a WARNING, and
-  writes no artifact. The 05:45 monitor then reports the feed as absent (exit
-  3, alert), which is the blind signal `evidence_store.blindness` already
-  derives from absence. That is loud.
-- Truncation is a property of the fetch, not of a sleeve. The calendar is the
-  union of all bars, so every sleeve is truncated together. A per-sleeve note
-  would carry no information that the run's log line does not.
-- The only per-sleeve "not graded" channel, `data_degraded`, means something
-  specific (KAN-109: no new entries were placed). The monitor's note says
-  exactly that, so reusing it would print a false reason.
-- A truncated warm-up must never be graded: it would be a different model
-  filed under the same `baseline_id`.
+The calendar is the union of all bars and is shared, but each sleeve's
+`window_start` comes from its own live history. Truncation can therefore hit
+one sleeve and not another, for example a sleeve whose book stopped recording
+early. So the failure is contained per sleeve:
+
+- `build_shadow_replays` catches any replay failure, logs it, and returns
+  that sleeve with no curve and the reason. The other sleeves are replayed as
+  usual. This was added in review: one raise used to propagate and blank all
+  six feeds.
+- The artifact names the failure in `replay_failed` (`{sleeve:
+  "<ExceptionType>: <message>"}`), and the paper log prints a WARNING per
+  sleeve.
+- The monitor records that sleeve NO_DATA, with the reason as the first note
+  and dated by the shadow's session. It is persisted as "ran, could not
+  judge" in the same way as a KAN-109 sleeve. The run exits 5 (partially
+  graded, alert naming the sleeve and why), or 3 if nothing is left to grade.
+- `data_degraded` was not reused for this. Its note says something specific
+  (KAN-109: no new entries were placed), which would be a false reason here.
 
 ## Re-grade
 
@@ -272,6 +297,13 @@ Earlier windows straddle the 07-25 bulk close and the 08-01 restart.
   (+0.27..+0.42 under every seeding) are live's own. Live momentum was 16%
   invested until 09-17, and its book does not move like the model's
   (KAN-103, KAN-85/94/95/96).
+- **The first Monday evidence digest after deploy may list that week's
+  earlier sessions as BLIND.** With no epoch open,
+  `scripts/ops/evidence_digest.py` (`_blind_pins`) judges blindness against
+  the newest `baseline_id` it finds in the week. The sessions filed before the
+  switch sit under the old id, so they read as having no verdict. This is
+  cosmetic for that one digest. The rows exist, and the next full week is
+  clean.
 - **thematic_momentum is expected to BREACH under the new baseline.** This is
   real under-investment. Live sat at about 42% invested from the restart to
   mid-September, while the warmed model was 70–90% invested through a rally.
@@ -313,13 +345,13 @@ Earlier windows straddle the 07-25 bulk close and the 08-01 restart.
 
 ## Reproducing
 
-From the repo root, with the password loaded from the keychain mirror in the
-same shell and never echoed:
+From the repo root. The password is loaded from the keychain mirror and the
+URL is built inline for the one command that needs it, so it is never
+exported to the shell or echoed. The re-grade itself needs no database:
 
 ```bash
-source deploy/launchd/secrets.sh; algo_load_secrets POSTGRES_PASSWORD
-export ALGO_DATABASE_URL="postgresql://algo:${POSTGRES_PASSWORD}@localhost:55432/algo_poc"
-unset POSTGRES_PASSWORD
+source deploy/launchd/secrets.sh; algo_load_secrets POSTGRES_PASSWORD; \
+ALGO_DATABASE_URL="postgresql://algo:${POSTGRES_PASSWORD}@localhost:55432/algo_poc" \
 PYTHONPATH=. python docs/decisions/assets/kan-105/extract_inputs.py --out /tmp/kan105
 PYTHONPATH=. python docs/decisions/assets/kan-105/regrade.py --inputs /tmp/kan105 --warmups 160,max
 PYTHONPATH=. python docs/decisions/assets/kan-105/regrade.py --inputs /tmp/kan105 --warmups 0,20,60,120,160,250,max

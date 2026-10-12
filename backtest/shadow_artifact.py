@@ -124,6 +124,11 @@ class ShadowArtifact:
     #: ``invested_at_window_start`` — how invested the model's own book was
     #: when grading began. Empty on artifacts written before the field existed.
     seeding: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: KAN-105: sleeves whose replay raised in the producing run, with
+    #: ``"<ExceptionType>: <message>"``. They have no curve; the monitor
+    #: records each NO_DATA with the reason first. Empty on artifacts written
+    #: before the field existed.
+    replay_failed: dict[str, str] = field(default_factory=dict)
 
 
 def shadow_id_for(
@@ -208,6 +213,7 @@ def dump_shadow(
     data_degraded: Mapping[str, str] | None = None,
     warmup_sessions: int | None = None,
     seeding: Mapping[str, Mapping[str, Any]] | None = None,
+    replay_failed: Mapping[str, str] | None = None,
 ) -> None:
     """Write the shadow artifact.
 
@@ -230,6 +236,7 @@ def dump_shadow(
         "seeding": {
             sleeve: dict(detail) for sleeve, detail in sorted((seeding or {}).items())
         },
+        "replay_failed": dict(sorted((replay_failed or {}).items())),
         "series": {
             sleeve: {session.isoformat(): value for session, value in curve.items()}
             for sleeve, curve in series.items()
@@ -282,5 +289,8 @@ def load_shadow(path: str | Path) -> ShadowArtifact:
         ),
         seeding={
             str(k): dict(v) for k, v in (raw.get("seeding") or {}).items()
+        },
+        replay_failed={
+            str(k): str(v) for k, v in (raw.get("replay_failed") or {}).items()
         },
     )

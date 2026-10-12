@@ -764,6 +764,34 @@ def apply_data_degraded(
     return report
 
 
+def apply_replay_failed(
+    report: PortfolioDivergenceReport,
+    reason: str,
+    *,
+    session: date | None = None,
+) -> PortfolioDivergenceReport:
+    """Record a sleeve whose shadow replay raised in the 05:15 run (KAN-105).
+
+    ``build_shadow_replays`` contains a replay failure to its sleeve — most
+    likely ``ShadowWarmupTruncated``, a fetch too short for that sleeve's
+    warm-up — so the other sleeves are still graded. This sleeve has no
+    curve, so it is NO_DATA ("ran, could not judge"), the reason goes FIRST in
+    the notes (the line the exit-5 alert quotes), and it is dated by the
+    shadow's session so the verdict is persisted rather than read as absence,
+    the same contract :func:`apply_data_degraded` keeps.
+    """
+    if report.window_end is None and session is not None:
+        report.window_end = session
+    report.status = "NO_DATA"
+    report.baseline_comparable = False
+    report.notes.insert(
+        0,
+        f"shadow replay failed (KAN-105): {reason} — not graded; see the "
+        "05:15 paper log",
+    )
+    return report
+
+
 def note_data_gaps(
     report: PortfolioDivergenceReport,
     live: dict[date, float],
@@ -1402,9 +1430,17 @@ def main() -> int:
             shadow_artifact.data_degraded.get(name)
             if shadow_artifact is not None else None
         )
+        failed_reason = (
+            shadow_artifact.replay_failed.get(name)
+            if shadow_artifact is not None else None
+        )
         if degraded_reason is not None:
             report = apply_data_degraded(
                 report, degraded_reason, session=shadow_artifact.session_date
+            )
+        elif failed_reason is not None:
+            report = apply_replay_failed(
+                report, failed_reason, session=shadow_artifact.session_date
             )
         elif args.shadow:
             report = apply_shadow_comparability(

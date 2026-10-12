@@ -390,3 +390,26 @@ def test_a_flow_the_runner_cannot_scale_yet_is_refused():
             _warm_bars(rally=False), _enter_once(), _Approve(),
             cash_flows={WARM_WS: CREDIT}, cash_flow_basis=(WARM_WS, SEED),
         )
+
+
+def test_a_flow_between_live_s_first_session_and_the_bars_first_is_absorbed():
+    """KAN-105 review. When the bars lack live's first window session, the
+    replay's anchor is the next bar session. A flow dated in (ws, anchor] has
+    no replayed session before the anchor's close, and replaying it raised
+    "cash flow applied on X, on or before the basis session X" — which, with
+    no per-sleeve isolation, blanked every sleeve. It is part of the opening
+    level instead: the monitor's comparison starts at the anchor."""
+    bars = _warm_bars(rally=True)
+    ws = WARM_WS
+    anchor = WARM_DAYS[WARM_DAYS.index(ws) + 1]
+    gapped = {TICKER: [b for b in bars[TICKER] if b["date"] != ws]}
+
+    plain = _warm_replay(_enter_once(), gapped).curve
+    absorbed = _warm_replay(_enter_once(), gapped, {anchor: CREDIT}).curve
+
+    assert min(plain) == anchor
+    assert absorbed == plain
+    assert absorbed[anchor] == pytest.approx(SEED)
+    # A later flow in the same gapped window is still replayed.
+    later = _warm_replay(_enter_once(), gapped, {WARM_FLOW: CREDIT}).curve
+    assert later.keys() == plain.keys()
