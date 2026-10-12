@@ -13,7 +13,18 @@ start), so live holds the credit as idle cash through the rally.
 
 "Live" here is the same model run through the same runner with the credit
 injected — the book live would hold if it followed the model exactly — so any
-divergence below is manufactured by the seeding rule alone.
+divergence below is manufactured by the seeding rule alone. Those scenarios
+run with no warm-up (a clean cold start at the window), which is where the
+KAN-113 rule was defined.
+
+KAN-105 adds a warm-up: the replay trades before the window, so its NAV on the
+window's first session is no longer live's, and the curve is normalised by
+``k = seed / nav(ws)``. A flow inside the window is then scaled by ``1/k`` so
+it is the same fraction of the shadow's book as of live's. The last section
+pins that against the two-pass definition (learn nav(ws), then replay with the
+scaled flow) built from FRESH signal functions — the replay does it in one
+pass, because a second pass over the same stateful signal function would
+start from the first pass's private book.
 """
 from __future__ import annotations
 
@@ -27,7 +38,11 @@ from backtest.costs import CostModel
 from backtest.divergence import build_report
 from backtest.runner import BacktestRunner
 from backtest.shadow_artifact import dump_shadow
-from backtest.shadow_series import build_shadow_series, replay_window
+from backtest.shadow_series import (
+    build_shadow_series,
+    replay_window,
+    replay_window_detail,
+)
 from backtest.simulator import SimulatedExecutor
 from shared.capital_flows import flow_adjust
 
@@ -36,6 +51,8 @@ DAYS = [date(2026, 9, 1) + timedelta(days=i) for i in range(20)]
 WINDOW_START = DAYS[2]
 FLOW_SESSION = DAYS[8]
 SEED = 10_000.0
+#: The KAN-113 scenarios are defined on a cold start at the window.
+COLD = {"warmup_sessions": 0, "lookback_sessions": 0}
 #: 20% of the post-credit book: 2,500 / 12,500.
 CREDIT = 2_500.0
 
@@ -75,6 +92,7 @@ def _replay(seed, cash_flows=None):
     return replay_window(
         bars_by_ticker=BARS, signals_fn=_signals, risk_engine=_Approve(),
         seed_nav=seed, window_start=WINDOW_START, cash_flows=cash_flows,
+        **COLD,
     )
 
 
@@ -182,7 +200,8 @@ def test_a_no_flow_shadow_artifact_is_byte_identical(tmp_path):
     def artifact(name, **kwargs):
         series = build_shadow_series(
             portfolios={"momentum": sleeve}, bars_by_ticker=BARS,
-            live_equity=live, window_sessions=len(DAYS) - 2, **kwargs,
+            live_equity=live, window_sessions=len(DAYS) - 2, **COLD,
+            **kwargs,
         )
         path = tmp_path / name
         dump_shadow(path, series=series, shadow_id="shadow:abc",
@@ -209,6 +228,7 @@ def test_a_transfer_is_injected_into_both_sleeves():
     series = build_shadow_series(
         portfolios={"momentum": sleeve, "sector_rotation": sleeve},
         bars_by_ticker=BARS, live_equity=live, window_sessions=len(DAYS) - 2,
+        **COLD,
         cash_flows={
             "momentum": {FLOW_SESSION: 1_000.0},
             "sector_rotation": {FLOW_SESSION: -1_000.0},
@@ -219,3 +239,154 @@ def test_a_transfer_is_injected_into_both_sleeves():
         days = sorted(curve)
         i = days.index(FLOW_SESSION)
         assert curve[days[i]] / curve[days[i - 1]] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# KAN-105: a flow inside a WARMED window
+# ---------------------------------------------------------------------------
+
+WARM_DAYS = [date(2026, 6, 1) + timedelta(days=i) for i in range(40)]
+WARM_N = 10
+LOOKBACK = 5
+WARM_WS = WARM_DAYS[LOOKBACK + WARM_N]
+WARM_FROM = WARM_DAYS[LOOKBACK]
+WARM_FLOW = WARM_DAYS[25]
+
+
+def _warm_price(index: int, *, rally: bool) -> float:
+    """+1%/session through the warm-up (so the shadow's NAV at ws is NOT the
+    seed), flat to the flow, then optionally a +15% rally."""
+    ws = WARM_DAYS.index(WARM_WS)
+    flow = WARM_DAYS.index(WARM_FLOW)
+    base = 100.0 * 1.01 ** min(index, ws)
+    if rally and index > flow:
+        base *= 1 + 0.15 * (index - flow) / (len(WARM_DAYS) - 1 - flow)
+    return base
+
+
+def _warm_bars(*, rally: bool) -> dict[str, list[dict]]:
+    return {TICKER: [
+        {"date": d, "open": _warm_price(i, rally=rally),
+         "high": _warm_price(i, rally=rally), "low": _warm_price(i, rally=rally),
+         "close": _warm_price(i, rally=rally), "volume": 1_000_000}
+        for i, d in enumerate(WARM_DAYS)
+    ]}
+
+
+def _enter_once():
+    """Everything in at the warm-up's first session; never again."""
+    def fn(ticker, bars):
+        if bars[-1]["date"] != WARM_FROM:
+            return None
+        return {"action": "buy", "ticker": ticker, "quantity": 1e9,
+                "limit_price": bars[-1]["close"] * 1.02, "sector": "Tech"}
+    return fn
+
+
+def _enter_every_session():
+    """Buys with all its cash every session: deploys a credit the next open."""
+    def fn(ticker, bars):
+        return {"action": "buy", "ticker": ticker, "quantity": 1e9,
+                "limit_price": bars[-1]["close"] * 1.02, "sector": "Tech"}
+    return fn
+
+
+def _warm_replay(signals_fn, bars, flows=None):
+    return replay_window_detail(
+        bars_by_ticker=bars, signals_fn=signals_fn, risk_engine=_Approve(),
+        seed_nav=SEED, window_start=WARM_WS, cash_flows=flows,
+        warmup_sessions=WARM_N, lookback_sessions=LOOKBACK,
+    )
+
+
+def test_a_warmed_shadow_returns_a_flow_free_curve():
+    """Flat prices through the window and the credit left idle: the raw book
+    steps up by the credit, the returned curve does not move at all."""
+    replay = _warm_replay(_enter_once(), _warm_bars(rally=False),
+                          {WARM_FLOW: CREDIT})
+
+    assert replay.warm_from == WARM_FROM
+    curve = replay.curve
+    days = sorted(curve)
+    for prev, day in zip(days, days[1:]):
+        assert curve[day] / curve[prev] == pytest.approx(1.0, abs=1e-12)
+
+
+def test_a_flow_inside_a_warmed_window_keeps_its_capacity_ratio():
+    """Live's credit is 25% of live's NAV at ws; the shadow receives 25% of
+    ITS NAV at ws, which the warm-up has grown away from the seed."""
+    bars = _warm_bars(rally=False)
+    result = BacktestRunner(SimulatedExecutor(CostModel()),
+                            initial_capital=SEED).run(
+        bars, _enter_once(), _Approve(), trade_start_date=WARM_FROM,
+        cash_flows={WARM_FLOW: CREDIT}, cash_flow_basis=(WARM_WS, SEED),
+    )
+    eod = dict(zip(result.dates, result.portfolio_values[1:]))
+
+    assert eod[WARM_WS] > SEED * 1.05  # the warm-up moved the book
+    [(session, applied)] = result.cash_flows_applied.items()
+    assert session == WARM_FLOW
+    assert applied / eod[WARM_WS] == pytest.approx(CREDIT / SEED, rel=1e-12)
+
+
+def test_the_one_pass_replay_equals_the_two_pass_definition():
+    """The investigation's definition: replay once to learn nav(ws), then
+    replay again with each in-window flow scaled by nav(ws)/seed, normalise,
+    flow-adjust. Built here from FRESH signal functions for each pass."""
+    bars = _warm_bars(rally=True)
+
+    def run(flows):
+        return BacktestRunner(SimulatedExecutor(CostModel()),
+                              initial_capital=SEED).run(
+            bars, _enter_every_session_from_warm(), _Approve(),
+            trade_start_date=WARM_FROM, cash_flows=flows,
+        )
+
+    first = run(None)
+    nav_ws = dict(zip(first.dates, first.portfolio_values[1:]))[WARM_WS]
+    k = SEED / nav_ws
+    second = run({WARM_FLOW: CREDIT / k})
+    raw = {d: v * k for d, v in zip(second.dates, second.portfolio_values[1:])
+           if d >= WARM_WS}
+    included = {d: (CREDIT if d >= WARM_FLOW else 0.0) for d in raw}
+    expected = flow_adjust(raw, included)
+
+    got = _warm_replay(_enter_every_session_from_warm(), bars,
+                       {WARM_FLOW: CREDIT}).curve
+
+    assert got.keys() == expected.keys()
+    for day in expected:
+        assert got[day] == pytest.approx(expected[day], rel=1e-12)
+    # And the scaling is load-bearing: the unscaled credit is a different book.
+    unscaled = run({WARM_FLOW: CREDIT})
+    assert unscaled.portfolio_values[-1] != pytest.approx(
+        second.portfolio_values[-1])
+
+
+def _enter_every_session_from_warm():
+    fn = _enter_every_session()
+
+    def gated(ticker, bars):
+        return None if bars[-1]["date"] < WARM_FROM else fn(ticker, bars)
+    return gated
+
+
+def test_flows_on_or_before_the_window_are_absorbed_by_the_normalisation():
+    """Live's NAV at ws already contains them; replaying them would count
+    them twice."""
+    bars = _warm_bars(rally=True)
+    plain = _warm_replay(_enter_once(), bars).curve
+
+    assert _warm_replay(_enter_once(), bars,
+                        {WARM_WS: CREDIT, WARM_DAYS[8]: 500.0}).curve == plain
+
+
+def test_a_flow_the_runner_cannot_scale_yet_is_refused():
+    """The scale is learned at the basis session's close; a flow applied on
+    or before it would be sized on a number that does not exist yet."""
+    with pytest.raises(ValueError, match="basis session"):
+        BacktestRunner(SimulatedExecutor(CostModel()),
+                       initial_capital=SEED).run(
+            _warm_bars(rally=False), _enter_once(), _Approve(),
+            cash_flows={WARM_WS: CREDIT}, cash_flow_basis=(WARM_WS, SEED),
+        )

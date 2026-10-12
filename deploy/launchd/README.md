@@ -34,7 +34,7 @@ chain now starts at 05:15, after the close in both seasons:
 |---|---|---|---|---|
 | `local.algo-earnings-refresh` | 04:45 | daily | 16:45 / 15:45 | ~4 min free tier (bounded at 15 min → ends by 05:00) |
 | `local.algo-earnings-topup` | 05:05 | daily | 17:05 / 16:05 | <1 min (bounded at 8 min → ends by 05:13) |
-| `local.algo-paper-trading` | 05:15 | Tue–Sat | 17:15 / 16:15 | 6–9 min (bounded at 3h) |
+| `local.algo-paper-trading` | 05:15 | Tue–Sat | 17:15 / 16:15 | 9–13 min since KAN-105's 2-year fetch, was 6–9 (bounded at 3h) |
 | `local.algo-divergence-monitor` | 05:45 | Tue–Sat | 17:45 / 16:45 | seconds |
 | `local.algo-pipeline-report` | 05:52 | Tue–Sat | 17:52 / 16:52 | seconds |
 | `local.algo-db-backup` | 06:15 | daily | — | ~1 s |
@@ -63,7 +63,8 @@ session and no way back once it shuts:
 | 05:15 under EST | from the failure to ~22:00 | 22:30 SGT |
 
 - **Start the catch-up at least 30 minutes before the open.** The fetch takes
-  6–9 min, and a fetch that runs past 09:30 ET gets today's forming bar. The
+  9–13 min (2 years of bars since KAN-105), and a fetch that runs past 09:30
+  ET gets today's forming bar. The
   guard's second half then refuses it (exit 4) *after* it has written a
   capital snapshot and a reconciliation reading. Both are true pre-open broker
   readings and the next good run supersedes them

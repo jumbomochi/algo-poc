@@ -26,7 +26,10 @@ from backtest.shadow_artifact import load_shadow
 from scripts.run_paper import produce_shadow_artifact
 
 
-SESSIONS = [date(2026, 1, 5) + timedelta(days=i) for i in range(140)]
+#: Long enough for the production warm-up (KAN-105): the window (30), the
+#: 160-session warm-up and 200 sessions of indicator history before it. The
+#: replay runs at its production defaults here, not at test-sized ones.
+SESSIONS = [date(2026, 1, 5) + timedelta(days=i) for i in range(400)]
 WINDOW = 30
 
 
@@ -153,13 +156,13 @@ def test_no_live_history_at_all_writes_an_empty_but_valid_artifact(tmp_path) -> 
 def test_whole_share_sizing_reaches_the_replay(tmp_path, monkeypatch) -> None:
     import scripts.run_paper as run_paper
     seen = {}
-    real = run_paper.build_shadow_series
+    real = run_paper.build_shadow_replays
 
     def spy(**kwargs):
         seen["whole_shares"] = kwargs.get("whole_shares")
         return real(**kwargs)
 
-    monkeypatch.setattr(run_paper, "build_shadow_series", spy)
+    monkeypatch.setattr(run_paper, "build_shadow_replays", spy)
     _produce(tmp_path, whole_shares=True)
     assert seen["whole_shares"] is True
 
@@ -175,3 +178,42 @@ def test_a_rung0_shadow_is_filed_under_its_own_id(tmp_path) -> None:
 
     assert set(rung0.series) == {"momentum"}
     assert rung0.shadow_id != fractional.shadow_id
+
+
+# ---------------------------------------------------------------------------
+# KAN-105 — the warm-up
+# ---------------------------------------------------------------------------
+
+
+def test_the_artifact_records_the_warm_up_and_each_sleeves_seeding(tmp_path) -> None:
+    from shared.universe import ACTIVE_SLEEVES
+
+    artifact = load_shadow(_produce(tmp_path))
+
+    assert artifact.warmup_sessions == 160
+    assert set(artifact.seeding) == set(ACTIVE_SLEEVES)
+    warm_from = SESSIONS[-WINDOW - 160].isoformat()
+    for sleeve, detail in artifact.seeding.items():
+        assert detail["warm_from"] == warm_from, sleeve
+        assert 0.0 <= detail["invested_at_window_start"] <= 1.5, sleeve
+
+
+def test_a_different_warm_up_files_under_a_different_id(tmp_path) -> None:
+    default = load_shadow(_produce(tmp_path, output_path=tmp_path / "a.json"))
+    shorter = load_shadow(_produce(tmp_path, output_path=tmp_path / "b.json",
+                                   warmup_sessions=120))
+
+    assert shorter.warmup_sessions == 120
+    assert default.shadow_id != shorter.shadow_id
+
+
+def test_bars_too_short_for_the_warm_up_raise_and_write_nothing(tmp_path) -> None:
+    """A one-year fetch cannot hold 30 + 160 + 200 sessions. The caller logs
+    the failure and the monitor reports the feed absent — never a shorter
+    warm-up under the same id."""
+    from backtest.shadow_series import ShadowWarmupTruncated
+
+    year = {t: bars[-250:] for t, bars in _universe_bars().items()}
+    with pytest.raises(ShadowWarmupTruncated):
+        _produce(tmp_path, bars_by_ticker=year)
+    assert not (tmp_path / "shadow_20260524.json").exists()

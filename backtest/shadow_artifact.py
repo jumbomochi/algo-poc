@@ -33,6 +33,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping
 
+from backtest.shadow_series import SHADOW_WARMUP_SESSIONS
 from services.risk_management.funding import DEFAULT_SLEEVE_CASH_BUFFER_BPS
 
 #: Prefix so a reader of an evidence row can tell a rolling-shadow identity from
@@ -62,6 +63,17 @@ SHADOW_DATING_VERSION = "session_date"
 #: enter the fingerprint, and every verdict after the switch files under a new
 #: ``baseline_id``.
 SHADOW_FUNDING_VERSION = "sleeve_cash"
+
+#: How the replay opens its window (KAN-105). ``gated:curve-normalised``: the
+#: signal function is never called before the warm-up's first session, the
+#: replay trades from there, and the curve (not the book) is scaled to live's
+#: NAV on the window's first session. Before it the warm-up bars reached the
+#: signal function with their buys refused, so every window opened on a
+#: phantom book and in cash (docs/decisions/shadow-seeding-2026-10.md). The
+#: version and the warm-up length both enter the fingerprint, so every verdict
+#: after the switch — and after any change of N — files under a new
+#: ``baseline_id``; momentum's recorded BREACH streak restarts with it.
+SHADOW_SEEDING_VERSION = "gated:curve-normalised"
 
 
 @dataclass(frozen=True)
@@ -105,6 +117,13 @@ class ShadowArtifact:
     #: monitor records each as NO_DATA with that reason instead of grading it.
     #: Empty on artifacts written before the field existed.
     data_degraded: dict[str, str] = field(default_factory=dict)
+    #: KAN-105: the warm-up the replay traded before each window. ``None`` on
+    #: artifacts written before the field existed (they were not warmed).
+    warmup_sessions: int | None = None
+    #: KAN-105: per sleeve, ``warm_from`` (ISO date) and
+    #: ``invested_at_window_start`` — how invested the model's own book was
+    #: when grading began. Empty on artifacts written before the field existed.
+    seeding: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def shadow_id_for(
@@ -112,6 +131,7 @@ def shadow_id_for(
     *,
     whole_shares: bool = False,
     cash_buffer_bps: float = DEFAULT_SLEEVE_CASH_BUFFER_BPS,
+    warmup_sessions: int = SHADOW_WARMUP_SESSIONS,
 ) -> str:
     """Stable identity for the model that produced a shadow.
 
@@ -130,6 +150,11 @@ def shadow_id_for(
     :data:`SHADOW_FUNDING_VERSION` and ``cash_buffer_bps`` always enter it
     (KAN-111), for the same reason: a replay that funds entries from the
     sleeve's cash is a different model from one that could borrow to 150%.
+
+    :data:`SHADOW_SEEDING_VERSION` and ``warmup_sessions`` always enter it
+    (KAN-105): a window opened on the model's warmed book is a different
+    comparison from one opened in cash on a phantom book, and a different N
+    is a different warm book.
 
     Raises:
         ValueError: A sleeve exposes no ``shadow_params``. Defaulting to an
@@ -161,6 +186,9 @@ def shadow_id_for(
     fingerprint.append(
         ("__funding__", f"{SHADOW_FUNDING_VERSION}@{float(cash_buffer_bps):g}bps")
     )
+    fingerprint.append(
+        ("__seeding__", f"warm{int(warmup_sessions)}:{SHADOW_SEEDING_VERSION}")
+    )
     digest = hashlib.sha256(
         json.dumps(fingerprint, sort_keys=True).encode()
     ).hexdigest()[:_DIGEST_CHARS]
@@ -178,6 +206,8 @@ def dump_shadow(
     bars_session: date | None = None,
     priced_at: datetime | None = None,
     data_degraded: Mapping[str, str] | None = None,
+    warmup_sessions: int | None = None,
+    seeding: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> None:
     """Write the shadow artifact.
 
@@ -196,6 +226,10 @@ def dump_shadow(
         "bars_session": bars_session.isoformat() if bars_session else None,
         "priced_at": priced_at.isoformat() if priced_at else None,
         "data_degraded": dict(sorted((data_degraded or {}).items())),
+        "warmup_sessions": warmup_sessions,
+        "seeding": {
+            sleeve: dict(detail) for sleeve, detail in sorted((seeding or {}).items())
+        },
         "series": {
             sleeve: {session.isoformat(): value for session, value in curve.items()}
             for sleeve, curve in series.items()
@@ -241,5 +275,12 @@ def load_shadow(path: str | Path) -> ShadowArtifact:
         ),
         data_degraded={
             str(k): str(v) for k, v in (raw.get("data_degraded") or {}).items()
+        },
+        warmup_sessions=(
+            int(raw["warmup_sessions"])
+            if raw.get("warmup_sessions") is not None else None
+        ),
+        seeding={
+            str(k): dict(v) for k, v in (raw.get("seeding") or {}).items()
         },
     )

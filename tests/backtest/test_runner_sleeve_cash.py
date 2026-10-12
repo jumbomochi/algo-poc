@@ -190,6 +190,9 @@ def test_shadow_replay_funds_entries_from_its_seed():
         risk_engine=_permissive(),
         seed_nav=10_000.0,
         window_start=D2,
+        # Five sessions hold no warm-up: a clean cold start at D2 (KAN-105).
+        warmup_sessions=0,
+        lookback_sessions=0,
     )
 
     # With 150%-style borrowing the shadow would hold 12,000 of stock on a

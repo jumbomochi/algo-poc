@@ -83,8 +83,13 @@ from backtest.portfolio_context import PortfolioContext
 from backtest.ranked_selection import ReplacementPolicy
 from backtest.aggregate_risk import AggregateRiskMonitor
 from backtest.divergence import DEFAULT_WINDOW_DAYS
-from backtest.shadow_artifact import dump_shadow, shadow_id_for
-from backtest.shadow_series import build_shadow_series
+from backtest.shadow_artifact import dump_shadow, load_shadow, shadow_id_for
+from backtest.shadow_series import (
+    SHADOW_LOOKBACK_SESSIONS,
+    SHADOW_WARMUP_SESSIONS,
+    build_shadow_replays,
+    shadow_fetch_years,
+)
 from services.risk_management.engine import RiskEngine
 from services.risk_management.funding import (
     DEFAULT_SLEEVE_CASH_BUFFER_BPS,
@@ -145,6 +150,46 @@ DATA_DRIVEN_EXIT_REASONS = frozenset({"rank_replacement"})
 #: shorten every window. A wider ad-hoc ``--window`` still works — the monitor
 #: intersects the two sides and already prints "Only N overlapping days".
 SHADOW_WINDOW_SESSIONS = DEFAULT_WINDOW_DAYS
+
+#: Years of bars the live signals need on their own: the longest lookback is
+#: the 200-session regime MA, inside one year. What a tagged run fetches.
+LIVE_SIGNAL_YEARS = 1
+
+
+def resolve_fetch_years(
+    requested: int | None,
+    *,
+    portfolio_tag: str | None,
+    warmup_sessions: int,
+) -> int:
+    """Years of bars the run fetches.
+
+    An explicit ``--years`` wins. Otherwise a graded run fetches what the
+    rolling shadow's warm-up needs (KAN-105): ``SHADOW_WINDOW_SESSIONS +
+    warmup + SHADOW_LOOKBACK_SESSIONS`` sessions, 2 years at the default
+    N = 160 — derived, so changing ``divergence.shadow_warmup_sessions``
+    cannot leave the fetch short. A shorter fetch is not silently tolerated:
+    the shadow raises ``ShadowWarmupTruncated`` and the monitor reports the
+    feed absent. A tagged run produces no shadow and fetches what the live
+    signals need.
+
+    The deeper fetch leaves live decisions unchanged: every lookback is a
+    trailing window (the 200-session regime MA, momentum's 126) that one
+    year already covers (pinned by
+    tests/scripts/test_run_paper_fetch_years.py).
+    """
+    if requested is not None:
+        return requested
+    if portfolio_tag is not None:
+        return LIVE_SIGNAL_YEARS
+    return max(
+        LIVE_SIGNAL_YEARS,
+        shadow_fetch_years(
+            window_sessions=SHADOW_WINDOW_SESSIONS,
+            warmup_sessions=warmup_sessions,
+            lookback_sessions=SHADOW_LOOKBACK_SESSIONS,
+        ),
+    )
 
 
 def live_equity_by_sleeve(state: PaperTradingState) -> dict[str, dict[date, float]]:
@@ -219,6 +264,8 @@ def produce_shadow_artifact(
     data_degraded: Mapping[str, str] | None = None,
     cash_buffer_bps: float = DEFAULT_SLEEVE_CASH_BUFFER_BPS,
     cash_flows: Mapping[str, Mapping[date, float]] | None = None,
+    warmup_sessions: int = SHADOW_WARMUP_SESSIONS,
+    lookback_sessions: int = SHADOW_LOOKBACK_SESSIONS,
 ):
     """Replay every sleeve over its rolling window and write the artifact.
 
@@ -258,6 +305,14 @@ def produce_shadow_artifact(
     flow is a fact about the book, not a model change, and a window with no
     flow inside it is replayed exactly as without the argument.
 
+    ``warmup_sessions``: KAN-105 — ``divergence.shadow_warmup_sessions``, the
+    sessions each replay trades before its window so the window opens on the
+    model's own book. Part of the fingerprint. The artifact records it, and
+    each sleeve's ``warm_from`` and invested fraction at the window's start.
+    Bars too short for it raise ``ShadowWarmupTruncated`` (no artifact is
+    written; the monitor reports the feed absent) rather than grading a
+    shorter warm-up under the same ``baseline_id``.
+
     Returns the path written. Raises on failure: the caller decides whether a
     shadow failure is worth stopping the paper run for, and at 05:15 it is not.
     """
@@ -270,7 +325,7 @@ def produce_shadow_artifact(
         earnings_lookup=earnings_lookup,
         portfolio_contexts=None,
     )
-    series = build_shadow_series(
+    replays = build_shadow_replays(
         portfolios={
             name: sleeve for name, sleeve in shadow_portfolios.items()
             if name not in degraded
@@ -281,7 +336,10 @@ def produce_shadow_artifact(
         whole_shares=whole_shares,
         cash_buffer_bps=cash_buffer_bps,
         cash_flows=cash_flows,
+        warmup_sessions=warmup_sessions,
+        lookback_sessions=lookback_sessions,
     )
+    series = {name: replay.curve for name, replay in replays.items()}
     # The session this shadow speaks for is the last US session LIVE valued
     # (live is keyed by session_date since KAN-103), not today's wall-clock
     # date: a Tuesday 04:15 run speaks for Monday, and the monitor dates its
@@ -294,6 +352,7 @@ def produce_shadow_artifact(
             shadow_portfolios,
             whole_shares=whole_shares,
             cash_buffer_bps=cash_buffer_bps,
+            warmup_sessions=warmup_sessions,
         ),
         window_sessions=window_sessions,
         session_date=max(graded_sessions) if graded_sessions else date.today(),
@@ -304,6 +363,16 @@ def produce_shadow_artifact(
         bars_session=bars_session,
         priced_at=priced_at,
         data_degraded=degraded,
+        warmup_sessions=warmup_sessions,
+        seeding={
+            name: {
+                "warm_from": (
+                    replay.warm_from.isoformat() if replay.warm_from else None
+                ),
+                "invested_at_window_start": replay.invested_at_start,
+            }
+            for name, replay in replays.items()
+        },
     )
     return output_path
 
@@ -1756,8 +1825,12 @@ def _parser(default_db_url: str, default_redis_url: str) -> argparse.ArgumentPar
     parser.add_argument(
         "--years",
         type=int,
-        default=1,
-        help="Years of historical bars for signal warmup (default: 1)",
+        default=None,
+        help=(
+            "Years of historical bars to fetch (default: derived from "
+            "divergence.shadow_warmup_sessions — 2 at N=160 — so the rolling "
+            "shadow can warm up; 1 for a tagged run)"
+        ),
     )
     parser.add_argument(
         "--init", action="store_true", help="Initialize fresh paper trading state"
@@ -2218,7 +2291,12 @@ def main() -> int | None:
     all_tickers = get_union_universe(
         [DRILL_BASE_SLEEVE] if portfolio_tag else list(CAPITAL_ALLOCATIONS.keys())
     )
-    print(f"\nFetching bars for {len(all_tickers)} tickers ({args.years} year)...")
+    fetch_years = resolve_fetch_years(
+        args.years,
+        portfolio_tag=portfolio_tag,
+        warmup_sessions=_config.divergence.shadow_warmup_sessions,
+    )
+    print(f"\nFetching bars for {len(all_tickers)} tickers ({fetch_years} year)...")
     # client_id is NOT optional here. The fetcher belongs to run_backtest and
     # defaults to 10 — the backtest's own id — so omitting it made the daily run
     # present the weekly refresh's identity on its historical-data connection.
@@ -2231,7 +2309,7 @@ def main() -> int | None:
     fetch_started_at = _utc_now()
     bars_by_ticker = fetch_bars_from_ib(
         tickers=all_tickers,
-        years=args.years,
+        years=fetch_years,
         host=args.ib_host,
         port=args.ib_port,
         client_id=args.ib_client_id,
@@ -2475,16 +2553,30 @@ def main() -> int | None:
                     priced_at=fetch_started_at,
                     data_degraded=data_degraded,
                     cash_buffer_bps=_config.currency.sleeve_cash_buffer_bps,
+                    warmup_sessions=_config.divergence.shadow_warmup_sessions,
                 )
                 print(f"  Shadow series written to {shadow_path}")
-            except Exception:
+                # KAN-105: the window should open on the model's warm book.
+                # A sleeve near 0% here is the symptom the warm-up fixed.
+                invested = {
+                    name: detail.get("invested_at_window_start")
+                    for name, detail in load_shadow(shadow_path).seeding.items()
+                }
+                if invested:
+                    print("  Shadow invested at window start: " + ", ".join(
+                        f"{name} {value:.0%}" if value is not None
+                        else f"{name} n/a"
+                        for name, value in sorted(invested.items())
+                    ))
+            except Exception as exc:
                 logger.exception(
                     "Shadow series failed; paper trading is unchanged. The "
                     "divergence monitor will report the feed as absent."
                 )
                 print(
-                    "  WARNING: shadow series failed — divergence will report "
-                    "no feed for today (paper run itself is unaffected)"
+                    f"  WARNING: shadow series failed ({type(exc).__name__}: "
+                    f"{exc}) — divergence will report no feed for today "
+                    "(paper run itself is unaffected)"
                 )
     except Exception:
         session.rollback()

@@ -304,7 +304,8 @@ def test_no_degradation_is_the_old_behaviour(state):
 # The shadow: not replayed, and named in the artifact
 # ---------------------------------------------------------------------------
 
-SESSIONS = [date(2026, 1, 5) + timedelta(days=i) for i in range(140)]
+#: Long enough for the production warm-up (KAN-105): 30 + 160 + 200.
+SESSIONS = [date(2026, 1, 5) + timedelta(days=i) for i in range(400)]
 
 
 def _universe_bars():

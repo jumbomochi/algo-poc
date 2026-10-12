@@ -267,6 +267,14 @@ class DivergenceConfig(BaseModel):
     #: Superseded by gate_epochs once epoch v2 starts (KAN-33): an open epoch's
     #: started_at wins, and the monitor reports which authority it used.
     live_history_from: date | None = None
+    #: KAN-105: sessions the rolling shadow trades before each window, so the
+    #: window opens on the model's own book rather than in cash. One N for
+    #: every sleeve. It enters the shadow's fingerprint (a change files
+    #: verdicts under a new ``baseline_id``), and the paper run derives its bar
+    #: fetch from it (``backtest.shadow_series.shadow_fetch_years``). Matches
+    #: ``backtest.shadow_series.SHADOW_WARMUP_SESSIONS``; see
+    #: docs/decisions/shadow-seeding-2026-10.md for why 160.
+    shadow_warmup_sessions: int = Field(default=160, ge=0)
 
 
 class FundamentalsCacheConfig(BaseModel):

@@ -123,6 +123,7 @@ class BacktestRunner:
         membership: MembershipCalendar | None = None,
         delisting_stale_sessions: int = DELISTING_STALE_SESSIONS,
         cash_flows: dict | None = None,
+        cash_flow_basis: tuple[Any, float] | None = None,
     ) -> BacktestResult:
         """Run a backtest over the provided bar data.
 
@@ -162,6 +163,19 @@ class BacktestRunner:
                 below zero): the replay cannot sell to fund it. The applied
                 amounts are in ``BacktestResult.cash_flows_applied``. ``None``
                 or empty leaves the run exactly as without it.
+            cash_flow_basis: KAN-105. ``(anchor_session, basis_nav)``: the
+                ``cash_flows`` are sized against a book worth ``basis_nav`` on
+                ``anchor_session`` (live's), so each one is multiplied by this
+                run's own end-of-day NAV on that session over ``basis_nav``
+                before it is applied. A flow keeps its size *relative to the
+                book* when the replay's NAV on the anchor differs from live's —
+                which it does after a warm-up, because the warm-up trades.
+                Every flow must apply strictly after the anchor (the scale is
+                not known until its close); one that would apply on or before
+                it raises ``ValueError``. Scaling inside the run, rather than a
+                first pass to learn the NAV, matters because a sleeve's signal
+                function is stateful: a second pass over the same function
+                starts with the first pass's book in its private state.
 
         Returns:
             BacktestResult with trades, portfolio_values, and metrics.
@@ -170,6 +184,9 @@ class BacktestRunner:
         cash_limited = {"downsized": 0, "skipped": 0}
         pending_flows = sorted((cash_flows or {}).items())
         flows_applied: dict = {}
+        # KAN-105: this run's NAV over live's on the basis session, learned at
+        # that session's close. ``None`` until then.
+        flow_scale: float | None = None if cash_flow_basis else 1.0
         positions: dict[str, list[_Lot]] = {}
         trades: list[dict] = []
         portfolio_values: list[float] = [self.initial_capital]
@@ -348,7 +365,13 @@ class BacktestRunner:
             # --- Phase 2b': capital flows (KAN-113), before today's decisions. ---
             while pending_flows and pending_flows[0][0] <= current_date:
                 _, amount = pending_flows.pop(0)
-                amount = float(amount)
+                if flow_scale is None:
+                    raise ValueError(
+                        f"cash flow applied on {current_date}, on or before "
+                        f"the basis session {cash_flow_basis[0]}: it cannot be "
+                        "scaled to this book before that session's close"
+                    )
+                amount = float(amount) * flow_scale
                 if amount < 0:
                     amount = -min(-amount, max(cash, 0.0))
                 cash += amount
@@ -480,6 +503,11 @@ class BacktestRunner:
                         lot.peak_price = max(lot.peak_price, mark)
             portfolio_values.append(nav)
             dates.append(current_date)
+            if (
+                flow_scale is None
+                and current_date >= cash_flow_basis[0]
+            ):
+                flow_scale = nav / float(cash_flow_basis[1])
 
         # Compute metrics
         metrics = BacktestMetrics.compute(
