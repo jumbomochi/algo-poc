@@ -291,6 +291,9 @@ def test_the_shadow_is_seeded_at_live_s_value_for_the_same_session(tmp_path):
         bars_by_ticker=bars,
         live_equity={"momentum": live["momentum"]},
         window_sessions=5,
+        # A fortnight of bars holds no warm-up; the dating is what is tested.
+        warmup_sessions=0,
+        lookback_sessions=0,
     )
 
     curve = series["momentum"]

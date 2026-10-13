@@ -94,7 +94,8 @@ transient or overwritten, so they are reports, not evidence.
   excluded and named on the console, never guessed. Verdicts from before the
   switch stay under the old shadow `baseline_id`, and new ones file under a new
   one (`SHADOW_DATING_VERSION` in the fingerprint). See
-  `docs/decisions/divergence-session-dating-2026-10.md`.
+  `docs/decisions/divergence-session-dating-2026-10.md`. KAN-105 moved the id
+  again (`SHADOW_SEEDING_VERSION` and the warm-up length), for the same reason.
 - **Keyed `(sleeve, session_date, baseline_id)`.** A re-run against the same
   baseline updates the row in place; a re-run after a rebaseline inserts new
   rows, because a verdict is only interpretable against the baseline that
@@ -140,6 +141,21 @@ exceed 1 because only one `session_date` ever existed per baseline.
 replays each sleeve's own signal function over the bars it just fetched, seeded
 at live's NAV `--window` sessions back, and writes the resulting curve. The
 monitor grades against that, so `window_end` is the current session.
+
+- **The window opens on the model's own book (KAN-105).** Each replay trades a
+  warm-up of `divergence.shadow_warmup_sessions` (160) sessions before the
+  window, and its curve is scaled so it starts at live's NAV. The signal
+  function is never called before the warm-up starts. Before KAN-105 it was fed
+  the pre-window bars with its buys refused, and because the sleeves record a
+  lot when they *emit* a buy, every window opened in cash on a phantom book.
+  The 05:15 fetch is derived from N (2 years at 160). A sleeve whose bars are
+  too short for its warm-up (or whose replay fails for any other reason) gets
+  no curve, never a shorter warm-up under the same id. It is named with the
+  reason in the artifact's `replay_failed`, and the monitor records it
+  `NO_DATA` with that reason first (exit 5, or 3 if nothing is left to grade).
+  The other sleeves are graded as usual. The artifact also records
+  `warmup_sessions` and, per sleeve, `warm_from` and
+  `invested_at_window_start`. See `docs/decisions/shadow-seeding-2026-10.md`.
 
 - **Mutually exclusive with `--pinned`** (exit 2). The shadow is the model
   replayed against live's own bars; the pin is a frozen artifact.

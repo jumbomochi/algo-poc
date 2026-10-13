@@ -153,3 +153,50 @@ def test_a_sleeve_or_window_outside_the_register_gets_no_note():
     early = _report("quality_value", date(2026, 3, 2), date(2026, 3, 31))
     note_data_gaps(early, {}, window_sessions=30)
     assert momentum.notes == [] and early.notes == []
+
+
+# ---------------------------------------------------------------------------
+# KAN-105: a sleeve whose replay failed in the 05:15 run
+# ---------------------------------------------------------------------------
+
+FAILED = ("ShadowWarmupTruncated: the bars hold 170 session(s) before the "
+          "window opening 2026-05-19")
+
+
+def _shadow_with_failed_replay(tmp_path: Path) -> Path:
+    path = _shadow(tmp_path)
+    raw = json.loads(path.read_text())
+    raw["data_degraded"] = {}
+    raw["replay_failed"] = {"quality_value": FAILED}
+    path.write_text(json.dumps(raw))
+    return path
+
+
+def test_the_artifact_round_trips_the_failed_replays(tmp_path):
+    assert load_shadow(
+        _shadow_with_failed_replay(tmp_path)
+    ).replay_failed == {"quality_value": FAILED}
+
+
+def test_a_failed_replay_is_recorded_ungraded_with_its_reason_first(tmp_path, monkeypatch):
+    """The other sleeves are still graded (exit 5, a partial); the failed one
+    is a persisted NO_DATA whose first note — the line the alert quotes —
+    names the failure."""
+    out = tmp_path / "divergence.json"
+    db_url = _db(tmp_path)
+
+    code = _run(monkeypatch, db_url=db_url,
+                shadow=_shadow_with_failed_replay(tmp_path), output=out)
+
+    reports = {r["portfolio"]: r for r in json.loads(out.read_text())["reports"]}
+    qv = reports["quality_value"]
+    assert qv["status"] == "NO_DATA"
+    assert qv["notes"][0].startswith("shadow replay failed (KAN-105): " + FAILED)
+    assert reports["momentum"]["status"] != "NO_DATA"
+    assert code == EXIT_PARTIALLY_GRADED
+
+    session = sessionmaker(bind=create_engine(db_url))()
+    rows = session.scalars(
+        select(DivergenceDaily).where(DivergenceDaily.sleeve == "quality_value")
+    ).all()
+    assert [r.status for r in rows] == ["NO_DATA"]

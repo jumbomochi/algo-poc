@@ -208,6 +208,15 @@ divergence:
   # gate_epochs row once epoch v2 starts (KAN-33).
   live_history_from: 2026-08-01
 
+  # Sessions the rolling shadow trades BEFORE each 30-session window (KAN-105),
+  # so the window opens on the model's own book instead of in cash on a phantom
+  # one. One N for every sleeve. Part of the shadow's fingerprint: changing it
+  # files every verdict under a new baseline_id. The 05:15 fetch is derived
+  # from it — 30 + N + 200 (regime MA) sessions, i.e. 2 years at 160 — so a
+  # larger N can lengthen the run. No epoch clamp: the warm-up may reach back
+  # before live_history_from. See docs/decisions/shadow-seeding-2026-10.md.
+  shadow_warmup_sessions: 160
+
 data:
   # Fundamentals / earnings caches read by quality_value and earnings_drift
   # (KAN-109). Relative paths resolve against the repository root, NOT the

@@ -26,7 +26,10 @@ from backtest.shadow_artifact import load_shadow
 from scripts.run_paper import produce_shadow_artifact
 
 
-SESSIONS = [date(2026, 1, 5) + timedelta(days=i) for i in range(140)]
+#: Long enough for the production warm-up (KAN-105): the window (30), the
+#: 160-session warm-up and 200 sessions of indicator history before it. The
+#: replay runs at its production defaults here, not at test-sized ones.
+SESSIONS = [date(2026, 1, 5) + timedelta(days=i) for i in range(400)]
 WINDOW = 30
 
 
@@ -153,13 +156,13 @@ def test_no_live_history_at_all_writes_an_empty_but_valid_artifact(tmp_path) -> 
 def test_whole_share_sizing_reaches_the_replay(tmp_path, monkeypatch) -> None:
     import scripts.run_paper as run_paper
     seen = {}
-    real = run_paper.build_shadow_series
+    real = run_paper.build_shadow_replays
 
     def spy(**kwargs):
         seen["whole_shares"] = kwargs.get("whole_shares")
         return real(**kwargs)
 
-    monkeypatch.setattr(run_paper, "build_shadow_series", spy)
+    monkeypatch.setattr(run_paper, "build_shadow_replays", spy)
     _produce(tmp_path, whole_shares=True)
     assert seen["whole_shares"] is True
 
@@ -175,3 +178,71 @@ def test_a_rung0_shadow_is_filed_under_its_own_id(tmp_path) -> None:
 
     assert set(rung0.series) == {"momentum"}
     assert rung0.shadow_id != fractional.shadow_id
+
+
+# ---------------------------------------------------------------------------
+# KAN-105 — the warm-up
+# ---------------------------------------------------------------------------
+
+
+def test_the_artifact_records_the_warm_up_and_each_sleeves_seeding(tmp_path) -> None:
+    from shared.universe import ACTIVE_SLEEVES
+
+    artifact = load_shadow(_produce(tmp_path))
+
+    assert artifact.warmup_sessions == 160
+    assert set(artifact.seeding) == set(ACTIVE_SLEEVES)
+    warm_from = SESSIONS[-WINDOW - 160].isoformat()
+    for sleeve, detail in artifact.seeding.items():
+        assert detail["warm_from"] == warm_from, sleeve
+        # The pre-KAN-105 replay opened every window at 0% by construction
+        # (buys refused before ws fill at ws+1 at the earliest). On this
+        # rising, all-bull fixture every sleeve's warm book is invested
+        # (measured 30-63%).
+        assert 0.25 <= detail["invested_at_window_start"] <= 1.0, (
+            sleeve, detail)
+    assert artifact.replay_failed == {}
+
+
+def test_a_different_warm_up_files_under_a_different_id(tmp_path) -> None:
+    default = load_shadow(_produce(tmp_path, output_path=tmp_path / "a.json"))
+    shorter = load_shadow(_produce(tmp_path, output_path=tmp_path / "b.json",
+                                   warmup_sessions=120))
+
+    assert shorter.warmup_sessions == 120
+    assert default.shadow_id != shorter.shadow_id
+
+
+def test_bars_too_short_for_the_warm_up_are_named_never_graded(tmp_path) -> None:
+    """A one-year fetch cannot hold 30 + 160 + 200 sessions. No sleeve gets a
+    curve — never a shorter warm-up under the same id — and each is named
+    with the reason, which the monitor records as NO_DATA (exit 3 when no
+    sleeve is left to grade)."""
+    from shared.universe import ACTIVE_SLEEVES
+
+    year = {t: bars[-250:] for t, bars in _universe_bars().items()}
+    artifact = load_shadow(_produce(tmp_path, bars_by_ticker=year))
+
+    assert artifact.series == {}
+    assert artifact.seeding == {}
+    assert set(artifact.replay_failed) == set(ACTIVE_SLEEVES)
+    for reason in artifact.replay_failed.values():
+        assert reason.startswith("ShadowWarmupTruncated: ")
+
+
+def test_one_sleeves_failure_does_not_blank_the_others(tmp_path) -> None:
+    """Each sleeve's window comes from its own live history, so truncation
+    can hit one sleeve alone. Before isolation one raise lost all six feeds."""
+    from shared.universe import ACTIVE_SLEEVES
+
+    live = _live_equity()
+    # Its book stopped early: its window opens 170 sessions in, too early for
+    # 160 + 200.
+    live["sector_rotation"] = {d: 10_000.0 for d in SESSIONS[:200]}
+
+    artifact = load_shadow(_produce(tmp_path, live_equity=live))
+
+    assert set(artifact.replay_failed) == {"sector_rotation"}
+    assert "ShadowWarmupTruncated" in artifact.replay_failed["sector_rotation"]
+    assert set(artifact.series) == set(ACTIVE_SLEEVES) - {"sector_rotation"}
+    assert "sector_rotation" not in artifact.seeding

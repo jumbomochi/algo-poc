@@ -254,3 +254,103 @@ def test_the_cash_buffer_is_part_of_the_model() -> None:
 
     assert shadow_id_for(roster) == shadow_id_for(roster, cash_buffer_bps=25.0)
     assert shadow_id_for(roster) != shadow_id_for(roster, cash_buffer_bps=50.0)
+
+
+# ---------------------------------------------------------------------------
+# KAN-105: a window opened on the warm book is a different comparison
+# ---------------------------------------------------------------------------
+
+
+def _pre_kan105_id(portfolios, *, whole_shares=False, cash_buffer_bps=25.0) -> str:
+    """``shadow_id_for`` exactly as it was before the seeding version."""
+    import hashlib
+
+    from backtest.shadow_artifact import (
+        SHADOW_DATING_VERSION,
+        SHADOW_FUNDING_VERSION,
+        SHADOW_ID_PREFIX,
+    )
+
+    fingerprint = sorted(
+        (name, json.dumps(s.shadow_params, sort_keys=True, default=str))
+        for name, s in portfolios.items()
+    )
+    if whole_shares:
+        fingerprint.append(("__sizing__", "whole_shares"))
+    fingerprint.append(("__dating__", SHADOW_DATING_VERSION))
+    fingerprint.append(
+        ("__funding__", f"{SHADOW_FUNDING_VERSION}@{float(cash_buffer_bps):g}bps")
+    )
+    digest = hashlib.sha256(
+        json.dumps(fingerprint, sort_keys=True).encode()
+    ).hexdigest()[:16]
+    return f"{SHADOW_ID_PREFIX}{digest}"
+
+
+@pytest.mark.parametrize("whole_shares", [False, True])
+def test_warm_seeded_shadow_files_under_a_new_baseline_id(whole_shares) -> None:
+    """Verdicts graded against a window that opened in cash on a phantom book
+    must not share a breach streak with ones graded against the warm book.
+    Momentum's recorded streak restarts here, on purpose."""
+    from backtest.shadow_artifact import SHADOW_SEEDING_VERSION
+
+    roster = _roster()
+    new = shadow_id_for(roster, whole_shares=whole_shares)
+
+    assert new != _pre_kan105_id(roster, whole_shares=whole_shares)
+    assert new.startswith("shadow:")
+    assert SHADOW_SEEDING_VERSION == "gated:curve-normalised"
+
+
+def test_the_warm_up_length_is_part_of_the_model() -> None:
+    from backtest.shadow_series import SHADOW_WARMUP_SESSIONS
+
+    roster = _roster()
+
+    assert SHADOW_WARMUP_SESSIONS == 160
+    assert shadow_id_for(roster) == shadow_id_for(roster, warmup_sessions=160)
+    assert shadow_id_for(roster) != shadow_id_for(roster, warmup_sessions=120)
+    assert shadow_id_for(roster, warmup_sessions=0) != shadow_id_for(roster)
+
+
+def test_the_warm_id_is_stable_across_runs_and_dict_order() -> None:
+    forward = _roster()
+    reversed_ = dict(reversed(list(_roster().items())))
+
+    assert shadow_id_for(forward) == shadow_id_for(_roster())
+    assert shadow_id_for(forward) == shadow_id_for(reversed_)
+    assert shadow_id_for(forward, warmup_sessions=120) == shadow_id_for(
+        reversed_, warmup_sessions=120
+    )
+
+
+def test_the_seeding_round_trips(tmp_path) -> None:
+    path = tmp_path / "shadow.json"
+    seeding = {
+        "sector_rotation": {"warm_from": "2026-01-02",
+                            "invested_at_window_start": 0.82},
+        "momentum": {"warm_from": "2026-01-02",
+                     "invested_at_window_start": 0.73},
+    }
+    dump_shadow(path, series=SERIES, shadow_id="shadow:abc", window_sessions=30,
+                session_date=SESSIONS[-1], produced_on=SESSIONS[-1],
+                warmup_sessions=160, seeding=seeding)
+
+    artifact = load_shadow(path)
+
+    assert artifact.warmup_sessions == 160
+    assert artifact.seeding == seeding
+
+
+def test_an_artifact_written_before_the_warm_up_loads_as_unwarmed(tmp_path) -> None:
+    path = tmp_path / "old.json"
+    dump_shadow(path, series=SERIES, shadow_id="shadow:abc", window_sessions=30,
+                session_date=SESSIONS[-1], produced_on=SESSIONS[-1])
+    raw = json.loads(path.read_text())
+    del raw["warmup_sessions"], raw["seeding"]
+    path.write_text(json.dumps(raw))
+
+    artifact = load_shadow(path)
+
+    assert artifact.warmup_sessions is None
+    assert artifact.seeding == {}
