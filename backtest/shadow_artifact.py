@@ -75,6 +75,20 @@ SHADOW_FUNDING_VERSION = "sleeve_cash"
 #: ``baseline_id``; momentum's recorded BREACH streak restarts with it.
 SHADOW_SEEDING_VERSION = "gated:curve-normalised"
 
+#: Where the replay's signal functions read their positions from (KAN-116).
+#: ``runner_book``: a ``PortfolioContext`` of the replay's own filled lots,
+#: re-bound before every session — the structure and code path live reads from
+#: the ``positions`` table. Before it each signal function kept a private
+#: record of the lots it had *asked* for, so an entry the replay did not fill
+#: stayed "held" and was never retried (20–49% of buy signals per sleeve in a
+#: 2y replay, 22–50% in the 10y refresh and D10 baselines), and
+#: entry prices, the earnings-drift hold clock and the tail-risk regime-at-entry
+#: were taken from the signal bar rather than the fill
+#: (docs/decisions/backtest-position-source-2026-10.md). A different model, so
+#: it enters the fingerprint and every verdict after the switch files under a
+#: new ``baseline_id``.
+SHADOW_POSITION_SOURCE_VERSION = "runner_book"
+
 
 @dataclass(frozen=True)
 class ShadowArtifact:
@@ -161,6 +175,10 @@ def shadow_id_for(
     comparison from one opened in cash on a phantom book, and a different N
     is a different warm book.
 
+    :data:`SHADOW_POSITION_SOURCE_VERSION` always enters it (KAN-116): a
+    replay whose signal functions read the fills is a different model from one
+    that read a record of what it had asked to buy.
+
     Raises:
         ValueError: A sleeve exposes no ``shadow_params``. Defaulting to an
             empty mapping would make the id track the roster and nothing else,
@@ -194,6 +212,7 @@ def shadow_id_for(
     fingerprint.append(
         ("__seeding__", f"warm{int(warmup_sessions)}:{SHADOW_SEEDING_VERSION}")
     )
+    fingerprint.append(("__positions__", SHADOW_POSITION_SOURCE_VERSION))
     digest = hashlib.sha256(
         json.dumps(fingerprint, sort_keys=True).encode()
     ).hexdigest()[:_DIGEST_CHARS]

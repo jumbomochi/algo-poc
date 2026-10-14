@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 from backtest.portfolio_context import HeldPosition, PendingOrder, PortfolioContext
+from backtest.portfolio_context import RunnerBook
 from scripts.run_backtest import make_earnings_drift_signals_fn
+from tests.backtest.books import empty_context, filled
 
 
 def _make_earnings_lookup():
@@ -44,6 +46,7 @@ def test_earnings_drift_buys_on_positive_surprise():
         surprise_threshold_pct=5.0,
         position_size_pct=0.08,
         initial_capital=20_000,
+        portfolio_context=empty_context(),
     )
 
     # AAPL had 10% surprise on 2024-02-01 (day index 31)
@@ -64,6 +67,7 @@ def test_earnings_drift_skips_negative_surprise():
         surprise_threshold_pct=5.0,
         position_size_pct=0.08,
         initial_capital=20_000,
+        portfolio_context=empty_context(),
     )
 
     # MSFT had -4.76% surprise (miss)
@@ -73,8 +77,14 @@ def test_earnings_drift_skips_negative_surprise():
 
 
 def test_earnings_drift_exits_after_hold_period():
-    """Exits after max_hold_days."""
+    """Exits after max_hold_days sessions counted from the FILL.
+
+    The book holds the lot a runner fills at the open after the signal, and
+    the clock counts sessions after that entry date — live's clock. Before
+    KAN-116 the replay counted from the signal bar, one session sooner.
+    """
     earnings_lookup = _make_earnings_lookup()
+    book = RunnerBook()
 
     signals_fn = make_earnings_drift_signals_fn(
         earnings_lookup=earnings_lookup,
@@ -82,24 +92,28 @@ def test_earnings_drift_exits_after_hold_period():
         max_hold_days=20,
         position_size_pct=0.08,
         initial_capital=20_000,
+        portfolio_context=book,
     )
 
     bars = _make_bars("AAPL")
 
     # Enter on earnings day (bars[:32] covers up to 2024-02-01)
+    book.bind(empty_context())
     entry = signals_fn("AAPL", bars[:32])
     assert entry is not None and entry["action"] == "buy"
 
-    # Hold for more bars until time exit triggers
-    sell_found = False
-    for end_idx in range(33, 55):
+    # Filled at bars[32]'s open; hold until the time exit triggers
+    sells = []
+    for end_idx in range(33, 60):
+        book.bind(filled("AAPL", bars, signal_index=31, decision_index=end_idx - 1))
         result = signals_fn("AAPL", bars[:end_idx])
-        if result and result["action"] == "sell":
+        if result is not None:
+            assert result["action"] == "sell"
             assert result["exit_reason"] == "time_exit"
-            sell_found = True
-            break
+            sells.append(end_idx)
 
-    assert sell_found, "Expected time_exit sell signal"
+    # 20 sessions after the 2024-02-02 fill: decided on bars[52] (2024-02-22)
+    assert sells and sells[0] == 53, sells
 
 
 def test_earnings_drift_hydrated_time_exit_uses_entry_date_and_full_quantity():

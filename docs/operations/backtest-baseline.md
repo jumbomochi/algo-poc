@@ -27,6 +27,7 @@ results so downstream tools can check it:
 | Fundamentals | available 45 days after period-end (or the row's `filing_date`) | A quarter ending 31 March is not public on 31 March. |
 | Share sizing | fractional, unless `--whole-shares` | Live truncates to whole shares and refuses the order at zero; the backtest does not, so the two disagree by default. See below. |
 | Entry funding | from the sleeve's own cash (KAN-111) | After risk approval an entry is capped at the cash the sleeve holds when it decides, net of entries already queued that session, its commission and a 25 bps buffer — `size_to_sleeve_cash`, the function the paper run uses. Same-session exit proceeds do not count. Before KAN-111 a sleeve's cash could go negative up to its exposure limit; live it cannot, because the fill projector refuses any fill that overdraws a sleeve. |
+| Position source | the runner's own fills (KAN-116) | Each sleeve reads what it holds from a `RunnerBook` that `BacktestRunner` re-binds before every session to a `PortfolioContext` of its filled lots — the structure and signal-function branch live hydrates from the `positions` table. A buy the runner does not fill (unreached DAY limit, risk or sleeve-cash refusal, crash freeze) leaves nothing behind and is asked again next session. Before KAN-116 each sleeve recorded a lot when it *emitted* a buy, so 23–33% of buy signals per sleeve in the 10y weekly refresh (22–50% on the D10-of-record bars) never filled and were never retried. |
 
 `config.fill_model`, `config.commission_minimum`,
 `config.slippage_bps_by_ticker`, `config.point_in_time_universe` and
@@ -317,6 +318,34 @@ pins"; this is the mechanism half of that.
 > a refresh that "drops" against the pin is the model change, not a decay.
 > **A re-pin decision is outstanding**: until it is made, the pin of record is
 > a leveraged-sim artifact the code can no longer produce.
+
+> **KAN-116: the replay now reads its own fills, so neither pin reproduces
+> again.** Every sleeve used to record a lot in a private `tracked` dict when it
+> *emitted* a buy. An entry the runner did not fill (an unreached DAY limit, a
+> risk or KAN-111 sleeve-cash refusal, a crash-freeze suppression) stayed
+> "held" there, was never retried, and only left when its phantom stop fired:
+> 23–33% of buy signals per sleeve in the 10-13 refresh, 50% for
+> earnings_drift on the D10-of-record bars, 66% in the Rung-0 pin. Each replay
+> now drives its sleeves from a `RunnerBook` the runner binds to its own lots
+> before each session — the live `PortfolioContext` path — and the weekly
+> artifact carries an `entry_funnel` per sleeve (risk-refused / cash-skipped /
+> queued / filled / expired). Re-running the edge pin's config: momentum
+> 160.15% → 137.90% (max DD 19.04% → 25.93%), thematic_momentum 112.11% →
+> 116.81% (max DD 40.12% → 48.65%), aggregate 71.38% → 72.07%; the Rung-0 pin
+> 114.56% → 76.67%. Every sleeve still FAILs D10. The rolling shadow files
+> under a new `baseline_id` (`SHADOW_POSITION_SOURCE_VERSION`). **A re-pin is
+> the operator's decision**; the full tables are in
+> `docs/decisions/backtest-position-source-2026-10.md`.
+>
+> **Two counters changed meaning with it.** `entry_signals_sized` (the
+> denominator of the "Unfillable signals %" line) and the whole-share skip
+> ledger behind `skipped_signals` count every buy signal a sleeve sizes. A
+> sleeve used to ask for an entry once and then believe it held the name;
+> it now asks again every session the entry still qualifies and has not
+> filled, so both count each retry (momentum, 10-13 bars: 857 → 1,621 sized
+> signals). Neither is comparable with an artifact written before KAN-116;
+> `entry_funnel` (signals, risk-refused, whole-share-skipped, cash-skipped,
+> queued, filled, expired) is the per-sleeve account to read instead.
 
 ### Where the pin lives, and what enforces it
 

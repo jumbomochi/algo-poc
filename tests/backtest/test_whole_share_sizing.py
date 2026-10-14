@@ -31,6 +31,7 @@ from scripts.run_backtest import (
     save_multi_portfolio_results,
 )
 from services.risk_management.engine import RiskEngine
+from tests.backtest.books import empty_context
 
 
 PRICE = 150.0
@@ -80,6 +81,7 @@ def test_flag_off_preserves_fractional_quantity():
         surprise_threshold_pct=5.0,
         position_size_pct=0.08,
         initial_capital=5_000,
+        portfolio_context=empty_context(),
     )
 
     result = signals_fn("AAPL", _make_bars()[:32])
@@ -96,6 +98,7 @@ def test_flag_off_preserves_fractional_quantity_on_weighted_site():
         regime_by_date=_bull_regime(),
         position_size_pct=0.25,
         initial_capital=474.71,
+        portfolio_context=empty_context(),
     )
 
     result = signals_fn("GLD", _make_bars(10))
@@ -131,6 +134,7 @@ def test_whole_shares_truncates_toward_zero():
         position_size_pct=0.08,
         initial_capital=5_000,
         whole_shares=True,
+        portfolio_context=empty_context(),
     )
 
     result = signals_fn("AAPL", _make_bars()[:32])
@@ -145,6 +149,7 @@ def test_whole_shares_truncates_the_weighted_site():
         position_size_pct=0.25,
         initial_capital=12_830,
         whole_shares=True,
+        portfolio_context=empty_context(),
     )
 
     result = signals_fn("GLD", _make_bars(10))
@@ -191,6 +196,7 @@ def test_zero_whole_share_quantity_produces_no_trade():
         initial_capital=711.51,
         whole_shares=True,
         skip_ledger=ledger,
+        portfolio_context=empty_context(),
     )
 
     assert signals_fn("AAPL", _make_bars()[:32]) is None
@@ -216,6 +222,7 @@ def test_skip_ledger_records_one_entry_per_occurrence():
         initial_capital=711.51,
         whole_shares=True,
         skip_ledger=ledger,
+        portfolio_context=empty_context(),
     )
 
     bars = _make_bars()
@@ -241,6 +248,7 @@ def test_no_skip_recorded_when_flag_is_off():
         initial_capital=711.51,
         whole_shares=False,
         skip_ledger=ledger,
+        portfolio_context=empty_context(),
     )
 
     result = signals_fn("AAPL", _make_bars()[:32])
@@ -263,6 +271,7 @@ def test_ledger_counts_every_entry_signal_it_sized():
         initial_capital=711.51,
         whole_shares=True,
         skip_ledger=ledger,
+        portfolio_context=empty_context(),
     )
 
     bars = _make_bars()
@@ -281,6 +290,7 @@ def test_ledger_counts_every_entry_signal_it_sized():
         initial_capital=100_000,
         whole_shares=True,
         skip_ledger=fillable,
+        portfolio_context=empty_context(),
     )
     assert rich_fn("AAPL", bars[:32]) is not None
     assert fillable.sized == 1

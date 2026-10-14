@@ -2,8 +2,14 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-from backtest.portfolio_context import HeldPosition, PendingOrder, PortfolioContext
+from backtest.portfolio_context import (
+    HeldPosition,
+    PendingOrder,
+    PortfolioContext,
+    RunnerBook,
+)
 from scripts.run_backtest import make_momentum_signals_fn
+from tests.backtest.books import empty_context, filled
 
 
 def _make_bars(ticker: str, days: int, base_price: float, daily_return: float):
@@ -38,6 +44,7 @@ def test_momentum_buys_top_ranked_ticker():
         position_size_pct=0.07,
         initial_capital=100_000,
         trailing_stop_pct=0.10,
+        portfolio_context=empty_context(),
     )
     # Feed enough bars for ranking (>126)
     winner_bars = bars_by_ticker["WINNER"]
@@ -61,30 +68,39 @@ def test_momentum_requires_min_bars():
         bars_by_ticker=bars_by_ticker,
         top_n=1,
         lookback_days=126,
+        portfolio_context=empty_context(),
     )
     signal = fn("SHORT", bars_by_ticker["SHORT"])
     assert signal is None
 
 
 def test_momentum_trailing_stop_exits():
-    """Momentum should sell when trailing stop triggers after profit."""
+    """Momentum should sell when trailing stop triggers after profit.
+
+    The book is what a runner holds: empty when the entry is signalled, then
+    the filled lot (entered at the next open, peak raised at each close).
+    """
     bars_by_ticker = {
         "TEST": _make_bars("TEST", 200, 100.0, 0.003),
     }
+    book = RunnerBook()
     fn = make_momentum_signals_fn(
         bars_by_ticker=bars_by_ticker,
         top_n=1,
         lookback_days=126,
         trailing_stop_pct=0.05,
+        portfolio_context=book,
     )
     # Enter at bar 150
     bars = bars_by_ticker["TEST"]
+    book.bind(empty_context())
     signal = fn("TEST", bars[:150])
     assert signal is not None and signal["action"] == "buy"
 
-    # Price keeps rising — update peak (no sell)
+    # Price keeps rising while held — no sell, and no second entry
+    book.bind(filled("TEST", bars, signal_index=149, decision_index=169))
     signal = fn("TEST", bars[:170])
-    assert signal is None or signal["action"] != "sell"
+    assert signal is None
 
     # Now simulate a 6% drop from peak
     peak_price = bars[169]["close"]
@@ -96,6 +112,8 @@ def test_momentum_trailing_stop_exits():
             "date": d, "open": drop_price, "high": drop_price,
             "low": drop_price, "close": drop_price, "volume": 500_000,
         })
+    book.bind(filled("TEST", drop_bars, signal_index=149,
+                     decision_index=len(drop_bars) - 1))
     signal = fn("TEST", drop_bars)
     assert signal is not None
     assert signal["action"] == "sell"

@@ -35,6 +35,8 @@ from scripts.run_paper import (
 )
 from shared.config import DivergenceConfig, load_config
 from shared.market_calendar import MarketCalendar
+from shared.universe import ACTIVE_SLEEVES
+from tests.backtest.books import empty_context
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -143,7 +145,9 @@ def _live_signals(bars_by_ticker: dict[str, list[dict]]) -> dict:
             "roe": 0.3, "debt_equity": 0.4, "profit_margin": 0.2,
         },
         earnings_lookup=lambda t, d: {"surprise_pct": 8.0},
-        portfolio_contexts=None,
+        # run_daily hydrates every sleeve's book before building it; an empty
+        # one asks each sleeve the entry question for every ticker.
+        portfolio_contexts={name: empty_context() for name in ACTIVE_SLEEVES},
     )
     out = {}
     for name, sleeve in portfolios.items():

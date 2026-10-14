@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from backtest.portfolio_context import PortfolioContext
+from backtest.portfolio_context import PortfolioContext, RunnerBook
 from backtest.ranked_selection import (
     ReplacementPolicy,
     rank_complete_universe,
@@ -80,10 +80,32 @@ class PortfolioConfig:
     #: the rolling shadow need to populate it — the backtest's own
     #: constructions do not.
     shadow_params: dict | None = None
+    #: KAN-116: the ``RunnerBook`` this sleeve's ``signals_fn`` reads its
+    #: positions from in a replay. Whoever replays ``signals_fn`` through a
+    #: ``BacktestRunner`` must pass it as ``run(book=...)``, or the first read
+    #: raises. ``None`` on a live roster, whose context is the real book.
+    book: RunnerBook | None = None
+
+
+def _require_position_source(portfolio_context: Any, sleeve: str) -> None:
+    """Refuse to build a sleeve that has no book to read its positions from.
+
+    KAN-116: a sleeve used to keep a private record of the lots it had *asked*
+    for, and the replay ran on that record. A buy the runner never filled
+    stayed "held" there and was never retried. Every sleeve now reads what
+    actually filled -- the live book, or a ``RunnerBook`` the replay's runner
+    refreshes -- and there is no third option.
+    """
+    if portfolio_context is None:
+        raise TypeError(
+            f"make_{sleeve}_signals_fn needs a portfolio_context: the live "
+            "PortfolioContext, or a backtest.portfolio_context.RunnerBook passed "
+            "to the BacktestRunner that replays it (run(book=...))"
+        )
 
 
 def _context_exit_quantity(
-    portfolio_context: PortfolioContext | None,
+    portfolio_context: PortfolioContext | RunnerBook,
     ticker: str,
     held_quantity: float,
 ) -> float | None:
@@ -92,8 +114,6 @@ def _context_exit_quantity(
     An active BUY is opposing flow and therefore suppresses a new SELL. Active
     SELL quantity only covers that portion of the durable filled position.
     """
-    if portfolio_context is None:
-        return 0.0
     if portfolio_context.pending_quantity(ticker, "buy") > 0:
         return None
     uncovered = max(
@@ -694,6 +714,13 @@ def make_signals_fn(
     Entry (add-on lot): in profit + new support signal + RSI < 40 + volume confirmation.
     Exit: regime-adaptive trailing stop from peak. No max loss (mean-reversion buys at
     support — a further drop is expected before recovery).
+
+    RETIRED (2026-05-26) and on no live or replay path. It still keeps the
+    pre-KAN-116 private record of the lots it *asked* for, so in a replay an
+    entry the runner did not fill would stay "held" and never be retried.
+    Porting it to the ``portfolio_context`` branch the six active sleeves use
+    is a precondition of reviving it
+    (docs/decisions/backtest-position-source-2026-10.md).
     """
     proximity_signal = SupportProximitySignal()
     strength_signal = SupportStrengthSignal()
@@ -861,7 +888,7 @@ def make_momentum_signals_fn(
     max_lots: int = 2,
     regime_by_date: dict | None = None,
     bear_tickers: set[str] | None = None,
-    portfolio_context: PortfolioContext | None = None,
+    portfolio_context: PortfolioContext | RunnerBook | None = None,
     eligible_tickers: list[str] | None = None,
     membership: MembershipCalendar | None = None,
     whole_shares: bool = False,
@@ -884,6 +911,7 @@ def make_momentum_signals_fn(
     non-members: without the per-date filter, top-N slots get taken by names the
     sleeve is not allowed to buy and it silently trades nothing.
     """
+    _require_position_source(portfolio_context, "momentum")
     # Pre-compute date -> {ticker: close_price} for ranking
     eligible = set(eligible_tickers or bars_by_ticker)
     price_by_date: dict[Any, dict[str, float]] = {}
@@ -918,8 +946,6 @@ def make_momentum_signals_fn(
         returns.sort(key=lambda x: x[1], reverse=True)
         rankings_by_date[d] = [t for t, _ in returns[:top_n]]
 
-    # Per-ticker lot tracking for exits
-    tracked: dict[str, list[dict]] = {}
 
     def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
         if len(bars) < lookback_days + 1:
@@ -928,12 +954,11 @@ def make_momentum_signals_fn(
         current_bar = bars[-1]
         current_price = current_bar["close"]
         current_date = current_bar["date"]
-        bar_count = len(bars)
-        held = portfolio_context.positions.get(ticker) if portfolio_context else None
+        held = portfolio_context.positions.get(ticker)
         lots = ([{
             "entry_price": held.avg_entry_price,
             "peak_price": max(held.peak_price, current_price),
-        }] if held else tracked.get(ticker, []))
+        }] if held else [])
 
         # Determine regime-adjusted parameters
         if regime_by_date:
@@ -951,12 +976,10 @@ def make_momentum_signals_fn(
             is_bear_ticker = bear_tickers and ticker in bear_tickers
             if is_bear_ticker and regime != "bear":
                 exit_quantity = _context_exit_quantity(
-                    portfolio_context, ticker, held.quantity if held else 0
+                    portfolio_context, ticker, held.quantity
                 )
                 if exit_quantity is None:
                     return None
-                if portfolio_context is None:
-                    tracked.pop(ticker, None)
                 return {
                     "action": "sell",
                     "ticker": ticker,
@@ -966,9 +989,6 @@ def make_momentum_signals_fn(
                     "exit_reason": "regime_change",
                 }
 
-            if portfolio_context is None:
-                for lot in lots:
-                    lot["peak_price"] = max(lot["peak_price"], current_price)
 
             should_sell = False
             exit_reason = "trailing_stop"
@@ -986,12 +1006,10 @@ def make_momentum_signals_fn(
 
             if should_sell:
                 exit_quantity = _context_exit_quantity(
-                    portfolio_context, ticker, held.quantity if held else 0
+                    portfolio_context, ticker, held.quantity
                 )
                 if exit_quantity is None:
                     return None
-                if portfolio_context is None:
-                    tracked.pop(ticker, None)
                 return {
                     "action": "sell",
                     "ticker": ticker,
@@ -1001,12 +1019,9 @@ def make_momentum_signals_fn(
                     "exit_reason": exit_reason,
                 }
 
-        # === Entry logic: buy if in top N and not already tracked ===
+        # === Entry logic: buy if in top N and not already held ===
         top_tickers = rankings_by_date.get(current_date, [])
-        pending_buy_quantity = (
-            portfolio_context.pending_quantity(ticker, "buy")
-            if portfolio_context else 0.0
-        )
+        pending_buy_quantity = portfolio_context.pending_quantity(ticker, "buy")
         if not lots and pending_buy_quantity <= 0 and ticker in top_tickers:
             quantity = _entry_quantity(
                 initial_capital=initial_capital,
@@ -1019,12 +1034,6 @@ def make_momentum_signals_fn(
             )
             if quantity is None:
                 return None
-            if portfolio_context is None:
-                tracked[ticker] = [{
-                    "entry_price": current_price,
-                    "entry_idx": bar_count,
-                    "peak_price": current_price,
-                }]
             return {
                 "action": "buy",
                 "ticker": ticker,
@@ -1091,7 +1100,7 @@ def make_sector_rotation_signals_fn(
     initial_capital: float = 100_000,
     trailing_stop_pct: float = 0.08,
     regime_by_date: dict | None = None,
-    portfolio_context: PortfolioContext | None = None,
+    portfolio_context: PortfolioContext | RunnerBook | None = None,
     eligible_tickers: list[str] | None = None,
     whole_shares: bool = False,
     skip_ledger: SkipLedger | None = None,
@@ -1106,6 +1115,7 @@ def make_sector_rotation_signals_fn(
     pool is every ticker in ``bars_by_ticker`` (the union of all sleeves), which
     lets the sector sleeve buy individual equities.
     """
+    _require_position_source(portfolio_context, "sector_rotation")
     defensive_sectors = {"XLU", "XLP", "XLV"}
 
     # Pre-compute date -> {ticker: close_price} for ranking
@@ -1148,7 +1158,6 @@ def make_sector_rotation_signals_fn(
         returns.sort(key=lambda x: x[1], reverse=True)
         rankings_by_date[d] = [t for t, _ in returns[:top_n]]
 
-    tracked: dict[str, list[dict]] = {}
 
     def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
         if len(bars) < lookback_days + 1:
@@ -1156,30 +1165,24 @@ def make_sector_rotation_signals_fn(
 
         current_price = bars[-1]["close"]
         current_date = bars[-1]["date"]
-        bar_count = len(bars)
-        held = portfolio_context.positions.get(ticker) if portfolio_context else None
+        held = portfolio_context.positions.get(ticker)
         lots = ([{
             "entry_price": held.avg_entry_price,
             "peak_price": max(held.peak_price, current_price),
-        }] if held else tracked.get(ticker, []))
+        }] if held else [])
 
         # Exit: trailing stop
         if lots:
-            if portfolio_context is None:
-                for lot in lots:
-                    lot["peak_price"] = max(lot["peak_price"], current_price)
 
             for lot in lots:
                 peak = lot["peak_price"]
                 entry = lot["entry_price"]
                 if peak > entry and (peak - current_price) / peak >= trailing_stop_pct:
                     exit_quantity = _context_exit_quantity(
-                        portfolio_context, ticker, held.quantity if held else 0
+                        portfolio_context, ticker, held.quantity
                     )
                     if exit_quantity is None:
                         return None
-                    if portfolio_context is None:
-                        tracked.pop(ticker, None)
                     return {
                         "action": "sell",
                         "ticker": ticker,
@@ -1189,12 +1192,9 @@ def make_sector_rotation_signals_fn(
                         "exit_reason": "trailing_stop",
                     }
 
-        # Entry: buy if in top N and not already tracked
+        # Entry: buy if in top N and not already held
         top_tickers = rankings_by_date.get(current_date, [])
-        pending_buy_quantity = (
-            portfolio_context.pending_quantity(ticker, "buy")
-            if portfolio_context else 0.0
-        )
+        pending_buy_quantity = portfolio_context.pending_quantity(ticker, "buy")
         if not lots and pending_buy_quantity <= 0 and ticker in top_tickers:
             quantity = _entry_quantity(
                 initial_capital=initial_capital,
@@ -1207,12 +1207,6 @@ def make_sector_rotation_signals_fn(
             )
             if quantity is None:
                 return None
-            if portfolio_context is None:
-                tracked[ticker] = [{
-                    "entry_price": current_price,
-                    "entry_idx": bar_count,
-                    "peak_price": current_price,
-                }]
             return {
                 "action": "buy",
                 "ticker": ticker,
@@ -1246,6 +1240,13 @@ def make_short_term_mr_signals_fn(
 
     Entry: RSI(2) < 10 AND price touches lower Bollinger Band AND volume > 1.5x avg.
     Exit: RSI(2) > 70 OR max_hold_days elapsed (whichever first). No trailing stop.
+
+    RETIRED (2026-05-26) and on no live or replay path. It still keeps the
+    pre-KAN-116 private record of the lots it *asked* for, so in a replay an
+    entry the runner did not fill would stay "held" and never be retried.
+    Porting it to the ``portfolio_context`` branch the six active sleeves use
+    is a precondition of reviving it
+    (docs/decisions/backtest-position-source-2026-10.md).
     """
     from services.signal_generation.technical import BollingerBandSignal
 
@@ -1358,7 +1359,7 @@ def make_thematic_momentum_signals_fn(
     trailing_stop_pct: float = 0.10,
     max_loss_pct: float = 0.08,
     regime_by_date: dict | None = None,
-    portfolio_context: PortfolioContext | None = None,
+    portfolio_context: PortfolioContext | RunnerBook | None = None,
     replacement_policy: ReplacementPolicy = ReplacementPolicy.TECHNICAL_ONLY,
     replacement_score_margin: float = 0.25,
     whole_shares: bool = False,
@@ -1369,6 +1370,7 @@ def make_thematic_momentum_signals_fn(
     Ranks thematic ETFs by 3-month return. Buys top N that are above
     their 50-day MA. Exits via trailing stop, max loss, or MA cross below.
     """
+    _require_position_source(portfolio_context, "thematic_momentum")
     # Pre-compute date -> {ticker: close_price}
     price_by_date: dict[Any, dict[str, float]] = {}
     eligible = set(eligible_tickers or bars_by_ticker)
@@ -1402,7 +1404,6 @@ def make_thematic_momentum_signals_fn(
         scores_by_date[d] = returns
         rankings_by_date[d] = rank_complete_universe(returns, top_n)
 
-    tracked: dict[str, list[dict]] = {}
 
     def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
         min_bars = max(lookback_days + 1, ma_period + 1)
@@ -1411,12 +1412,11 @@ def make_thematic_momentum_signals_fn(
 
         current_price = bars[-1]["close"]
         current_date = bars[-1]["date"]
-        bar_count = len(bars)
-        held = portfolio_context.positions.get(ticker) if portfolio_context else None
+        held = portfolio_context.positions.get(ticker)
         lots = ([{
             "entry_price": held.avg_entry_price,
             "peak_price": max(held.peak_price, current_price),
-        }] if held else tracked.get(ticker, []))
+        }] if held else [])
 
         # Determine regime-adjusted trailing stop and max loss
         effective_trailing = trailing_stop_pct
@@ -1434,9 +1434,6 @@ def make_thematic_momentum_signals_fn(
 
         # Exit logic
         if lots:
-            if portfolio_context is None:
-                for lot in lots:
-                    lot["peak_price"] = max(lot["peak_price"], current_price)
 
             should_sell = False
             exit_reason = "unknown"
@@ -1461,12 +1458,10 @@ def make_thematic_momentum_signals_fn(
 
             if should_sell:
                 exit_quantity = _context_exit_quantity(
-                    portfolio_context, ticker, held.quantity if held else 0
+                    portfolio_context, ticker, held.quantity
                 )
                 if exit_quantity is None:
                     return None
-                if portfolio_context is None:
-                    tracked.pop(ticker, None)
                 return {
                     "action": "sell",
                     "ticker": ticker,
@@ -1486,11 +1481,7 @@ def make_thematic_momentum_signals_fn(
 
         top_tickers = rankings_by_date.get(current_date, [])
         scores = scores_by_date.get(current_date, {})
-        held_tickers = (
-            set(portfolio_context.positions)
-            if portfolio_context is not None
-            else set(tracked)
-        )
+        held_tickers = set(portfolio_context.positions)
         if lots and held_tickers | set(top_tickers) <= set(scores):
             replacements = target_deltas(
                 held=held_tickers,
@@ -1504,12 +1495,10 @@ def make_thematic_momentum_signals_fn(
             )
             if replacement is not None:
                 exit_quantity = _context_exit_quantity(
-                    portfolio_context, ticker, held.quantity if held else 0
+                    portfolio_context, ticker, held.quantity
                 )
                 if exit_quantity is None:
                     return None
-                if portfolio_context is None:
-                    tracked.pop(ticker, None)
                 return {
                     "action": "sell",
                     "ticker": ticker,
@@ -1521,10 +1510,7 @@ def make_thematic_momentum_signals_fn(
                     "score_improvement": replacement.score_improvement,
                 }
 
-        pending_buy_quantity = (
-            portfolio_context.pending_quantity(ticker, "buy")
-            if portfolio_context else 0.0
-        )
+        pending_buy_quantity = portfolio_context.pending_quantity(ticker, "buy")
         if (
             not lots
             and pending_buy_quantity <= 0
@@ -1542,12 +1528,6 @@ def make_thematic_momentum_signals_fn(
             )
             if quantity is None:
                 return None
-            if portfolio_context is None:
-                tracked[ticker] = [{
-                    "entry_price": current_price,
-                    "entry_idx": bar_count,
-                    "peak_price": current_price,
-                }]
             return {
                 "action": "buy",
                 "ticker": ticker,
@@ -1578,7 +1558,7 @@ def make_quality_value_signals_fn(
     initial_capital: float = 100_000,
     trailing_stop_pct: float = 0.12,
     regime_by_date: dict | None = None,
-    portfolio_context: PortfolioContext | None = None,
+    portfolio_context: PortfolioContext | RunnerBook | None = None,
     replacement_policy: ReplacementPolicy = ReplacementPolicy.TECHNICAL_ONLY,
     replacement_score_margin: float = 0.25,
     membership: MembershipCalendar | None = None,
@@ -1594,7 +1574,7 @@ def make_quality_value_signals_fn(
     ``membership`` restricts each date's ranking to index members on that date,
     so top-N slots are not taken by names the runner will refuse to buy.
     """
-    tracked: dict[str, list[dict]] = {}
+    _require_position_source(portfolio_context, "quality_value")
 
     def _compute_quality_score(fundamentals: dict) -> float:
         """Compute composite quality-value score. Higher = better."""
@@ -1644,18 +1624,11 @@ def make_quality_value_signals_fn(
 
         current_price = bars[-1]["close"]
         current_date = bars[-1]["date"]
-        bar_count = len(bars)
-        held = portfolio_context.positions.get(ticker) if portfolio_context else None
+        held = portfolio_context.positions.get(ticker)
         lots = ([{
             "entry_price": held.avg_entry_price,
             "peak_price": max(held.peak_price, current_price),
-        }] if held else tracked.get(ticker, []))
-
-        fundamentals = None
-        if portfolio_context is None:
-            fundamentals = fundamentals_lookup(ticker, current_date)
-            if fundamentals is None:
-                return None
+        }] if held else [])
 
         # Determine regime-adjusted trailing stop
         effective_trailing = trailing_stop_pct
@@ -1666,21 +1639,16 @@ def make_quality_value_signals_fn(
 
         # Exit logic: trailing stop
         if lots:
-            if portfolio_context is None:
-                for lot in lots:
-                    lot["peak_price"] = max(lot["peak_price"], current_price)
 
             for lot in lots:
                 peak = lot["peak_price"]
                 entry = lot["entry_price"]
                 if peak > entry and (peak - current_price) / peak >= effective_trailing:
                     exit_quantity = _context_exit_quantity(
-                        portfolio_context, ticker, held.quantity if held else 0
+                        portfolio_context, ticker, held.quantity
                     )
                     if exit_quantity is None:
                         return None
-                    if portfolio_context is None:
-                        tracked.pop(ticker, None)
                     return {
                         "action": "sell",
                         "ticker": ticker,
@@ -1690,8 +1658,7 @@ def make_quality_value_signals_fn(
                         "exit_reason": "trailing_stop",
                     }
 
-        if fundamentals is None:
-            fundamentals = fundamentals_lookup(ticker, current_date)
+        fundamentals = fundamentals_lookup(ticker, current_date)
         if fundamentals is None:
             return None
 
@@ -1701,11 +1668,7 @@ def make_quality_value_signals_fn(
         score = scores[ticker]
         top_tickers = rankings_by_date.get(current_date, [])
 
-        held_tickers = (
-            set(portfolio_context.positions)
-            if portfolio_context is not None
-            else set(tracked)
-        )
+        held_tickers = set(portfolio_context.positions)
         if lots and held_tickers | set(top_tickers) <= set(scores):
             replacements = target_deltas(
                 held=held_tickers,
@@ -1719,12 +1682,10 @@ def make_quality_value_signals_fn(
             )
             if replacement is not None:
                 exit_quantity = _context_exit_quantity(
-                    portfolio_context, ticker, held.quantity if held else 0
+                    portfolio_context, ticker, held.quantity
                 )
                 if exit_quantity is None:
                     return None
-                if portfolio_context is None:
-                    tracked.pop(ticker, None)
                 return {
                     "action": "sell",
                     "ticker": ticker,
@@ -1736,10 +1697,7 @@ def make_quality_value_signals_fn(
                     "score_improvement": replacement.score_improvement,
                 }
 
-        pending_buy_quantity = (
-            portfolio_context.pending_quantity(ticker, "buy")
-            if portfolio_context else 0.0
-        )
+        pending_buy_quantity = portfolio_context.pending_quantity(ticker, "buy")
         if not lots and pending_buy_quantity <= 0 and ticker in top_tickers:
             quantity = _entry_quantity(
                 initial_capital=initial_capital,
@@ -1752,12 +1710,6 @@ def make_quality_value_signals_fn(
             )
             if quantity is None:
                 return None
-            if portfolio_context is None:
-                tracked[ticker] = [{
-                    "entry_price": current_price,
-                    "entry_idx": bar_count,
-                    "peak_price": current_price,
-                }]
             return {
                 "action": "buy",
                 "ticker": ticker,
@@ -1784,7 +1736,7 @@ def make_earnings_drift_signals_fn(
     initial_capital: float = 100_000,
     trailing_stop_pct: float = 0.06,
     regime_by_date: dict | None = None,
-    portfolio_context: PortfolioContext | None = None,
+    portfolio_context: PortfolioContext | RunnerBook | None = None,
     eligible_tickers: list[str] | None = None,
     whole_shares: bool = False,
     skip_ledger: SkipLedger | None = None,
@@ -1801,8 +1753,8 @@ def make_earnings_drift_signals_fn(
     Exits are deliberately *not* scoped: a position already held has to remain
     sellable even if the universe changed underneath it.
     """
+    _require_position_source(portfolio_context, "earnings_drift")
     eligible = frozenset(eligible_tickers) if eligible_tickers is not None else None
-    tracked: dict[str, dict] = {}
 
     def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
         if len(bars) < 5:
@@ -1810,13 +1762,12 @@ def make_earnings_drift_signals_fn(
 
         current_price = bars[-1]["close"]
         current_date = bars[-1]["date"]
-        bar_count = len(bars)
-        held = portfolio_context.positions.get(ticker) if portfolio_context else None
+        held = portfolio_context.positions.get(ticker)
         lot = ({
             "entry_price": held.avg_entry_price,
             "peak_price": max(held.peak_price, current_price),
             "entry_date": held.entry_date,
-        } if held else tracked.get(ticker))
+        } if held else None)
 
         # Determine regime-adjusted trailing stop
         effective_trailing = trailing_stop_pct
@@ -1827,23 +1778,19 @@ def make_earnings_drift_signals_fn(
 
         # Exit logic
         if lot is not None:
-            if portfolio_context is None:
-                lot["peak_price"] = max(lot["peak_price"], current_price)
-                bars_held = bar_count - lot["entry_idx"]
-            else:
-                bars_held = sum(
-                    1 for bar in bars if bar["date"] > lot["entry_date"]
-                )
+            # Sessions since the fill, counted from the book's entry date as
+            # live counts them (not from the bar the entry was signalled on).
+            bars_held = sum(
+                1 for bar in bars if bar["date"] > lot["entry_date"]
+            )
 
             # Time exit
             if bars_held >= max_hold_days:
                 exit_quantity = _context_exit_quantity(
-                    portfolio_context, ticker, held.quantity if held else 0
+                    portfolio_context, ticker, held.quantity
                 )
                 if exit_quantity is None:
                     return None
-                if portfolio_context is None:
-                    tracked.pop(ticker, None)
                 return {
                     "action": "sell",
                     "ticker": ticker,
@@ -1858,12 +1805,10 @@ def make_earnings_drift_signals_fn(
             entry = lot["entry_price"]
             if peak > entry and (peak - current_price) / peak >= effective_trailing:
                 exit_quantity = _context_exit_quantity(
-                    portfolio_context, ticker, held.quantity if held else 0
+                    portfolio_context, ticker, held.quantity
                 )
                 if exit_quantity is None:
                     return None
-                if portfolio_context is None:
-                    tracked.pop(ticker, None)
                 return {
                     "action": "sell",
                     "ticker": ticker,
@@ -1880,10 +1825,7 @@ def make_earnings_drift_signals_fn(
         if eligible is not None and ticker not in eligible:
             return None
 
-        if (
-            portfolio_context
-            and portfolio_context.pending_quantity(ticker, "buy") > 0
-        ):
+        if portfolio_context.pending_quantity(ticker, "buy") > 0:
             return None
 
         event = earnings_lookup(ticker, current_date)
@@ -1912,12 +1854,6 @@ def make_earnings_drift_signals_fn(
         )
         if quantity is None:
             return None
-        if portfolio_context is None:
-            tracked[ticker] = {
-                "entry_price": current_price,
-                "entry_idx": bar_count,
-                "peak_price": current_price,
-            }
         return {
             "action": "buy",
             "ticker": ticker,
@@ -1939,7 +1875,7 @@ def make_tail_risk_hedge_signals_fn(
     regime_by_date: dict,
     position_size_pct: float = 0.25,
     initial_capital: float = 100_000,
-    portfolio_context: PortfolioContext | None = None,
+    portfolio_context: PortfolioContext | RunnerBook | None = None,
     whole_shares: bool = False,
     skip_ledger: SkipLedger | None = None,
 ):
@@ -1951,13 +1887,13 @@ def make_tail_risk_hedge_signals_fn(
     Bear: 40% SH + 30% PSQ + 20% SDS + 10% GLD
     Regime change triggers full rotation (sell all, re-buy per new allocation).
     """
+    _require_position_source(portfolio_context, "tail_risk_hedge")
     ALLOCATIONS = {
         "bull": {"GLD": 0.50, "TLT": 0.50},
         "neutral": {"GLD": 0.40, "TLT": 0.40, "SH": 0.20},
         "bear": {"SH": 0.40, "PSQ": 0.30, "SDS": 0.20, "GLD": 0.10},
     }
 
-    tracked: dict[str, dict] = {}  # ticker -> {entry_price, regime_at_entry}
 
     def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
         if len(bars) < 2:
@@ -1967,8 +1903,7 @@ def make_tail_risk_hedge_signals_fn(
         current_date = bars[-1]["date"]
         regime = regime_by_date.get(current_date, "bull")
 
-        held = portfolio_context.positions.get(ticker) if portfolio_context else None
-        lot = tracked.get(ticker) if portfolio_context is None else held
+        held = portfolio_context.positions.get(ticker)
 
         allocation = ALLOCATIONS.get(regime, {})
 
@@ -1976,10 +1911,8 @@ def make_tail_risk_hedge_signals_fn(
             held is not None
             and regime_by_date.get(held.entry_date, regime) != regime
         )
-        if (
-            portfolio_context is not None
-            and held is not None
-            and (ticker not in allocation or hydrated_regime_changed)
+        if held is not None and (
+            ticker not in allocation or hydrated_regime_changed
         ):
             exit_quantity = _context_exit_quantity(
                 portfolio_context, ticker, held.quantity
@@ -1995,24 +1928,9 @@ def make_tail_risk_hedge_signals_fn(
                 "exit_reason": "regime_change",
             }
 
-        # Detect regime change and sell existing positions
-        if portfolio_context is None and lot is not None and lot["regime_at_entry"] != regime:
-            tracked.pop(ticker, None)
-            return {
-                "action": "sell",
-                "ticker": ticker,
-                "limit_price": current_price,
-                "quantity": 0,
-                "sector": "Unknown",
-                "exit_reason": "regime_change",
-            }
-
         # Entry: buy if ticker is in current regime allocation and not already held
-        pending_buy_quantity = (
-            portfolio_context.pending_quantity(ticker, "buy")
-            if portfolio_context else 0.0
-        )
-        if lot is None and pending_buy_quantity <= 0 and ticker in allocation:
+        pending_buy_quantity = portfolio_context.pending_quantity(ticker, "buy")
+        if held is None and pending_buy_quantity <= 0 and ticker in allocation:
             weight = allocation[ticker]
             quantity = _entry_quantity(
                 initial_capital=initial_capital,
@@ -2026,11 +1944,6 @@ def make_tail_risk_hedge_signals_fn(
             )
             if quantity is None:
                 return None
-            if portfolio_context is None:
-                tracked[ticker] = {
-                    "entry_price": current_price,
-                    "regime_at_entry": regime,
-                }
             return {
                 "action": "buy",
                 "ticker": ticker,
@@ -2602,6 +2515,7 @@ def save_multi_portfolio_results(
             "entry_signals_sized": (entry_signals_sized or {}).get(name, 0),
             # KAN-111: entries the sleeve's cash could not fully fund.
             "sleeve_cash": result.sleeve_cash,
+            "entry_funnel": result.entry_funnel,
         }
 
     payload = {
@@ -2932,9 +2846,13 @@ def main():
     if args.whole_shares:
         print("  Whole-share sizing ON (truncate toward zero, as live does)")
 
+    # KAN-116: each sleeve reads its own replayed book, as live reads the real one.
+    books = {name: RunnerBook() for name in skip_ledgers}
+
     mom_signals_fn = make_momentum_signals_fn(
         whole_shares=args.whole_shares,
         skip_ledger=skip_ledgers["momentum"],
+        portfolio_context=books["momentum"],
         bars_by_ticker=bars_by_ticker,
         top_n=5,
         lookback_days=126,
@@ -2948,6 +2866,7 @@ def main():
     sector_signals_fn = make_sector_rotation_signals_fn(
         whole_shares=args.whole_shares,
         skip_ledger=skip_ledgers["sector_rotation"],
+        portfolio_context=books["sector_rotation"],
         bars_by_ticker=bars_by_ticker,
         eligible_tickers=list(UNIVERSE_REGISTRY["sector_rotation"]),
         top_n=3,
@@ -2959,6 +2878,7 @@ def main():
     thematic_signals_fn = make_thematic_momentum_signals_fn(
         whole_shares=args.whole_shares,
         skip_ledger=skip_ledgers["thematic_momentum"],
+        portfolio_context=books["thematic_momentum"],
         bars_by_ticker=bars_by_ticker,
         eligible_tickers=UNIVERSE_REGISTRY["thematic_momentum"],
         top_n=8,
@@ -2973,6 +2893,7 @@ def main():
     qv_signals_fn = make_quality_value_signals_fn(
         whole_shares=args.whole_shares,
         skip_ledger=skip_ledgers["quality_value"],
+        portfolio_context=books["quality_value"],
         fundamentals_lookup=fundamentals_lookup,
         sector_map=SECTOR_MAP,
         bars_by_ticker=bars_by_ticker,
@@ -2989,6 +2910,7 @@ def main():
     ed_signals_fn = make_earnings_drift_signals_fn(
         whole_shares=args.whole_shares,
         skip_ledger=skip_ledgers["earnings_drift"],
+        portfolio_context=books["earnings_drift"],
         earnings_lookup=earnings_lookup,
         surprise_threshold_pct=5.0,
         max_hold_days=20,
@@ -3000,6 +2922,7 @@ def main():
     tail_risk_signals_fn = make_tail_risk_hedge_signals_fn(
         whole_shares=args.whole_shares,
         skip_ledger=skip_ledgers["tail_risk_hedge"],
+        portfolio_context=books["tail_risk_hedge"],
         regime_by_date=regime_by_date,
         position_size_pct=0.25,
         initial_capital=args.capital * fractions.get("tail_risk_hedge", SLEEVE_ALLOCATIONS["tail_risk_hedge"]),
@@ -3009,6 +2932,7 @@ def main():
             name="momentum",
             capital=args.capital * fractions.get("momentum", SLEEVE_ALLOCATIONS["momentum"]),
             signals_fn=mom_signals_fn,
+            book=books["momentum"],
             risk_engine=RiskEngine(
                 position_entry_limit_pct=12.0,
                 sector_concentration_pct=30.0,
@@ -3020,6 +2944,7 @@ def main():
             name="sector_rotation",
             capital=args.capital * fractions.get("sector_rotation", SLEEVE_ALLOCATIONS["sector_rotation"]),
             signals_fn=sector_signals_fn,
+            book=books["sector_rotation"],
             risk_engine=RiskEngine(
                 position_entry_limit_pct=20.0,
                 sector_concentration_pct=50.0,
@@ -3031,6 +2956,7 @@ def main():
             name="thematic_momentum",
             capital=args.capital * fractions.get("thematic_momentum", SLEEVE_ALLOCATIONS["thematic_momentum"]),
             signals_fn=thematic_signals_fn,
+            book=books["thematic_momentum"],
             risk_engine=RiskEngine(
                 position_entry_limit_pct=15.0,
                 sector_concentration_pct=50.0,
@@ -3042,6 +2968,7 @@ def main():
             name="quality_value",
             capital=args.capital * fractions.get("quality_value", SLEEVE_ALLOCATIONS["quality_value"]),
             signals_fn=qv_signals_fn,
+            book=books["quality_value"],
             risk_engine=RiskEngine(
                 position_entry_limit_pct=10.0,
                 sector_concentration_pct=30.0,
@@ -3053,6 +2980,7 @@ def main():
             name="earnings_drift",
             capital=args.capital * fractions.get("earnings_drift", SLEEVE_ALLOCATIONS["earnings_drift"]),
             signals_fn=ed_signals_fn,
+            book=books["earnings_drift"],
             risk_engine=RiskEngine(
                 position_entry_limit_pct=8.0,
                 sector_concentration_pct=30.0,
@@ -3064,6 +2992,7 @@ def main():
             name="tail_risk_hedge",
             capital=args.capital * fractions.get("tail_risk_hedge", SLEEVE_ALLOCATIONS["tail_risk_hedge"]),
             signals_fn=tail_risk_signals_fn,
+            book=books["tail_risk_hedge"],
             risk_engine=RiskEngine(
                 position_entry_limit_pct=25.0,
                 sector_concentration_pct=50.0,
@@ -3085,6 +3014,7 @@ def main():
             capital=pc.capital,
             signals_fn=make_crash_freeze_signals_fn(pc.signals_fn, regime_by_date),
             risk_engine=pc.risk_engine,
+            book=pc.book,
         )
 
     # 2b. Apply ML signal filter if requested
@@ -3102,6 +3032,7 @@ def main():
                     strategy_name=name,
                 ),
                 risk_engine=pc.risk_engine,
+                book=pc.book,
             )
 
     shadow_recorders = _create_backtest_shadow_recorders(
@@ -3130,6 +3061,7 @@ def main():
             candidate_observer=shadow_recorders.get(name),
             portfolio_name=name,
             membership=membership,
+            book=pc.book,
         )
     elapsed = time.time() - t0
 

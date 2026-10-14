@@ -12,6 +12,7 @@ from datetime import date
 
 from scripts.run_backtest import make_momentum_signals_fn
 from shared.universe import MembershipCalendar
+from tests.backtest.books import empty_context
 
 
 DAYS = [date(2025, 3, 3 + i) for i in range(5)]
@@ -46,6 +47,7 @@ def _signals_fn(**overrides):
         position_size_pct=0.10,
         initial_capital=10_000.0,
     )
+    kwargs["portfolio_context"] = empty_context()
     kwargs.update(overrides)
     return make_momentum_signals_fn(**kwargs)
 
@@ -146,6 +148,7 @@ class TestSectorRotationScoping:
             position_size_pct=0.20,
             initial_capital=10_000.0,
             eligible_tickers=["AAPL", "MSFT"],
+            portfolio_context=empty_context(),
         )
         bars = _bars_by_ticker()
 

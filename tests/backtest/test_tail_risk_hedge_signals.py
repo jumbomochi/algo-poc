@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 from backtest.portfolio_context import HeldPosition, PendingOrder, PortfolioContext
+from backtest.portfolio_context import RunnerBook
 from scripts.run_backtest import make_tail_risk_hedge_signals_fn
+from tests.backtest.books import empty_context, filled
 
 
 def _make_bars(n: int, start_price: float = 100.0, start_date: date = date(2024, 1, 1)):
@@ -32,6 +34,7 @@ def test_tail_risk_hedge_buys_bull_allocation():
         regime_by_date=regime_by_date,
         position_size_pct=0.25,
         initial_capital=100_000,
+        portfolio_context=empty_context(),
     )
 
     bars = _make_bars(10)
@@ -60,6 +63,7 @@ def test_tail_risk_hedge_buys_bear_allocation():
         regime_by_date=regime_by_date,
         position_size_pct=0.25,
         initial_capital=100_000,
+        portfolio_context=empty_context(),
     )
 
     bars = _make_bars(10)
@@ -90,27 +94,35 @@ def test_tail_risk_hedge_buys_bear_allocation():
 
 
 def test_tail_risk_hedge_regime_change_sells():
-    """When regime changes from bull to bear, existing GLD position gets sold."""
+    """When regime changes from bull to bear, existing GLD position gets sold.
+
+    The regime at entry is the regime on the session the buy FILLED (the
+    book's entry date), as live reads it — so the buy is signalled on day 8
+    and fills on day 9, both bull, before the regime turns on day 10.
+    """
     # First 10 days bull, then bear from day 10 onward
     regime_by_date = {}
     for i in range(20):
         d = date(2024, 1, 1) + timedelta(days=i)
         regime_by_date[d] = "bull" if i < 10 else "bear"
 
+    book = RunnerBook()
     signals_fn = make_tail_risk_hedge_signals_fn(
         regime_by_date=regime_by_date,
         position_size_pct=0.25,
         initial_capital=100_000,
+        portfolio_context=book,
     )
 
-    # Buy GLD in bull regime (bars up to day 9)
-    bull_bars = _make_bars(10)
-    buy_result = signals_fn("GLD", bull_bars)
+    # Buy GLD in bull regime (bars up to day 8)
+    book.bind(empty_context())
+    buy_result = signals_fn("GLD", _make_bars(9))
     assert buy_result is not None
     assert buy_result["action"] == "buy"
 
-    # Now present bars that include a bear-regime day (day 10)
+    # Filled at day 9's open; now present bars that include a bear-regime day (day 10)
     bear_bars = _make_bars(11)
+    book.bind(filled("GLD", bear_bars, signal_index=8, decision_index=10))
     sell_result = signals_fn("GLD", bear_bars)
     assert sell_result is not None
     assert sell_result["action"] == "sell"

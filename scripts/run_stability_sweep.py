@@ -51,6 +51,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from backtest.metrics import BacktestMetrics
+from backtest.portfolio_context import RunnerBook
 from backtest.runner import BacktestRunner
 from backtest.simulator import SimulatedExecutor
 from research.evaluation.stability import (
@@ -201,6 +202,9 @@ def run_grid_point(
     kwargs[parameter] = int(value) if parameter in _INTEGER_PARAMETERS else value
 
     factory_kwargs = dict(kwargs)
+    # KAN-116: the sweep replays the sleeve on its own fills, as live does.
+    book = RunnerBook()
+    factory_kwargs["portfolio_context"] = book
     if spec.scoped_by_membership:
         factory_kwargs["membership"] = membership
     signals_fn = spec.signals_factory(
@@ -218,6 +222,7 @@ def run_grid_point(
         spec.build_risk_engine(),
         portfolio_name=spec.name,
         membership=membership,
+        book=book,
     )
     metrics = BacktestMetrics.compute(result.portfolio_values, result.trades)
     return {"value": value, **metrics}

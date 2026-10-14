@@ -6,6 +6,12 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from backtest.metrics import BacktestMetrics
+from backtest.portfolio_context import (
+    HeldPosition,
+    PendingOrder,
+    PortfolioContext,
+    RunnerBook,
+)
 from backtest.simulator import SimulatedExecutor
 from research.shadow import CandidateObserver
 from services.risk_management.funding import (
@@ -52,6 +58,15 @@ class BacktestResult:
     # from what was asked; ``portfolio_values`` (and so ``metrics``) include
     # these steps — callers that compare returns remove them.
     cash_flows_applied: dict = field(default_factory=dict)
+    # KAN-116: what happened to every buy signal the runner saw on or after
+    # ``trade_start_date``: refused by risk, skipped for sleeve cash, queued,
+    # and of the queued ones how many filled and how many expired unfilled.
+    entry_funnel: dict = field(
+        default_factory=lambda: {
+            "signals": 0, "risk_refused": 0, "whole_share_skipped": 0,
+            "cash_skipped": 0, "queued": 0, "filled": 0, "expired": 0,
+        }
+    )
 
 
 class BacktestRunner:
@@ -124,6 +139,7 @@ class BacktestRunner:
         delisting_stale_sessions: int = DELISTING_STALE_SESSIONS,
         cash_flows: dict | None = None,
         cash_flow_basis: tuple[Any, float] | None = None,
+        book: RunnerBook | None = None,
     ) -> BacktestResult:
         """Run a backtest over the provided bar data.
 
@@ -173,15 +189,28 @@ class BacktestRunner:
                 Every flow must apply strictly after the anchor (the scale is
                 not known until its close); one that would apply on or before
                 it raises ``ValueError``. Scaling inside the run, rather than a
-                first pass to learn the NAV, matters because a sleeve's signal
-                function is stateful: a second pass over the same function
-                starts with the first pass's book in its private state.
+                first pass to learn the NAV, mattered because a sleeve's signal
+                function was stateful: a second pass over the same function
+                started with the first pass's book in its private state (until
+                KAN-116, which moved that state into ``book``).
+            book: KAN-116. A :class:`backtest.portfolio_context.RunnerBook`
+                the sleeve's signal function was built with as its
+                ``portfolio_context``. Before each session's decisions it is
+                bound to a ``PortfolioContext`` of this run's own filled lots
+                (and its still-working orders), so the signal function sees
+                what actually filled — as live does — instead of a private
+                record of what it *asked* for. A buy that does not fill
+                leaves no lot behind and is simply re-evaluated next session.
+                Pass it whenever ``signals_fn`` was built with one: an
+                unbound book raises on its first read. ``None`` only for a
+                signal function that reads no positions (a test stub).
 
         Returns:
             BacktestResult with trades, portfolio_values, and metrics.
         """
         cash = self.initial_capital
         cash_limited = {"downsized": 0, "skipped": 0}
+        funnel = BacktestResult().entry_funnel
         pending_flows = sorted((cash_flows or {}).items())
         flows_applied: dict = {}
         # KAN-105: this run's NAV over live's on the basis session, learned at
@@ -321,6 +350,7 @@ class BacktestRunner:
                 if fill is None:
                     continue
 
+                funnel["filled"] += 1
                 cash -= fill["fill_price"] * fill["quantity"] + fill["commission"]
                 positions.setdefault(ticker, []).append(
                     _Lot(
@@ -379,6 +409,19 @@ class BacktestRunner:
                     flows_applied.get(current_date, 0.0) + amount
                 )
 
+            # --- Phase 2c': KAN-116, hand the sleeve its own book. ---
+            # Built once per session, before any decision, exactly as live
+            # builds one PortfolioContext per sleeve per run: every ticker's
+            # decision this session reads the same book, and an exit queued for
+            # one ticker does not change what another ticker's replacement
+            # logic sees as held until it fills.
+            if book is not None:
+                book.bind(
+                    _runner_context(
+                        positions, pending_exits, self.initial_capital
+                    )
+                )
+
             # --- Phase 2c: decide, using bars up to and including today's close. ---
             for ticker in bars_by_ticker:
                 if ticker not in traded_today or ticker in non_members:
@@ -399,6 +442,7 @@ class BacktestRunner:
                     # Skip new entries before trade_start_date
                     if trade_start_date is not None and current_date < trade_start_date:
                         continue
+                    funnel["signals"] += 1
                     limit_price = signal["limit_price"]
                     quantity = signal["quantity"]
                     sector = signal.get("sector", "Unknown")
@@ -437,12 +481,14 @@ class BacktestRunner:
                             )
 
                     if not decision.approved:
+                        funnel["risk_refused"] += 1
                         continue
 
                     order_quantity = decision.adjusted_quantity
                     if self.whole_shares:
                         truncated = float(int(order_quantity))
                         if truncated <= 0:
+                            funnel["whole_share_skipped"] += 1
                             if self.skip_ledger is not None:
                                 self.skip_ledger.record(
                                     ticker=ticker,
@@ -471,11 +517,13 @@ class BacktestRunner:
                     )
                     if not funding.approved:
                         cash_limited["skipped"] += 1
+                        funnel["cash_skipped"] += 1
                         continue
                     if funding.downsized:
                         cash_limited["downsized"] += 1
                         order_quantity = funding.quantity
 
+                    funnel["queued"] += 1
                     pending_entries[ticker] = _PendingEntry(
                         limit_price=limit_price,
                         quantity=order_quantity,
@@ -508,6 +556,11 @@ class BacktestRunner:
                 and current_date >= cash_flow_basis[0]
             ):
                 flow_scale = nav / float(cash_flow_basis[1])
+
+        # Entries still queued after the last session neither filled nor expired.
+        funnel["expired"] = (
+            funnel["queued"] - funnel["filled"] - len(pending_entries)
+        )
 
         # Compute metrics
         metrics = BacktestMetrics.compute(
@@ -544,6 +597,7 @@ class BacktestRunner:
             open_positions=open_positions,
             sleeve_cash=cash_limited,
             cash_flows_applied=flows_applied,
+            entry_funnel=funnel,
         )
 
 
@@ -578,6 +632,63 @@ class _Lot:
     def __post_init__(self):
         if self.peak_price == 0.0:
             self.peak_price = self.entry_price
+
+
+def _runner_context(
+    positions: dict[str, list[_Lot]],
+    pending_exits: dict[str, str],
+    sleeve_budget: float,
+) -> PortfolioContext:
+    """KAN-116: this run's filled lots as a live-shaped ``PortfolioContext``.
+
+    Field for field what ``PaperTradingState.build_portfolio_context`` reads
+    from the ``positions`` table: total quantity, quantity-weighted fill price,
+    the high-water mark since entry (the runner raises ``peak_price`` at each
+    close after decisions, as live's ``update_peak_prices`` does after its
+    signals), and the first fill's session. Entries queued yesterday have
+    already filled or expired by the time decisions run, so the only working
+    orders are exits that could not fill (no bar) — shown as pending sells,
+    which ``_context_exit_quantity`` reads to avoid a duplicate exit.
+    """
+    held = {}
+    for ticker, lots in positions.items():
+        if not lots or sum(lot.quantity for lot in lots) <= 0:
+            continue
+        # The average is accumulated lot by lot exactly as the live fill path
+        # (``PaperTradingState._apply_fill_accounting``) accumulates it, so a
+        # single lot's average IS its fill price. ``sum(p*q)/q`` can land one
+        # ulp below it, and the sleeves' ``peak > entry`` test then arms a
+        # trailing stop on a position that has never risen — a decision live
+        # would not take (caught by tests/backtest/test_position_source_parity).
+        quantity, average = lots[0].quantity, lots[0].entry_price
+        for lot in lots[1:]:
+            average = (average * quantity + lot.entry_price * lot.quantity) / (
+                quantity + lot.quantity
+            )
+            quantity += lot.quantity
+        held[ticker] = HeldPosition(
+            quantity=quantity,
+            avg_entry_price=average,
+            peak_price=max(lot.peak_price for lot in lots),
+            entry_date=min(lot.entry_date for lot in lots),
+        )
+    pending = {
+        ticker: PendingOrder(
+            ticker=ticker,
+            action="sell",
+            quantity=held[ticker].quantity,
+            limit_price=None,
+            recommendation_id=f"backtest-exit-{ticker}",
+        )
+        for ticker in pending_exits
+        if ticker in held
+    }
+    return PortfolioContext(
+        positions=held,
+        pending_orders=pending,
+        sleeve_budget=float(sleeve_budget),
+        reserved_notional=0.0,
+    )
 
 
 def collect_sorted_dates(bars_by_ticker: dict[str, list[dict]]) -> list:

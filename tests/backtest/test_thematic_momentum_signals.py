@@ -5,6 +5,7 @@ from datetime import date, timedelta
 from backtest.portfolio_context import HeldPosition, PendingOrder, PortfolioContext
 from backtest.ranked_selection import ReplacementPolicy
 from scripts.run_backtest import make_thematic_momentum_signals_fn
+from tests.backtest.books import empty_context
 
 
 def _make_trending_bars(tickers: list[str], days: int = 100, base_price: float = 50.0):
@@ -39,6 +40,7 @@ def test_thematic_momentum_buys_top_ranked():
         lookback_days=63,
         position_size_pct=0.15,
         initial_capital=20_000,
+        portfolio_context=empty_context(),
     )
 
     # LIT (index 4) has strongest trend, should get buy signal
@@ -74,6 +76,7 @@ def test_thematic_momentum_requires_above_ma():
         ma_period=50,
         position_size_pct=0.15,
         initial_capital=20_000,
+        portfolio_context=empty_context(),
     )
 
     for ticker in tickers:
@@ -92,6 +95,7 @@ def test_thematic_momentum_requires_min_bars():
         lookback_days=63,
         position_size_pct=0.15,
         initial_capital=20_000,
+        portfolio_context=empty_context(),
     )
 
     result = signals_fn("ARKK", bars["ARKK"])
@@ -144,6 +148,7 @@ def test_thematic_ranking_uses_only_the_eligible_universe():
         eligible_tickers=["ARKK"],
         top_n=1,
         lookback_days=63,
+        portfolio_context=empty_context(),
     )
 
     assert fn("ARKK", bars["ARKK"])["action"] == "buy"

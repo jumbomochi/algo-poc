@@ -95,7 +95,10 @@ transient or overwritten, so they are reports, not evidence.
   switch stay under the old shadow `baseline_id`, and new ones file under a new
   one (`SHADOW_DATING_VERSION` in the fingerprint). See
   `docs/decisions/divergence-session-dating-2026-10.md`. KAN-105 moved the id
-  again (`SHADOW_SEEDING_VERSION` and the warm-up length), for the same reason.
+  again (`SHADOW_SEEDING_VERSION` and the warm-up length), for the same reason,
+  and KAN-116 once more (`SHADOW_POSITION_SOURCE_VERSION`:
+  `shadow:89693c0029cad3e6` → `shadow:12d4b27466b26cd8` at the 2026-10-15
+  parameters).
 - **Keyed `(sleeve, session_date, baseline_id)`.** A re-run against the same
   baseline updates the row in place; a re-run after a rebaseline inserts new
   rows, because a verdict is only interpretable against the baseline that
@@ -146,8 +149,9 @@ monitor grades against that, so `window_end` is the current session.
   warm-up of `divergence.shadow_warmup_sessions` (160) sessions before the
   window, and its curve is scaled so it starts at live's NAV. The signal
   function is never called before the warm-up starts. Before KAN-105 it was fed
-  the pre-window bars with its buys refused, and because the sleeves record a
-  lot when they *emit* a buy, every window opened in cash on a phantom book.
+  the pre-window bars with its buys refused, and because the sleeves then
+  recorded a lot when they *emitted* a buy, every window opened in cash on a
+  phantom book.
   The 05:15 fetch is derived from N (2 years at 160). A sleeve whose bars are
   too short for its warm-up (or whose replay fails for any other reason) gets
   no curve, never a shorter warm-up under the same id. It is named with the
@@ -156,6 +160,15 @@ monitor grades against that, so `window_end` is the current session.
   The other sleeves are graded as usual. The artifact also records
   `warmup_sessions` and, per sleeve, `warm_from` and
   `invested_at_window_start`. See `docs/decisions/shadow-seeding-2026-10.md`.
+
+- **The replay holds what it filled (KAN-116).** Each sleeve reads its
+  positions from a `RunnerBook` (`PortfolioConfig.book`) that the replay's
+  runner re-binds before every session to a `PortfolioContext` of its own
+  filled lots — the same structure and signal-function branch the 05:15 run
+  hydrates from the `positions` table. An entry the replay does not fill is
+  re-evaluated the next session, as live's is; before KAN-116 it stayed a
+  phantom holding. The id moved with it (`SHADOW_POSITION_SOURCE_VERSION`). See
+  `docs/decisions/backtest-position-source-2026-10.md`.
 
 - **Mutually exclusive with `--pinned`** (exit 2). The shadow is the model
   replayed against live's own bars; the pin is a frozen artifact.

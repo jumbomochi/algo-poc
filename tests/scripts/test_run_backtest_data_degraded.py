@@ -23,6 +23,7 @@ import pytest
 
 from scripts import run_backtest
 from shared.data_cache import write_cache_document
+from tests.backtest.books import empty_context
 
 FIRST_SESSION = date(2023, 1, 3)
 SESSIONS = 320
@@ -148,6 +149,7 @@ def test_a_nan_surprise_is_not_an_entry():
     def fn_for(surprise):
         return run_backtest.make_earnings_drift_signals_fn(
             earnings_lookup=lambda t, d: {"surprise_pct": surprise} if d == on else None,
+            portfolio_context=empty_context(),
         )
 
     assert fn_for(float("nan"))("AAA", bars) is None

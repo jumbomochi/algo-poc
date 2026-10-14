@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+from tests.backtest.books import empty_context
+
 
 def test_thematic_momentum_accepts_regime():
     """Thematic momentum should accept regime_by_date parameter."""
@@ -23,6 +25,7 @@ def test_thematic_momentum_accepts_regime():
         trailing_stop_pct=0.10,
         initial_capital=100_000,
         regime_by_date=regime_by_date,
+        portfolio_context=empty_context(),
     )
     assert callable(fn)
 
@@ -39,6 +42,7 @@ def test_quality_value_accepts_regime():
         trailing_stop_pct=0.12,
         initial_capital=100_000,
         regime_by_date=regime_by_date,
+        portfolio_context=empty_context(),
     )
     assert callable(fn)
 
@@ -53,6 +57,7 @@ def test_earnings_drift_accepts_regime():
         trailing_stop_pct=0.06,
         initial_capital=100_000,
         regime_by_date=regime_by_date,
+        portfolio_context=empty_context(),
     )
     assert callable(fn)
 
@@ -96,6 +101,7 @@ def test_thematic_momentum_tightens_trailing_stop_in_bear():
         max_loss_pct=0.08,
         initial_capital=100_000,
         regime_by_date=regime_by_date,
+        portfolio_context=empty_context(),
     )
 
     fn_neutral = make_thematic_momentum_signals_fn(
@@ -106,6 +112,7 @@ def test_thematic_momentum_tightens_trailing_stop_in_bear():
         max_loss_pct=0.08,
         initial_capital=100_000,
         regime_by_date=None,
+        portfolio_context=empty_context(),
     )
 
     # Both should be callable
@@ -152,6 +159,7 @@ def test_quality_value_tightens_trailing_stop_in_bear():
         trailing_stop_pct=0.12,
         initial_capital=100_000,
         regime_by_date=regime_by_date,
+        portfolio_context=empty_context(),
     )
     assert callable(fn)
 
@@ -179,11 +187,16 @@ def test_earnings_drift_tightens_trailing_stop_in_bear():
     for i in range(50):
         regime_by_date[base_date + timedelta(days=i)] = "bear"
 
+    from backtest.portfolio_context import RunnerBook
+    from tests.backtest.books import filled
+
+    book = RunnerBook()
     fn = make_earnings_drift_signals_fn(
         earnings_lookup=earnings_lookup,
         trailing_stop_pct=0.06,
         initial_capital=100_000,
         regime_by_date=regime_by_date,
+        portfolio_context=book,
     )
 
     # Build bars: entry, rise, then drop
@@ -206,6 +219,7 @@ def test_earnings_drift_tightens_trailing_stop_in_bear():
         })
 
     # Entry should happen (surprise earnings within window)
+    book.bind(empty_context())
     result = fn("AAPL", bars[:5])
     assert result is not None
     assert result["action"] == "buy"
@@ -215,10 +229,15 @@ def test_earnings_drift_tightens_trailing_stop_in_bear():
     # Peak = 118, trigger at (118 - x)/118 >= 0.04 => x <= 118*0.96 = 113.28
     triggered_sell = False
     for i in range(5, len(bars)):
+        # The lot a runner holds: filled at bars[5]'s open, peak raised at each close
+        book.bind(filled("AAPL", bars, signal_index=4, decision_index=i))
         result = fn("AAPL", bars[:i+1])
         if result and result["action"] == "sell":
             triggered_sell = True
             assert result["exit_reason"] in ("trailing_stop", "time_exit")
+            # 112.0 on bars[19] is the first close >= 4% below the 118 peak;
+            # the untightened 6% stop would wait for bars[20] (110.5).
+            assert result["exit_reason"] == "trailing_stop" and i == 19, (result, i)
             break
 
     # Should eventually exit
@@ -261,6 +280,7 @@ def test_thematic_momentum_tightens_max_loss_in_bear():
         max_loss_pct=0.08,
         initial_capital=100_000,
         regime_by_date=regime_by_date,
+        portfolio_context=empty_context(),
     )
     assert callable(fn)
 
@@ -287,6 +307,7 @@ def test_crash_regime_tightens_more_than_bear():
         trailing_stop_pct=0.06,
         initial_capital=100_000,
         regime_by_date=regime_by_date,
+        portfolio_context=empty_context(),
     )
     assert callable(fn)
 
@@ -329,5 +350,6 @@ def test_neutral_regime_no_tightening():
         trailing_stop_pct=0.06,
         initial_capital=100_000,
         regime_by_date=regime_by_date,
+        portfolio_context=empty_context(),
     )
     assert callable(fn)

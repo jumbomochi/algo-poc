@@ -1,0 +1,944 @@
+{
+ "code": {
+  "after": "KAN-116 branch",
+  "before": "origin/main 6b93d6a"
+ },
+ "option2_prototype_two_year": {
+  "earnings_drift": {
+   "invested_mean": 0.306295,
+   "sharpe": 0.788563,
+   "total_return": 0.119194
+  },
+  "momentum": {
+   "invested_mean": 0.868677,
+   "sharpe": 0.772431,
+   "total_return": 0.298867
+  },
+  "quality_value": {
+   "invested_mean": 0.912258,
+   "sharpe": 1.027804,
+   "total_return": 0.323761
+  },
+  "sector_rotation": {
+   "invested_mean": 0.904301,
+   "sharpe": 0.19037,
+   "total_return": 0.03173
+  },
+  "tail_risk_hedge": {
+   "invested_mean": 0.226364,
+   "sharpe": -0.622297,
+   "total_return": -0.049619
+  },
+  "thematic_momentum": {
+   "invested_mean": 0.769434,
+   "sharpe": 1.459933,
+   "total_return": 0.749806
+  }
+ },
+ "pins": {
+  "edge_pin_20260915": {
+   "aggregate_total_return": {
+    "after": 0.720693,
+    "before": 0.713754
+   },
+   "sleeves": {
+    "earnings_drift": {
+     "after": {
+      "invested": 0.423605,
+      "max_drawdown": 0.148637,
+      "sharpe": 0.627556,
+      "total_return": 0.558685,
+      "trades": 678,
+      "unfilled_pct": 0.655488
+     },
+     "before": {
+      "invested": 0.380787,
+      "max_drawdown": 0.143293,
+      "sharpe": 0.531927,
+      "total_return": 0.404834,
+      "trades": 569,
+      "unfilled_pct": 0.503923
+     }
+    },
+    "momentum": {
+     "after": {
+      "invested": 0.825073,
+      "max_drawdown": 0.25934,
+      "sharpe": 0.526387,
+      "total_return": 1.378973,
+      "trades": 761,
+      "unfilled_pct": 0.527966
+     },
+     "before": {
+      "invested": 0.747186,
+      "max_drawdown": 0.190371,
+      "sharpe": 0.632349,
+      "total_return": 1.601488,
+      "trades": 619,
+      "unfilled_pct": 0.266979
+     }
+    },
+    "quality_value": {
+     "after": {
+      "invested": 0.914212,
+      "max_drawdown": 0.174581,
+      "sharpe": 0.32627,
+      "total_return": 0.193173,
+      "trades": 115,
+      "unfilled_pct": 0.643052
+     },
+     "before": {
+      "invested": 0.826806,
+      "max_drawdown": 0.178935,
+      "sharpe": 0.301473,
+      "total_return": 0.155964,
+      "trades": 75,
+      "unfilled_pct": 0.312977
+     }
+    },
+    "sector_rotation": {
+     "after": {
+      "invested": 0.855653,
+      "max_drawdown": 0.234135,
+      "sharpe": 0.547546,
+      "total_return": 0.790763,
+      "trades": 155,
+      "unfilled_pct": 0.697761
+     },
+     "before": {
+      "invested": 0.775273,
+      "max_drawdown": 0.22001,
+      "sharpe": 0.543989,
+      "total_return": 0.713709,
+      "trades": 118,
+      "unfilled_pct": 0.272189
+     }
+    },
+    "tail_risk_hedge": {
+     "after": {
+      "invested": 0.256178,
+      "max_drawdown": 0.194955,
+      "sharpe": -0.420165,
+      "total_return": -0.164003,
+      "trades": 368,
+      "unfilled_pct": 0.2173
+     },
+     "before": {
+      "invested": 0.184318,
+      "max_drawdown": 0.201982,
+      "sharpe": -0.645681,
+      "total_return": -0.199102,
+      "trades": 364,
+      "unfilled_pct": 0.229474
+     }
+    },
+    "thematic_momentum": {
+     "after": {
+      "invested": 0.652049,
+      "max_drawdown": 0.486477,
+      "sharpe": 0.564372,
+      "total_return": 1.168109,
+      "trades": 916,
+      "unfilled_pct": 0.535678
+     },
+     "before": {
+      "invested": 0.519344,
+      "max_drawdown": 0.401187,
+      "sharpe": 0.634275,
+      "total_return": 1.121063,
+      "trades": 696,
+      "unfilled_pct": 0.277492
+     }
+    }
+   }
+  },
+  "rung0_pin_20260925": {
+   "aggregate_total_return": {
+    "after": 0.766725,
+    "before": 1.145564
+   },
+   "sleeves": {
+    "momentum": {
+     "after": {
+      "invested": 0.80095,
+      "max_drawdown": 0.30047,
+      "sharpe": 0.38892,
+      "total_return": 0.766725,
+      "trades": 661,
+      "unfilled_pct": 0.756151
+     },
+     "before": {
+      "invested": 0.703925,
+      "max_drawdown": 0.199026,
+      "sharpe": 0.543714,
+      "total_return": 1.145564,
+      "trades": 559,
+      "unfilled_pct": 0.656269
+     }
+    }
+   }
+  }
+ },
+ "shadow_11_windows": {
+  "sleeves": {
+   "earnings_drift": {
+    "after": {
+     "invested_at_start": 0.740667,
+     "mean_abs_gap": 0.007438,
+     "statuses": {
+      "OK": 11
+     }
+    },
+    "before": {
+     "invested_at_start": 0.777548,
+     "mean_abs_gap": 0.016713,
+     "statuses": {
+      "BREACH": 2,
+      "OK": 9
+     }
+    }
+   },
+   "momentum": {
+    "after": {
+     "invested_at_start": 0.789595,
+     "mean_abs_gap": 0.015886,
+     "statuses": {
+      "OK": 10,
+      "WARNING": 1
+     }
+    },
+    "before": {
+     "invested_at_start": 0.679908,
+     "mean_abs_gap": 0.003878,
+     "statuses": {
+      "OK": 11
+     }
+    }
+   },
+   "quality_value": {
+    "after": {
+     "invested_at_start": 0.854435,
+     "mean_abs_gap": 0.019073,
+     "statuses": {
+      "OK": 9,
+      "WARNING": 2
+     }
+    },
+    "before": {
+     "invested_at_start": 0.794382,
+     "mean_abs_gap": 0.012609,
+     "statuses": {
+      "OK": 10,
+      "WARNING": 1
+     }
+    }
+   },
+   "sector_rotation": {
+    "after": {
+     "invested_at_start": 0.93053,
+     "mean_abs_gap": 0.010997,
+     "statuses": {
+      "OK": 11
+     }
+    },
+    "before": {
+     "invested_at_start": 0.706951,
+     "mean_abs_gap": 0.007888,
+     "statuses": {
+      "OK": 11
+     }
+    }
+   },
+   "tail_risk_hedge": {
+    "after": {
+     "invested_at_start": 0.215945,
+     "mean_abs_gap": 0.004024,
+     "statuses": {
+      "OK": 11
+     }
+    },
+    "before": {
+     "invested_at_start": 0.155659,
+     "mean_abs_gap": 0.001445,
+     "statuses": {
+      "OK": 11
+     }
+    }
+   },
+   "thematic_momentum": {
+    "after": {
+     "invested_at_start": 0.982544,
+     "mean_abs_gap": 0.047101,
+     "statuses": {
+      "BREACH": 8,
+      "OK": 2,
+      "WARNING": 1
+     }
+    },
+    "before": {
+     "invested_at_start": 0.779806,
+     "mean_abs_gap": 0.03888,
+     "statuses": {
+      "BREACH": 7,
+      "OK": 1,
+      "WARNING": 3
+     }
+    }
+   }
+  },
+  "window_ends": [
+   "2026-09-23",
+   "2026-10-08"
+  ]
+ },
+ "stability": {
+  "momentum": {
+   "after": {
+    "is_plateau": true,
+    "relative_degradation": 0.078728,
+    "sharpe_by_lookback": {
+     "100.0": 0.523546,
+     "113.0": 0.521661,
+     "126.0": 0.550012,
+     "139.0": 0.472692,
+     "152.0": 0.508943
+    }
+   },
+   "before": {
+    "is_plateau": true,
+    "relative_degradation": 0.104712,
+    "sharpe_by_lookback": {
+     "100.0": 0.436604,
+     "113.0": 0.596587,
+     "126.0": 0.556092,
+     "139.0": 0.486402,
+     "152.0": 0.471856
+    }
+   }
+  },
+  "sector_rotation": {
+   "after": {
+    "is_plateau": true,
+    "relative_degradation": -0.097134,
+    "sharpe_by_lookback": {
+     "42.0": 0.775259,
+     "52.0": 0.762604,
+     "63.0": 0.639133,
+     "74.0": 0.565591,
+     "84.0": 0.701405
+    }
+   },
+   "before": {
+    "is_plateau": true,
+    "relative_degradation": 0.077008,
+    "sharpe_by_lookback": {
+     "42.0": 0.836084,
+     "52.0": 0.676291,
+     "63.0": 0.685983,
+     "74.0": 0.426591,
+     "84.0": 0.593659
+    }
+   }
+  }
+ },
+ "ten_year": {
+  "d10_of_record_20260819": {
+   "holdout": {
+    "first_session": "2026-06-01",
+    "last_session": "2026-08-18",
+    "n_sessions": 55
+   },
+   "sleeves": {
+    "earnings_drift": {
+     "after": {
+      "cash_refused_retries": 915,
+      "dsr": 0.553483,
+      "dsr_at_before_sr_star": 0.415215,
+      "holdout_sharpe": 0.0,
+      "invested": 0.428463,
+      "lots": 679,
+      "max_drawdown": 0.14863,
+      "passes_fdr": true,
+      "psr": 0.9751,
+      "sharpe": 0.627273,
+      "signals_sized": 1969,
+      "total_return": 0.558638,
+      "trades": 679,
+      "unfilled_pct": 0.655155,
+      "verdict": "FAIL"
+     },
+     "before": {
+      "dsr": 0.303523,
+      "dsr_at_before_sr_star": 0.303523,
+      "holdout_sharpe": 0.0,
+      "invested": 0.385097,
+      "lots": 571,
+      "max_drawdown": 0.143367,
+      "passes_fdr": true,
+      "psr": 0.952125,
+      "sharpe": 0.531621,
+      "signals_sized": 1147,
+      "total_return": 0.404662,
+      "trades": 571,
+      "unfilled_pct": 0.50218,
+      "verdict": "FAIL"
+     }
+    },
+    "momentum": {
+     "after": {
+      "cash_refused_retries": 721,
+      "dsr": 0.406692,
+      "dsr_at_before_sr_star": 0.279195,
+      "holdout_sharpe": -0.844678,
+      "invested": 0.836038,
+      "lots": 757,
+      "max_drawdown": 0.260717,
+      "passes_fdr": true,
+      "psr": 0.94454,
+      "sharpe": 0.508912,
+      "signals_sized": 1657,
+      "total_return": 1.321503,
+      "trades": 749,
+      "unfilled_pct": 0.54315,
+      "verdict": "FAIL"
+     },
+     "before": {
+      "dsr": 0.339562,
+      "dsr_at_before_sr_star": 0.339562,
+      "holdout_sharpe": 0.249136,
+      "invested": 0.772257,
+      "lots": 613,
+      "max_drawdown": 0.207242,
+      "passes_fdr": true,
+      "psr": 0.961157,
+      "sharpe": 0.563604,
+      "signals_sized": 847,
+      "total_return": 1.372956,
+      "trades": 606,
+      "unfilled_pct": 0.276269,
+      "verdict": "FAIL"
+     }
+    },
+    "quality_value": {
+     "after": {
+      "cash_refused_retries": 159,
+      "dsr": 0.239233,
+      "dsr_at_before_sr_star": 0.144968,
+      "holdout_sharpe": 2.00801,
+      "invested": 0.917161,
+      "lots": 126,
+      "max_drawdown": 0.174581,
+      "passes_fdr": false,
+      "psr": 0.869287,
+      "sharpe": 0.358204,
+      "signals_sized": 358,
+      "total_return": 0.214773,
+      "trades": 109,
+      "unfilled_pct": 0.648045,
+      "verdict": "FAIL"
+     },
+     "before": {
+      "dsr": 0.118141,
+      "dsr_at_before_sr_star": 0.118141,
+      "holdout_sharpe": 4.632432,
+      "invested": 0.826109,
+      "lots": 87,
+      "max_drawdown": 0.178935,
+      "passes_fdr": false,
+      "psr": 0.847988,
+      "sharpe": 0.323266,
+      "signals_sized": 126,
+      "total_return": 0.167677,
+      "trades": 71,
+      "unfilled_pct": 0.309524,
+      "verdict": "FAIL"
+     }
+    },
+    "sector_rotation": {
+     "after": {
+      "cash_refused_retries": 263,
+      "dsr": 0.533756,
+      "dsr_at_before_sr_star": 0.396966,
+      "holdout_sharpe": 0.522677,
+      "invested": 0.847945,
+      "lots": 164,
+      "max_drawdown": 0.228249,
+      "passes_fdr": true,
+      "psr": 0.97114,
+      "sharpe": 0.611575,
+      "signals_sized": 490,
+      "total_return": 0.905688,
+      "trades": 156,
+      "unfilled_pct": 0.665306,
+      "verdict": "FAIL"
+     },
+     "before": {
+      "dsr": 0.41068,
+      "dsr_at_before_sr_star": 0.41068,
+      "holdout_sharpe": -0.258094,
+      "invested": 0.762912,
+      "lots": 125,
+      "max_drawdown": 0.214961,
+      "passes_fdr": true,
+      "psr": 0.973709,
+      "sharpe": 0.623158,
+      "signals_sized": 170,
+      "total_return": 0.841007,
+      "trades": 120,
+      "unfilled_pct": 0.264706,
+      "verdict": "FAIL"
+     }
+    },
+    "tail_risk_hedge": {
+     "after": {
+      "cash_refused_retries": 0,
+      "dsr": 0.000714,
+      "dsr_at_before_sr_star": 0.000198,
+      "holdout_sharpe": -1.998027,
+      "invested": 0.254941,
+      "lots": 369,
+      "max_drawdown": 0.188477,
+      "passes_fdr": false,
+      "psr": 0.091245,
+      "sharpe": -0.419755,
+      "signals_sized": 466,
+      "total_return": -0.162826,
+      "trades": 367,
+      "unfilled_pct": 0.208155,
+      "verdict": "FAIL"
+     },
+     "before": {
+      "dsr": 2.3e-05,
+      "dsr_at_before_sr_star": 2.3e-05,
+      "holdout_sharpe": -4.777251,
+      "invested": 0.202573,
+      "lots": 367,
+      "max_drawdown": 0.199997,
+      "passes_fdr": false,
+      "psr": 0.029657,
+      "sharpe": -0.598196,
+      "signals_sized": 473,
+      "total_return": -0.185198,
+      "trades": 366,
+      "unfilled_pct": 0.224101,
+      "verdict": "FAIL"
+     }
+    },
+    "thematic_momentum": {
+     "after": {
+      "cash_refused_retries": 776,
+      "dsr": 0.463476,
+      "dsr_at_before_sr_star": 0.329797,
+      "holdout_sharpe": -0.885696,
+      "invested": 0.655764,
+      "lots": 927,
+      "max_drawdown": 0.489801,
+      "passes_fdr": true,
+      "psr": 0.958761,
+      "sharpe": 0.554975,
+      "signals_sized": 2019,
+      "total_return": 1.134487,
+      "trades": 919,
+      "unfilled_pct": 0.540862,
+      "verdict": "FAIL"
+     },
+     "before": {
+      "dsr": 0.430968,
+      "dsr_at_before_sr_star": 0.430968,
+      "holdout_sharpe": -0.890454,
+      "invested": 0.521569,
+      "lots": 707,
+      "max_drawdown": 0.398778,
+      "passes_fdr": true,
+      "psr": 0.976763,
+      "sharpe": 0.639861,
+      "signals_sized": 976,
+      "total_return": 1.1297,
+      "trades": 701,
+      "unfilled_pct": 0.275615,
+      "verdict": "FAIL"
+     }
+    }
+   },
+   "sr_star": {
+    "after": 0.036806,
+    "before": 0.043828
+   }
+  },
+  "refresh_20261013": {
+   "holdout": {
+    "first_session": "2026-06-01",
+    "last_session": "2026-10-12",
+    "n_sessions": 93
+   },
+   "sleeves": {
+    "earnings_drift": {
+     "after": {
+      "cash_refused_retries": 319,
+      "dsr": 0.406926,
+      "dsr_at_before_sr_star": 0.246468,
+      "holdout_sharpe": 2.165721,
+      "invested": 0.394145,
+      "lots": 878,
+      "max_drawdown": 0.168297,
+      "passes_fdr": true,
+      "psr": 0.961006,
+      "sharpe": 0.564016,
+      "signals_sized": 1508,
+      "total_return": 0.551752,
+      "trades": 878,
+      "unfilled_pct": 0.417772,
+      "verdict": "FAIL"
+     },
+     "before": {
+      "dsr": 0.327261,
+      "dsr_at_before_sr_star": 0.327261,
+      "holdout_sharpe": 2.338921,
+      "invested": 0.323891,
+      "lots": 705,
+      "max_drawdown": 0.096803,
+      "passes_fdr": true,
+      "psr": 0.977883,
+      "sharpe": 0.640883,
+      "signals_sized": 1053,
+      "total_return": 0.525768,
+      "trades": 705,
+      "unfilled_pct": 0.330484,
+      "verdict": "FAIL"
+     }
+    },
+    "momentum": {
+     "after": {
+      "cash_refused_retries": 655,
+      "dsr": 0.43441,
+      "dsr_at_before_sr_star": 0.268926,
+      "holdout_sharpe": -0.05469,
+      "invested": 0.810438,
+      "lots": 771,
+      "max_drawdown": 0.247706,
+      "passes_fdr": true,
+      "psr": 0.966819,
+      "sharpe": 0.586597,
+      "signals_sized": 1621,
+      "total_return": 1.628467,
+      "trades": 763,
+      "unfilled_pct": 0.524368,
+      "verdict": "FAIL"
+     },
+     "before": {
+      "dsr": 0.400012,
+      "dsr_at_before_sr_star": 0.400012,
+      "holdout_sharpe": 0.912686,
+      "invested": 0.730383,
+      "lots": 634,
+      "max_drawdown": 0.19517,
+      "passes_fdr": true,
+      "psr": 0.985884,
+      "sharpe": 0.702341,
+      "signals_sized": 857,
+      "total_return": 1.878367,
+      "trades": 626,
+      "unfilled_pct": 0.26021,
+      "verdict": "FAIL"
+     }
+    },
+    "quality_value": {
+     "after": {
+      "cash_refused_retries": 0,
+      "dsr": 0.021825,
+      "dsr_at_before_sr_star": 0.006718,
+      "holdout_sharpe": 0.0,
+      "invested": 0.0,
+      "lots": 0,
+      "max_drawdown": 0.0,
+      "passes_fdr": false,
+      "psr": 0.5,
+      "sharpe": 0.0,
+      "signals_sized": 0,
+      "total_return": 0.0,
+      "trades": 0,
+      "unfilled_pct": 0.0,
+      "verdict": "FAIL"
+     },
+     "before": {
+      "dsr": 0.006718,
+      "dsr_at_before_sr_star": 0.006718,
+      "holdout_sharpe": 0.0,
+      "invested": 0.0,
+      "lots": 0,
+      "max_drawdown": 0.0,
+      "passes_fdr": false,
+      "psr": 0.5,
+      "sharpe": 0.0,
+      "signals_sized": 0,
+      "total_return": 0.0,
+      "trades": 0,
+      "unfilled_pct": 0.0,
+      "verdict": "FAIL"
+     }
+    },
+    "sector_rotation": {
+     "after": {
+      "cash_refused_retries": 300,
+      "dsr": 0.462606,
+      "dsr_at_before_sr_star": 0.294413,
+      "holdout_sharpe": -0.454429,
+      "invested": 0.844939,
+      "lots": 163,
+      "max_drawdown": 0.225608,
+      "passes_fdr": true,
+      "psr": 0.970517,
+      "sharpe": 0.609089,
+      "signals_sized": 522,
+      "total_return": 0.901991,
+      "trades": 157,
+      "unfilled_pct": 0.687739,
+      "verdict": "FAIL"
+     },
+     "before": {
+      "dsr": 0.266281,
+      "dsr_at_before_sr_star": 0.266281,
+      "holdout_sharpe": -0.989049,
+      "invested": 0.767521,
+      "lots": 125,
+      "max_drawdown": 0.216708,
+      "passes_fdr": true,
+      "psr": 0.96524,
+      "sharpe": 0.582974,
+      "signals_sized": 170,
+      "total_return": 0.770725,
+      "trades": 120,
+      "unfilled_pct": 0.264706,
+      "verdict": "FAIL"
+     }
+    },
+    "tail_risk_hedge": {
+     "after": {
+      "cash_refused_retries": 0,
+      "dsr": 0.00039,
+      "dsr_at_before_sr_star": 6.8e-05,
+      "holdout_sharpe": -1.980969,
+      "invested": 0.255462,
+      "lots": 375,
+      "max_drawdown": 0.187593,
+      "passes_fdr": false,
+      "psr": 0.091753,
+      "sharpe": -0.418999,
+      "signals_sized": 478,
+      "total_return": -0.162444,
+      "trades": 372,
+      "unfilled_pct": 0.215481,
+      "verdict": "FAIL"
+     },
+     "before": {
+      "dsr": 4e-06,
+      "dsr_at_before_sr_star": 4e-06,
+      "holdout_sharpe": -4.15871,
+      "invested": 0.183992,
+      "lots": 366,
+      "max_drawdown": 0.212167,
+      "passes_fdr": false,
+      "psr": 0.02364,
+      "sharpe": -0.627373,
+      "signals_sized": 476,
+      "total_return": -0.196315,
+      "trades": 363,
+      "unfilled_pct": 0.231092,
+      "verdict": "FAIL"
+     }
+    },
+    "thematic_momentum": {
+     "after": {
+      "cash_refused_retries": 593,
+      "dsr": 0.492008,
+      "dsr_at_before_sr_star": 0.319015,
+      "holdout_sharpe": 0.045238,
+      "invested": 0.641649,
+      "lots": 923,
+      "max_drawdown": 0.474516,
+      "passes_fdr": true,
+      "psr": 0.976089,
+      "sharpe": 0.632957,
+      "signals_sized": 1831,
+      "total_return": 1.390406,
+      "trades": 912,
+      "unfilled_pct": 0.495904,
+      "verdict": "FAIL"
+     },
+     "before": {
+      "dsr": 0.364311,
+      "dsr_at_before_sr_star": 0.364311,
+      "holdout_sharpe": 0.031723,
+      "invested": 0.519034,
+      "lots": 703,
+      "max_drawdown": 0.395252,
+      "passes_fdr": true,
+      "psr": 0.981698,
+      "sharpe": 0.671898,
+      "signals_sized": 968,
+      "total_return": 1.220628,
+      "trades": 694,
+      "unfilled_pct": 0.27376,
+      "verdict": "FAIL"
+     }
+    }
+   },
+   "sr_star": {
+    "after": 0.040276,
+    "before": 0.049352
+   }
+  }
+ },
+ "two_year": {
+  "sleeves": {
+   "earnings_drift": {
+    "after": {
+     "buy_signals": 430,
+     "invested": 0.307942,
+     "lots": 144,
+     "max_drawdown": 0.068039,
+     "never_filled_pct": 0.665116,
+     "retries": 260,
+     "retries_filled": 67,
+     "sharpe": 0.705738,
+     "total_return": 0.103084
+    },
+    "before": {
+     "buy_signals": 238,
+     "invested": 0.28399,
+     "lots": 122,
+     "max_drawdown": 0.035234,
+     "never_filled_pct": 0.487395,
+     "retries": 81,
+     "retries_filled": 37,
+     "sharpe": 0.66428,
+     "total_return": 0.089924
+    }
+   },
+   "momentum": {
+    "after": {
+     "buy_signals": 179,
+     "invested": 0.869034,
+     "lots": 136,
+     "max_drawdown": 0.245085,
+     "never_filled_pct": 0.240223,
+     "retries": 43,
+     "retries_filled": 27,
+     "sharpe": 0.772678,
+     "total_return": 0.296523
+    },
+    "before": {
+     "buy_signals": 138,
+     "invested": 0.814431,
+     "lots": 111,
+     "max_drawdown": 0.23173,
+     "never_filled_pct": 0.195652,
+     "retries": 21,
+     "retries_filled": 15,
+     "sharpe": 0.922198,
+     "total_return": 0.353913
+    }
+   },
+   "quality_value": {
+    "after": {
+     "buy_signals": 445,
+     "invested": 0.916147,
+     "lots": 132,
+     "max_drawdown": 0.173113,
+     "never_filled_pct": 0.703371,
+     "retries": 313,
+     "retries_filled": 58,
+     "sharpe": 0.958318,
+     "total_return": 0.284908
+    },
+    "before": {
+     "buy_signals": 133,
+     "invested": 0.810385,
+     "lots": 86,
+     "max_drawdown": 0.18167,
+     "never_filled_pct": 0.353383,
+     "retries": 37,
+     "retries_filled": 27,
+     "sharpe": 0.320421,
+     "total_return": 0.071142
+    }
+   },
+   "sector_rotation": {
+    "after": {
+     "buy_signals": 155,
+     "invested": 0.890995,
+     "lots": 43,
+     "max_drawdown": 0.16419,
+     "never_filled_pct": 0.722581,
+     "retries": 112,
+     "retries_filled": 14,
+     "sharpe": -0.074597,
+     "total_return": -0.028949
+    },
+    "before": {
+     "buy_signals": 42,
+     "invested": 0.785136,
+     "lots": 29,
+     "max_drawdown": 0.16241,
+     "never_filled_pct": 0.309524,
+     "retries": 8,
+     "retries_filled": 5,
+     "sharpe": -0.046971,
+     "total_return": -0.020685
+    }
+   },
+   "tail_risk_hedge": {
+    "after": {
+     "buy_signals": 135,
+     "invested": 0.231438,
+     "lots": 99,
+     "max_drawdown": 0.067,
+     "never_filled_pct": 0.266667,
+     "retries": 36,
+     "retries_filled": 29,
+     "sharpe": -0.484252,
+     "total_return": -0.038596
+    },
+    "before": {
+     "buy_signals": 127,
+     "invested": 0.147196,
+     "lots": 87,
+     "max_drawdown": 0.050901,
+     "never_filled_pct": 0.314961,
+     "retries": 39,
+     "retries_filled": 28,
+     "sharpe": -0.022385,
+     "total_return": -0.002014
+    }
+   },
+   "thematic_momentum": {
+    "after": {
+     "buy_signals": 513,
+     "invested": 0.76951,
+     "lots": 174,
+     "max_drawdown": 0.138108,
+     "never_filled_pct": 0.660819,
+     "retries": 338,
+     "retries_filled": 58,
+     "sharpe": 1.458702,
+     "total_return": 0.749049
+    },
+    "before": {
+     "buy_signals": 186,
+     "invested": 0.614237,
+     "lots": 132,
+     "max_drawdown": 0.123499,
+     "never_filled_pct": 0.290323,
+     "retries": 50,
+     "retries_filled": 38,
+     "sharpe": 1.567368,
+     "total_return": 0.613999
+    }
+   }
+  },
+  "window": [
+   "2024-09-03",
+   "2026-10-08"
+  ]
+ }
+}

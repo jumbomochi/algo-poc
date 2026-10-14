@@ -4,6 +4,7 @@ from datetime import date
 
 from backtest.portfolio_context import HeldPosition, PendingOrder, PortfolioContext
 from scripts.run_backtest import make_sector_rotation_signals_fn
+from tests.backtest.books import empty_context
 
 
 def _make_bars(tickers: list[str], days: int = 100, base_price: float = 100.0, daily_return: float = 0.001):
@@ -37,6 +38,7 @@ def test_sector_rotation_buys_top_ranked():
         lookback_days=63,
         position_size_pct=0.20,
         initial_capital=20_000,
+        portfolio_context=empty_context(),
     )
 
     # XLY has highest return (index 4, fastest growth), should get buy signal
@@ -57,6 +59,7 @@ def test_sector_rotation_skips_low_ranked():
         lookback_days=63,
         position_size_pct=0.20,
         initial_capital=20_000,
+        portfolio_context=empty_context(),
     )
 
     # XLK has lowest return (index 0, slowest growth), should NOT get buy signal
@@ -75,6 +78,7 @@ def test_sector_rotation_requires_min_bars():
         lookback_days=63,
         position_size_pct=0.20,
         initial_capital=20_000,
+        portfolio_context=empty_context(),
     )
 
     result = signals_fn("XLK", bars["XLK"])

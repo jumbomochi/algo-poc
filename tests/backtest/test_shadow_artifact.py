@@ -354,3 +354,79 @@ def test_an_artifact_written_before_the_warm_up_loads_as_unwarmed(tmp_path) -> N
 
     assert artifact.warmup_sessions is None
     assert artifact.seeding == {}
+
+
+# ---------------------------------------------------------------------------
+# KAN-116: a replay that reads its own fills is a different model
+# ---------------------------------------------------------------------------
+
+
+def _pre_kan116_id(portfolios, *, whole_shares=False, cash_buffer_bps=25.0,
+                   warmup_sessions=160) -> str:
+    """``shadow_id_for`` exactly as it was before the position-source version."""
+    import hashlib
+
+    from backtest.shadow_artifact import (
+        SHADOW_DATING_VERSION,
+        SHADOW_FUNDING_VERSION,
+        SHADOW_ID_PREFIX,
+        SHADOW_SEEDING_VERSION,
+    )
+
+    fingerprint = sorted(
+        (name, json.dumps(s.shadow_params, sort_keys=True, default=str))
+        for name, s in portfolios.items()
+    )
+    if whole_shares:
+        fingerprint.append(("__sizing__", "whole_shares"))
+    fingerprint.append(("__dating__", SHADOW_DATING_VERSION))
+    fingerprint.append(
+        ("__funding__", f"{SHADOW_FUNDING_VERSION}@{float(cash_buffer_bps):g}bps")
+    )
+    fingerprint.append(
+        ("__seeding__", f"warm{int(warmup_sessions)}:{SHADOW_SEEDING_VERSION}")
+    )
+    digest = hashlib.sha256(
+        json.dumps(fingerprint, sort_keys=True).encode()
+    ).hexdigest()[:16]
+    return f"{SHADOW_ID_PREFIX}{digest}"
+
+
+@pytest.mark.parametrize("whole_shares", [False, True])
+def test_a_fill_driven_shadow_files_under_a_new_baseline_id(whole_shares) -> None:
+    """Verdicts graded against a replay whose sleeves believed they held every
+    buy they had asked for must not share a breach streak with ones graded
+    against a replay that reads its own fills."""
+    from backtest.shadow_artifact import SHADOW_POSITION_SOURCE_VERSION
+
+    roster = _roster()
+    new = shadow_id_for(roster, whole_shares=whole_shares)
+
+    assert new != _pre_kan116_id(roster, whole_shares=whole_shares)
+    assert new == shadow_id_for(roster, whole_shares=whole_shares)
+    assert SHADOW_POSITION_SOURCE_VERSION == "runner_book"
+
+
+def test_the_production_baseline_id_restarts_at_kan116() -> None:
+    """The id the 05:15 run will stamp, recorded in the KAN-116 PR and decision.
+
+    Pinned so a later fingerprint change is a deliberate edit here too, not a
+    silent restart of every breach streak."""
+    from scripts.run_paper import build_portfolios
+    from shared.config import load_config
+
+    from pathlib import Path
+
+    config = load_config(str(Path(__file__).resolve().parents[2] / "config" / "default.yaml"))
+    roster = build_portfolios(
+        capital=100_000.0, bars_by_ticker={}, regime_by_date={},
+        fundamentals_lookup=lambda t, d: None, earnings_lookup=lambda t, d: None,
+        portfolio_contexts=None,
+    )
+    kwargs = dict(
+        whole_shares=False,
+        cash_buffer_bps=config.currency.sleeve_cash_buffer_bps,
+        warmup_sessions=config.divergence.shadow_warmup_sessions,
+    )
+    assert _pre_kan116_id(roster, **kwargs) == "shadow:89693c0029cad3e6"
+    assert shadow_id_for(roster, **kwargs) == "shadow:12d4b27466b26cd8"

@@ -26,9 +26,9 @@ replay trades a warm-up of :data:`SHADOW_WARMUP_SESSIONS` sessions before the
 window, so on the window's first session the shadow holds what the model would
 hold. Until KAN-105 the bars before the window reached ``signals_fn`` but its
 buys were refused (``BacktestRunner.run``'s ``trade_start_date``). That was
-not a cold start, it was a phantom one: every sleeve's signal function records
-a lot in its private ``tracked`` book when it *emits* a buy, not when the buy
-fills, so after ~230 warm-up sessions it believed it held the whole top-N while
+not a cold start, it was a phantom one: every sleeve's signal function then
+recorded a lot in its private ``tracked`` book when it *emitted* a buy, not when
+the buy filled (removed by KAN-116, below), so after ~230 warm-up sessions it believed it held the whole top-N while
 the replay held cash — and it never bought those names inside the window.
 Measured on the 2026-10-09 run, sector_rotation held all 11 of its ETFs as
 phantoms and took its first entry 18 sessions into a 30-session window, and
@@ -38,8 +38,8 @@ momentum's recorded BREACH streak was an artifact of it
 * ``signals_fn`` is **never called** for a bar dated before ``warm_from``, the
   session :data:`SHADOW_WARMUP_SESSIONS` before the window on the bars' own
   calendar. Its first call still receives the full history in ``bars``, so
-  every lookback is warm; the only state the earlier calls used to build was
-  the phantom book.
+  every lookback is warm. (The earlier calls used to build the phantom book;
+  since KAN-116 they would build nothing, and the gate keeps them uncalled.)
 * The replay **trades from** ``warm_from``, seeded at live's NAV there.
 * The curve from the window's first session on is **multiplied** by
   ``k = seed_nav / nav(window_start)``. The book itself is not rebased: under
@@ -52,6 +52,17 @@ momentum's recorded BREACH streak was an artifact of it
   would silently grade a different model under the same ``baseline_id``.
   :func:`build_shadow_replays` contains the failure to that sleeve and names
   it, so the monitor records the sleeve NO_DATA with the reason.
+
+**Positions come from the replay's own fills (KAN-116).** Each sleeve's
+``signals_fn`` reads its holdings from a
+:class:`backtest.portfolio_context.RunnerBook` (``PortfolioConfig.book``), which
+``BacktestRunner`` re-binds before every session's decisions to a
+``PortfolioContext`` of the lots that actually filled — the same structure, and
+the same signal-function branch, live's 05:15 run hydrates from the
+``positions`` table. A buy the replay does not fill (an unreached DAY limit, a
+risk or sleeve-cash refusal) leaves nothing behind and is re-evaluated on the
+next session, as it is live. The callers pass ``book`` through; a sleeve whose
+book was never bound raises on its first read.
 
 **Capital flows (KAN-113) are replayed, not rescaled away.** When the operator
 credits or transfers sleeve cash inside the window, the shadow receives it on
@@ -83,6 +94,7 @@ from datetime import date
 from typing import Any, Callable
 
 from backtest.costs import CostModel
+from backtest.portfolio_context import RunnerBook
 from backtest.runner import BacktestResult, BacktestRunner, collect_sorted_dates
 from backtest.simulator import SimulatedExecutor
 from services.risk_management.funding import DEFAULT_SLEEVE_CASH_BUFFER_BPS
@@ -161,9 +173,12 @@ def _gated(
 ) -> Callable[[str, list[dict]], dict | None]:
     """``signals_fn``, never called for a bar dated before ``warm_from``.
 
-    Returning ``None`` there instead of calling it is the fix: a call the
-    runner then refuses to trade still records a lot in the signal function's
-    private book (see the module docstring).
+    Before KAN-116 this was the fix for the phantom warm-up book: a call the
+    runner then refused to trade still recorded a lot in the signal function's
+    private book (see the module docstring). Signal functions now read the
+    runner's fills, so an early call would leave nothing behind; the gate stays
+    because it is what defines ``warm_from`` as the first session the model
+    acted on.
     """
 
     def gated(ticker: str, bars: list[dict]) -> dict | None:
@@ -218,6 +233,7 @@ def replay_window_detail(
     cash_flows: Mapping[date, float] | None = None,
     warmup_sessions: int = SHADOW_WARMUP_SESSIONS,
     lookback_sessions: int = SHADOW_LOOKBACK_SESSIONS,
+    book: RunnerBook | None = None,
 ) -> WindowReplay:
     """:func:`replay_window`, plus how the window was seeded.
 
@@ -282,6 +298,7 @@ def replay_window_detail(
             trade_start_date=warm_from,
             cash_flows=inside,
             cash_flow_basis=(anchor, seed_nav),
+            book=book,
         )
     else:
         result = runner.run(
@@ -289,6 +306,7 @@ def replay_window_detail(
             _gated(signals_fn, warm_from),
             risk_engine,
             trade_start_date=warm_from,
+            book=book,
         )
 
     # ``portfolio_values`` carries pre-day-0 capital at index 0, so element
@@ -333,6 +351,7 @@ def replay_window(
     cash_flows: Mapping[date, float] | None = None,
     warmup_sessions: int = SHADOW_WARMUP_SESSIONS,
     lookback_sessions: int = SHADOW_LOOKBACK_SESSIONS,
+    book: RunnerBook | None = None,
 ) -> dict[date, float]:
     """Return ``{session: equity}`` for the model's own run over the window.
 
@@ -368,6 +387,9 @@ def replay_window(
             window. ``0`` is a clean cold start: signals gated before the
             window and trading from it.
         lookback_sessions: Indicator history required before the warm-up.
+        book: KAN-116. The ``RunnerBook`` ``signals_fn`` was built with
+            (``PortfolioConfig.book``); the runner binds it to the replay's own
+            filled lots before each session's decisions.
 
     Returns:
         Equity by session for ``window_start`` onward. Empty when no session
@@ -390,6 +412,7 @@ def replay_window(
         cash_flows=cash_flows,
         warmup_sessions=warmup_sessions,
         lookback_sessions=lookback_sessions,
+        book=book,
     ).curve
 
 
@@ -442,6 +465,7 @@ def build_shadow_replays(
                 cash_flows=(cash_flows or {}).get(name),
                 warmup_sessions=warmup_sessions,
                 lookback_sessions=lookback_sessions,
+                book=getattr(sleeve, "book", None),
             )
         except Exception as exc:  # noqa: BLE001 — isolated, logged, named
             logger.exception("Shadow replay failed for sleeve %s", name)

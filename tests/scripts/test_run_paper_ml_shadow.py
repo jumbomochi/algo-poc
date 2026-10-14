@@ -16,6 +16,7 @@ from datetime import date, timedelta
 import pytest
 
 from scripts.run_paper import build_portfolios, load_ml_shadow_model
+from tests.backtest.books import empty_context
 
 
 SESSIONS = [date(2026, 1, 5) + timedelta(days=i) for i in range(140)]
@@ -40,6 +41,9 @@ def _build(**kw):
         regime_by_date={d: "bull" for d in SESSIONS},
         fundamentals_lookup=lambda t, d: {"roe": 0.3, "debt_equity": 0.4, "profit_margin": 0.2},
         earnings_lookup=lambda t, d: {"surprise_pct": 8.0},
+        # The ML shadow wraps the LIVE roster, which always reads a hydrated
+        # book (build_portfolio_contexts): empty here.
+        portfolio_contexts={s: empty_context() for s in ACTIVE_SLEEVES},
     )
     kwargs.update(kw)
     return build_portfolios(**kwargs)

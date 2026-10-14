@@ -30,6 +30,7 @@ from services.risk_management.engine import RiskEngine
 from shared.models.base import Base
 from shared.models.equity_snapshot import EquitySnapshot
 from shared.universe import DRILL_PORTFOLIO, UNIVERSE_REGISTRY
+from tests.backtest.books import empty_context
 
 GRADED_SLEEVE = "momentum"
 
@@ -196,7 +197,7 @@ class TestTaggedSleeveSetup:
     def test_drill_sleeve_is_named_for_the_tag_not_the_base_sleeve(self):
         """Otherwise its positions and cash would be a graded sleeve's."""
         drill = build_drill_portfolio(
-            DRILL_PORTFOLIO, 500.0, {"AAPL": make_bars()}, None
+            DRILL_PORTFOLIO, 500.0, {"AAPL": make_bars()}, empty_context()
         )
         assert drill.name == DRILL_PORTFOLIO
         assert drill.capital == pytest.approx(500.0)

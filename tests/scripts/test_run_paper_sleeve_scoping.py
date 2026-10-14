@@ -33,6 +33,7 @@ from scripts.run_paper import (
     build_portfolios,
 )
 from shared.universe import ACTIVE_SLEEVES, UNIVERSE_REGISTRY
+from tests.backtest.books import empty_context
 
 #: A ticker in no sleeve's declared universe. Asserted, not assumed — a future
 #: universe edit that adopted this symbol would silently defang every test here.
@@ -98,10 +99,15 @@ def _build(sleeve: str, *, intruder_bars=None, contexts=None):
     }
     bars_by_ticker[INTRUDER] = intruder_bars or _soaring()
 
+    # Live always hydrates a context for every sleeve (build_portfolio_contexts);
+    # an empty book unless the test says the sleeve holds something.
+    live_contexts = {name: empty_context() for name in ACTIVE_SLEEVES}
+    live_contexts.update(contexts or {})
+
     return build_portfolios(
         capital=100_000.0,
         bars_by_ticker=bars_by_ticker,
-        portfolio_contexts=contexts,
+        portfolio_contexts=live_contexts,
         # Never "crash": the entry freeze would suppress buys for a reason that
         # has nothing to do with the universe, and the test would pass hollow.
         regime_by_date={day: "bull" for day in SESSIONS},
@@ -187,7 +193,8 @@ def test_the_drill_sleeve_is_scoped_like_the_sleeve_it_mirrors() -> None:
     bars_by_ticker[INTRUDER] = _soaring()
 
     drill = build_drill_portfolio(
-        tag="__drill__", capital=10_000.0, bars_by_ticker=bars_by_ticker
+        tag="__drill__", capital=10_000.0, bars_by_ticker=bars_by_ticker,
+        portfolio_context=empty_context(),
     )
 
     signal = drill.signals_fn(INTRUDER, bars_by_ticker[INTRUDER])
