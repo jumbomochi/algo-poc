@@ -85,7 +85,7 @@ transient or overwritten, so they are reports, not evidence.
   session in the window, so a Saturday catch-up run records Friday's session.
   Since KAN-103, live is keyed by the **US session each snapshot valued**
   (`equity_snapshots.session_date`), not by `equity_snapshots.date`, which is
-  the SGT run date. The Tuesday 04:15 run values Monday's close, and the 04:45
+  the SGT run date. The Tuesday 05:15 run values Monday's close, and the 05:45
   monitor files Monday's verdict. Before KAN-103 every compared pair was one
   session apart, and no Monday was ever graded. Two runs that value the same
   session (the Tuesday after a US Monday holiday, or a weekend catch-up) keep

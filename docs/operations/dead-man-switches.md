@@ -19,9 +19,9 @@ has to detect anything. The absence of a message is the message.
 
 | Switch | Pinged by | Cadence | Covers |
 |---|---|---|---|
-| `DEADMAN_WATCHDOG_URL` | Alertmanager, from the always-firing `Watchdog` rule | every 5 min | Prometheus / Alertmanager / docker / the host stopped |
+| `DEADMAN_WATCHDOG_URL` | Alertmanager, from the always-firing `Watchdog` rule | every 5 min | Prometheus / Alertmanager / docker / the host stopped. **No external check is configured today** — the observability stack is not deployed, so nothing pings it (see below) |
 | `ALGO_DEADMAN_PAPER_URL` | `deploy/launchd/run_paper.sh`, on a **successful** run only | once a day (~05:22 SGT, Tue–Sat) | the host is up, but the trading run did not happen or failed |
-| `ALGO_DEADMAN_DIVERGENCE_URL` | `deploy/launchd/run_divergence.sh`, on a run that reached a **verdict** (exit 0/1/3/4, not 2) | once a day (~05:46 SGT, Tue–Sat) | the 05:45 drift check did not happen — as on 2026-08-13/14, which left a permanent hole in the gate evidence |
+| `ALGO_DEADMAN_DIVERGENCE_URL` | `deploy/launchd/run_divergence.sh`, on a run that reached a **verdict** (exit 0/1/3/4/5, not 2) | once a day (~05:46 SGT, Tue–Sat) | the 05:45 drift check did not happen — as on 2026-08-13/14, which left a permanent hole in the gate evidence |
 | `ALGO_DEADMAN_REFRESH_URL` | `deploy/launchd/run_backtest_refresh.sh`, on a **successful** run only | once a week (~Tue 06:30–12:30 SGT) | the weekly baseline refresh did not happen — as on 2026-08-11, when the host booted after the calendar slot and launchd did not re-fire it |
 | `ALGO_DEADMAN_BACKUP_URL` | `deploy/launchd/run_db_backup.sh`, on a **verified** dump | once a day (~06:16 SGT) | the RPO ≤ 1 day promise quietly stopped being kept |
 | `ALGO_DEADMAN_DIGEST_URL` | `scripts/ops/evidence_digest.py`, on a **delivered** digest | once a week (Mon ~08:00 SGT) | the weekly evidence digest was not sent |
@@ -53,17 +53,22 @@ deploy/launchd/secrets.sh --check       # confirm they resolve
 
 Configure the external checks:
 
-Set the provider's timezone to **Asia/Singapore** first — every cron below is
-in SGT, because the launchd slots are.
+Set the timezone to **Asia/Singapore** on **every check** — every cron below is
+in SGT, because the launchd slots are. At healthchecks.io the timezone is a
+per-check setting and a new check defaults to **UTC**, so there is no account-wide
+switch to flip. Until 2026-10-12 most checks here were on UTC: SGT pings for the
+paper and divergence runs arrived 8 h before the UTC crons expected them, and the
+daily backup check sat red from 16:15 to 06:15 SGT every day. Nothing was failing; the checks were reading SGT pings
+against UTC crons.
 
 | Check | Switch | Provider schedule | Grace | Why |
 |---|---|---|---|---|
-| Watchdog | `DEADMAN_WATCHDOG_URL` | `*/5 * * * *` | ≥ 15 min | Alertmanager re-notifies every 5 min; the grace must survive one missed ping without a false page. |
+| Watchdog | `DEADMAN_WATCHDOG_URL` | `*/5 * * * *` | ≥ 15 min | **Not configured** — the check was deleted on 2026-10-12 because nothing pings it while the observability stack is not deployed. Re-create it if the stack is brought up: Alertmanager re-notifies every 5 min, so the grace must survive one missed ping without a false page. |
 | Paper run | `ALGO_DEADMAN_PAPER_URL` | `15 5 * * 2-6` | 2 h | `local.algo-paper-trading.plist` is `Weekday` 2–6, i.e. **Tue–Sat SGT** — which is US Mon–Fri, because the 05:15 SGT run covers the session that closed earlier that morning (04:00 SGT under EDT, 05:00 under EST; KAN-104 moved it from 04:15, which fell before the EST close). A run refused by the close guard (exit 4) does not ping, so this check pages for it. Sunday and Monday are legitimately quiet. A flat 26 h period instead of this cron pages every Sunday and stays red through Monday. |
 | Divergence | `ALGO_DEADMAN_DIVERGENCE_URL` | `45 5 * * 2-6` | 4 h | Same Tue–Sat shape, 30 min after the paper run. The 4 h grace covers the 5-minute DB port wait plus a slow cold boot. |
 | Backtest refresh | `ALGO_DEADMAN_REFRESH_URL` | `30 6 * * 2` | 12 h | Weekly (Tue 06:30 SGT, after the daily chain — KAN-104), and the run itself can take hours against ~830 point-in-time tickers, so the grace is generous enough that a merely slow run does not page. |
 | DB backup | `ALGO_DEADMAN_BACKUP_URL` | `15 6 * * *` | 2 h | Daily at 06:15 (05:15 until KAN-104 put the paper run there) — this one really is every day, weekends included. |
-| Evidence digest | `ALGO_DEADMAN_DIGEST_URL` | `0 8 * * 1` | 12 h | Weekly (Mon 08:00 SGT). Prefer the cron over a plain "8 days": an 8-day period lets a missed Monday stay invisible for over a week, which is the failure KAN-64 existed to close. |
+| Evidence digest | `ALGO_DEADMAN_DIGEST_URL` | `0 8 * * 1` | 12 h | Weekly (Mon 08:00 SGT). Prefer the cron over a plain "8 days". A period counts from the last ping, so a missed Monday stays invisible until Tuesday 08:00 plus grace. The cron expects the ping on Monday itself, and with a 12 h grace it pages at Monday 20:00. That is a day sooner, not a week. |
 | Earnings refresh | `ALGO_DEADMAN_EARNINGS_URL` | `45 4 * * *` | 2 h | Daily **including weekends** (KAN-110): the cache must stay within 2 days of fetch age, so the job runs every day. It pings only when the 04:45 run made the cache current (an INCOMPLETE, FAILED or timed-out run alerts on Telegram itself and withholds the ping). Timeline: last ping day 0 ~04:50 → day 1's run misses → the check pages at **day 1 ~06:45**, and the sleeve degrades at the **day 2 05:15** paper run (fetch age just over 2 days) unless day 2's run succeeds — ~22 h to act. A 20 h grace would page at day 2 ~00:45, only ~4.5 h before the degraded run, which is why it is 2 h. The run is ~4 min and bounded at 15, so 2 h never pages a merely slow run. It cannot arm until the first complete run, i.e. after the initial backfill of the live universe (~7 days on the free tier). |
 
 The cron is the **expected check-in time**, and every wrapper waits on a port or
@@ -135,9 +140,9 @@ has received a ping, not merely a check that exists.
 Two of them cannot get that first ping today without other work:
 
 * `DEADMAN_WATCHDOG_URL` is pinged by Alertmanager, and the observability stack
-  is not deployed on this host. Pause the check rather than leaving it grey, so
-  the dashboard shows six switches you believe in rather than five plus a
-  decoration.
+  is not deployed on this host. Its check was **deleted** on 2026-10-12 rather
+  than left grey or paused, so the dashboard shows only switches that can fire.
+  Re-create it, and confirm a first ping, if the stack is ever deployed.
 * `ALGO_DEADMAN_REFRESH_URL` only pings on a **successful** weekly refresh, and
   the refresh has been failing. The switch is correct; the job is not.
 
@@ -196,7 +201,9 @@ This is the acceptance criterion that cannot be automated: it proves the
 delivery path end to end, including the part that does not depend on the
 service being monitored. **Run it by hand; do not let an agent run it.**
 
-Prerequisite: the observability overlay is up with real Telegram credentials.
+Prerequisite: the observability overlay is up with real Telegram credentials,
+and the external `DEADMAN_WATCHDOG_URL` check has been **re-created** at the
+provider. It was deleted on 2026-10-12 while the stack was not deployed.
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d

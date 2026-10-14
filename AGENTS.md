@@ -53,7 +53,7 @@ algo-poc is an automated US equities trading bot built as a set of Python micros
 ### Data flow
 
 ```
-scripts/run_paper.py (launchd, 04:15) -> risk_management -> execution
+scripts/run_paper.py (launchd, 05:15 SGT Tue–Sat) -> risk_management -> execution
                                                                  |
                                                             notifications
                                                                  |

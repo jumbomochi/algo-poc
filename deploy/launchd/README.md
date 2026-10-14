@@ -655,8 +655,8 @@ weekend login failure (2026-10-03, Sat 16:38) escalated toward Sunday and Monday
 04:15 runs that do not exist, and every page said they "will abort". The
 countdown now steps to the first day in `PAPER_RUN_WEEKDAYS` (launchd numbering,
 pinned to the plist by a drift test), so a weekend failure pages every 12h until
-Mon 22:15 and then tightens only before the real Tue 04:15 run. While that run
-is a day or more away the page names it — "The next paper run (Tue 04:15) is in
+Mon 22:15 and then tightens only before the real Tue run (05:15 since KAN-104). While that run
+is a day or more away the page names it — "The next paper run (Tue 05:15) is in
 2d 11h"; under 24h it keeps the "in N min" wording.
 
 ### `AutoRestartTime` — why it is 2:00 PM, not 11:55 PM
