@@ -20,7 +20,7 @@ restart replays it. Execution retries it on its own:
 - another client's order: every 5 min (`SUBMITTED_ELSEWHERE_RETRY_SECONDS`).
 
 A held **BUY** gives up once the session it was sized for has closed. That is
-the first NYSE close after its approval, so a BUY approved by the 04:15 SGT
+the first NYSE close after its approval, so a BUY approved by the 05:15 SGT
 run (after the US close) is sized for the next day. The intent then becomes
 `SUBMISSION_FAILED` with reason `deferred past session`, and the message is
 acked. A stale-priced entry is never placed hours late.

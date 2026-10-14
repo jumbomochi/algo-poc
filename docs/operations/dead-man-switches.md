@@ -56,9 +56,9 @@ Configure the external checks:
 Set the timezone to **Asia/Singapore** on **every check** — every cron below is
 in SGT, because the launchd slots are. At healthchecks.io the timezone is a
 per-check setting and a new check defaults to **UTC**, so there is no account-wide
-switch to flip. Until 2026-10-12 most checks here were on UTC: the paper and
-divergence crons fired 8 h early, and the daily backup check sat red from 16:15 to
-06:15 SGT every day. Nothing was failing; the checks were reading SGT pings
+switch to flip. Until 2026-10-12 most checks here were on UTC: SGT pings for the
+paper and divergence runs arrived 8 h before the UTC crons expected them, and the
+daily backup check sat red from 16:15 to 06:15 SGT every day. Nothing was failing; the checks were reading SGT pings
 against UTC crons.
 
 | Check | Switch | Provider schedule | Grace | Why |
@@ -201,7 +201,9 @@ This is the acceptance criterion that cannot be automated: it proves the
 delivery path end to end, including the part that does not depend on the
 service being monitored. **Run it by hand; do not let an agent run it.**
 
-Prerequisite: the observability overlay is up with real Telegram credentials.
+Prerequisite: the observability overlay is up with real Telegram credentials,
+and the external `DEADMAN_WATCHDOG_URL` check has been **re-created** at the
+provider. It was deleted on 2026-10-12 while the stack was not deployed.
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
