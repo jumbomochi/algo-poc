@@ -54,7 +54,7 @@ algo-poc is an automated US equities trading bot built as a set of Python micros
 ### Data flow
 
 ```
-scripts/run_paper.py (launchd, 04:15) -> risk_management -> execution
+scripts/run_paper.py (launchd, 05:15 SGT Tue–Sat) -> risk_management -> execution
                                                                  |
                                                             notifications
                                                                  |
@@ -161,7 +161,7 @@ Three layers, and confusing them is the recurring error:
   a second; do not add a code path that reads it.
 - **Rotating a secret means both places.** Update the 1Password item, then
   `secrets.sh --import`, or the jobs keep using the old value until the next
-  04:15 tells you otherwise.
+  05:15 paper run tells you otherwise.
 
 ### Piping `op read` into a tool that prompts
 
