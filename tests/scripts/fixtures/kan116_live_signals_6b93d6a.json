@@ -1,0 +1,1407 @@
+{
+ "2025-12-29|earnings_drift|AAPL": {
+  "action": "sell",
+  "exit_reason": "time_exit",
+  "limit_price": 283.6849,
+  "quantity": 6.0,
+  "sector": "Unknown",
+  "ticker": "AAPL"
+ },
+ "2025-12-29|earnings_drift|ABT": {
+  "action": "sell",
+  "exit_reason": "time_exit",
+  "limit_price": 501.0099,
+  "quantity": 7.0,
+  "sector": "Unknown",
+  "ticker": "ABT"
+ },
+ "2025-12-29|earnings_drift|AMD": {
+  "action": "buy",
+  "limit_price": 119.3332,
+  "quantity": 12.8916,
+  "sector": "Unknown",
+  "signals": {
+   "actual_eps": 1.0,
+   "estimate_eps": 1.0,
+   "strategy": "earnings_drift",
+   "surprise_pct": 12.0
+  },
+  "ticker": "AMD"
+ },
+ "2025-12-29|earnings_drift|BSX": {
+  "action": "buy",
+  "limit_price": 310.5307,
+  "quantity": 4.9541,
+  "sector": "Unknown",
+  "signals": {
+   "actual_eps": 1.0,
+   "estimate_eps": 1.0,
+   "strategy": "earnings_drift",
+   "surprise_pct": 9.0
+  },
+  "ticker": "BSX"
+ },
+ "2025-12-29|earnings_drift|CME": {
+  "action": "buy",
+  "limit_price": 134.0433,
+  "quantity": 11.4769,
+  "sector": "Unknown",
+  "signals": {
+   "actual_eps": 1.0,
+   "estimate_eps": 1.0,
+   "strategy": "earnings_drift",
+   "surprise_pct": 8.0
+  },
+  "ticker": "CME"
+ },
+ "2025-12-29|earnings_drift|GOOGL": {
+  "action": "buy",
+  "limit_price": 118.5762,
+  "quantity": 12.9739,
+  "sector": "Unknown",
+  "signals": {
+   "actual_eps": 1.0,
+   "estimate_eps": 1.0,
+   "strategy": "earnings_drift",
+   "surprise_pct": 6.0
+  },
+  "ticker": "GOOGL"
+ },
+ "2025-12-29|earnings_drift|PGR": {
+  "action": "buy",
+  "limit_price": 153.7869,
+  "quantity": 10.0035,
+  "sector": "Unknown",
+  "signals": {
+   "actual_eps": 1.0,
+   "estimate_eps": 1.0,
+   "strategy": "earnings_drift",
+   "surprise_pct": 12.0
+  },
+  "ticker": "PGR"
+ },
+ "2025-12-29|earnings_drift|REGN": {
+  "action": "buy",
+  "limit_price": 57.1009,
+  "quantity": 26.9418,
+  "sector": "Unknown",
+  "signals": {
+   "actual_eps": 1.0,
+   "estimate_eps": 1.0,
+   "strategy": "earnings_drift",
+   "surprise_pct": 8.0
+  },
+  "ticker": "REGN"
+ },
+ "2025-12-29|momentum|AAPL": {
+  "action": "sell",
+  "exit_reason": "trailing_stop",
+  "limit_price": 283.6849,
+  "quantity": 6.0,
+  "sector": "Unknown",
+  "ticker": "AAPL"
+ },
+ "2025-12-29|momentum|CSCO": {
+  "action": "buy",
+  "limit_price": 248.4231,
+  "quantity": 11.1487,
+  "sector": "Unknown",
+  "signals": {
+   "lookback_days": 126,
+   "rank": 1,
+   "strategy": "momentum"
+  },
+  "ticker": "CSCO"
+ },
+ "2025-12-29|momentum|ISRG": {
+  "action": "buy",
+  "limit_price": 310.5757,
+  "quantity": 8.9176,
+  "sector": "Unknown",
+  "signals": {
+   "lookback_days": 126,
+   "rank": 5,
+   "strategy": "momentum"
+  },
+  "ticker": "ISRG"
+ },
+ "2025-12-29|momentum|NFLX": {
+  "action": "buy",
+  "limit_price": 349.0355,
+  "quantity": 7.935,
+  "sector": "Unknown",
+  "signals": {
+   "lookback_days": 126,
+   "rank": 3,
+   "strategy": "momentum"
+  },
+  "ticker": "NFLX"
+ },
+ "2025-12-29|quality_value|AAPL": {
+  "action": "sell",
+  "exit_reason": "trailing_stop",
+  "limit_price": 283.6849,
+  "quantity": 6.0,
+  "sector": "Technology",
+  "ticker": "AAPL"
+ },
+ "2025-12-29|quality_value|ADBE": {
+  "action": "buy",
+  "limit_price": 466.4976,
+  "quantity": 1.9781,
+  "sector": "Technology",
+  "signals": {
+   "quality_score": 0.897,
+   "rank": 14,
+   "strategy": "quality_value"
+  },
+  "ticker": "ADBE"
+ },
+ "2025-12-29|quality_value|ADP": {
+  "action": "buy",
+  "limit_price": 82.6674,
+  "quantity": 11.1628,
+  "sector": "Industrials",
+  "signals": {
+   "quality_score": 1.023,
+   "rank": 6,
+   "strategy": "quality_value"
+  },
+  "ticker": "ADP"
+ },
+ "2025-12-29|quality_value|BKNG": {
+  "action": "buy",
+  "limit_price": 205.1367,
+  "quantity": 4.4985,
+  "sector": "Consumer Discretionary",
+  "signals": {
+   "quality_score": 0.93,
+   "rank": 12,
+   "strategy": "quality_value"
+  },
+  "ticker": "BKNG"
+ },
+ "2025-12-29|quality_value|CI": {
+  "action": "buy",
+  "limit_price": 335.2021,
+  "quantity": 2.753,
+  "sector": "Healthcare",
+  "signals": {
+   "quality_score": 0.973,
+   "rank": 10,
+   "strategy": "quality_value"
+  },
+  "ticker": "CI"
+ },
+ "2025-12-29|quality_value|CMCSA": {
+  "action": "buy",
+  "limit_price": 164.3453,
+  "quantity": 5.615,
+  "sector": "Communication Services",
+  "signals": {
+   "quality_score": 0.923,
+   "rank": 13,
+   "strategy": "quality_value"
+  },
+  "ticker": "CMCSA"
+ },
+ "2025-12-29|quality_value|CVX": {
+  "action": "buy",
+  "limit_price": 35.9431,
+  "quantity": 25.6739,
+  "sector": "Energy",
+  "signals": {
+   "quality_score": 1.003,
+   "rank": 7,
+   "strategy": "quality_value"
+  },
+  "ticker": "CVX"
+ },
+ "2025-12-29|quality_value|GOOGL": {
+  "action": "buy",
+  "limit_price": 118.5762,
+  "quantity": 7.7823,
+  "sector": "Communication Services",
+  "signals": {
+   "quality_score": 0.887,
+   "rank": 15,
+   "strategy": "quality_value"
+  },
+  "ticker": "GOOGL"
+ },
+ "2025-12-29|quality_value|ITW": {
+  "action": "buy",
+  "limit_price": 109.2807,
+  "quantity": 8.4443,
+  "sector": "Industrials",
+  "signals": {
+   "quality_score": 1.073,
+   "rank": 5,
+   "strategy": "quality_value"
+  },
+  "ticker": "ITW"
+ },
+ "2025-12-29|quality_value|LOW": {
+  "action": "buy",
+  "limit_price": 44.5181,
+  "quantity": 20.7286,
+  "sector": "Consumer Discretionary",
+  "signals": {
+   "quality_score": 1.087,
+   "rank": 2,
+   "strategy": "quality_value"
+  },
+  "ticker": "LOW"
+ },
+ "2025-12-29|quality_value|MA": {
+  "action": "buy",
+  "limit_price": 392.3057,
+  "quantity": 2.3522,
+  "sector": "Financials",
+  "signals": {
+   "quality_score": 0.983,
+   "rank": 8,
+   "strategy": "quality_value"
+  },
+  "ticker": "MA"
+ },
+ "2025-12-29|quality_value|MDLZ": {
+  "action": "buy",
+  "limit_price": 171.4699,
+  "quantity": 5.3817,
+  "sector": "Consumer Staples",
+  "signals": {
+   "quality_score": 1.077,
+   "rank": 4,
+   "strategy": "quality_value"
+  },
+  "ticker": "MDLZ"
+ },
+ "2025-12-29|quality_value|MS": {
+  "action": "buy",
+  "limit_price": 238.8434,
+  "quantity": 3.8636,
+  "sector": "Financials",
+  "signals": {
+   "quality_score": 1.083,
+   "rank": 3,
+   "strategy": "quality_value"
+  },
+  "ticker": "MS"
+ },
+ "2025-12-29|quality_value|NOC": {
+  "action": "buy",
+  "limit_price": 291.9151,
+  "quantity": 3.1612,
+  "sector": "Industrials",
+  "signals": {
+   "quality_score": 0.98,
+   "rank": 9,
+   "strategy": "quality_value"
+  },
+  "ticker": "NOC"
+ },
+ "2025-12-29|quality_value|WFC": {
+  "action": "buy",
+  "limit_price": 271.5748,
+  "quantity": 3.398,
+  "sector": "Financials",
+  "signals": {
+   "quality_score": 0.953,
+   "rank": 11,
+   "strategy": "quality_value"
+  },
+  "ticker": "WFC"
+ },
+ "2025-12-29|quality_value|ZTS": {
+  "action": "buy",
+  "limit_price": 277.7124,
+  "quantity": 3.3229,
+  "sector": "Healthcare",
+  "signals": {
+   "quality_score": 1.09,
+   "rank": 1,
+   "strategy": "quality_value"
+  },
+  "ticker": "ZTS"
+ },
+ "2025-12-29|sector_rotation|XLB": {
+  "action": "sell",
+  "exit_reason": "trailing_stop",
+  "limit_price": 36.6069,
+  "quantity": 6.0,
+  "sector": "Unknown",
+  "ticker": "XLB"
+ },
+ "2025-12-29|sector_rotation|XLK": {
+  "action": "buy",
+  "limit_price": 429.9206,
+  "quantity": 7.1548,
+  "sector": "Unknown",
+  "signals": {
+   "lookback_days": 63,
+   "rank": 1,
+   "strategy": "sector_rotation"
+  },
+  "ticker": "XLK"
+ },
+ "2025-12-29|tail_risk_hedge|PSQ": {
+  "action": "sell",
+  "exit_reason": "regime_change",
+  "limit_price": 28.6788,
+  "quantity": 5.0,
+  "sector": "Unknown",
+  "ticker": "PSQ"
+ },
+ "2025-12-29|tail_risk_hedge|SDS": {
+  "action": "sell",
+  "exit_reason": "regime_change",
+  "limit_price": 137.6786,
+  "quantity": 7.0,
+  "sector": "Unknown",
+  "ticker": "SDS"
+ },
+ "2025-12-29|tail_risk_hedge|TLT": {
+  "action": "buy",
+  "limit_price": 129.1081,
+  "quantity": 12.4218,
+  "sector": "Unknown",
+  "signals": {
+   "regime": "bull",
+   "strategy": "tail_risk_hedge",
+   "weight": 0.5
+  },
+  "ticker": "TLT"
+ },
+ "2025-12-29|thematic_momentum|ARKF": {
+  "action": "sell",
+  "exit_reason": "ma_cross_below",
+  "limit_price": 288.2827,
+  "quantity": 6.0,
+  "sector": "Unknown",
+  "ticker": "ARKF"
+ },
+ "2025-12-29|thematic_momentum|ARKW": {
+  "action": "buy",
+  "limit_price": 487.2362,
+  "quantity": 3.9067,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 2,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "ARKW"
+ },
+ "2025-12-29|thematic_momentum|BOTZ": {
+  "action": "buy",
+  "limit_price": 34.3004,
+  "quantity": 55.495,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 6,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "BOTZ"
+ },
+ "2025-12-29|thematic_momentum|HERO": {
+  "action": "buy",
+  "limit_price": 39.9588,
+  "quantity": 47.6366,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 1,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "HERO"
+ },
+ "2025-12-29|thematic_momentum|ICLN": {
+  "action": "buy",
+  "limit_price": 200.8941,
+  "quantity": 9.4751,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 3,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "ICLN"
+ },
+ "2025-12-29|thematic_momentum|PBW": {
+  "action": "buy",
+  "limit_price": 139.6623,
+  "quantity": 13.6293,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 8,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "PBW"
+ },
+ "2025-12-29|thematic_momentum|PRNT": {
+  "action": "buy",
+  "limit_price": 31.4465,
+  "quantity": 60.5314,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 5,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "PRNT"
+ },
+ "2025-12-29|thematic_momentum|TAN": {
+  "action": "buy",
+  "limit_price": 282.1431,
+  "quantity": 6.7466,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 4,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "TAN"
+ },
+ "2025-12-29|thematic_momentum|WCLD": {
+  "action": "buy",
+  "limit_price": 68.3913,
+  "quantity": 27.8325,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 7,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "WCLD"
+ },
+ "2025-12-30|earnings_drift|AAPL": {
+  "action": "sell",
+  "exit_reason": "time_exit",
+  "limit_price": 288.1758,
+  "quantity": 6.0,
+  "sector": "Unknown",
+  "ticker": "AAPL"
+ },
+ "2025-12-30|earnings_drift|ABT": {
+  "action": "sell",
+  "exit_reason": "time_exit",
+  "limit_price": 506.9547,
+  "quantity": 7.0,
+  "sector": "Unknown",
+  "ticker": "ABT"
+ },
+ "2025-12-30|earnings_drift|AMD": {
+  "action": "buy",
+  "limit_price": 119.5325,
+  "quantity": 12.8701,
+  "sector": "Unknown",
+  "signals": {
+   "actual_eps": 1.0,
+   "estimate_eps": 1.0,
+   "strategy": "earnings_drift",
+   "surprise_pct": 11.0
+  },
+  "ticker": "AMD"
+ },
+ "2025-12-30|earnings_drift|BLK": {
+  "action": "buy",
+  "limit_price": 58.73,
+  "quantity": 26.1944,
+  "sector": "Unknown",
+  "signals": {
+   "actual_eps": 1.0,
+   "estimate_eps": 1.0,
+   "strategy": "earnings_drift",
+   "surprise_pct": 13.0
+  },
+  "ticker": "BLK"
+ },
+ "2025-12-30|earnings_drift|ICE": {
+  "action": "buy",
+  "limit_price": 132.2004,
+  "quantity": 11.6369,
+  "sector": "Unknown",
+  "signals": {
+   "actual_eps": 1.0,
+   "estimate_eps": 1.0,
+   "strategy": "earnings_drift",
+   "surprise_pct": 13.0
+  },
+  "ticker": "ICE"
+ },
+ "2025-12-30|earnings_drift|INTU": {
+  "action": "buy",
+  "limit_price": 109.355,
+  "quantity": 14.0679,
+  "sector": "Unknown",
+  "signals": {
+   "actual_eps": 1.0,
+   "estimate_eps": 1.0,
+   "strategy": "earnings_drift",
+   "surprise_pct": 13.0
+  },
+  "ticker": "INTU"
+ },
+ "2025-12-30|earnings_drift|VRTX": {
+  "action": "buy",
+  "limit_price": 389.7514,
+  "quantity": 3.9471,
+  "sector": "Unknown",
+  "signals": {
+   "actual_eps": 1.0,
+   "estimate_eps": 1.0,
+   "strategy": "earnings_drift",
+   "surprise_pct": 9.0
+  },
+  "ticker": "VRTX"
+ },
+ "2025-12-30|momentum|AAPL": {
+  "action": "sell",
+  "exit_reason": "trailing_stop",
+  "limit_price": 288.1758,
+  "quantity": 6.0,
+  "sector": "Unknown",
+  "ticker": "AAPL"
+ },
+ "2025-12-30|momentum|CSCO": {
+  "action": "buy",
+  "limit_price": 254.2895,
+  "quantity": 10.8915,
+  "sector": "Unknown",
+  "signals": {
+   "lookback_days": 126,
+   "rank": 1,
+   "strategy": "momentum"
+  },
+  "ticker": "CSCO"
+ },
+ "2025-12-30|momentum|ISRG": {
+  "action": "buy",
+  "limit_price": 317.9331,
+  "quantity": 8.7113,
+  "sector": "Unknown",
+  "signals": {
+   "lookback_days": 126,
+   "rank": 5,
+   "strategy": "momentum"
+  },
+  "ticker": "ISRG"
+ },
+ "2025-12-30|momentum|NFLX": {
+  "action": "buy",
+  "limit_price": 349.7621,
+  "quantity": 7.9185,
+  "sector": "Unknown",
+  "signals": {
+   "lookback_days": 126,
+   "rank": 3,
+   "strategy": "momentum"
+  },
+  "ticker": "NFLX"
+ },
+ "2025-12-30|quality_value|AAPL": {
+  "action": "sell",
+  "exit_reason": "trailing_stop",
+  "limit_price": 288.1758,
+  "quantity": 6.0,
+  "sector": "Technology",
+  "ticker": "AAPL"
+ },
+ "2025-12-30|quality_value|ADBE": {
+  "action": "buy",
+  "limit_price": 469.7052,
+  "quantity": 1.9646,
+  "sector": "Technology",
+  "signals": {
+   "quality_score": 0.897,
+   "rank": 14,
+   "strategy": "quality_value"
+  },
+  "ticker": "ADBE"
+ },
+ "2025-12-30|quality_value|ADP": {
+  "action": "buy",
+  "limit_price": 84.7714,
+  "quantity": 10.8857,
+  "sector": "Industrials",
+  "signals": {
+   "quality_score": 1.023,
+   "rank": 6,
+   "strategy": "quality_value"
+  },
+  "ticker": "ADP"
+ },
+ "2025-12-30|quality_value|BKNG": {
+  "action": "buy",
+  "limit_price": 203.9526,
+  "quantity": 4.5246,
+  "sector": "Consumer Discretionary",
+  "signals": {
+   "quality_score": 0.93,
+   "rank": 12,
+   "strategy": "quality_value"
+  },
+  "ticker": "BKNG"
+ },
+ "2025-12-30|quality_value|CI": {
+  "action": "buy",
+  "limit_price": 331.1441,
+  "quantity": 2.7867,
+  "sector": "Healthcare",
+  "signals": {
+   "quality_score": 0.973,
+   "rank": 10,
+   "strategy": "quality_value"
+  },
+  "ticker": "CI"
+ },
+ "2025-12-30|quality_value|CMCSA": {
+  "action": "buy",
+  "limit_price": 168.1366,
+  "quantity": 5.4884,
+  "sector": "Communication Services",
+  "signals": {
+   "quality_score": 0.923,
+   "rank": 13,
+   "strategy": "quality_value"
+  },
+  "ticker": "CMCSA"
+ },
+ "2025-12-30|quality_value|CVX": {
+  "action": "buy",
+  "limit_price": 34.9481,
+  "quantity": 26.4049,
+  "sector": "Energy",
+  "signals": {
+   "quality_score": 1.003,
+   "rank": 7,
+   "strategy": "quality_value"
+  },
+  "ticker": "CVX"
+ },
+ "2025-12-30|quality_value|GOOGL": {
+  "action": "buy",
+  "limit_price": 119.2521,
+  "quantity": 7.7382,
+  "sector": "Communication Services",
+  "signals": {
+   "quality_score": 0.887,
+   "rank": 15,
+   "strategy": "quality_value"
+  },
+  "ticker": "GOOGL"
+ },
+ "2025-12-30|quality_value|ITW": {
+  "action": "buy",
+  "limit_price": 107.902,
+  "quantity": 8.5522,
+  "sector": "Industrials",
+  "signals": {
+   "quality_score": 1.073,
+   "rank": 5,
+   "strategy": "quality_value"
+  },
+  "ticker": "ITW"
+ },
+ "2025-12-30|quality_value|LOW": {
+  "action": "buy",
+  "limit_price": 45.3542,
+  "quantity": 20.3465,
+  "sector": "Consumer Discretionary",
+  "signals": {
+   "quality_score": 1.087,
+   "rank": 2,
+   "strategy": "quality_value"
+  },
+  "ticker": "LOW"
+ },
+ "2025-12-30|quality_value|MA": {
+  "action": "buy",
+  "limit_price": 390.7197,
+  "quantity": 2.3618,
+  "sector": "Financials",
+  "signals": {
+   "quality_score": 0.983,
+   "rank": 8,
+   "strategy": "quality_value"
+  },
+  "ticker": "MA"
+ },
+ "2025-12-30|quality_value|MDLZ": {
+  "action": "buy",
+  "limit_price": 171.6621,
+  "quantity": 5.3757,
+  "sector": "Consumer Staples",
+  "signals": {
+   "quality_score": 1.077,
+   "rank": 4,
+   "strategy": "quality_value"
+  },
+  "ticker": "MDLZ"
+ },
+ "2025-12-30|quality_value|MS": {
+  "action": "buy",
+  "limit_price": 243.2019,
+  "quantity": 3.7944,
+  "sector": "Financials",
+  "signals": {
+   "quality_score": 1.083,
+   "rank": 3,
+   "strategy": "quality_value"
+  },
+  "ticker": "MS"
+ },
+ "2025-12-30|quality_value|NOC": {
+  "action": "buy",
+  "limit_price": 291.2266,
+  "quantity": 3.1687,
+  "sector": "Industrials",
+  "signals": {
+   "quality_score": 0.98,
+   "rank": 9,
+   "strategy": "quality_value"
+  },
+  "ticker": "NOC"
+ },
+ "2025-12-30|quality_value|WFC": {
+  "action": "buy",
+  "limit_price": 279.2616,
+  "quantity": 3.3044,
+  "sector": "Financials",
+  "signals": {
+   "quality_score": 0.953,
+   "rank": 11,
+   "strategy": "quality_value"
+  },
+  "ticker": "WFC"
+ },
+ "2025-12-30|quality_value|ZTS": {
+  "action": "buy",
+  "limit_price": 271.5082,
+  "quantity": 3.3988,
+  "sector": "Healthcare",
+  "signals": {
+   "quality_score": 1.09,
+   "rank": 1,
+   "strategy": "quality_value"
+  },
+  "ticker": "ZTS"
+ },
+ "2025-12-30|sector_rotation|XLB": {
+  "action": "sell",
+  "exit_reason": "trailing_stop",
+  "limit_price": 36.5494,
+  "quantity": 6.0,
+  "sector": "Unknown",
+  "ticker": "XLB"
+ },
+ "2025-12-30|sector_rotation|XLK": {
+  "action": "buy",
+  "limit_price": 431.0179,
+  "quantity": 7.1366,
+  "sector": "Unknown",
+  "signals": {
+   "lookback_days": 63,
+   "rank": 1,
+   "strategy": "sector_rotation"
+  },
+  "ticker": "XLK"
+ },
+ "2025-12-30|tail_risk_hedge|PSQ": {
+  "action": "sell",
+  "exit_reason": "regime_change",
+  "limit_price": 27.7455,
+  "quantity": 5.0,
+  "sector": "Unknown",
+  "ticker": "PSQ"
+ },
+ "2025-12-30|tail_risk_hedge|SDS": {
+  "action": "sell",
+  "exit_reason": "regime_change",
+  "limit_price": 139.2684,
+  "quantity": 7.0,
+  "sector": "Unknown",
+  "ticker": "SDS"
+ },
+ "2025-12-30|tail_risk_hedge|TLT": {
+  "action": "buy",
+  "limit_price": 127.2683,
+  "quantity": 12.6013,
+  "sector": "Unknown",
+  "signals": {
+   "regime": "bull",
+   "strategy": "tail_risk_hedge",
+   "weight": 0.5
+  },
+  "ticker": "TLT"
+ },
+ "2025-12-30|thematic_momentum|ARKF": {
+  "action": "sell",
+  "exit_reason": "ma_cross_below",
+  "limit_price": 294.3681,
+  "quantity": 6.0,
+  "sector": "Unknown",
+  "ticker": "ARKF"
+ },
+ "2025-12-30|thematic_momentum|ARKW": {
+  "action": "buy",
+  "limit_price": 492.6628,
+  "quantity": 3.8637,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 2,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "ARKW"
+ },
+ "2025-12-30|thematic_momentum|BOTZ": {
+  "action": "buy",
+  "limit_price": 34.7628,
+  "quantity": 54.7568,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 5,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "BOTZ"
+ },
+ "2025-12-30|thematic_momentum|HERO": {
+  "action": "buy",
+  "limit_price": 41.2469,
+  "quantity": 46.1489,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 1,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "HERO"
+ },
+ "2025-12-30|thematic_momentum|ICLN": {
+  "action": "buy",
+  "limit_price": 198.2711,
+  "quantity": 9.6005,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 3,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "ICLN"
+ },
+ "2025-12-30|thematic_momentum|PRNT": {
+  "action": "buy",
+  "limit_price": 32.005,
+  "quantity": 59.4751,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 4,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "PRNT"
+ },
+ "2025-12-30|thematic_momentum|TAN": {
+  "action": "buy",
+  "limit_price": 281.6723,
+  "quantity": 6.7579,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 6,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "TAN"
+ },
+ "2025-12-30|thematic_momentum|WCLD": {
+  "action": "buy",
+  "limit_price": 68.3007,
+  "quantity": 27.8694,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 7,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "WCLD"
+ },
+ "2025-12-31|earnings_drift|AAPL": {
+  "action": "sell",
+  "exit_reason": "time_exit",
+  "limit_price": 294.6594,
+  "quantity": 6.0,
+  "sector": "Unknown",
+  "ticker": "AAPL"
+ },
+ "2025-12-31|earnings_drift|ABT": {
+  "action": "sell",
+  "exit_reason": "time_exit",
+  "limit_price": 500.1528,
+  "quantity": 7.0,
+  "sector": "Unknown",
+  "ticker": "ABT"
+ },
+ "2025-12-31|earnings_drift|BKNG": {
+  "action": "buy",
+  "limit_price": 202.3674,
+  "quantity": 7.602,
+  "sector": "Unknown",
+  "signals": {
+   "actual_eps": 1.0,
+   "estimate_eps": 1.0,
+   "strategy": "earnings_drift",
+   "surprise_pct": 9.0
+  },
+  "ticker": "BKNG"
+ },
+ "2025-12-31|earnings_drift|CMCSA": {
+  "action": "buy",
+  "limit_price": 163.8229,
+  "quantity": 9.3906,
+  "sector": "Unknown",
+  "signals": {
+   "actual_eps": 1.0,
+   "estimate_eps": 1.0,
+   "strategy": "earnings_drift",
+   "surprise_pct": 13.0
+  },
+  "ticker": "CMCSA"
+ },
+ "2025-12-31|earnings_drift|COST": {
+  "action": "buy",
+  "limit_price": 41.7442,
+  "quantity": 36.853,
+  "sector": "Unknown",
+  "signals": {
+   "actual_eps": 1.0,
+   "estimate_eps": 1.0,
+   "strategy": "earnings_drift",
+   "surprise_pct": 12.0
+  },
+  "ticker": "COST"
+ },
+ "2025-12-31|earnings_drift|SCHW": {
+  "action": "buy",
+  "limit_price": 301.9046,
+  "quantity": 5.0956,
+  "sector": "Unknown",
+  "signals": {
+   "actual_eps": 1.0,
+   "estimate_eps": 1.0,
+   "strategy": "earnings_drift",
+   "surprise_pct": 10.0
+  },
+  "ticker": "SCHW"
+ },
+ "2025-12-31|momentum|AAPL": {
+  "action": "sell",
+  "exit_reason": "trailing_stop",
+  "limit_price": 294.6594,
+  "quantity": 6.0,
+  "sector": "Unknown",
+  "ticker": "AAPL"
+ },
+ "2025-12-31|momentum|CSCO": {
+  "action": "buy",
+  "limit_price": 251.6682,
+  "quantity": 11.005,
+  "sector": "Unknown",
+  "signals": {
+   "lookback_days": 126,
+   "rank": 1,
+   "strategy": "momentum"
+  },
+  "ticker": "CSCO"
+ },
+ "2025-12-31|momentum|ISRG": {
+  "action": "buy",
+  "limit_price": 318.5844,
+  "quantity": 8.6935,
+  "sector": "Unknown",
+  "signals": {
+   "lookback_days": 126,
+   "rank": 4,
+   "strategy": "momentum"
+  },
+  "ticker": "ISRG"
+ },
+ "2025-12-31|momentum|NFLX": {
+  "action": "buy",
+  "limit_price": 349.4172,
+  "quantity": 7.9263,
+  "sector": "Unknown",
+  "signals": {
+   "lookback_days": 126,
+   "rank": 5,
+   "strategy": "momentum"
+  },
+  "ticker": "NFLX"
+ },
+ "2025-12-31|quality_value|AAPL": {
+  "action": "sell",
+  "exit_reason": "trailing_stop",
+  "limit_price": 294.6594,
+  "quantity": 6.0,
+  "sector": "Technology",
+  "ticker": "AAPL"
+ },
+ "2025-12-31|quality_value|ADBE": {
+  "action": "buy",
+  "limit_price": 469.9951,
+  "quantity": 1.9634,
+  "sector": "Technology",
+  "signals": {
+   "quality_score": 0.897,
+   "rank": 14,
+   "strategy": "quality_value"
+  },
+  "ticker": "ADBE"
+ },
+ "2025-12-31|quality_value|ADP": {
+  "action": "buy",
+  "limit_price": 85.0363,
+  "quantity": 10.8518,
+  "sector": "Industrials",
+  "signals": {
+   "quality_score": 1.023,
+   "rank": 6,
+   "strategy": "quality_value"
+  },
+  "ticker": "ADP"
+ },
+ "2025-12-31|quality_value|BKNG": {
+  "action": "buy",
+  "limit_price": 202.3674,
+  "quantity": 4.56,
+  "sector": "Consumer Discretionary",
+  "signals": {
+   "quality_score": 0.93,
+   "rank": 12,
+   "strategy": "quality_value"
+  },
+  "ticker": "BKNG"
+ },
+ "2025-12-31|quality_value|CI": {
+  "action": "buy",
+  "limit_price": 321.9264,
+  "quantity": 2.8665,
+  "sector": "Healthcare",
+  "signals": {
+   "quality_score": 0.973,
+   "rank": 10,
+   "strategy": "quality_value"
+  },
+  "ticker": "CI"
+ },
+ "2025-12-31|quality_value|CMCSA": {
+  "action": "buy",
+  "limit_price": 163.8229,
+  "quantity": 5.6329,
+  "sector": "Communication Services",
+  "signals": {
+   "quality_score": 0.923,
+   "rank": 13,
+   "strategy": "quality_value"
+  },
+  "ticker": "CMCSA"
+ },
+ "2025-12-31|quality_value|CVX": {
+  "action": "buy",
+  "limit_price": 34.5045,
+  "quantity": 26.7443,
+  "sector": "Energy",
+  "signals": {
+   "quality_score": 1.003,
+   "rank": 7,
+   "strategy": "quality_value"
+  },
+  "ticker": "CVX"
+ },
+ "2025-12-31|quality_value|GOOGL": {
+  "action": "buy",
+  "limit_price": 120.1237,
+  "quantity": 7.6821,
+  "sector": "Communication Services",
+  "signals": {
+   "quality_score": 0.887,
+   "rank": 15,
+   "strategy": "quality_value"
+  },
+  "ticker": "GOOGL"
+ },
+ "2025-12-31|quality_value|ITW": {
+  "action": "buy",
+  "limit_price": 105.8563,
+  "quantity": 8.7175,
+  "sector": "Industrials",
+  "signals": {
+   "quality_score": 1.073,
+   "rank": 5,
+   "strategy": "quality_value"
+  },
+  "ticker": "ITW"
+ },
+ "2025-12-31|quality_value|LOW": {
+  "action": "buy",
+  "limit_price": 44.2411,
+  "quantity": 20.8584,
+  "sector": "Consumer Discretionary",
+  "signals": {
+   "quality_score": 1.087,
+   "rank": 2,
+   "strategy": "quality_value"
+  },
+  "ticker": "LOW"
+ },
+ "2025-12-31|quality_value|MA": {
+  "action": "buy",
+  "limit_price": 390.8393,
+  "quantity": 2.3611,
+  "sector": "Financials",
+  "signals": {
+   "quality_score": 0.983,
+   "rank": 8,
+   "strategy": "quality_value"
+  },
+  "ticker": "MA"
+ },
+ "2025-12-31|quality_value|MDLZ": {
+  "action": "buy",
+  "limit_price": 173.9658,
+  "quantity": 5.3045,
+  "sector": "Consumer Staples",
+  "signals": {
+   "quality_score": 1.077,
+   "rank": 4,
+   "strategy": "quality_value"
+  },
+  "ticker": "MDLZ"
+ },
+ "2025-12-31|quality_value|MS": {
+  "action": "buy",
+  "limit_price": 241.6795,
+  "quantity": 3.8183,
+  "sector": "Financials",
+  "signals": {
+   "quality_score": 1.083,
+   "rank": 3,
+   "strategy": "quality_value"
+  },
+  "ticker": "MS"
+ },
+ "2025-12-31|quality_value|NOC": {
+  "action": "buy",
+  "limit_price": 292.1505,
+  "quantity": 3.1586,
+  "sector": "Industrials",
+  "signals": {
+   "quality_score": 0.98,
+   "rank": 9,
+   "strategy": "quality_value"
+  },
+  "ticker": "NOC"
+ },
+ "2025-12-31|quality_value|WFC": {
+  "action": "buy",
+  "limit_price": 283.5151,
+  "quantity": 3.2549,
+  "sector": "Financials",
+  "signals": {
+   "quality_score": 0.953,
+   "rank": 11,
+   "strategy": "quality_value"
+  },
+  "ticker": "WFC"
+ },
+ "2025-12-31|quality_value|ZTS": {
+  "action": "buy",
+  "limit_price": 273.2352,
+  "quantity": 3.3773,
+  "sector": "Healthcare",
+  "signals": {
+   "quality_score": 1.09,
+   "rank": 1,
+   "strategy": "quality_value"
+  },
+  "ticker": "ZTS"
+ },
+ "2025-12-31|sector_rotation|XLB": {
+  "action": "sell",
+  "exit_reason": "trailing_stop",
+  "limit_price": 36.4419,
+  "quantity": 6.0,
+  "sector": "Unknown",
+  "ticker": "XLB"
+ },
+ "2025-12-31|sector_rotation|XLK": {
+  "action": "buy",
+  "limit_price": 429.2925,
+  "quantity": 7.1653,
+  "sector": "Unknown",
+  "signals": {
+   "lookback_days": 63,
+   "rank": 2,
+   "strategy": "sector_rotation"
+  },
+  "ticker": "XLK"
+ },
+ "2025-12-31|sector_rotation|XLY": {
+  "action": "buy",
+  "limit_price": 230.3429,
+  "quantity": 13.354,
+  "sector": "Unknown",
+  "signals": {
+   "lookback_days": 63,
+   "rank": 3,
+   "strategy": "sector_rotation"
+  },
+  "ticker": "XLY"
+ },
+ "2025-12-31|tail_risk_hedge|PSQ": {
+  "action": "sell",
+  "exit_reason": "regime_change",
+  "limit_price": 28.1737,
+  "quantity": 5.0,
+  "sector": "Unknown",
+  "ticker": "PSQ"
+ },
+ "2025-12-31|tail_risk_hedge|SDS": {
+  "action": "sell",
+  "exit_reason": "regime_change",
+  "limit_price": 142.0412,
+  "quantity": 7.0,
+  "sector": "Unknown",
+  "ticker": "SDS"
+ },
+ "2025-12-31|tail_risk_hedge|TLT": {
+  "action": "buy",
+  "limit_price": 125.4886,
+  "quantity": 12.78,
+  "sector": "Unknown",
+  "signals": {
+   "regime": "bull",
+   "strategy": "tail_risk_hedge",
+   "weight": 0.5
+  },
+  "ticker": "TLT"
+ },
+ "2025-12-31|thematic_momentum|ARKF": {
+  "action": "sell",
+  "exit_reason": "ma_cross_below",
+  "limit_price": 295.7137,
+  "quantity": 6.0,
+  "sector": "Unknown",
+  "ticker": "ARKF"
+ },
+ "2025-12-31|thematic_momentum|ARKW": {
+  "action": "buy",
+  "limit_price": 502.9902,
+  "quantity": 3.7844,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 2,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "ARKW"
+ },
+ "2025-12-31|thematic_momentum|BOTZ": {
+  "action": "buy",
+  "limit_price": 34.8134,
+  "quantity": 54.6772,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 5,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "BOTZ"
+ },
+ "2025-12-31|thematic_momentum|HERO": {
+  "action": "buy",
+  "limit_price": 40.4805,
+  "quantity": 47.0226,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 1,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "HERO"
+ },
+ "2025-12-31|thematic_momentum|ICLN": {
+  "action": "buy",
+  "limit_price": 205.1598,
+  "quantity": 9.2781,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 3,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "ICLN"
+ },
+ "2025-12-31|thematic_momentum|PRNT": {
+  "action": "buy",
+  "limit_price": 31.7348,
+  "quantity": 59.9815,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 4,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "PRNT"
+ },
+ "2025-12-31|thematic_momentum|TAN": {
+  "action": "buy",
+  "limit_price": 284.9033,
+  "quantity": 6.6812,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 6,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "TAN"
+ },
+ "2025-12-31|thematic_momentum|WCLD": {
+  "action": "buy",
+  "limit_price": 68.6803,
+  "quantity": 27.7154,
+  "sector": "Unknown",
+  "signals": {
+   "above_ma_50": true,
+   "lookback_days": 63,
+   "rank": 7,
+   "strategy": "thematic_momentum"
+  },
+  "ticker": "WCLD"
+ }
+}

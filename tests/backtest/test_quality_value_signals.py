@@ -5,6 +5,7 @@ from datetime import date, timedelta
 from backtest.portfolio_context import HeldPosition, PendingOrder, PortfolioContext
 from backtest.ranked_selection import ReplacementPolicy
 from scripts.run_backtest import make_quality_value_signals_fn
+from tests.backtest.books import empty_context
 
 
 def _make_fundamentals_lookup():
@@ -53,6 +54,7 @@ def test_quality_value_buys_high_quality():
         top_n=1,
         position_size_pct=0.10,
         initial_capital=20_000,
+        portfolio_context=empty_context(),
     )
 
     # AAPL has best fundamentals (highest ROE=0.25, lowest D/E=0.5, best margin=0.30)
@@ -75,6 +77,7 @@ def test_quality_value_skips_low_quality():
         top_n=1,
         position_size_pct=0.10,
         initial_capital=20_000,
+        portfolio_context=empty_context(),
     )
 
     # Call all tickers to populate scores
@@ -98,6 +101,7 @@ def test_quality_value_requires_fundamentals():
         top_n=1,
         position_size_pct=0.10,
         initial_capital=20_000,
+        portfolio_context=empty_context(),
     )
 
     result = signals_fn("UNKNOWN", bars["UNKNOWN"])
@@ -142,6 +146,7 @@ def test_quality_value_complete_ranking_does_not_depend_on_call_order():
         bars_by_ticker=bars,
         top_n=1,
         initial_capital=20_000,
+        portfolio_context=empty_context(),
     )
 
     assert fn("AAPL", bars["AAPL"])["action"] == "buy"

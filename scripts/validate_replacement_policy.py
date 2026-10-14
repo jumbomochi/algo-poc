@@ -25,6 +25,7 @@ from backtest.costs import (
     CostModel,
 )
 from backtest.metrics import BacktestMetrics
+from backtest.portfolio_context import RunnerBook
 from backtest.ranked_selection import ReplacementPolicy
 from backtest.runner import BacktestRunner
 from backtest.simulator import SimulatedExecutor
@@ -211,6 +212,8 @@ def evaluate_replacement_policies(
     for policy in ReplacementPolicy:
         quality_capital = capital * 0.1538
         thematic_capital = capital * 0.1410
+        # KAN-116: each replay reads its own fills, as live reads the book.
+        quality_book, thematic_book = RunnerBook(), RunnerBook()
         quality_signals = make_quality_value_signals_fn(
             fundamentals_lookup=fundamentals_lookup,
             sector_map=dict(sector_map),
@@ -223,6 +226,7 @@ def evaluate_replacement_policies(
             regime_by_date=regime_by_date,
             replacement_policy=policy,
             replacement_score_margin=score_margin,
+            portfolio_context=quality_book,
         )
         thematic_signals = make_thematic_momentum_signals_fn(
             bars_by_ticker=bars_by_ticker,
@@ -235,12 +239,14 @@ def evaluate_replacement_policies(
             regime_by_date=regime_by_date,
             replacement_policy=policy,
             replacement_score_margin=score_margin,
+            portfolio_context=thematic_book,
         )
         portfolio_configs = {
             "quality_value": PortfolioConfig(
                 name="quality_value",
                 capital=quality_capital,
                 signals_fn=quality_signals,
+                book=quality_book,
                 risk_engine=RiskEngine(
                     position_entry_limit_pct=10.0,
                     sector_concentration_pct=30.0,
@@ -252,6 +258,7 @@ def evaluate_replacement_policies(
                 name="thematic_momentum",
                 capital=thematic_capital,
                 signals_fn=thematic_signals,
+                book=thematic_book,
                 risk_engine=RiskEngine(
                     position_entry_limit_pct=15.0,
                     sector_concentration_pct=50.0,
@@ -269,7 +276,8 @@ def evaluate_replacement_policies(
         )
         results = {
             name: BacktestRunner(executor, config.capital).run(
-                bars_by_ticker, config.signals_fn, config.risk_engine
+                bars_by_ticker, config.signals_fn, config.risk_engine,
+                book=config.book,
             )
             for name, config in portfolio_configs.items()
         }

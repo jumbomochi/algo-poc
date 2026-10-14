@@ -79,7 +79,7 @@ from shared.data_cache import (
     load_data_caches,
 )
 from backtest._portfolio_state import SimplePortfolioState
-from backtest.portfolio_context import PortfolioContext
+from backtest.portfolio_context import PortfolioContext, RunnerBook
 from backtest.ranked_selection import ReplacementPolicy
 from backtest.aggregate_risk import AggregateRiskMonitor
 from backtest.divergence import DEFAULT_WINDOW_DAYS
@@ -474,6 +474,17 @@ def build_portfolios(
     """
     portfolios = {}
     contexts = portfolio_contexts or {}
+    # KAN-116: a roster built without live contexts is a replay (the rolling
+    # shadow). Each sleeve then reads a RunnerBook its runner refreshes
+    # from the replay's own fills, instead of a private record of what
+    # it asked to buy.
+    books = (
+        {name: RunnerBook() for name in CAPITAL_ALLOCATIONS}
+        if portfolio_contexts is None else {}
+    )
+
+    def _context(name: str):
+        return books[name] if books else contexts.get(name)
 
     mom_cap = capital * CAPITAL_ALLOCATIONS["momentum"]
     mom_params = {
@@ -490,7 +501,7 @@ def build_portfolios(
             eligible_tickers=UNIVERSE_REGISTRY["momentum"],
             initial_capital=mom_cap,
             bear_tickers=BEAR_TICKERS,
-            portfolio_context=contexts.get("momentum"),
+            portfolio_context=_context("momentum"),
             **mom_params,
         ),
         risk_engine=RiskEngine(
@@ -500,6 +511,7 @@ def build_portfolios(
             max_lots_per_ticker=1,
         ),
         shadow_params=_shadow_params("momentum", mom_params),
+        book=books.get("momentum"),
     )
 
     sec_cap = capital * CAPITAL_ALLOCATIONS["sector_rotation"]
@@ -516,7 +528,7 @@ def build_portfolios(
             bars_by_ticker=bars_by_ticker,
             eligible_tickers=UNIVERSE_REGISTRY["sector_rotation"],
             initial_capital=sec_cap,
-            portfolio_context=contexts.get("sector_rotation"),
+            portfolio_context=_context("sector_rotation"),
             **sec_params,
         ),
         risk_engine=RiskEngine(
@@ -526,6 +538,7 @@ def build_portfolios(
             max_lots_per_ticker=1,
         ),
         shadow_params=_shadow_params("sector_rotation", sec_params),
+        book=books.get("sector_rotation"),
     )
 
     qv_cap = capital * CAPITAL_ALLOCATIONS["quality_value"]
@@ -544,7 +557,7 @@ def build_portfolios(
             eligible_tickers=UNIVERSE_REGISTRY["quality_value"],
             initial_capital=qv_cap,
             regime_by_date=regime_by_date,
-            portfolio_context=contexts.get("quality_value"),
+            portfolio_context=_context("quality_value"),
             replacement_policy=ReplacementPolicy.TECHNICAL_ONLY,
             **qv_params,
         ),
@@ -558,6 +571,7 @@ def build_portfolios(
             "quality_value",
             {**qv_params, "replacement_policy": ReplacementPolicy.TECHNICAL_ONLY.name},
         ),
+        book=books.get("quality_value"),
     )
 
     ed_cap = capital * CAPITAL_ALLOCATIONS["earnings_drift"]
@@ -575,7 +589,7 @@ def build_portfolios(
             eligible_tickers=UNIVERSE_REGISTRY["earnings_drift"],
             initial_capital=ed_cap,
             regime_by_date=regime_by_date,
-            portfolio_context=contexts.get("earnings_drift"),
+            portfolio_context=_context("earnings_drift"),
             **ed_params,
         ),
         risk_engine=RiskEngine(
@@ -585,6 +599,7 @@ def build_portfolios(
             max_lots_per_ticker=1,
         ),
         shadow_params=_shadow_params("earnings_drift", ed_params),
+        book=books.get("earnings_drift"),
     )
 
     them_cap = capital * CAPITAL_ALLOCATIONS["thematic_momentum"]
@@ -602,7 +617,7 @@ def build_portfolios(
             eligible_tickers=UNIVERSE_REGISTRY["thematic_momentum"],
             initial_capital=them_cap,
             regime_by_date=regime_by_date,
-            portfolio_context=contexts.get("thematic_momentum"),
+            portfolio_context=_context("thematic_momentum"),
             replacement_policy=ReplacementPolicy.TECHNICAL_ONLY,
             **them_params,
         ),
@@ -616,6 +631,7 @@ def build_portfolios(
             "thematic_momentum",
             {**them_params, "replacement_policy": ReplacementPolicy.TECHNICAL_ONLY.name},
         ),
+        book=books.get("thematic_momentum"),
     )
 
     tr_cap = capital * CAPITAL_ALLOCATIONS["tail_risk_hedge"]
@@ -626,7 +642,7 @@ def build_portfolios(
         signals_fn=make_tail_risk_hedge_signals_fn(
             regime_by_date=regime_by_date,
             initial_capital=tr_cap,
-            portfolio_context=contexts.get("tail_risk_hedge"),
+            portfolio_context=_context("tail_risk_hedge"),
             **tr_params,
         ),
         risk_engine=RiskEngine(
@@ -636,6 +652,7 @@ def build_portfolios(
             max_lots_per_ticker=1,
         ),
         shadow_params=_shadow_params("tail_risk_hedge", tr_params),
+        book=books.get("tail_risk_hedge"),
     )
 
     # Level 3: Crash entry freeze — block new buys during crash regime.
@@ -658,6 +675,7 @@ def build_portfolios(
             portfolios[name] = PortfolioConfig(
                 name=pc.name, capital=pc.capital, signals_fn=inner,
                 risk_engine=pc.risk_engine, shadow_params=pc.shadow_params,
+                book=pc.book,
             )
             continue
         portfolios[name] = PortfolioConfig(
@@ -669,6 +687,7 @@ def build_portfolios(
             # a field omitted here is lost silently — the sleeve keeps working
             # and only the model fingerprint quietly stops tracking the model.
             shadow_params=pc.shadow_params,
+            book=pc.book,
         )
 
     return portfolios
