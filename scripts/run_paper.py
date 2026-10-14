@@ -700,7 +700,7 @@ def build_drill_portfolio(
     tag: str,
     capital: float,
     bars_by_ticker: dict[str, list[dict]],
-    portfolio_context: PortfolioContext | None = None,
+    portfolio_context: PortfolioContext,
 ) -> PortfolioConfig:
     """Build the single sleeve a ``--portfolio-tag`` run trades.
 

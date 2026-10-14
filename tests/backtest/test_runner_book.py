@@ -273,3 +273,16 @@ def test_no_sleeve_keeps_a_private_record_of_its_lots(family):
     fn = _factory(family, _universe(family)[0], empty_context())
     assert "tracked" not in fn.__code__.co_freevars
     assert "portfolio_context" in fn.__code__.co_freevars
+
+
+def test_a_single_lots_average_is_exactly_its_fill_price():
+    """``sum(p*q)/q`` lands one ulp below ``p`` for this fill; the sleeves'
+    ``peak > entry`` test would then arm a trailing stop on a position that
+    never rose. Live's fill accounting keeps the fill price, and so must the
+    runner's context (found by test_position_source_parity)."""
+    price, qty = 27.722294599999998, 55.4049
+    assert price * qty / qty != price  # the trap is real
+    ctx = _runner_context({"COST": [_Lot("COST", qty, price, date(2025, 4, 23), 1.0)]}, {}, 1.0)
+    held = ctx.positions["COST"]
+    assert held.avg_entry_price == price
+    assert not held.peak_price > held.avg_entry_price

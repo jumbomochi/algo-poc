@@ -652,12 +652,23 @@ def _runner_context(
     """
     held = {}
     for ticker, lots in positions.items():
-        quantity = sum(lot.quantity for lot in lots)
-        if not lots or quantity <= 0:
+        if not lots or sum(lot.quantity for lot in lots) <= 0:
             continue
+        # The average is accumulated lot by lot exactly as the live fill path
+        # (``PaperTradingState._apply_fill_accounting``) accumulates it, so a
+        # single lot's average IS its fill price. ``sum(p*q)/q`` can land one
+        # ulp below it, and the sleeves' ``peak > entry`` test then arms a
+        # trailing stop on a position that has never risen — a decision live
+        # would not take (caught by tests/backtest/test_position_source_parity).
+        quantity, average = lots[0].quantity, lots[0].entry_price
+        for lot in lots[1:]:
+            average = (average * quantity + lot.entry_price * lot.quantity) / (
+                quantity + lot.quantity
+            )
+            quantity += lot.quantity
         held[ticker] = HeldPosition(
             quantity=quantity,
-            avg_entry_price=sum(lot.entry_price * lot.quantity for lot in lots) / quantity,
+            avg_entry_price=average,
             peak_price=max(lot.peak_price for lot in lots),
             entry_date=min(lot.entry_date for lot in lots),
         )

@@ -38,18 +38,18 @@
  "pins": {
   "edge_pin_20260915": {
    "aggregate_total_return": {
-    "after": 0.702566,
+    "after": 0.720693,
     "before": 0.713754
    },
    "sleeves": {
     "earnings_drift": {
      "after": {
-      "invested": 0.423674,
-      "max_drawdown": 0.15687,
-      "sharpe": 0.608707,
-      "total_return": 0.533536,
-      "trades": 671,
-      "unfilled_pct": 0.662135
+      "invested": 0.423605,
+      "max_drawdown": 0.148637,
+      "sharpe": 0.627556,
+      "total_return": 0.558685,
+      "trades": 678,
+      "unfilled_pct": 0.655488
      },
      "before": {
       "invested": 0.380787,
@@ -98,12 +98,12 @@
     },
     "sector_rotation": {
      "after": {
-      "invested": 0.86355,
+      "invested": 0.855653,
       "max_drawdown": 0.234135,
-      "sharpe": 0.504231,
-      "total_return": 0.704345,
-      "trades": 156,
-      "unfilled_pct": 0.712014
+      "sharpe": 0.547546,
+      "total_return": 0.790763,
+      "trades": 155,
+      "unfilled_pct": 0.697761
      },
      "before": {
       "invested": 0.775273,
@@ -183,8 +183,8 @@
   "sleeves": {
    "earnings_drift": {
     "after": {
-     "invested_at_start": 0.740644,
-     "mean_abs_gap": 0.008042,
+     "invested_at_start": 0.740667,
+     "mean_abs_gap": 0.007438,
      "statuses": {
       "OK": 11
      }
@@ -351,20 +351,20 @@
    "sleeves": {
     "earnings_drift": {
      "after": {
-      "cash_refused_retries": 933,
-      "dsr": 0.51967,
-      "dsr_at_before_sr_star": 0.370028,
+      "cash_refused_retries": 915,
+      "dsr": 0.553483,
+      "dsr_at_before_sr_star": 0.415215,
       "holdout_sharpe": 0.0,
-      "invested": 0.428147,
-      "lots": 670,
-      "max_drawdown": 0.156484,
+      "invested": 0.428463,
+      "lots": 679,
+      "max_drawdown": 0.14863,
       "passes_fdr": true,
-      "psr": 0.967491,
-      "sharpe": 0.589712,
-      "signals_sized": 1992,
-      "total_return": 0.513199,
-      "trades": 670,
-      "unfilled_pct": 0.663655,
+      "psr": 0.9751,
+      "sharpe": 0.627273,
+      "signals_sized": 1969,
+      "total_return": 0.558638,
+      "trades": 679,
+      "unfilled_pct": 0.655155,
       "verdict": "FAIL"
      },
      "before": {
@@ -387,7 +387,7 @@
     "momentum": {
      "after": {
       "cash_refused_retries": 721,
-      "dsr": 0.41929,
+      "dsr": 0.406692,
       "dsr_at_before_sr_star": 0.279195,
       "holdout_sharpe": -0.844678,
       "invested": 0.836038,
@@ -422,7 +422,7 @@
     "quality_value": {
      "after": {
       "cash_refused_retries": 159,
-      "dsr": 0.249397,
+      "dsr": 0.239233,
       "dsr_at_before_sr_star": 0.144968,
       "holdout_sharpe": 2.00801,
       "invested": 0.917161,
@@ -456,20 +456,20 @@
     },
     "sector_rotation": {
      "after": {
-      "cash_refused_retries": 229,
-      "dsr": 0.519686,
-      "dsr_at_before_sr_star": 0.371346,
-      "holdout_sharpe": 0.598827,
-      "invested": 0.85112,
-      "lots": 165,
+      "cash_refused_retries": 263,
+      "dsr": 0.533756,
+      "dsr_at_before_sr_star": 0.396966,
+      "holdout_sharpe": 0.522677,
+      "invested": 0.847945,
+      "lots": 164,
       "max_drawdown": 0.228249,
       "passes_fdr": true,
-      "psr": 0.966294,
-      "sharpe": 0.589868,
-      "signals_sized": 492,
-      "total_return": 0.856155,
-      "trades": 157,
-      "unfilled_pct": 0.664634,
+      "psr": 0.97114,
+      "sharpe": 0.611575,
+      "signals_sized": 490,
+      "total_return": 0.905688,
+      "trades": 156,
+      "unfilled_pct": 0.665306,
       "verdict": "FAIL"
      },
      "before": {
@@ -492,7 +492,7 @@
     "tail_risk_hedge": {
      "after": {
       "cash_refused_retries": 0,
-      "dsr": 0.0008,
+      "dsr": 0.000714,
       "dsr_at_before_sr_star": 0.000198,
       "holdout_sharpe": -1.998027,
       "invested": 0.254941,
@@ -527,7 +527,7 @@
     "thematic_momentum": {
      "after": {
       "cash_refused_retries": 776,
-      "dsr": 0.476332,
+      "dsr": 0.463476,
       "dsr_at_before_sr_star": 0.329797,
       "holdout_sharpe": -0.885696,
       "invested": 0.655764,
@@ -561,7 +561,7 @@
     }
    },
    "sr_star": {
-    "after": 0.036155,
+    "after": 0.036806,
     "before": 0.043828
    }
   },
@@ -574,20 +574,20 @@
    "sleeves": {
     "earnings_drift": {
      "after": {
-      "cash_refused_retries": 311,
-      "dsr": 0.417523,
-      "dsr_at_before_sr_star": 0.256766,
-      "holdout_sharpe": 2.189597,
-      "invested": 0.392493,
+      "cash_refused_retries": 319,
+      "dsr": 0.406926,
+      "dsr_at_before_sr_star": 0.246468,
+      "holdout_sharpe": 2.165721,
+      "invested": 0.394145,
       "lots": 878,
-      "max_drawdown": 0.167958,
+      "max_drawdown": 0.168297,
       "passes_fdr": true,
-      "psr": 0.963695,
-      "sharpe": 0.574393,
-      "signals_sized": 1510,
-      "total_return": 0.560389,
+      "psr": 0.961006,
+      "sharpe": 0.564016,
+      "signals_sized": 1508,
+      "total_return": 0.551752,
       "trades": 878,
-      "unfilled_pct": 0.418543,
+      "unfilled_pct": 0.417772,
       "verdict": "FAIL"
      },
      "before": {
@@ -610,7 +610,7 @@
     "momentum": {
      "after": {
       "cash_refused_retries": 655,
-      "dsr": 0.432376,
+      "dsr": 0.43441,
       "dsr_at_before_sr_star": 0.268926,
       "holdout_sharpe": -0.05469,
       "invested": 0.810438,
@@ -645,7 +645,7 @@
     "quality_value": {
      "after": {
       "cash_refused_retries": 0,
-      "dsr": 0.021555,
+      "dsr": 0.021825,
       "dsr_at_before_sr_star": 0.006718,
       "holdout_sharpe": 0.0,
       "invested": 0.0,
@@ -680,7 +680,7 @@
     "sector_rotation": {
      "after": {
       "cash_refused_retries": 300,
-      "dsr": 0.460572,
+      "dsr": 0.462606,
       "dsr_at_before_sr_star": 0.294413,
       "holdout_sharpe": -0.454429,
       "invested": 0.844939,
@@ -715,7 +715,7 @@
     "tail_risk_hedge": {
      "after": {
       "cash_refused_retries": 0,
-      "dsr": 0.000383,
+      "dsr": 0.00039,
       "dsr_at_before_sr_star": 6.8e-05,
       "holdout_sharpe": -1.980969,
       "invested": 0.255462,
@@ -750,7 +750,7 @@
     "thematic_momentum": {
      "after": {
       "cash_refused_retries": 593,
-      "dsr": 0.489948,
+      "dsr": 0.492008,
       "dsr_at_before_sr_star": 0.319015,
       "holdout_sharpe": 0.045238,
       "invested": 0.641649,
@@ -784,7 +784,7 @@
     }
    },
    "sr_star": {
-    "after": 0.04038,
+    "after": 0.040276,
     "before": 0.049352
    }
   }
@@ -793,15 +793,15 @@
   "sleeves": {
    "earnings_drift": {
     "after": {
-     "buy_signals": 432,
-     "invested": 0.308518,
-     "lots": 145,
-     "max_drawdown": 0.062935,
-     "never_filled_pct": 0.664352,
-     "retries": 261,
-     "retries_filled": 69,
-     "sharpe": 0.752798,
-     "total_return": 0.109342
+     "buy_signals": 430,
+     "invested": 0.307942,
+     "lots": 144,
+     "max_drawdown": 0.068039,
+     "never_filled_pct": 0.665116,
+     "retries": 260,
+     "retries_filled": 67,
+     "sharpe": 0.705738,
+     "total_return": 0.103084
     },
     "before": {
      "buy_signals": 238,

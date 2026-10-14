@@ -80,7 +80,8 @@ SHADOW_SEEDING_VERSION = "gated:curve-normalised"
 #: re-bound before every session — the structure and code path live reads from
 #: the ``positions`` table. Before it each signal function kept a private
 #: record of the lots it had *asked* for, so an entry the replay did not fill
-#: stayed "held" and was never retried (20–49% of buy signals per sleeve), and
+#: stayed "held" and was never retried (20–49% of buy signals per sleeve in a
+#: 2y replay, 22–50% in the 10y refresh and D10 baselines), and
 #: entry prices, the earnings-drift hold clock and the tail-risk regime-at-entry
 #: were taken from the signal bar rather than the fill
 #: (docs/decisions/backtest-position-source-2026-10.md). A different model, so

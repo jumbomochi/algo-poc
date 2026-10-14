@@ -4,12 +4,16 @@
 Implemented in the KAN-116 PR. All figures compare `origin/main` at `6b93d6a`
 (before) with the KAN-116 branch (after), on the same inputs. Every
 measurement was re-run on the final code, not on the investigation's
-prototype. The two agree exactly wherever their inputs did not change; see
-[Reproducing](#reproducing).
+prototype; see [Reproducing](#reproducing) for where the two differ.
 
-Nothing in the live trading path changed.
-`tests/scripts/test_live_roster_unchanged.py` proves it: the 05:15 roster
-produces the same decisions on a fixed scenario on both commits.
+**Live decisions are unchanged.** `tests/scripts/test_live_roster_unchanged.py`
+proves it: on a fixed scenario — including holdings one tick or one session
+either side of every exit threshold — the 05:15 roster's decisions are
+byte-identical on both commits. One live-path behaviour did change:
+`build_portfolios` (and `build_drill_portfolio`) now **raise** when a sleeve
+has no context, where they used to fall back silently to the phantom
+`tracked` path. The 05:15 run always hydrates all six, so it never reaches
+that error.
 
 **Data handling.**
 
@@ -66,6 +70,12 @@ own filled lots, through the same code path live uses.**
   every buy signal: risk-refused, skipped for whole shares, skipped for
   sleeve cash, queued, filled, expired. The weekly artifact now carries it
   per sleeve.
+- **Two existing counters now include retries.** `entry_signals_sized` (the
+  "Unfillable signals %" denominator) and the whole-share skip ledger behind
+  `skipped_signals` count every buy a sleeve sizes. Because an unfilled entry
+  is now asked again each session, both count each retry: momentum on the
+  10-13 bars goes from 857 to 1,621 sized signals. Neither is comparable with
+  a pre-KAN-116 artifact; read `entry_funnel` instead.
 
 **Re-pinning is the operator's decision, and this change makes none.**
 `divergence.baseline_pin` still names `backtest_multi_20260915_102125.json`.
@@ -143,7 +153,7 @@ path-dependent sleeves by several points:
 | sector_rotation | 90.4 / 89.1 | **+3.2% / −2.9%** | 0.19 / −0.07 |
 | thematic_momentum | 76.9 / 77.0 | +75.0% / +74.9% | 1.46 / 1.46 |
 | quality_value* | 91.2 / 91.6 | +32.4% / +28.5% | 1.03 / 0.96 |
-| earnings_drift* | 30.6 / 30.9 | +11.9% / +10.9% | 0.79 / 0.75 |
+| earnings_drift* | 30.6 / 30.8 | +11.9% / +10.3% | 0.79 / 0.71 |
 | tail_risk_hedge | 22.6 / 23.1 | −5.0% / −3.9% | −0.62 / −0.48 |
 
 Option 2 still fails acceptance criterion 2 (the backtest and live use the
@@ -178,9 +188,9 @@ Columns:
 |---|---|---|---|---|---|---|
 | momentum | 19.6% → 24.0% | 21/15 → 43/27 | 81.4 → 86.9 | +35.4% → +29.7% | 0.92 → 0.77 | 23.2% → 24.5% |
 | sector_rotation | 31.0% → 72.3% | 8/5 → 112/14 | 78.5 → 89.1 | −2.1% → −2.9% | −0.05 → −0.07 | 16.2% → 16.4% |
-| thematic_momentum | 29.0% → 66.1% | 50/38 → 338/58 | 61.4 → 77.0 | +61.4% → +74.9% | 1.57 → 1.46 | 12.4% → 13.8% |
+| thematic_momentum | 29.0% → 66.1% | 50/38 → 338/58 | 61.4 → 77.0 | +61.4% → +74.9% | 1.57 → 1.46 | 12.3% → 13.8% |
 | quality_value* | 35.3% → 70.3% | 37/27 → 313/58 | 81.0 → 91.6 | +7.1% → +28.5% | 0.32 → 0.96 | 18.2% → 17.3% |
-| earnings_drift* | 48.7% → 66.4% | 81/37 → 261/69 | 28.4 → 30.9 | +9.0% → +10.9% | 0.66 → 0.75 | 3.5% → 6.3% |
+| earnings_drift* | 48.7% → 66.5% | 81/37 → 260/67 | 28.4 → 30.8 | +9.0% → +10.3% | 0.66 → 0.71 | 3.5% → 6.8% |
 | tail_risk_hedge | 31.5% → 26.7% | 39/28 → 36/29 | 14.7 → 23.1 | −0.2% → −3.9% | −0.02 → −0.48 | 5.1% → 6.7% |
 
 **Why the "never filled" share rises after the change.** Every session that a
@@ -227,16 +237,16 @@ clone's caches (no fundamentals cache; partial Alpha Vantage earnings).
 Before the change, the run reproduces that artifact to the cent for every
 sleeve except earnings_drift, whose cache was refreshed after it.
 
-SR\* per period: 0.0494 → 0.0404. Holdout: 2026-06-01..2026-10-12, 93
+SR\* per period: 0.0494 → 0.0403. Holdout: 2026-06-01..2026-10-12, 93
 sessions.
 
 | sleeve | never filled (before) | cash-refused retries (after) | mean invested % | total return | Sharpe | max DD | PSR | DSR as reported (at before-SR\*) | holdout Sharpe | D10 |
 |---|---|---|---|---|---|---|---|---|---|---|
-| momentum | 26% (223/857) | 655 | 73.0 → 81.0 | +187.8% → +162.8% | 0.70 → 0.59 | 19.5% → 24.8% | 0.986 → 0.967 | 0.400 → 0.432 (0.269) | 0.91 → −0.05 | FAIL → FAIL |
-| sector_rotation | 26% (45/170) | 300 | 76.8 → 84.5 | +77.1% → +90.2% | 0.58 → 0.61 | 21.7% → 22.6% | 0.965 → 0.971 | 0.266 → 0.461 (0.294) | −0.99 → −0.45 | FAIL → FAIL |
-| thematic_momentum | 27% (265/968) | 593 | 51.9 → 64.2 | +122.1% → +139.0% | 0.67 → 0.63 | 39.5% → 47.5% | 0.982 → 0.976 | 0.364 → 0.490 (0.319) | 0.03 → 0.05 | FAIL → FAIL |
+| momentum | 26% (223/857) | 655 | 73.0 → 81.0 | +187.8% → +162.8% | 0.70 → 0.59 | 19.5% → 24.8% | 0.986 → 0.967 | 0.400 → 0.434 (0.269) | 0.91 → −0.05 | FAIL → FAIL |
+| sector_rotation | 26% (45/170) | 300 | 76.8 → 84.5 | +77.1% → +90.2% | 0.58 → 0.61 | 21.7% → 22.6% | 0.965 → 0.971 | 0.266 → 0.463 (0.294) | −0.99 → −0.45 | FAIL → FAIL |
+| thematic_momentum | 27% (265/968) | 593 | 51.9 → 64.2 | +122.1% → +139.0% | 0.67 → 0.63 | 39.5% → 47.5% | 0.982 → 0.976 | 0.364 → 0.492 (0.319) | 0.03 → 0.05 | FAIL → FAIL |
 | quality_value (no cache) | — | 0 | 0 → 0 | 0 | 0 | 0 | 0.500 | 0.007 → 0.022 (0.007) | 0 | FAIL → FAIL |
-| earnings_drift (degraded cache) | 33% (348/1053) | 311 | 32.4 → 39.2 | +52.6% → +56.0% | 0.64 → 0.57 | 9.7% → 16.8% | 0.978 → 0.964 | 0.327 → 0.418 (0.257) | 2.34 → 2.19 | FAIL → FAIL |
+| earnings_drift (degraded cache) | 33% (348/1053) | 319 | 32.4 → 39.4 | +52.6% → +55.2% | 0.64 → 0.56 | 9.7% → 16.8% | 0.978 → 0.961 | 0.327 → 0.407 (0.246) | 2.34 → 2.17 | FAIL → FAIL |
 | tail_risk_hedge | 23% (110/476) | 0 | 18.4 → 25.5 | −19.6% → −16.2% | −0.63 → −0.42 | 21.2% → 18.8% | 0.024 → 0.092 | 0.000 → 0.000 (0.000) | −4.16 → −1.98 | FAIL → FAIL |
 
 **B: the D10-of-record bars**
@@ -246,32 +256,34 @@ Inputs: the bars of `backtest_multi_20260819_183451.json`, the source of
 Those are the caches that run used, so quality_value and earnings_drift
 trade.
 
-SR\* per period: 0.0438 → 0.0362. Holdout: 2026-06-01..2026-08-18, 55
+SR\* per period: 0.0438 → 0.0368. Holdout: 2026-06-01..2026-08-18, 55
 sessions.
 
 | sleeve | never filled (before) | cash-refused retries (after) | mean invested % | total return | Sharpe | max DD | PSR | DSR as reported (at before-SR\*) | holdout Sharpe | D10 |
 |---|---|---|---|---|---|---|---|---|---|---|
-| momentum | 28% (234/847) | 721 | 77.2 → 83.6 | +137.3% → +132.2% | 0.56 → 0.51 | 20.7% → 26.1% | 0.961 → 0.945 | 0.340 → 0.419 (0.279) | 0.25 → −0.84 | FAIL → FAIL |
-| sector_rotation | 26% (45/170) | 229 | 76.3 → 85.1 | +84.1% → +85.6% | 0.62 → 0.59 | 21.5% → 22.8% | 0.974 → 0.966 | 0.411 → 0.520 (0.371) | −0.26 → 0.60 | FAIL → FAIL |
-| thematic_momentum | 28% (269/976) | 776 | 52.2 → 65.6 | +113.0% → +113.4% | 0.64 → 0.55 | 39.9% → 49.0% | 0.977 → 0.959 | 0.431 → 0.476 (0.330) | −0.89 → −0.89 | FAIL → FAIL |
-| quality_value | 31% (39/126) | 159 | 82.6 → 91.7 | +16.8% → +21.5% | 0.32 → 0.36 | 17.9% → 17.5% | 0.848 → 0.869 | 0.118 → 0.249 (0.145) | 4.63 → 2.01 | FAIL → FAIL |
-| earnings_drift | 50% (576/1147) | 933 | 38.5 → 42.8 | +40.5% → +51.3% | 0.53 → 0.59 | 14.3% → 15.6% | 0.952 → 0.967 | 0.304 → 0.520 (0.370) | 0.00 → 0.00 | FAIL → FAIL |
+| momentum | 28% (234/847) | 721 | 77.2 → 83.6 | +137.3% → +132.2% | 0.56 → 0.51 | 20.7% → 26.1% | 0.961 → 0.945 | 0.340 → 0.407 (0.279) | 0.25 → −0.84 | FAIL → FAIL |
+| sector_rotation | 26% (45/170) | 263 | 76.3 → 84.8 | +84.1% → +90.6% | 0.62 → 0.61 | 21.5% → 22.8% | 0.974 → 0.971 | 0.411 → 0.534 (0.397) | −0.26 → 0.52 | FAIL → FAIL |
+| thematic_momentum | 28% (269/976) | 776 | 52.2 → 65.6 | +113.0% → +113.4% | 0.64 → 0.55 | 39.9% → 49.0% | 0.977 → 0.959 | 0.431 → 0.463 (0.330) | −0.89 → −0.89 | FAIL → FAIL |
+| quality_value | 31% (39/126) | 159 | 82.6 → 91.7 | +16.8% → +21.5% | 0.32 → 0.36 | 17.9% → 17.5% | 0.848 → 0.869 | 0.118 → 0.239 (0.145) | 4.63 → 2.01 | FAIL → FAIL |
+| earnings_drift | 50% (576/1147) | 915 | 38.5 → 42.8 | +40.5% → +55.9% | 0.53 → 0.63 | 14.3% → 14.9% | 0.952 → 0.975 | 0.304 → 0.553 (0.415) | 0.00 → 0.00 | FAIL → FAIL |
 | tail_risk_hedge | 22% (106/473) | 0 | 20.3 → 25.5 | −18.5% → −16.3% | −0.60 → −0.42 | 20.0% → 18.8% | 0.030 → 0.091 | 0.000 → 0.001 (0.000) | −4.78 → −2.00 | FAIL → FAIL |
 
 **What the D10 numbers say.**
 
 - **Every sleeve still FAILs D10 on both bar sets.** The nearest is
-  earnings_drift and sector_rotation at 0.520 as reported (0.370 against the
+  earnings_drift on the 08-19 bars at 0.553 as reported (0.415 against the
   before-SR\*), still far below 0.95.
 - **FDR verdicts are unchanged.**
 - **The plateaus are unchanged.** Momentum and sector_rotation lookback both
   remain plateaus (see below).
 - **The KAN-33 hold is unaffected.**
-- **On its own Sharpe, the fix lowers DSR** for momentum (0.400 → 0.269 and
-  0.340 → 0.279) and thematic momentum (0.364 → 0.319 and 0.431 → 0.330). It
-  lowers earnings_drift on the refresh (0.327 → 0.257) and sector_rotation on
-  the 08-19 bars (0.411 → 0.371). Quality value (0.118 → 0.145) and
-  earnings_drift on the 08-19 bars (0.304 → 0.370) rise.
+- **On its own Sharpe (against the before-SR\*), DSR falls for some sleeves
+  and rises for others.** It falls for momentum (0.400 → 0.269 and
+  0.340 → 0.279), thematic momentum (0.364 → 0.319 and 0.431 → 0.330),
+  earnings_drift on the refresh (0.327 → 0.246) and sector_rotation on the
+  08-19 bars (0.411 → 0.397). It rises for sector_rotation on the refresh
+  (0.266 → 0.294), quality_value (0.118 → 0.145) and earnings_drift on the
+  08-19 bars (0.304 → 0.415).
 - **The legacy backtest flattered** momentum and thematic momentum:
   - it showed higher Sharpe and lower drawdowns, because phantom lots kept
     those sleeves under-invested;
@@ -289,12 +301,12 @@ pinned artifact itself (the "pin as stored" column) is unreproducible by
 | sleeve | pin as stored | total return before → after | Sharpe | max DD | trades |
 |---|---|---|---|---|---|
 | momentum | +179.66% | +160.15% → +137.90% | 0.63 → 0.53 | 19.04% → 25.93% | 619 → 761 |
-| sector_rotation | +71.51% | +71.37% → +70.43% | 0.54 → 0.50 | 22.00% → 23.41% | 118 → 156 |
+| sector_rotation | +71.51% | +71.37% → +79.08% | 0.54 → 0.55 | 22.00% → 23.41% | 118 → 155 |
 | thematic_momentum | +129.63% | +112.11% → +116.81% | 0.63 → 0.56 | 40.12% → 48.65% | 696 → 916 |
 | quality_value | +15.63% | +15.60% → +19.32% | 0.30 → 0.33 | 17.89% → 17.46% | 75 → 115 |
-| earnings_drift | +38.48% | +40.48% → +53.35% | 0.53 → 0.61 | 14.33% → 15.69% | 569 → 671 |
+| earnings_drift | +38.48% | +40.48% → +55.87% | 0.53 → 0.63 | 14.33% → 14.86% | 569 → 678 |
 | tail_risk_hedge | −19.91% | −19.91% → −16.40% | −0.65 → −0.42 | 20.20% → 19.50% | 364 → 368 |
-| **aggregate** | | **+71.38% → +70.26%** | | | |
+| **aggregate** | | **+71.38% → +72.07%** | | | |
 
 **The Rung-0 pin moves the most.** `rung0_momentum_20260925.json` (momentum
 only, USD 3,700, whole shares) goes from +114.56% to +76.67%. Its Sharpe goes
@@ -319,11 +331,11 @@ it signalled.
 
 | sleeve | verdicts before → after | invested at window start | mean abs gap |
 |---|---|---|---|
-| momentum | 11 OK → 10 OK, 1 WARNING | 68% → 79% | 0.39 → 1.59 pp |
+| momentum | 11 OK → 1 WARNING, 10 OK | 68% → 79% | 0.39 → 1.59 pp |
 | sector_rotation | 11 OK → 11 OK | 71% → 93% | 0.79 → 1.10 pp |
 | thematic_momentum | 7 BREACH, 3 WARNING, 1 OK → 8 BREACH, 1 WARNING, 2 OK | 78% → 98% | 3.89 → 4.71 pp |
-| quality_value* | 10 OK, 1 WARNING → 9 OK, 2 WARNING | 79% → 85% | 1.26 → 1.91 pp |
-| earnings_drift* | 9 OK, 2 BREACH → 11 OK | 78% → 74% | 1.67 → 0.80 pp |
+| quality_value* | 1 WARNING, 10 OK → 2 WARNING, 9 OK | 79% → 85% | 1.26 → 1.91 pp |
+| earnings_drift* | 2 BREACH, 9 OK → 11 OK | 78% → 74% | 1.67 → 0.74 pp |
 | tail_risk_hedge | 11 OK → 11 OK | 16% → 22% | 0.14 → 0.40 pp |
 
 The model side is now more invested at every window start.
@@ -402,6 +414,14 @@ The 2y and shadow figures used KAN-105's scratch bar extraction:
 `docs/decisions/assets/kan-105/extract_inputs.py` describes the same inputs.
 
 **Before the change, the final code reproduces the investigation prototype's
-legacy numbers exactly; after it, the prototype's option-1 numbers.** That
-holds for every sleeve except earnings_drift on the deploy clone's earnings
-cache, which was refreshed between the two runs.
+legacy numbers exactly** (except earnings_drift on the deploy clone's earnings
+cache, which was refreshed between the runs). **After it, the final code
+differs from the prototype in one deliberate place.** The prototype averaged a
+position's lots as `sum(p*q)/q`, which for a single lot can land one ulp below
+the fill price. The sleeves' `peak > entry` test then armed a trailing stop on
+a position that had never risen, so it worked as a stop-loss that live does
+not have. The parity test caught it once its bars gapped at the open.
+`_runner_context` now accumulates the average lot by lot exactly as live's
+fill accounting does. Sleeves without a max-loss stop moved: earnings_drift on
+both bar sets, sector_rotation on the 08-19 bars, and both in the edge-pin
+re-run. Every figure in this document is from the corrected code.

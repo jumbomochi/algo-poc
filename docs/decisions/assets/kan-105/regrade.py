@@ -22,6 +22,13 @@ and grades each against live (``equity_snapshots`` by ``session_date``, later
 run wins, from ``divergence.live_history_from``) with the monitor's own
 functions over a 30-session window.
 
+KAN-116 note: every replay now passes ``book=pf.book`` (the sleeve's
+``RunnerBook``), so this runs on current code. The ``old`` column therefore no
+longer reproduces the pre-KAN-105 replay's PHANTOM book — sleeves read their
+own fills now, so a refused pre-window buy leaves nothing behind and ``old``
+becomes a clean cold start. To reproduce the decision doc's ``old`` figures
+exactly, run this script on ``c2c202e`` (or any commit before KAN-116).
+
 quality_value / earnings_drift are not replayed in production (KAN-109). They
 are graded here on whatever caches ``--fundamentals-cache`` /
 ``--earnings-cache`` point at — a STRUCTURAL check of the seeding, not
@@ -106,7 +113,8 @@ def _old_replay(pf, bars, seed, ws):
     signal fn, buys refused before ws, no normalisation."""
     result = BacktestRunner(SimulatedExecutor(CostModel()),
                             initial_capital=seed).run(
-        bars, pf.signals_fn, pf.risk_engine, trade_start_date=ws)
+        bars, pf.signals_fn, pf.risk_engine, trade_start_date=ws,
+        book=pf.book)
     eod = dict(zip(result.dates, result.portfolio_values[1:]))
     return {d: v for d, v in eod.items() if d >= ws}
 
@@ -202,7 +210,7 @@ def main() -> None:
                 detail = replay_window_detail(
                     bars_by_ticker=two_years, signals_fn=pf.signals_fn,
                     risk_engine=pf.risk_engine, seed_nav=seed,
-                    window_start=ws, warmup_sessions=n,
+                    window_start=ws, warmup_sessions=n, book=pf.book,
                 )
                 curve = {d: v for d, v in detail.curve.items() if d in live}
                 row[f"A{w}"] = {**_grade(live, curve),
