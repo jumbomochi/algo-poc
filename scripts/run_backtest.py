@@ -589,6 +589,26 @@ def fetch_bars_from_ib(
     return bars_by_ticker
 
 
+def apply_symbol_tables_to_cache(
+    bars_by_ticker: dict[str, list[dict]],
+    aliases: Mapping[str, BacktestAlias],
+    unpriced: Mapping[str, Unpriced],
+) -> list[str]:
+    """Apply the fetch's KAN-119 tables to bars loaded from a cache, in place.
+
+    Both are idempotent, so a cache written after KAN-119 is unchanged. An
+    older one loses the bars that are another company's (PARA, IR, AA)
+    instead of grading on them, and the own-symbol bars an alias would have
+    replaced (IB's FB is a 2025 ETF). Returns the aliased tickers left with
+    no bars: the cache predates the aliases and needs a re-fetch.
+    """
+    for ticker in list(bars_by_ticker):
+        bars_by_ticker[ticker] = drop_unpriced(
+            ticker, clip_to_alias(ticker, bars_by_ticker[ticker], aliases), unpriced
+        )
+    return sorted(t for t in aliases if t in bars_by_ticker and not bars_by_ticker[t])
+
+
 REGIME_PARAMS = {
     "bull": {"trailing_stop_pct": 0.15, "max_loss_pct": 0.10},
     "neutral": {"trailing_stop_pct": 0.12, "max_loss_pct": 0.08},
@@ -2769,6 +2789,15 @@ def main():
             for ticker, bars in bars_raw.items()
             if ticker in all_set
         }
+        stale = apply_symbol_tables_to_cache(
+            bars_by_ticker, BACKTEST_ALIASES, BACKTEST_UNPRICED
+        )
+        if stale:
+            print(
+                f"  WARNING: cache predates KAN-119's aliases — {len(stale)} renamed "
+                f"members have no bars ({', '.join(stale[:10])}"
+                f"{'...' if len(stale) > 10 else ''}); re-fetch to price them"
+            )
         missing = [t for t in all_tickers if t not in bars_by_ticker]
         if missing:
             print(f"  WARNING: {len(missing)} required tickers missing from cache: {', '.join(missing[:10])}{'...' if len(missing) > 10 else ''}")

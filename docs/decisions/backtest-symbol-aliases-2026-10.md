@@ -15,7 +15,7 @@ with *that member's* prices?
 | 2026-10-13 refresh, as fetched | 142,331 of 1,265,341 | **11.25%** | BLOCKED |
 | same bars, with the aliases and the unpriced table | 111,972 of 1,265,341 | **8.85%** | BLOCKED |
 
-The 33 aliases recover **32,016** membership-days. Three tickers that IB
+The 33 aliases recover **32,014** membership-days. Three tickers that IB
 prices as a *different company* for part of their membership lose **1,655**
 days they should never have counted (the second finding below). The figure is
 `scripts/run_backtest.py`'s own fetch path (`fetch_bars_from_ib` with
@@ -138,6 +138,14 @@ fixable from the fetch:
 `SATS` was the one recoverable name in the group: EchoStar renamed to `ECHO`
 (conId 47965865), and the membership file switches at 2026-07-01. It is
 aliased.
+
+## Cached bars
+
+A run from `--bars-from-json` applies the same two tables to the cache
+(`apply_symbol_tables_to_cache`). A cache written before KAN-119 has no bars
+for the aliased tickers under their old symbols, so the run prints a WARNING
+naming them and they stay excluded until a re-fetch. Its PARA, IR and AA bars
+are dropped exactly as a fresh fetch drops them.
 
 ## Not done
 

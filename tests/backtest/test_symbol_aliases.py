@@ -175,6 +175,28 @@ def test_drop_unpriced():
     assert sa.drop_unpriced("AAPL", bars, {"PARA": sa.Unpriced("PARA", None, "x")}) == bars
 
 
+def test_a_cached_run_applies_both_tables_and_names_a_pre_kan119_cache():
+    from scripts.run_backtest import apply_symbol_tables_to_cache
+
+    old = sa.BacktestAlias("FB", "META", 1, "META", date(2022, 7, 1), "x")
+    unpriced = {"PARA": sa.Unpriced("PARA", None, "x"), "IR": sa.Unpriced("IR", date(2020, 4, 1), "x")}
+    cache = {
+        # A pre-KAN-119 cache: FB holds IB's 2025 ETF of the same symbol.
+        "FB": [{"date": date(2025, 7, 1)}],
+        "PARA": [{"date": date(2023, 1, 3)}],
+        "IR": [{"date": date(2019, 1, 2)}, {"date": date(2020, 4, 1)}],
+        "AAPL": [{"date": date(2019, 1, 2)}],
+    }
+    stale = apply_symbol_tables_to_cache(cache, {"FB": old}, unpriced)
+    assert stale == ["FB"]
+    assert cache == {"FB": [], "PARA": [], "IR": [{"date": date(2020, 4, 1)}],
+                     "AAPL": [{"date": date(2019, 1, 2)}]}
+    # Idempotent: a cache written after KAN-119 passes through unchanged.
+    fresh = {"FB": [{"date": date(2022, 6, 30)}], "IR": [{"date": date(2020, 4, 1)}]}
+    assert apply_symbol_tables_to_cache(fresh, {"FB": old}, unpriced) == []
+    assert fresh == {"FB": [{"date": date(2022, 6, 30)}], "IR": [{"date": date(2020, 4, 1)}]}
+
+
 def test_the_paper_run_fetches_without_aliases():
     source = (REPO / "scripts" / "run_paper.py").read_text()
     call = source[source.index("bars_by_ticker = fetch_bars_from_ib("):]
