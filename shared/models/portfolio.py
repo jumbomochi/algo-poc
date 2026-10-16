@@ -18,6 +18,16 @@ from shared.models.base import Base
 
 
 class Position(Base):
+    """A lot the book holds now. Not a history of lots.
+
+    A sell that closes a lot fully *deletes* its row (``PaperTradingState``,
+    ``scripts/paper_state.py``); only the ops repair scripts and the legacy
+    retirement mark a row ``status="closed"``. Every reader therefore filters
+    ``status == "open"``. To see what a sleeve held on a past date, union the
+    open rows with ``trades`` (``entry_date`` .. ``executed_at``); querying
+    this table by ``opened_at`` misses every lot since sold (KAN-117).
+    """
+
     __tablename__ = "positions"
     __table_args__ = (
         Index("ix_positions_ticker_status", "ticker", "status"),
