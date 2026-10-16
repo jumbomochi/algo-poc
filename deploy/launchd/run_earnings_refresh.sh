@@ -188,7 +188,7 @@ run_fundamentals_step() {
             echo "$(ts): fundamentals refresh INCOMPLETE — $summary" >> "$LOG_FILE" ;;
         2)
             echo "$(ts): fundamentals refresh FAILED — $summary" >> "$LOG_FILE"
-            telegram "❌ Fundamentals refresh FAILED: Alpha Vantage refused or errored. Progress saved; fundamentals.json's fetched_at NOT advanced (quality_value degrades once it is 14 days old). $summary. See $LOG_REF." ;;
+            telegram "❌ Fundamentals refresh FAILED: Alpha Vantage refused or errored, or after a full pass too many live names have no stored quarter (THIN). Progress saved; fundamentals.json's fetched_at NOT advanced (quality_value degrades once it is 14 days old). $summary. See $LOG_REF." ;;
         75)
             echo "$(ts): fundamentals refresh SKIPPED — another refresh holds the lock" >> "$LOG_FILE"
             telegram "⚠️ Fundamentals refresh SKIPPED: another Alpha Vantage refresh (a hand-run?) held the cache lock. $summary. See $LOG_REF." ;;

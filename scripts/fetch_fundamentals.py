@@ -47,9 +47,10 @@ a. live tickers **never fetched** from Alpha Vantage, newest reported quarter
 b. live tickers **behind**: ``earnings.json`` shows a quarter reported at least
    ``statement_lag_days`` ago that is newer than the newest stored one, and the
    ticker was not asked in the last ``retry_days`` days; oldest report first;
-c. live tickers **aging**: no stored quarter, or the newest is over
-   ``aging_days`` old, and not asked in the last ``aging_retry_days`` days —
-   the fallback for a report the earnings cache never carried.
+c. live tickers **aging**, asked at most every ``aging_retry_days`` days:
+   one the earnings cache knows nothing about whose newest stored quarter is
+   missing or over ``aging_days`` old, or one whose newer quarter Alpha
+   Vantage has already offered and could not be stored.
 
 Failures are handled as in the earnings refresh: a quota notice stops the run,
 a transport or malformed response is retried once and then skips the ticker
@@ -59,9 +60,12 @@ consecutive days is excluded from the stamp gate (``LIVE_REFUSED``).
 
 What ``fetched_at`` means
 -------------------------
-The START of the most recent run that was not stopped or terminated, after
-which every live ticker (bar the excluded) had been fetched from Alpha Vantage
-at least once. Whether each ticker's quarter is current is the period rule's
+The START of the most recent run over the whole live universe (never a
+``--tickers`` subset) that was not stopped or terminated, after which every
+live ticker (bar the excluded) had been fetched from Alpha Vantage at least
+once, and at most ``max_stale_ticker_fraction`` (20%) of them had no stored
+quarter — the freshness rule only judges tickers that have rows, so a cache
+missing names entirely would otherwise read fresh (THIN, exit 2). Whether each ticker's quarter is current is the period rule's
 job (``data.fundamentals.max_period_age_days``), judged on the rows. A run
 short of that bar saves its rows and leaves ``fetched_at`` where it was —
 ``null`` until the first complete pass — so the sleeve stays degraded rather
@@ -149,9 +153,13 @@ def load_fundamentals_cache(path: str) -> dict[str, list[dict]]:
 
 def _available_on(row: Mapping[str, Any], lag: timedelta) -> date:
     filed = row.get("filing_date")
-    if filed:
-        return _as_date(filed)
-    return _as_date(row["report_date"]) + lag
+    available = _as_date(filed) if filed else _as_date(row["report_date"]) + lag
+    # A quarter this cache first saw later than that was not in it before: a
+    # replay must not use it earlier than the cache could have (KAN-110).
+    seen = row.get("first_seen_at")
+    if seen:
+        available = max(available, _as_date(str(seen)[:10]))
+    return available
 
 
 def build_fundamentals_lookup(
@@ -271,6 +279,19 @@ def _text(value: Any) -> str | None:
     return None if text in ("", "None") else text
 
 
+def _nearest_quarter(
+    quarters: Mapping[str, Mapping[str, Any]], period: str
+) -> Mapping[str, Any] | None:
+    """The quarter dated within ``_SAME_QUARTER`` of ``period``, if exactly one.
+
+    The two endpoints can date a 52/53-week filer's quarter a few days apart;
+    the planner already treats such dates as one quarter, so the parser must.
+    """
+    target = _as_date(period)
+    close = [q for p, q in quarters.items() if abs(_as_date(p) - target) <= _SAME_QUARTER]
+    return close[0] if len(close) == 1 else None
+
+
 def _total_debt(balance: Mapping[str, Any]) -> float:
     """Short plus long-term debt. Alpha Vantage's own total when present."""
     from scripts.fetch_earnings import _number
@@ -303,7 +324,7 @@ def parse_statements(
     balances = _quarters(balance)
     rows = []
     for period, inc in _quarters(income).items():
-        bal = balances.get(period)
+        bal = balances.get(period) or _nearest_quarter(balances, period)
         if bal is None:
             continue
         net_income = _number(inc.get("netIncome"))
@@ -345,10 +366,11 @@ def merge_first_seen(
     a later restatement cannot reach the cache. A quarter not yet stored is
     added only if ``seen_at`` is within ``capture_window_days`` of its period
     end. Rows from another source (the legacy yfinance cache, restated and
-    undated) are dropped once Alpha Vantage answers for the ticker, so one
-    ticker never mixes the two.
+    undated) are dropped once an Alpha Vantage quarter is stored for the
+    ticker, so one ticker never mixes the two.
     """
-    kept = [dict(r) for r in (old or []) if _is_av_row(r)] if new else list(old or [])
+    kept = [dict(r) for r in (old or []) if _is_av_row(r)]
+    legacy = [r for r in (old or []) if not _is_av_row(r)]
     stored = {r["report_date"] for r in kept}
     window = timedelta(days=capture_window_days)
     seen_day = seen_at.astimezone(timezone.utc).date()
@@ -360,6 +382,10 @@ def merge_first_seen(
         kept.append({**row, "first_seen_at": seen_at.astimezone(timezone.utc).isoformat()})
         stored.add(period)
         added.append(period)
+    if not kept:
+        # Nothing of Alpha Vantage's is storable yet: keep what was there
+        # rather than leave the ticker with no rows at all.
+        return list(old or []), added
     return sorted(kept, key=lambda r: r["report_date"]), added
 
 
@@ -435,15 +461,27 @@ def plan_fundamentals(
             never.append((-newest_period.toordinal(), index, ticker))
             continue
         stored = newest_stored(ticker)
+        offered = (state.get(ticker) or {}).get("newest_offered")
         if reported is not None and (stored is None or reported[0] > stored + _SAME_QUARTER):
+            if offered and _as_date(offered) >= reported[0] - _SAME_QUARTER:
+                # Alpha Vantage already offered that quarter and it could not
+                # be stored (outside the capture window, or a figure missing).
+                # Asking every few days would not change that; weekly may.
+                if not asked_within(ticker, aging_retry_days):
+                    aging.append(ticker)
+                continue
             # A newer quarter is known. Ask once its statements can exist, not
             # before: the aging fallback would only fetch the old one again.
             filed = today - reported[1] >= timedelta(days=statement_lag_days)
             if filed and not asked_within(ticker, retry_days):
                 behind.append((reported[1], index, ticker))
             continue
-        if (stored is None or (today - stored).days > aging_days) and not asked_within(
-            ticker, aging_retry_days
+        # The fallback for a ticker the earnings cache knows nothing about: with
+        # earnings rows and no newer quarter, the next one simply is not out.
+        if (
+            reported is None
+            and (stored is None or (today - stored).days > aging_days)
+            and not asked_within(ticker, aging_retry_days)
         ):
             aging.append(ticker)
 
@@ -469,7 +507,7 @@ def plan_fundamentals(
 
 @dataclass
 class FundamentalsResult:
-    status: str  # CURRENT | FAILED | INCOMPLETE | TERMINATED
+    status: str  # CURRENT | FAILED | THIN | INCOMPLETE | SUBSET | TERMINATED
     exit_code: int
     calls: int
     fetched: list[str]
@@ -526,11 +564,20 @@ def run_fundamentals_refresh(
     aging_retry_days: int = 7,
     refusal_limit: int = 3,
     max_consecutive_errors: int = 3,
+    max_missing_fraction: float = 0.20,
+    stamp_allowed: bool = True,
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     log: Callable[[str], None] = print,
     termination: Any = None,
 ) -> FundamentalsResult:
-    """One budgeted refresh of ``fundamentals.json`` (see the module docstring)."""
+    """One budgeted refresh of ``fundamentals.json`` (see the module docstring).
+
+    ``stamp_allowed`` is False for a hand-run over a subset (``--tickers``):
+    it saves rows but can never vouch for the whole universe.
+    ``max_missing_fraction``: a pass after which more than this share of live
+    names has no stored quarter is THIN, not current — the freshness rule
+    only judges the tickers that have rows, so it cannot see the gap.
+    """
     from scripts.fetch_earnings import (
         EXIT_CURRENT,
         EXIT_FAILED,
@@ -575,11 +622,20 @@ def run_fundamentals_refresh(
         f"{len(plan.selected)} ticker(s), budget {budget} request(s)"
     )
 
+    class OutOfBudget(Exception):
+        pass
+
     def call_with_retry(fn: Callable[[], Any]) -> Any:
+        """One retry for a transport/malformed failure, every request inside
+        the budget: the free tier counts retries too."""
+        if client.calls - calls_before >= budget:
+            raise OutOfBudget()
         try:
             return fn()
         except AlphaVantageError as exc:
             if exc.kind not in ("transport", "malformed"):
+                raise
+            if client.calls - calls_before >= budget:
                 raise
             log(f"  retrying once after {exc.kind}: {exc}")
             term.checkpoint()
@@ -614,6 +670,9 @@ def run_fundamentals_refresh(
                     call_with_retry(lambda: client.statement("BALANCE_SHEET", symbol))
                     if income else None
                 )
+            except OutOfBudget:
+                log(f"{tag}: budget of {budget} request(s) spent mid-ticker; nothing merged")
+                break
             except AlphaVantageError as exc:
                 entry["status"] = f"error:{exc.kind}"
                 if exc.kind == "limit":
@@ -669,7 +728,15 @@ def run_fundamentals_refresh(
         t for t in live
         if not (ticker_state.get(t) or {}).get("last_success_at") and t not in excluded
     ]
-    current = not terminated and stopped is None and not live_without_fetch
+    with_rows = sum(1 for t in live if cache.get(t))
+    thin = bool(live) and (len(live) - with_rows) / len(live) > max_missing_fraction
+    current = (
+        stamp_allowed
+        and not terminated
+        and stopped is None
+        and not live_without_fetch
+        and not thin
+    )
     with term.shielded():
         if current:
             fetched_at: datetime | None = started
@@ -697,8 +764,13 @@ def run_fundamentals_refresh(
         status, code = "CURRENT", EXIT_CURRENT
     elif stopped or any(t in gating for t in refused + errored):
         status, code = "FAILED", EXIT_FAILED
-    else:
+    elif live_without_fetch:
         status, code = "INCOMPLETE", EXIT_INCOMPLETE
+    elif not stamp_allowed:
+        status, code = "SUBSET", EXIT_CURRENT
+    else:
+        # Every live name asked, and too many still have no quarter.
+        status, code = "THIN", EXIT_FAILED
 
     result = FundamentalsResult(
         status=status, exit_code=code, calls=client.calls - calls_before,
@@ -721,6 +793,16 @@ def run_fundamentals_refresh(
             f"{', '.join(sorted(excluded))} on {refusal_limit}+ consecutive days; excluded "
             "from the freshness gate, but quality_value cannot rank them. Map each in "
             "data.earnings.refresh.symbol_overrides"
+        )
+    if thin and not live_without_fetch:
+        result.messages.append(
+            f"THIN: only {with_rows} of {len(live)} live tickers have a stored quarter "
+            f"(more than {max_missing_fraction:.0%} missing); fetched_at is not advanced "
+            "and quality_value stays degraded"
+        )
+    if not stamp_allowed:
+        result.messages.append(
+            "SUBSET: --tickers run; rows saved, fetched_at left where it was"
         )
     if live_without_fetch:
         per_run = max(budget // 2, 1)
@@ -933,6 +1015,8 @@ def main(
                 aging_retry_days=cfg.aging_retry_days,
                 refusal_limit=cfg.refusal_exclude_after_days,
                 max_consecutive_errors=cfg.max_consecutive_errors,
+                max_missing_fraction=data_cfg.fundamentals.max_stale_ticker_fraction,
+                stamp_allowed=args.tickers is None,
             )
     except LockHeld as exc:
         print(f"SKIPPED: {exc}")

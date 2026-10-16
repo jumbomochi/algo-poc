@@ -940,7 +940,10 @@ rationale in the wrapper header.
   so the history is shallow and grows forward, and a backtest or shadow that
   starts before it marks quality_value `SHALLOW` (degraded) rather than grading
   it on empty lookups. The initial fill takes ~33 runs (99 tickers, 3 a run);
-  quality_value stays DATA-DEGRADED until it completes. Its outcome never
+  quality_value stays DATA-DEGRADED until it completes, and afterwards
+  whenever more than 20% of live names hold no stored quarter (THIN, exit 2:
+  the freshness rule only judges tickers that have rows). A `--tickers`
+  hand-run saves rows but never stamps the cache. Its outcome never
   changes the job's exit code or the dead-man ping; 1, 2, 75 and 124
   Telegram, 3 (the fill) is logged only, and KAN-109 degrades the sleeve once
   `fetched_at` is 14 days old. Bookkeeping in `fundamentals_fetch_state.json`.

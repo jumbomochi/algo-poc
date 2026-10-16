@@ -285,10 +285,18 @@ def test_a_current_cache_with_nothing_due_is_restamped_without_a_call(tmp_path):
     assert _cache(tmp_path).fetched_at == later
 
 
+GOOD = [f"G{i}" for i in range(5)]
+
+
+def _good(av):
+    for t in GOOD:
+        av.add(t, {"2026-06-30": {}})
+
+
 def test_a_delisted_name_costs_one_request_and_is_reported(tmp_path):
     av = FakeAV({("INCOME_STATEMENT", "ATVI"): _fixture("income_statement_ATVI.json")})
-    av.add("A", {"2026-06-30": {}})
-    result = _run(tmp_path, av, ["A", "ATVI"])
+    _good(av)
+    result = _run(tmp_path, av, GOOD + ["ATVI"], budget=12)
     assert av.requested().count(("INCOME_STATEMENT", "ATVI")) == 1
     assert ("BALANCE_SHEET", "ATVI") not in av.requested()
     assert result.status == "CURRENT", "a name AV has nothing for must not hold the cache stale"
@@ -343,9 +351,9 @@ def test_retries_spend_the_budget_too(tmp_path):
 
 def test_a_symbol_refused_three_days_running_is_excluded_and_named(tmp_path):
     av = FakeAV({("INCOME_STATEMENT", "BAD"): json.dumps({"Error Message": "Invalid API call"}).encode()})
-    av.add("A", {"2026-06-30": {}})
+    _good(av)
     for day in range(3):
-        result = _run(tmp_path, av, ["A", "BAD"], now=NOW + timedelta(days=day))
+        result = _run(tmp_path, av, GOOD + ["BAD"], budget=12, now=NOW + timedelta(days=day))
     assert result.status == "CURRENT", "a refused name must not hold the sleeve degraded forever"
     assert any(m.startswith("LIVE_REFUSED:") and "BAD" in m for m in result.messages)
 
@@ -410,11 +418,14 @@ def test_the_main_entry_writes_a_cache_the_lookup_reads(tmp_path, capsys):
     av.add("A", {"2026-06-30": {"ni": 50, "eq": 500}})
     code = ff.main(["--tickers", "A", "--cache-dir", str(tmp_path), "--min-interval", "0"],
                    transport=av, env={"ALPHAVANTAGE_API_KEY": KEY})
-    assert code == fe.EXIT_CURRENT, capsys.readouterr().out
-    lookup = ff.build_fundamentals_lookup(_cache(tmp_path).data)
-    # Available 45 days after the period end, as before.
-    assert lookup("A", date(2026, 8, 13)) is None
-    assert lookup("A", date(2026, 8, 14))["roe"] == 0.1
+    out = capsys.readouterr().out
+    assert code == fe.EXIT_CURRENT, out
+    # A --tickers run saves rows but cannot vouch for the universe.
+    assert "status=SUBSET" in out
+    doc = _cache(tmp_path)
+    assert doc.fetched_at is None
+    lookup = ff.build_fundamentals_lookup(doc.data)
+    assert lookup("A", date.today())["roe"] == 0.1
 
 
 # --- SHALLOW ---------------------------------------------------------------------
@@ -508,3 +519,92 @@ def test_the_paper_run_hands_the_shadow_its_own_degraded_set():
     call = source[source.index("shadow_path = produce_shadow_artifact("):]
     call = call[: call.index("print(f\"  Shadow series written")]
     assert "data_degraded=shadow_data_degraded(" in call
+
+
+# --- review fixes (PR #247) ------------------------------------------------------
+
+
+def test_a_quarter_is_not_available_before_the_cache_first_saw_it():
+    row = {"report_date": "2026-06-30", "first_seen_at": "2026-10-17T01:00:00+00:00", "roe": 0.1}
+    lookup = ff.build_fundamentals_lookup({"A": [row]})
+    assert lookup("A", date(2026, 8, 14)) is None, "45 days after period end, but not yet seen"
+    assert lookup("A", date(2026, 10, 17))["roe"] == 0.1
+
+
+def test_a_full_pass_with_too_many_names_missing_is_thin_not_current(tmp_path):
+    av = FakeAV()
+    for t in ("A", "B", "C"):
+        av.add(t, {"2026-06-30": {}})
+    # D and E: Alpha Vantage has nothing (2 of 5 = 40% missing).
+    result = _run(tmp_path, av, ["A", "B", "C", "D", "E"], budget=10)
+    assert (result.status, result.exit_code) == ("THIN", fe.EXIT_FAILED)
+    assert _cache(tmp_path).fetched_at is None
+    assert any(m.startswith("THIN:") for m in result.messages)
+
+
+def test_a_quarter_offered_but_unstorable_is_not_re_asked_every_few_days(tmp_path):
+    earnings = {"A": _earnings_rows("2026-03-31", "2026-04-25")}
+    state = {"A": {**_asked(4), "newest_offered": "2026-03-31"}}
+    plan = _plan(live=["A"], earnings=earnings, state=state, cache={})
+    assert plan.behind == [] and plan.aging == [], "asked 4 days ago: wait for the weekly cadence"
+    state = {"A": {**_asked(8), "newest_offered": "2026-03-31"}}
+    plan = _plan(live=["A"], earnings=earnings, state=state, cache={})
+    assert plan.aging == ["A"]
+
+
+def test_aging_is_only_for_a_ticker_the_earnings_cache_knows_nothing_about():
+    cache = {"A": _stored("2026-05-31"), "B": _stored("2026-05-31")}
+    state = {"A": _asked(30), "B": _asked(30)}
+    earnings = {"A": _earnings_rows("2026-05-31", "2026-06-20")}  # nothing newer out yet
+    plan = _plan(live=["A", "B"], cache=cache, state=state, earnings=earnings)
+    assert plan.aging == ["B"]
+
+
+def test_income_and_balance_dated_days_apart_are_one_quarter():
+    income, balance = map(json.loads, _statements("X", {"2026-06-28": {}}))
+    balance["quarterlyReports"][0]["fiscalDateEnding"] = "2026-06-30"
+    rows = ff.parse_statements("X", income, balance)
+    assert [r["report_date"] for r in rows] == ["2026-06-28"]
+
+
+def test_every_request_including_retries_stays_inside_the_budget(tmp_path):
+    av = FakeAV(default=OSError("reset"))
+    result = _run(tmp_path, av, ["A", "B", "C"], budget=6)
+    assert len(av.urls) <= 6
+    result = _run(tmp_path, FakeAV(default=OSError("reset")), ["A"], budget=3)
+    assert result.calls <= 3
+
+
+def test_legacy_rows_survive_an_answer_with_nothing_storable():
+    legacy = [{"report_date": "2025-12-31", "roe": 0.3}]
+    old = ff.parse_statements("X", *map(json.loads, _statements("X", {"2025-06-30": {}})))
+    merged, added = ff.merge_first_seen(legacy, old, seen_at=NOW, capture_window_days=135)
+    assert added == [] and merged == legacy
+
+
+def _flaky_first(answer: bytes):
+    calls = iter([OSError("reset")])
+
+    def respond(url):
+        for exc in calls:
+            raise exc
+        return answer
+
+    return respond
+
+
+def test_a_retry_on_the_balance_sheet_cannot_overspend(tmp_path):
+    av = FakeAV()
+    av.add("A", {"2026-06-30": {}})
+    av.table[("BALANCE_SHEET", "A")] = OSError("reset")
+    result = _run(tmp_path, av, ["A"], budget=2)
+    assert len(av.urls) == 2 and result.calls == 2
+
+
+def test_a_retried_income_statement_leaves_no_room_for_the_balance_sheet(tmp_path):
+    av = FakeAV()
+    av.add("A", {"2026-06-30": {}})
+    av.table[("INCOME_STATEMENT", "A")] = _flaky_first(av.table[("INCOME_STATEMENT", "A")])
+    result = _run(tmp_path, av, ["A"], budget=2)
+    assert len(av.urls) == 2, "the balance sheet would be the third request"
+    assert result.fetched == [] and not _cache(tmp_path).data
