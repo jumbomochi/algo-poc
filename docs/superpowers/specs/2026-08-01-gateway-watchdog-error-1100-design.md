@@ -30,6 +30,10 @@ a 1100 are the always-on `ib_insync` clients, chiefly the `execution` service.
   transient and auto-recovers (1102) within seconds to minutes; restarting the
   Gateway would disrupt a session about to self-heal and risk re-entering the
   login flow.
+  *Superseded in part by KAN-118 (2026-10-16):* a 1100 that lasts 30 min gets
+  one guarded restart, after one did not self-heal for 7h11m on 2026-10-14. See
+  `deploy/launchd/README.md` § "Error 1100: one guarded restart after 30
+  minutes".
 
 ## Design
 
@@ -96,7 +100,7 @@ the marker and is never alerted.
 ## Out of scope
 
 - Farm-status codes (2103 / 2105 / 2107 / 2108).
-- Kickstart-on-1100.
+- Kickstart-on-1100. (Added later by KAN-118, after 30 min and once per outage.)
 - Observer in `data_ingestion` — `execution`'s persistent session is
   sufficient (1100 is broadcast to all connected clients).
 

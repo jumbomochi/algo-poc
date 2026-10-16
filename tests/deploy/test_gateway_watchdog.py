@@ -83,6 +83,10 @@ class Host:
         self.ibc_log_text = "12:00:00 Login has completed\n"
         self.now = RUN_AT
         self.disable_docker = False
+        # launchd labels `launchctl list` should show with a live PID (KAN-118).
+        self.running_jobs: list[str] = []
+        self.list_filler = 0
+        self.kickstart_rc = 0
 
         self._write_stubs()
 
@@ -183,7 +187,12 @@ class Host:
             '    echo "PID	Status	Label"\n'
             '    echo "-	0	local.algo-paper-trading"\n'
             '    [ -n "$STUB_GW_PID" ] && echo "$STUB_GW_PID	0	local.ibc-gateway"\n'
+            '    for j in $STUB_RUNNING_JOBS; do echo "4242	0	$j"; done\n'
+            # A real `launchctl list` is ~20KB, more than a pipe buffer.
+            '    for ((i = 0; i < ${STUB_LIST_FILLER:-0}; i++)); do\n'
+            '        echo "-	0	com.apple.filler.service.number.$i.with.a.long.label"; done\n'
             "fi\n"
+            'if [ "${1:-}" = "kickstart" ]; then exit "${STUB_KICKSTART_RC:-0}"; fi\n'
             "exit 0\n",
         )
 
@@ -218,6 +227,9 @@ class Host:
             STUB_GW_ETIME=self.gateway_etime,
             STUB_CURL_LOG=str(self.curl_log),
             STUB_LAUNCHCTL_LOG=str(self.launchctl_log),
+            STUB_RUNNING_JOBS=" ".join(self.running_jobs),
+            STUB_LIST_FILLER=str(self.list_filler),
+            STUB_KICKSTART_RC=str(self.kickstart_rc),
         )
         if self.disable_docker:
             # An explicitly empty $ALGO_DOCKER_BIN is the documented "this host
@@ -714,7 +726,9 @@ def test_a_live_1100_with_a_matching_gateway_still_alerts_as_before(host):
     body = " ".join(host.messages())
     assert "Error 1100" in body, body
     assert "~10 min" in body
-    assert "NOT restart" in body
+    # KAN-118: under CONN_RESTART_SECS it still only alerts, and says when a
+    # restart would come.
+    assert "will restart the Gateway if this lasts 30 min" in body, body
     assert host.conn_marker.exists(), "a live latch must survive"
     assert host.conn_alert_marker.exists()
     assert not any("kickstart" in c for c in host.launchctl_calls())
@@ -1224,3 +1238,469 @@ def _paper_run_weekdays() -> set[int]:
     m = re.search(r'^PAPER_RUN_WEEKDAYS="([0-7 ]+)"$', WATCHDOG.read_text(), re.MULTILINE)
     assert m, 'gateway_watchdog.sh has no PAPER_RUN_WEEKDAYS="..." constant'
     return {int(d) % 7 for d in m.group(1).split()}
+
+
+# ---------------------------------------------------------------------------
+# KAN-118 — restart a Gateway stuck in a sustained Error 1100, once
+# ---------------------------------------------------------------------------
+# The 2026-10-14 incident: the Gateway lost IB server connectivity at 12:20 SGT
+# on a Wednesday and sat on "Connecting to server..." for 7h11m. The watchdog
+# paged once at 12:28 and never acted; a human restart fixed it in a minute.
+
+# Wednesday 12:50 SGT: clear of every restart blackout and of US market hours.
+WED_MIDDAY = datetime(2026, 10, 14, 12, 50, 0).timestamp()
+KICKSTART = f"kickstart -k gui/{os.getuid()}/local.ibc-gateway"
+RESTART_MARKER = "ibc/.gateway_connectivity_restarted"
+
+
+def _kickstarts(host: Host) -> list[str]:
+    return [c for c in host.launchctl_calls() if c.startswith("kickstart")]
+
+
+def _restart_record(host: Host) -> dict[str, str]:
+    path = host.home / RESTART_MARKER
+    if not path.exists():
+        return {}
+    return dict(ln.split("=", 1) for ln in path.read_text().splitlines() if "=" in ln)
+
+
+@pytest.fixture()
+def stuck(host) -> Host:
+    """A validated 1100, 35 min old, execution up, at a quiet hour."""
+    host.now = WED_MIDDAY
+    host.write_conn_marker(lost_ago=35 * 60, pid="live")
+    return host
+
+
+def _advance(host: Host, secs: int) -> None:
+    """Move the clock AND the running Gateway's age, as real time does. Moving
+    only the clock re-derives a different start epoch and the KAN-63 check
+    then (correctly) calls the latch stale."""
+    up = host.gateway_uptime() + secs
+    days, rest = divmod(up, 86400)
+    hms = f"{rest // 3600:02d}:{rest % 3600 // 60:02d}:{rest % 60:02d}"
+    host.gateway_etime = f"{days}-{hms}" if days else hms
+    host.now += secs
+
+
+def _replace_gateway(host: Host, *, pid: str = "77001", up_secs: int = 60) -> None:
+    """What a successful kickstart looks like from outside: a new process."""
+    host.gateway_pid = pid
+    host.gateway_etime = f"{up_secs // 60:02d}:{up_secs % 60:02d}"
+
+
+def test_a_validated_1100_past_thirty_minutes_restarts_the_gateway_once(stuck):
+    """AC1: exactly one guarded kickstart, logged and paged, recorded first."""
+    stuck.run()
+
+    assert _kickstarts(stuck) == [KICKSTART]
+    body = " ".join(stuck.messages())
+    assert "RESTARTED" in body and "~35 min" in body, body
+    assert "kickstarting local.ibc-gateway" in stuck.watchdog_log()
+    record = _restart_record(stuck)
+    assert record["restarted_pid"] == stuck.gateway_pid
+    assert record["restarted_at"] == str(int(stuck.now))
+    assert record["outcome"] == "pending"
+
+
+def test_the_restart_path_is_the_one_the_port_down_path_uses(stuck):
+    """Same launchctl verb and target as the two-strike port-down kickstart, so
+    there is one way this script restarts the Gateway, not two."""
+    stuck.run()
+    text = WATCHDOG.read_text()
+    assert text.count('kickstart -k "gui/$(id -u)/$GW_LABEL"') == 2
+
+
+def test_under_thirty_minutes_it_only_alerts(host):
+    host.now = WED_MIDDAY
+    host.write_conn_marker(lost_ago=29 * 60, pid="live")
+    host.run()
+
+    assert _kickstarts(host) == []
+    assert "will restart the Gateway if this lasts 30 min" in " ".join(host.messages())
+
+
+def test_the_same_process_still_in_1100_is_not_restarted_twice(stuck):
+    """AC2, first half: a kickstart that did not replace the process."""
+    stuck.run()
+    stuck.clear_messages()
+    # No throttle reset: the refusal is the restart's outcome and must page at
+    # once, even though the restart page touched the alert marker (review S2).
+    _advance(stuck, 600)
+    stuck.run()
+
+    assert _kickstarts(stuck) == [KICKSTART], "restarted the same outage twice"
+    body = " ".join(stuck.messages())
+    assert "NOT restarting" in body and "already restarted this Gateway" in body, body
+    assert "A human needs to look" in body
+
+
+def test_a_restarted_gateway_that_goes_back_into_1100_is_not_restarted_again(stuck):
+    """AC2, second half: the new Gateway also goes into a sustained 1100."""
+    stuck.run()
+    stuck.clear_messages()
+    restarted_at = stuck.now
+
+    # The kickstart produced a new process 60s later; it reconnects, then loses
+    # the IB servers again and stays lost past the threshold.
+    stuck.now = restarted_at + 60 + 40 * 60
+    _replace_gateway(stuck, up_secs=40 * 60)
+    stuck.write_conn_marker(lost_ago=35 * 60, pid="live")
+    stuck.run()
+
+    assert _kickstarts(stuck) == [KICKSTART]
+    body = " ".join(stuck.messages())
+    assert "went back into Error 1100" in body and "A human needs to look" in body, body
+    assert _restart_record(stuck)["outcome"] == "failed"
+
+
+def test_a_later_unrelated_gateway_can_be_restarted_again(stuck):
+    """Once per outage, not once ever: a Gateway that came up well after our
+    restart (here a day later, from a human or a cold restart) is a new one."""
+    stuck.run()
+    stuck.now += 86_400
+    _replace_gateway(stuck, pid="88002", up_secs=6 * 3600)
+    stuck.write_conn_marker(lost_ago=35 * 60, pid="live")
+    stuck.run()
+
+    assert _kickstarts(stuck) == [KICKSTART, KICKSTART]
+
+
+@pytest.mark.parametrize("case", ["stale", "unvalidated", "execution_down",
+                                  "login_rejected", "identity_unreadable",
+                                  "unreadable_loss_time"])
+def test_no_kickstart_without_a_trustworthy_live_1100(host, case):
+    """AC3: every state in which the latch, its writer or the login cannot be
+    trusted keeps the alert-only behaviour."""
+    host.now = WED_MIDDAY
+    if case == "stale":
+        host.write_conn_marker(lost_ago=35 * 60, pid="12345", started_ago=100_000)
+    elif case == "unvalidated":
+        host.write_conn_marker(lost_ago=35 * 60)          # never stamped yet
+    elif case == "execution_down":
+        host.write_conn_marker(lost_ago=35 * 60, pid="live")
+        host.containers["execution"] = ("exited", "Exited (1) 1 hour ago")
+    elif case == "login_rejected":
+        host.write_conn_marker(lost_ago=35 * 60, pid="live")
+        host.ibc_log_text = "12:40:00 Dialog: Unrecognized Username or Password\n"
+    elif case == "identity_unreadable":
+        host.write_conn_marker(lost_ago=35 * 60, pid="live")
+        host.gateway_pid = ""
+    elif case == "unreadable_loss_time":
+        host.write_conn_marker(lost_ago=35 * 60, pid="live")
+        lines = host.conn_marker.read_text().splitlines()
+        host.conn_marker.write_text("\n".join(["garbage"] + lines[1:]) + "\n")
+    host.run()
+
+    assert _kickstarts(host) == [], case
+    if case == "login_rejected":
+        assert "rejecting the login" in " ".join(host.messages())
+    if case == "unreadable_loss_time":
+        assert "loss time is unreadable" in " ".join(host.messages())
+
+
+def test_an_unvalidated_latch_is_restarted_for_once_the_next_cycle_confirms_it(host):
+    """The stamp-then-validate sequence: first sight stamps, the next cycle
+    (now confirmed against the running Gateway) may restart."""
+    host.now = WED_MIDDAY
+    host.write_conn_marker(lost_ago=35 * 60)
+    host.run()
+    assert _kickstarts(host) == []
+    _advance(host, 300)
+    host.run()
+    assert _kickstarts(host) == [KICKSTART]
+
+
+@pytest.mark.parametrize(
+    "when, jobs, reason",
+    [
+        (datetime(2026, 10, 14, 13, 55), [], "daily auto-restart (14:00)"),
+        (datetime(2026, 10, 14, 14, 10), [], "daily auto-restart (14:00)"),
+        (datetime(2026, 10, 18, 8, 5), [], "weekly cold restart (Sun 08:00)"),
+        (datetime(2026, 10, 14, 5, 12), [], "paper run's slot"),
+        (datetime(2026, 10, 14, 5, 25), [], "paper run's slot"),
+        (datetime(2026, 10, 14, 6, 10), ["local.algo-paper-trading"],
+         "local.algo-paper-trading is running"),
+        (datetime(2026, 10, 13, 9, 0), ["local.algo-backtest-refresh"],
+         "local.algo-backtest-refresh is running"),
+    ],
+)
+def test_no_restart_inside_a_blackout(host, when, jobs, reason):
+    """AC4: never race IBC's own restarts, a paper run, or the refresh fetch."""
+    host.now = when.timestamp()
+    host.running_jobs = jobs
+    host.write_conn_marker(lost_ago=35 * 60, pid="live")
+    host.run()
+
+    assert _kickstarts(host) == []
+    body = " ".join(host.messages())
+    assert "restart deferred" in body and reason in body, body
+
+
+@pytest.mark.parametrize(
+    "when",
+    [datetime(2026, 10, 14, 13, 49), datetime(2026, 10, 14, 14, 15),
+     datetime(2026, 10, 14, 5, 30), datetime(2026, 10, 19, 5, 15),  # Monday: no run
+     datetime(2026, 10, 14, 8, 5)],                                  # Wed: no cold restart
+)
+def test_just_outside_a_blackout_the_restart_goes_ahead(host, when):
+    host.now = when.timestamp()
+    host.write_conn_marker(lost_ago=35 * 60, pid="live")
+    host.run()
+    assert _kickstarts(host) == [KICKSTART], when
+
+
+def test_a_deferred_restart_goes_ahead_once_the_blackout_ends(host):
+    host.now = datetime(2026, 10, 14, 14, 5).timestamp()
+    host.write_conn_marker(lost_ago=35 * 60, pid="live")
+    host.run()
+    assert _kickstarts(host) == []
+    _advance(host, 15 * 60)              # 14:20
+    host.run()
+    assert _kickstarts(host) == [KICKSTART]
+
+
+def test_recovery_after_a_restart_is_paged_once_in_place_of_the_generic_all_clear(stuck):
+    """Outcome, the usual way: execution reconnects and clears the latch."""
+    stuck.run()
+    stuck.clear_messages()
+    _replace_gateway(stuck)
+    stuck.conn_marker.unlink()
+    stuck.now += 300
+    stuck.run()
+
+    msgs = stuck.messages()
+    assert len(msgs) == 1, msgs
+    assert "back after the watchdog's Error 1100 restart" in msgs[0]
+    assert _restart_record(stuck)["outcome"] == "recovered"
+    assert not stuck.conn_alert_marker.exists()
+
+    stuck.clear_messages()
+    stuck.now += 300
+    stuck.run()
+    assert stuck.messages() == [], "the outcome was paged twice"
+
+
+def test_recovery_is_also_reported_when_the_old_latch_is_dropped_as_stale(stuck):
+    """Outcome, the other way: the watchdog sees the new Gateway before
+    execution has reconnected, so the old session's latch goes as stale."""
+    stuck.run()
+    stuck.clear_messages()
+    old_pid = stuck.gateway_pid
+    _replace_gateway(stuck)
+    stuck.now += 300
+    stuck.run()
+
+    body = " ".join(stuck.messages())
+    assert "back after the watchdog's Error 1100 restart" in body, body
+    assert "STALE" not in body
+    assert f"pid {stuck.gateway_pid}" in body and old_pid != stuck.gateway_pid
+    assert _restart_record(stuck)["outcome"] == "recovered"
+
+
+def test_a_restarted_gateway_that_never_reopens_its_port_is_paged_once(stuck):
+    """And the port-down two-strike path does not kickstart the same outage a
+    second time while the restarted Gateway may still be logging in (review
+    S4). Past CONN_RESTART_VERIFY_SECS the failure is paged and the port-down
+    path acts on its own terms, as it would for any closed port."""
+    stuck.run()
+    stuck.clear_messages()
+    stuck.port_up = False
+    stuck.now += 300                # +5 min: strike 1
+    stuck.run()
+    stuck.now += 300                # +10 min: strike 2, held
+    stuck.run()
+    assert _kickstarts(stuck) == [KICKSTART], "second kickstart inside the verify window"
+    assert "holding the kickstart" in stuck.watchdog_log()
+    assert not any("still DOWN" in m for m in stuck.messages())
+
+    stuck.now += 300                # +15 min: outcome paged, then port-down acts
+    stuck.run()
+    stuck.now += 300
+    stuck.run()
+
+    pages = [m for m in stuck.messages() if "still DOWN" in m]
+    assert len(pages) == 1, stuck.messages()
+    assert _restart_record(stuck)["outcome"] == "failed"
+    assert _kickstarts(stuck) == [KICKSTART, KICKSTART]
+
+
+def test_a_new_outage_hours_after_a_restart_is_restarted_for_again(stuck):
+    """Once per OUTAGE (review S1): the Gateway our restart produced can have an
+    unrelated 1100 that evening, and that one gets its own restart."""
+    stuck.run()
+    restarted_at = stuck.now
+    # The process our kickstart produced: up 60s after it, so it is inside the
+    # born window and only the outage's timing tells the two cases apart.
+    stuck.now += 300
+    _replace_gateway(stuck, up_secs=240)
+    stuck.conn_marker.unlink()      # execution reconnected and cleared it
+    stuck.run()                     # recovered
+    stuck.clear_messages()
+
+    _advance(stuck, int(restarted_at + 9 * 3600 - stuck.now))
+    stuck.write_conn_marker(lost_ago=35 * 60, pid="live")
+    stuck.run()
+    assert _kickstarts(stuck) == [KICKSTART, KICKSTART]
+
+
+def test_a_recycled_pid_does_not_match_an_old_restart_record(stuck):
+    """Review N3: the record is never deleted, so a pid reused by a Gateway
+    that started long after the restart must not read as "already restarted"."""
+    (stuck.home / RESTART_MARKER).write_text(
+        f"restarted_pid={stuck.gateway_pid}\nrestarted_at={int(stuck.now - 30 * 86400)}\n"
+        f"lost_at={int(stuck.now - 30 * 86400 - 2000)}\noutcome=recovered\n")
+    stuck.run()
+    assert _kickstarts(stuck) == [KICKSTART]
+
+
+def test_a_short_blip_on_a_restarted_gateway_does_not_page_for_a_human(stuck):
+    """Refusals are only asked past CONN_RESTART_SECS (review S1)."""
+    stuck.run()
+    stuck.clear_messages()
+    _replace_gateway(stuck, up_secs=300)
+    stuck.now += 300
+    stuck.write_conn_marker(lost_ago=200, pid="live")
+    stuck.conn_alert_marker.unlink()     # make an alert due, to read what it says
+    stuck.run()
+
+    body = " ".join(stuck.messages())
+    assert "A human needs to look" not in body, body
+    assert "will restart the Gateway if this lasts 30 min" in body, body
+    assert _kickstarts(stuck) == [KICKSTART]
+
+
+def test_a_failed_kickstart_is_paged_as_failed_and_not_retried(stuck):
+    """Review S3: launchctl refusing the kickstart is not a restart."""
+    stuck.kickstart_rc = 113
+    stuck.run()
+
+    body = " ".join(stuck.messages())
+    assert "restart FAILED" in body and "exited 113" in body, body
+    assert "RESTARTED" not in body
+    assert _restart_record(stuck)["outcome"] == "failed"
+
+    stuck.clear_messages()
+    stuck.conn_alert_marker.unlink()
+    _advance(stuck, 300)
+    stuck.run()
+    assert _kickstarts(stuck) == [KICKSTART], "retried a failed kickstart"
+    assert "already restarted this Gateway" in " ".join(stuck.messages())
+
+
+def test_a_running_job_is_found_in_a_launchctl_table_larger_than_a_pipe(host):
+    """Review N1: an early-exiting reader on a 20KB table can SIGPIPE launchctl,
+    and under pipefail that read as "nothing running"; the guard failed open."""
+    host.now = datetime(2026, 10, 13, 9, 0).timestamp()
+    host.running_jobs = ["local.algo-backtest-refresh"]
+    host.list_filler = 2000
+    host.write_conn_marker(lost_ago=35 * 60, pid="live")
+    host.run()
+    assert _kickstarts(host) == []
+    assert "local.algo-backtest-refresh is running" in " ".join(host.messages())
+
+
+# -- AC5: re-alert cadence ---------------------------------------------------
+
+MARKET_FNS = ("now_epoch", "algo_local_wday_hms", "in_us_market_hours")
+
+
+@pytest.mark.parametrize(
+    "when, expected",
+    [
+        (datetime(2026, 10, 12, 21, 29), False),   # Mon, before the open
+        (datetime(2026, 10, 12, 21, 30), True),    # Mon open under EDT
+        (datetime(2026, 10, 13, 4, 59), True),     # Tue small hours (EST close 05:00)
+        (datetime(2026, 10, 13, 5, 0), False),
+        (datetime(2026, 10, 16, 22, 0), True),     # Fri evening
+        (datetime(2026, 10, 17, 4, 30), True),     # Sat small hours: Fri session
+        (datetime(2026, 10, 17, 21, 30), False),   # Sat evening: no session
+        (datetime(2026, 10, 18, 3, 0), False),     # Sun
+        (datetime(2026, 10, 12, 3, 0), False),     # Mon small hours: no Sun session
+        (datetime(2026, 10, 14, 12, 50), False),   # Wed midday
+    ],
+)
+def test_market_hours_cover_both_seasons_without_a_dst_table(when, expected):
+    res = subprocess.run(
+        ["bash", "-c", _lift(*MARKET_FNS) + "in_us_market_hours && echo yes || echo no\n"],
+        capture_output=True, text=True, timeout=60,
+        env=dict(os.environ, ALGO_NOW_EPOCH=str(int(when.timestamp()))),
+    )
+    assert res.stdout.strip() == ("yes" if expected else "no"), when
+
+
+def _refused_1100(host: Host, when: datetime) -> None:
+    """A sustained 1100 the watchdog may not restart (login rejected), so the
+    re-alert cadence is what's under test."""
+    host.now = when.timestamp()
+    host.ibc_log_text = "Dialog: Too many failed login attempts\n"
+    host.write_conn_marker(lost_ago=2 * 3600, pid="live")
+
+
+def test_during_market_hours_a_sustained_1100_re_alerts_hourly(host):
+    _refused_1100(host, datetime(2026, 10, 14, 23, 0))
+    host.run()
+    host.clear_messages()
+
+    host.age_marker(host.conn_alert_marker, 59 * 60)
+    host.run()
+    assert host.messages() == []
+    host.age_marker(host.conn_alert_marker, 60 * 60)
+    host.run()
+    assert any("Repeats hourly during US market hours" in m for m in host.messages())
+
+
+def test_outside_market_hours_the_twelve_hour_cadence_is_unchanged(host):
+    _refused_1100(host, datetime(2026, 10, 14, 15, 0))
+    host.run()
+    host.clear_messages()
+
+    host.age_marker(host.conn_alert_marker, 11 * 3600)
+    host.run()
+    assert host.messages() == []
+    host.age_marker(host.conn_alert_marker, 12 * 3600)
+    host.run()
+    assert len(host.messages()) == 1
+
+
+# -- the blackout constants are the host's real schedule ---------------------
+
+def _readme_recorded(key: str) -> str:
+    m = re.search(rf"`{key}=([^`]+)`", README.read_text())
+    assert m, f"deploy/launchd/README.md no longer records `{key}=...`"
+    return m.group(1)
+
+
+def _watchdog_int(name: str) -> int:
+    m = re.search(rf"^{name}=(\d+)$", WATCHDOG.read_text(), re.MULTILINE)
+    assert m, f"gateway_watchdog.sh has no {name}= constant"
+    return int(m.group(1))
+
+
+def test_the_restart_blackouts_match_the_recorded_ibc_schedule():
+    auto = _parse_ibc_time(_readme_recorded("AutoRestartTime"))
+    assert divmod(auto, 60) == (_watchdog_int("IBC_AUTO_RESTART_HOUR"),
+                                _watchdog_int("IBC_AUTO_RESTART_MIN"))
+    cold = _parse_ibc_time(_readme_recorded("ColdRestartTime"))
+    assert divmod(cold, 60) == (_watchdog_int("IBC_COLD_RESTART_HOUR"),
+                                _watchdog_int("IBC_COLD_RESTART_MIN"))
+    # README: the cold restart is weekly, on Sundays (launchd/%w numbering 0).
+    assert _watchdog_int("IBC_COLD_RESTART_WDAY") == 0
+
+
+@pytest.mark.skipif(not CONFIG_INI.exists(), reason="operator host only (no ~/ibc/config.ini in CI)")
+def test_the_live_ibc_cold_restart_agrees_with_the_watchdog():
+    live = None
+    for line in CONFIG_INI.read_text().splitlines():
+        if line.strip().startswith("ColdRestartTime="):
+            live = line.split("=", 1)[1].strip()
+    assert live is not None, "~/ibc/config.ini has no ColdRestartTime"
+    assert divmod(_parse_ibc_time(live), 60) == (
+        _watchdog_int("IBC_COLD_RESTART_HOUR"), _watchdog_int("IBC_COLD_RESTART_MIN"))
+
+
+def test_every_ib_client_job_is_a_real_launchd_label():
+    m = re.search(r'^IB_CLIENT_JOBS="([^"]+)"$', WATCHDOG.read_text(), re.MULTILINE)
+    assert m
+    for label in m.group(1).split():
+        assert (REPO / "deploy/launchd" / f"{label}.plist").exists(), label

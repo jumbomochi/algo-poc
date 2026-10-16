@@ -698,6 +698,8 @@ needs no credential, so the "nothing can alert" hole is closed.
 - **State markers:** `~/ibc/.gateway_down_marker` (one strike pending),
   `~/ibc/.gateway_auth_failure_alerted` (alert already sent; cleared on
   recovery), `~/ibc/.gateway_connectivity_alerted` (Error 1100 alert sent),
+  `~/ibc/.gateway_connectivity_restarted` (the KAN-118 restart record: which
+  Gateway pid was restarted, when, and the outcome; never deleted),
   `~/ibc/.docker_stack_alerted` (stack-liveness alert sent).
 - **For live:** change `PORT=7497` to `7496` in the script.
 
@@ -733,6 +735,72 @@ Three guards, all in the watchdog:
 3. **The reported duration is bounded.** Past 24h the message says the number is
    a floor rather than a measurement, because an unbounded, ever-growing figure
    in an alert is itself the signal that nothing is measuring it.
+
+### Error 1100: one guarded restart after 30 minutes (KAN-118)
+
+Until KAN-118 the watchdog never restarted for a 1100, on the 2026-08-01
+reasoning that a 1100 self-heals in seconds to minutes. On **2026-10-14** one
+did not. The Gateway lost IB's servers at 12:20 SGT and sat on "Connecting to
+server..." for **7h11m**. The watchdog paged once at 12:28 (its re-alert was
+12h), and a human restart at 19:31 fixed it within a minute. The same stall at
+21:00 would have cost a night of order routing.
+
+The watchdog now restarts the Gateway **once** when all of these hold:
+
+- The latch has been present for at least `CONN_RESTART_SECS` (1800s).
+- The latch carries a stamp that matches the running Gateway (guard 1 above).
+  An unstamped latch is stamped on first sight and can qualify the next cycle.
+- `execution` is running (guard 2), and the loss epoch on line 1 is readable.
+- The newest IBC log shows no rejected login, the same check the port-down
+  path makes before it kickstarts.
+- It is outside every blackout:
+  - IBC's daily `AutoRestartTime` (14:00), from 10 min before to 15 min after;
+  - the Sunday `ColdRestartTime` (08:00), the same width;
+  - the 05:15 paper slot on run days, from 5 min before to 15 min after;
+  - any time `local.algo-paper-trading`, `local.algo-pipeline-report` or
+    `local.algo-backtest-refresh` shows a PID in `launchctl list`, because each
+    holds its own IB session.
+
+  A blackout **defers** the restart, and the next cycle asks again.
+
+The restart is `launchctl kickstart -k`, the same verb the port-down path uses,
+and it is paged. If launchctl refuses the kickstart (non-zero exit), the page
+says the restart FAILED, and it is not retried for that outage.
+
+The record `~/ibc/.gateway_connectivity_restarted` is written *before* the
+kickstart, so no outage is ever restarted twice:
+
+- If the same process, alive since before the kickstart, is still in a 1100, the
+  kickstart did not replace it. The watchdog **refuses** to restart again.
+- If the Gateway the kickstart produced (started within 15 min of it) loses the
+  servers again within an hour of the restart, the restart did not help. The
+  watchdog **refuses** too.
+
+Both refusals page at once, bypassing the re-alert throttle, that a human is
+needed. Every refusal is considered only after the 1100 has lasted 30 min, so a
+short blip never pages for a human.
+
+A **new** outage may be restarted for again: a loss more than an hour after the
+restart, even on the restarted Gateway, or any loss on a Gateway that came up
+later, from a cold restart or a human.
+
+**Outcome pages, once each:**
+
+| Outcome | What happened |
+|---|---|
+| "back after the watchdog's Error 1100 restart" | Execution reconnected and cleared the latch, or the old session's latch was dropped against the new Gateway. Either replaces the generic all-clear. |
+| "port 7497 is still DOWN" | The port stayed shut 15 min after the kickstart. Until then the two-strike port-down path holds its kickstart, because the Gateway may still be logging in. After that it applies as usual. |
+
+**Re-alert cadence.** While a 1100 is sustained but not yet restarted, or the
+restart is refused, the page repeats **hourly** during US market hours and every
+12h otherwise. Market hours are 21:30–05:00 SGT: Mon–Fri evenings and Tue–Sat
+small hours. That is the union of the EDT and EST sessions, so no DST table is
+needed. The same cadence covers the "execution is DOWN" variant.
+
+**Known limit.** Execution rewrites the latch with a fresh loss time on every
+1100 it receives. A Gateway that keeps sending 1100 without a 1101/1102 in
+between therefore restarts the 30-minute clock each time. The single long
+1100 of 2026-10-14 is the case this is built for.
 
 ### Docker engine + stack liveness (KAN-66)
 
