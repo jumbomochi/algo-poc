@@ -97,9 +97,13 @@ CONN_RESTART_BORN_SECS=900
 # How long a restarted Gateway gets to reopen its port before the outcome is
 # paged as "still down".
 CONN_RESTART_VERIFY_SECS=900
+# A 1100 recorded within this long after our restart, on the Gateway the
+# restart produced, is the same outage coming back. Later than this it is a new
+# outage on that Gateway and may be restarted for.
+CONN_RESTART_SAME_OUTAGE_SECS=3600
 # launchd jobs that hold an IB API session of their own. A restart under them
 # would break a paper run mid-decision or a 5h refresh fetch.
-IB_CLIENT_JOBS="local.algo-paper-trading local.algo-backtest-refresh"
+IB_CLIENT_JOBS="local.algo-paper-trading local.algo-pipeline-report local.algo-backtest-refresh"
 # Scheduled Gateway restarts the watchdog must not race. They mirror
 # ~/ibc/config.ini (AutoRestartTime=2:00 PM, ColdRestartTime=08:00 on Sundays),
 # recorded in deploy/launchd/README.md and asserted by the test suite.
@@ -433,10 +437,15 @@ hhmm_of() {
 
 # Is any launchd job that holds its own IB session running right now? A job is
 # running when `launchctl list` shows a numeric PID for it.
+# The table is captured before it is parsed: piping it into an awk that exits
+# on the first match can SIGPIPE launchctl (its real output is larger than a
+# pipe buffer), and under pipefail that reads as "nothing running".
 ib_client_job_running() {
-    "$ALGO_LAUNCHCTL_BIN" list 2>/dev/null | awk -v jobs=" $IB_CLIENT_JOBS " '
-        index(jobs, " " $NF " ") && $1 ~ /^[0-9]+$/ { print $NF; found = 1; exit }
-        END { exit !found }'
+    local table
+    table="$("$ALGO_LAUNCHCTL_BIN" list 2>/dev/null)"
+    awk -v jobs=" $IB_CLIENT_JOBS " '
+        !found && index(jobs, " " $NF " ") && $1 ~ /^[0-9]+$/ { print $NF; found = 1 }
+        END { exit !found }' <<< "$table"
 }
 
 # Prints why a restart must wait right now, or nothing (exit 1) when it may go
@@ -482,30 +491,39 @@ restart_blackout_reason() {
 #   wait <text>        not yet (under CONN_RESTART_SECS, or a blackout)
 #   refuse <text>      never for this outage (already restarted, or login
 #                      rejected); the alert says a human is needed
-# Arguments: latch age, running Gateway pid, running Gateway start epoch.
+# Arguments: latch age, latch loss epoch, running Gateway pid, its start epoch.
+#
+# Every refusal is asked only once the 1100 has lasted CONN_RESTART_SECS, so a
+# short blip never pages "a human needs to look".
 conn_restart_decision() {
-    local age="$1" gw_pid="$2" gw_started="$3" r_pid r_at born reason
+    local age="$1" lost_at="$2" gw_pid="$3" gw_started="$4" r_pid r_at born since reason
+    if [ "$age" -lt "$CONN_RESTART_SECS" ]; then
+        echo "wait it will restart the Gateway if this lasts $((CONN_RESTART_SECS / 60)) min"; return 0
+    fi
     r_pid="$(restart_marker_field restarted_pid)"
     r_at="$(restart_marker_field restarted_at)"
     case "$r_at" in ''|*[!0-9]*) r_at="" ;; esac
 
-    # Once per outage, keyed on the Gateway process. Same pid: the kickstart
-    # did not replace the process. A Gateway born just after our kickstart:
-    # the restart produced it, and it went straight back into a 1100.
-    if [ -n "$r_pid" ] && [ "$r_pid" = "$gw_pid" ]; then
-        echo "refuse the watchdog already restarted this Gateway (pid $gw_pid) at $(hhmm_of "${r_at:-0}") and the same process is still in Error 1100"; return 0
-    fi
     if [ -n "$r_at" ]; then
+        # Same process, alive since before our kickstart: the kickstart did not
+        # replace it. The start-time bound keeps a recycled pid from matching
+        # an old record.
+        if [ "$r_pid" = "$gw_pid" ] && [ "$gw_started" -le $(( r_at + 5 )) ]; then
+            echo "refuse the watchdog already restarted this Gateway (pid $gw_pid) at $(hhmm_of "$r_at") and the same process is still in Error 1100"; return 0
+        fi
+        # The Gateway our kickstart produced, losing the servers again soon
+        # after: the same outage, which the restart did not fix. A loss
+        # recorded later than CONN_RESTART_SAME_OUTAGE_SECS after the restart
+        # is a new outage and may be restarted for.
         born=$(( gw_started - r_at ))
-        if [ "$born" -ge -5 ] && [ "$born" -le "$CONN_RESTART_BORN_SECS" ]; then
-            echo "refuse the watchdog restarted the Gateway at $(hhmm_of "$r_at") and the new one (pid $gw_pid) went back into Error 1100"; return 0
+        since=$(( lost_at - r_at ))
+        if [ "$born" -ge -5 ] && [ "$born" -le "$CONN_RESTART_BORN_SECS" ] \
+            && [ "$since" -ge -5 ] && [ "$since" -le "$CONN_RESTART_SAME_OUTAGE_SECS" ]; then
+            echo "refuse the watchdog restarted the Gateway at $(hhmm_of "$r_at") and the new one (pid $gw_pid) went back into Error 1100 at $(hhmm_of "$lost_at")"; return 0
         fi
     fi
     if ibc_login_rejected; then
         echo "refuse the IBC log shows IB rejecting the login, and a restart would loop failed logins toward a lockout"; return 0
-    fi
-    if [ "$age" -lt "$CONN_RESTART_SECS" ]; then
-        echo "wait it will restart the Gateway if this lasts $((CONN_RESTART_SECS / 60)) min"; return 0
     fi
     if reason="$(restart_blackout_reason)"; then
         echo "wait restart deferred: $reason"; return 0
@@ -515,14 +533,23 @@ conn_restart_decision() {
 
 # Kickstart the Gateway for a sustained 1100 and record it. The record is
 # written BEFORE the kickstart, so a watchdog killed mid-call can never restart
-# the same outage twice.
+# the same outage twice. A kickstart launchctl refuses is not retried: the
+# record already names this pid, so the next cycle refuses, and this page says
+# so now rather than claiming a restart.
 conn_restart_gateway() {
-    local age="$1" gw_pid="$2" lost_at="$3" now
+    local age="$1" gw_pid="$2" lost_at="$3" now rc
     now="$(now_epoch)"
     printf 'restarted_pid=%s\nrestarted_at=%s\nlost_at=%s\noutcome=pending\n' \
         "$gw_pid" "$now" "$lost_at" > "$CONN_RESTART_MARKER"
     echo "$(ts): IB Error 1100 sustained ${age}s (port $PORT up, execution up, latch validated for pid $gw_pid) — kickstarting $GW_LABEL (KAN-118, once per outage)" >> "$LOG_FILE"
     "$ALGO_LAUNCHCTL_BIN" kickstart -k "gui/$(id -u)/$GW_LABEL" >> "$LOG_FILE" 2>&1
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        set_restart_marker_field outcome failed
+        echo "$(ts): KAN-118 kickstart FAILED (launchctl exit $rc) — not retrying for this outage" >> "$LOG_FILE"
+        telegram "🚨 IB Gateway has been in Error 1100 for ~$((age / 60)) min, and the watchdog's restart FAILED: launchctl kickstart exited $rc. It will not retry for this outage. A human needs to restart the Gateway."
+        return 0
+    fi
     telegram "⚠️ IB Gateway was in Error 1100 (no server connectivity) for ~$((age / 60)) min with port $PORT up — the watchdog has RESTARTED it, once for this outage. It will report whether it came back."
 }
 
@@ -622,7 +649,9 @@ if nc -z -G 3 127.0.0.1 "$PORT" 2>/dev/null; then
             # its writer up and a readable loss time, is ever restarted for.
             # Every other state keeps the alert-only behaviour.
             if [ -n "$LATCH_VALIDATED" ] && [ "$EXEC_STATE" = "up" ] && [ "$LOST_AT" -gt 0 ]; then
-                DECISION="$(conn_restart_decision "$AGE" "$GW_PID" "$GW_STARTED")"
+                DECISION="$(conn_restart_decision "$AGE" "$LOST_AT" "$GW_PID" "$GW_STARTED")"
+            elif [ "$EXEC_STATE" = "up" ] && [ -n "$LATCH_VALIDATED" ]; then
+                DECISION="wait it will not restart the Gateway: the latch's loss time is unreadable"
             elif [ "$EXEC_STATE" = "up" ]; then
                 DECISION="wait it will restart the Gateway only once this latch is confirmed against the running Gateway"
             else
@@ -641,7 +670,13 @@ if nc -z -G 3 127.0.0.1 "$PORT" 2>/dev/null; then
             else
                 REPEAT_TEXT="Repeats every 12h, hourly during US market hours"
             fi
-            if need_alert "$CONN_ALERT_MARKER" "$REALERT_SECS"; then
+            # A refusal while a restart awaits its outcome IS that outcome:
+            # page it now, not after the throttle the restart page started.
+            FORCE_ALERT=""
+            case "$DECISION" in
+                refuse\ *) [ "$(restart_marker_field outcome)" = "pending" ] && FORCE_ALERT=1 ;;
+            esac
+            if [ -n "$FORCE_ALERT" ] || need_alert "$CONN_ALERT_MARKER" "$REALERT_SECS"; then
                 if [ "$EXEC_STATE" = "down" ]; then
                     echo "$(ts): Error 1100 latch present but the execution service is DOWN — reporting execution, not a 1100 duration" >> "$LOG_FILE"
                     algo_alert_local "execution service is down; the Error 1100 latch cannot be trusted or cleared"
@@ -737,7 +772,14 @@ if ibc_login_rejected; then
 fi
 
 # No auth failure in evidence — treat as a dead/stuck process. Two strikes.
-if [ -f "$MARKER" ]; then
+if [ -f "$MARKER" ] && [ -n "$R_AT" ] && [ "$(restart_marker_field outcome)" = "pending" ] \
+        && [ $(( $(now_epoch) - R_AT )) -lt "$CONN_RESTART_VERIFY_SECS" ]; then
+    # KAN-118: the Gateway was kickstarted for a 1100 under
+    # CONN_RESTART_VERIFY_SECS ago and may still be logging in. A second
+    # kickstart now would restart one outage twice; the strike is kept, so the
+    # first cycle past the window acts on it.
+    echo "$(ts): port $PORT down 2 consecutive checks, but the Gateway was restarted for Error 1100 at $(hhmm_of "$R_AT") — holding the kickstart until $((CONN_RESTART_VERIFY_SECS / 60)) min after it" >> "$LOG_FILE"
+elif [ -f "$MARKER" ]; then
     echo "$(ts): port $PORT down 2 consecutive checks — kickstarting $GW_LABEL" >> "$LOG_FILE"
     "$ALGO_LAUNCHCTL_BIN" kickstart -k "gui/$(id -u)/$GW_LABEL" >> "$LOG_FILE" 2>&1
     rm -f "$MARKER"            # reset; next run confirms recovery (or strikes again)

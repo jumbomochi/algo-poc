@@ -85,6 +85,8 @@ class Host:
         self.disable_docker = False
         # launchd labels `launchctl list` should show with a live PID (KAN-118).
         self.running_jobs: list[str] = []
+        self.list_filler = 0
+        self.kickstart_rc = 0
 
         self._write_stubs()
 
@@ -186,7 +188,11 @@ class Host:
             '    echo "-	0	local.algo-paper-trading"\n'
             '    [ -n "$STUB_GW_PID" ] && echo "$STUB_GW_PID	0	local.ibc-gateway"\n'
             '    for j in $STUB_RUNNING_JOBS; do echo "4242	0	$j"; done\n'
+            # A real `launchctl list` is ~20KB, more than a pipe buffer.
+            '    for ((i = 0; i < ${STUB_LIST_FILLER:-0}; i++)); do\n'
+            '        echo "-	0	com.apple.filler.service.number.$i.with.a.long.label"; done\n'
             "fi\n"
+            'if [ "${1:-}" = "kickstart" ]; then exit "${STUB_KICKSTART_RC:-0}"; fi\n'
             "exit 0\n",
         )
 
@@ -222,6 +228,8 @@ class Host:
             STUB_CURL_LOG=str(self.curl_log),
             STUB_LAUNCHCTL_LOG=str(self.launchctl_log),
             STUB_RUNNING_JOBS=" ".join(self.running_jobs),
+            STUB_LIST_FILLER=str(self.list_filler),
+            STUB_KICKSTART_RC=str(self.kickstart_rc),
         )
         if self.disable_docker:
             # An explicitly empty $ALGO_DOCKER_BIN is the documented "this host
@@ -1316,7 +1324,8 @@ def test_the_same_process_still_in_1100_is_not_restarted_twice(stuck):
     """AC2, first half: a kickstart that did not replace the process."""
     stuck.run()
     stuck.clear_messages()
-    stuck.conn_alert_marker.unlink()     # force the next alert to be due
+    # No throttle reset: the refusal is the restart's outcome and must page at
+    # once, even though the restart page touched the alert marker (review S2).
     _advance(stuck, 600)
     stuck.run()
 
@@ -1337,7 +1346,6 @@ def test_a_restarted_gateway_that_goes_back_into_1100_is_not_restarted_again(stu
     stuck.now = restarted_at + 60 + 40 * 60
     _replace_gateway(stuck, up_secs=40 * 60)
     stuck.write_conn_marker(lost_ago=35 * 60, pid="live")
-    stuck.conn_alert_marker.unlink()
     stuck.run()
 
     assert _kickstarts(stuck) == [KICKSTART]
@@ -1387,6 +1395,8 @@ def test_no_kickstart_without_a_trustworthy_live_1100(host, case):
     assert _kickstarts(host) == [], case
     if case == "login_rejected":
         assert "rejecting the login" in " ".join(host.messages())
+    if case == "unreadable_loss_time":
+        assert "loss time is unreadable" in " ".join(host.messages())
 
 
 def test_an_unvalidated_latch_is_restarted_for_once_the_next_cycle_confirms_it(host):
@@ -1489,13 +1499,22 @@ def test_recovery_is_also_reported_when_the_old_latch_is_dropped_as_stale(stuck)
 
 
 def test_a_restarted_gateway_that_never_reopens_its_port_is_paged_once(stuck):
+    """And the port-down two-strike path does not kickstart the same outage a
+    second time while the restarted Gateway may still be logging in (review
+    S4). Past CONN_RESTART_VERIFY_SECS the failure is paged and the port-down
+    path acts on its own terms, as it would for any closed port."""
     stuck.run()
     stuck.clear_messages()
     stuck.port_up = False
-    stuck.now += 300
-    stuck.run()                     # inside the verify window: strike only
+    stuck.now += 300                # +5 min: strike 1
+    stuck.run()
+    stuck.now += 300                # +10 min: strike 2, held
+    stuck.run()
+    assert _kickstarts(stuck) == [KICKSTART], "second kickstart inside the verify window"
+    assert "holding the kickstart" in stuck.watchdog_log()
     assert not any("still DOWN" in m for m in stuck.messages())
-    stuck.now += 900
+
+    stuck.now += 300                # +15 min: outcome paged, then port-down acts
     stuck.run()
     stuck.now += 300
     stuck.run()
@@ -1503,6 +1522,82 @@ def test_a_restarted_gateway_that_never_reopens_its_port_is_paged_once(stuck):
     pages = [m for m in stuck.messages() if "still DOWN" in m]
     assert len(pages) == 1, stuck.messages()
     assert _restart_record(stuck)["outcome"] == "failed"
+    assert _kickstarts(stuck) == [KICKSTART, KICKSTART]
+
+
+def test_a_new_outage_hours_after_a_restart_is_restarted_for_again(stuck):
+    """Once per OUTAGE (review S1): the Gateway our restart produced can have an
+    unrelated 1100 that evening, and that one gets its own restart."""
+    stuck.run()
+    restarted_at = stuck.now
+    # The process our kickstart produced: up 60s after it, so it is inside the
+    # born window and only the outage's timing tells the two cases apart.
+    stuck.now += 300
+    _replace_gateway(stuck, up_secs=240)
+    stuck.conn_marker.unlink()      # execution reconnected and cleared it
+    stuck.run()                     # recovered
+    stuck.clear_messages()
+
+    _advance(stuck, int(restarted_at + 9 * 3600 - stuck.now))
+    stuck.write_conn_marker(lost_ago=35 * 60, pid="live")
+    stuck.run()
+    assert _kickstarts(stuck) == [KICKSTART, KICKSTART]
+
+
+def test_a_recycled_pid_does_not_match_an_old_restart_record(stuck):
+    """Review N3: the record is never deleted, so a pid reused by a Gateway
+    that started long after the restart must not read as "already restarted"."""
+    (stuck.home / RESTART_MARKER).write_text(
+        f"restarted_pid={stuck.gateway_pid}\nrestarted_at={int(stuck.now - 30 * 86400)}\n"
+        f"lost_at={int(stuck.now - 30 * 86400 - 2000)}\noutcome=recovered\n")
+    stuck.run()
+    assert _kickstarts(stuck) == [KICKSTART]
+
+
+def test_a_short_blip_on_a_restarted_gateway_does_not_page_for_a_human(stuck):
+    """Refusals are only asked past CONN_RESTART_SECS (review S1)."""
+    stuck.run()
+    stuck.clear_messages()
+    _replace_gateway(stuck, up_secs=300)
+    stuck.now += 300
+    stuck.write_conn_marker(lost_ago=200, pid="live")
+    stuck.conn_alert_marker.unlink()     # make an alert due, to read what it says
+    stuck.run()
+
+    body = " ".join(stuck.messages())
+    assert "A human needs to look" not in body, body
+    assert "will restart the Gateway if this lasts 30 min" in body, body
+    assert _kickstarts(stuck) == [KICKSTART]
+
+
+def test_a_failed_kickstart_is_paged_as_failed_and_not_retried(stuck):
+    """Review S3: launchctl refusing the kickstart is not a restart."""
+    stuck.kickstart_rc = 113
+    stuck.run()
+
+    body = " ".join(stuck.messages())
+    assert "restart FAILED" in body and "exited 113" in body, body
+    assert "RESTARTED" not in body
+    assert _restart_record(stuck)["outcome"] == "failed"
+
+    stuck.clear_messages()
+    stuck.conn_alert_marker.unlink()
+    _advance(stuck, 300)
+    stuck.run()
+    assert _kickstarts(stuck) == [KICKSTART], "retried a failed kickstart"
+    assert "already restarted this Gateway" in " ".join(stuck.messages())
+
+
+def test_a_running_job_is_found_in_a_launchctl_table_larger_than_a_pipe(host):
+    """Review N1: an early-exiting reader on a 20KB table can SIGPIPE launchctl,
+    and under pipefail that read as "nothing running"; the guard failed open."""
+    host.now = datetime(2026, 10, 13, 9, 0).timestamp()
+    host.running_jobs = ["local.algo-backtest-refresh"]
+    host.list_filler = 2000
+    host.write_conn_marker(lost_ago=35 * 60, pid="live")
+    host.run()
+    assert _kickstarts(host) == []
+    assert "local.algo-backtest-refresh is running" in " ".join(host.messages())
 
 
 # -- AC5: re-alert cadence ---------------------------------------------------
