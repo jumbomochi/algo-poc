@@ -1,0 +1,2136 @@
+[
+ {
+  "ticker": "AA",
+  "first": "2015-01-01",
+  "last": "2016-10-01",
+  "pinned_days": 21,
+  "latest_days": 1,
+  "own": [
+   {
+    "conId": 251962528,
+    "symbol": "AA",
+    "primaryExchange": "NYSE",
+    "longName": "ALCOA CORP",
+    "stockType": "COMMON",
+    "head": "2016-10-18"
+   }
+  ]
+ },
+ {
+  "ticker": "ABC",
+  "first": "2015-01-01",
+  "last": "2023-07-01",
+  "pinned_days": 1770,
+  "latest_days": 1750,
+  "own": [],
+  "candidate": "COR",
+  "candidate_details": [
+   {
+    "conId": 1714996,
+    "symbol": "COR",
+    "primaryExchange": "NYSE",
+    "longName": "CENCORA INC",
+    "stockType": "COMMON",
+    "head": "1996-05-28"
+   }
+  ]
+ },
+ {
+  "ticker": "ABMD",
+  "first": "2018-07-01",
+  "last": "2022-10-01",
+  "pinned_days": 1134,
+  "latest_days": 1134,
+  "own": []
+ },
+ {
+  "ticker": "ADS",
+  "first": "2015-01-01",
+  "last": "2020-07-01",
+  "pinned_days": 1016,
+  "latest_days": 996,
+  "own": [],
+  "candidate": "BFH",
+  "candidate_details": [
+   {
+    "conId": 12362013,
+    "symbol": "BFH",
+    "primaryExchange": "NYSE",
+    "longName": "BREAD FINANCIAL HOLDINGS INC",
+    "stockType": "COMMON",
+    "head": null
+   }
+  ]
+ },
+ {
+  "ticker": "AET",
+  "first": "2015-01-01",
+  "last": "2018-10-01",
+  "pinned_days": 575,
+  "latest_days": 555,
+  "own": []
+ },
+ {
+  "ticker": "AGN",
+  "first": "2015-01-01",
+  "last": "2020-04-01",
+  "pinned_days": 952,
+  "latest_days": 932,
+  "own": []
+ },
+ {
+  "ticker": "ALXN",
+  "first": "2015-01-01",
+  "last": "2021-07-01",
+  "pinned_days": 1268,
+  "latest_days": 1248,
+  "own": []
+ },
+ {
+  "ticker": "ANDV",
+  "first": "2017-10-01",
+  "last": "2018-07-01",
+  "pinned_days": 251,
+  "latest_days": 251,
+  "own": []
+ },
+ {
+  "ticker": "ANSS",
+  "first": "2017-07-01",
+  "last": "2025-07-01",
+  "pinned_days": 2073,
+  "latest_days": 2073,
+  "own": []
+ },
+ {
+  "ticker": "ANTM",
+  "first": "2015-01-01",
+  "last": "2022-04-01",
+  "pinned_days": 1456,
+  "latest_days": 1436,
+  "own": [],
+  "candidate": "ELV",
+  "candidate_details": [
+   {
+    "conId": 173962302,
+    "symbol": "ELV",
+    "primaryExchange": "NYSE",
+    "longName": "ELEVANCE HEALTH INC",
+    "stockType": "COMMON",
+    "head": "2001-10-30"
+   }
+  ]
+ },
+ {
+  "ticker": "APC",
+  "first": "2015-01-01",
+  "last": "2019-07-01",
+  "pinned_days": 763,
+  "latest_days": 743,
+  "own": [
+   {
+    "conId": 854080544,
+    "symbol": "APC",
+    "primaryExchange": "NASDAQ",
+    "longName": "ARKO PETROLEUM CORP",
+    "stockType": "COMMON",
+    "head": "2026-02-12"
+   }
+  ]
+ },
+ {
+  "ticker": "ARNC",
+  "first": "2017-01-01",
+  "last": "2020-04-01",
+  "pinned_days": 879,
+  "latest_days": 879,
+  "own": [],
+  "candidate": "HWM",
+  "candidate_details": [
+   {
+    "conId": 403121976,
+    "symbol": "HWM",
+    "primaryExchange": "NYSE",
+    "longName": "HOWMET AEROSPACE INC",
+    "stockType": "COMMON",
+    "head": "1980-03-17"
+   }
+  ]
+ },
+ {
+  "ticker": "ATVI",
+  "first": "2015-10-01",
+  "last": "2023-10-01",
+  "pinned_days": 1833,
+  "latest_days": 1813,
+  "own": []
+ },
+ {
+  "ticker": "AVB",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 2510,
+  "latest_days": 2510,
+  "own": []
+ },
+ {
+  "ticker": "AVGO",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 1,
+  "latest_days": 1,
+  "own": [
+   {
+    "conId": 313130367,
+    "symbol": "AVGO",
+    "primaryExchange": "NASDAQ",
+    "longName": "BROADCOM INC",
+    "stockType": "COMMON",
+    "head": "2016-02-02"
+   }
+  ]
+ },
+ {
+  "ticker": "BBBY",
+  "first": "2015-01-01",
+  "last": "2017-07-01",
+  "pinned_days": 261,
+  "latest_days": 241,
+  "own": []
+ },
+ {
+  "ticker": "BCR",
+  "first": "2015-01-01",
+  "last": "2018-01-01",
+  "pinned_days": 385,
+  "latest_days": 365,
+  "own": []
+ },
+ {
+  "ticker": "BHGE",
+  "first": "2017-10-01",
+  "last": "2019-10-01",
+  "pinned_days": 566,
+  "latest_days": 566,
+  "own": [],
+  "candidate": "BKR",
+  "candidate_details": [
+   {
+    "conId": 281316445,
+    "symbol": "BKR",
+    "primaryExchange": "NASDAQ",
+    "longName": "BAKER HUGHES CO",
+    "stockType": "COMMON",
+    "head": "2017-07-05"
+   }
+  ]
+ },
+ {
+  "ticker": "BHI",
+  "first": "2015-01-01",
+  "last": "2017-07-01",
+  "pinned_days": 261,
+  "latest_days": 241,
+  "own": [],
+  "candidate": "BKR",
+  "candidate_details": [
+   {
+    "conId": 281316445,
+    "symbol": "BKR",
+    "primaryExchange": "NASDAQ",
+    "longName": "BAKER HUGHES CO",
+    "stockType": "COMMON",
+    "head": "2017-07-05"
+   }
+  ]
+ },
+ {
+  "ticker": "BK",
+  "first": "2015-01-01",
+  "last": "2026-04-01",
+  "pinned_days": 2458,
+  "latest_days": 2438,
+  "own": [],
+  "candidate": "BNY",
+  "candidate_details": [
+   {
+    "conId": 44986804,
+    "symbol": "BNY",
+    "primaryExchange": "NYSE",
+    "longName": "BANK OF NEW YORK MELLON CORP",
+    "stockType": "COMMON",
+    "head": "1980-03-17"
+   }
+  ]
+ },
+ {
+  "ticker": "BLL",
+  "first": "2015-01-01",
+  "last": "2022-04-01",
+  "pinned_days": 1456,
+  "latest_days": 1436,
+  "own": [],
+  "candidate": "BALL",
+  "candidate_details": [
+   {
+    "conId": 5052,
+    "symbol": "BALL",
+    "primaryExchange": "NYSE",
+    "longName": "BALL CORP",
+    "stockType": "COMMON",
+    "head": "1980-03-17"
+   }
+  ]
+ },
+ {
+  "ticker": "CA",
+  "first": "2015-01-01",
+  "last": "2018-10-01",
+  "pinned_days": 575,
+  "latest_days": 555,
+  "own": []
+ },
+ {
+  "ticker": "CBG",
+  "first": "2015-01-01",
+  "last": "2018-01-01",
+  "pinned_days": 385,
+  "latest_days": 365,
+  "own": [],
+  "candidate": "CBRE",
+  "candidate_details": [
+   {
+    "conId": 95514904,
+    "symbol": "CBRE",
+    "primaryExchange": "NYSE",
+    "longName": "CBRE GROUP INC - A",
+    "stockType": "COMMON",
+    "head": "2004-06-10"
+   }
+  ]
+ },
+ {
+  "ticker": "CBS",
+  "first": "2015-01-01",
+  "last": "2019-10-01",
+  "pinned_days": 827,
+  "latest_days": 807,
+  "own": [],
+  "candidate": "PARA",
+  "candidate_details": [
+   {
+    "conId": 880582719,
+    "symbol": "PARA",
+    "primaryExchange": "NASDAQ",
+    "longName": "BANZAI INTERNATIONAL INC",
+    "stockType": "COMMON",
+    "head": "2021-02-12"
+   }
+  ]
+ },
+ {
+  "ticker": "CDAY",
+  "first": "2021-10-01",
+  "last": "2024-01-01",
+  "pinned_days": 626,
+  "latest_days": 626,
+  "own": [],
+  "candidate": "DAY",
+  "candidate_details": []
+ },
+ {
+  "ticker": "CELG",
+  "first": "2015-01-01",
+  "last": "2019-10-01",
+  "pinned_days": 827,
+  "latest_days": 807,
+  "own": []
+ },
+ {
+  "ticker": "CERN",
+  "first": "2015-01-01",
+  "last": "2022-04-01",
+  "pinned_days": 1456,
+  "latest_days": 1436,
+  "own": []
+ },
+ {
+  "ticker": "CHK",
+  "first": "2015-01-01",
+  "last": "2018-01-01",
+  "pinned_days": 385,
+  "latest_days": 365,
+  "own": [],
+  "candidate": "EXE",
+  "candidate_details": [
+   {
+    "conId": 470458975,
+    "symbol": "EXE",
+    "primaryExchange": "NASDAQ",
+    "longName": "EXPAND ENERGY CORP",
+    "stockType": "COMMON",
+    "head": "2021-02-10"
+   }
+  ]
+ },
+ {
+  "ticker": "CMA",
+  "first": "2015-01-01",
+  "last": "2024-04-01",
+  "pinned_days": 1957,
+  "latest_days": 1937,
+  "own": []
+ },
+ {
+  "ticker": "COG",
+  "first": "2015-01-01",
+  "last": "2021-10-01",
+  "pinned_days": 1332,
+  "latest_days": 1312,
+  "own": [],
+  "candidate": "CTRA",
+  "candidate_details": []
+ },
+ {
+  "ticker": "COH",
+  "first": "2015-01-01",
+  "last": "2017-10-01",
+  "pinned_days": 324,
+  "latest_days": 304,
+  "own": [],
+  "candidate": "TPR",
+  "candidate_details": [
+   {
+    "conId": 292491487,
+    "symbol": "TPR",
+    "primaryExchange": "NYSE",
+    "longName": "TAPESTRY INC",
+    "stockType": "COMMON",
+    "head": "2000-10-05"
+   }
+  ]
+ },
+ {
+  "ticker": "COL",
+  "first": "2015-01-01",
+  "last": "2018-10-01",
+  "pinned_days": 575,
+  "latest_days": 555,
+  "own": []
+ },
+ {
+  "ticker": "COO",
+  "first": "2016-10-01",
+  "last": "2026-08-16",
+  "pinned_days": 1756,
+  "latest_days": 1746,
+  "own": [
+   {
+    "conId": 685217803,
+    "symbol": "COO",
+    "primaryExchange": "NASDAQ",
+    "longName": "COOPER COS INC/THE",
+    "stockType": "COMMON",
+    "head": "2023-09-26"
+   }
+  ]
+ },
+ {
+  "ticker": "CPGX",
+  "first": "2015-10-01",
+  "last": "2016-07-01",
+  "pinned_days": 10,
+  "latest_days": 0,
+  "own": []
+ },
+ {
+  "ticker": "CSRA",
+  "first": "2016-01-01",
+  "last": "2018-04-01",
+  "pinned_days": 449,
+  "latest_days": 429,
+  "own": [
+   {
+    "conId": 910132626,
+    "symbol": "CSRA",
+    "primaryExchange": "ARCA",
+    "longName": "COHEN & STERS RL AST ACT ETF",
+    "stockType": "ETF",
+    "head": "2026-08-12"
+   }
+  ]
+ },
+ {
+  "ticker": "CTL",
+  "first": "2015-01-01",
+  "last": "2020-07-01",
+  "pinned_days": 1016,
+  "latest_days": 996,
+  "own": [],
+  "candidate": "LUMN",
+  "candidate_details": [
+   {
+    "conId": 446613345,
+    "symbol": "LUMN",
+    "primaryExchange": "NASDAQ",
+    "longName": "LUMEN TECHNOLOGIES INC",
+    "stockType": "COMMON",
+    "head": "2006-11-16"
+   }
+  ]
+ },
+ {
+  "ticker": "CTLT",
+  "first": "2021-01-01",
+  "last": "2024-10-01",
+  "pinned_days": 1005,
+  "latest_days": 1005,
+  "own": []
+ },
+ {
+  "ticker": "CTRA",
+  "first": "2022-01-01",
+  "last": "2026-04-01",
+  "pinned_days": 1126,
+  "latest_days": 1126,
+  "own": []
+ },
+ {
+  "ticker": "CTXS",
+  "first": "2015-01-01",
+  "last": "2022-07-01",
+  "pinned_days": 1520,
+  "latest_days": 1500,
+  "own": []
+ },
+ {
+  "ticker": "CXO",
+  "first": "2016-04-01",
+  "last": "2021-01-01",
+  "pinned_days": 1141,
+  "latest_days": 1121,
+  "own": []
+ },
+ {
+  "ticker": "DAY",
+  "first": "2024-04-01",
+  "last": "2026-01-01",
+  "pinned_days": 502,
+  "latest_days": 502,
+  "own": []
+ },
+ {
+  "ticker": "DD",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 241,
+  "latest_days": 221,
+  "own": [
+   {
+    "conId": 887235923,
+    "symbol": "DD",
+    "primaryExchange": "NYSE",
+    "longName": "DUPONT DE NEMOURS INC",
+    "stockType": "COMMON",
+    "head": "2017-09-01"
+   }
+  ]
+ },
+ {
+  "ticker": "DFS",
+  "first": "2015-01-01",
+  "last": "2025-04-01",
+  "pinned_days": 2207,
+  "latest_days": 2187,
+  "own": []
+ },
+ {
+  "ticker": "DISCA",
+  "first": "2015-01-01",
+  "last": "2022-04-01",
+  "pinned_days": 1456,
+  "latest_days": 1436,
+  "own": [],
+  "candidate": "WBD",
+  "candidate_details": []
+ },
+ {
+  "ticker": "DISCK",
+  "first": "2015-01-01",
+  "last": "2022-04-01",
+  "pinned_days": 1456,
+  "latest_days": 1436,
+  "own": [],
+  "candidate": "WBD",
+  "candidate_details": []
+ },
+ {
+  "ticker": "DISH",
+  "first": "2017-04-01",
+  "last": "2023-04-01",
+  "pinned_days": 1572,
+  "latest_days": 1572,
+  "own": []
+ },
+ {
+  "ticker": "DLPH",
+  "first": "2015-01-01",
+  "last": "2017-10-01",
+  "pinned_days": 324,
+  "latest_days": 304,
+  "own": [],
+  "candidate": "APTV",
+  "candidate_details": [
+   {
+    "conId": 748351585,
+    "symbol": "APTV",
+    "primaryExchange": "NYSE",
+    "longName": "APTIV PLC",
+    "stockType": "COMMON",
+    "head": "2011-11-17"
+   }
+  ]
+ },
+ {
+  "ticker": "DNB",
+  "first": "2015-01-01",
+  "last": "2017-04-01",
+  "pinned_days": 198,
+  "latest_days": 178,
+  "own": []
+ },
+ {
+  "ticker": "DO",
+  "first": "2015-01-01",
+  "last": "2016-07-01",
+  "pinned_days": 10,
+  "latest_days": 0,
+  "own": []
+ },
+ {
+  "ticker": "DOW",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 261,
+  "latest_days": 241,
+  "own": [
+   {
+    "conId": 356576040,
+    "symbol": "DOW",
+    "primaryExchange": "NYSE",
+    "longName": "DOW INC",
+    "stockType": "COMMON",
+    "head": "2019-03-20"
+   }
+  ]
+ },
+ {
+  "ticker": "DPS",
+  "first": "2015-01-01",
+  "last": "2018-07-01",
+  "pinned_days": 512,
+  "latest_days": 492,
+  "own": [],
+  "candidate": "KDP",
+  "candidate_details": [
+   {
+    "conId": 324057162,
+    "symbol": "KDP",
+    "primaryExchange": "NASDAQ",
+    "longName": "KEURIG DR PEPPER INC",
+    "stockType": "COMMON",
+    "head": "2008-04-28"
+   }
+  ]
+ },
+ {
+  "ticker": "DRE",
+  "first": "2017-10-01",
+  "last": "2022-10-01",
+  "pinned_days": 1322,
+  "latest_days": 1322,
+  "own": []
+ },
+ {
+  "ticker": "DWDP",
+  "first": "2017-10-01",
+  "last": "2019-04-01",
+  "pinned_days": 438,
+  "latest_days": 438,
+  "own": [],
+  "candidate": "DD",
+  "candidate_details": [
+   {
+    "conId": 887235923,
+    "symbol": "DD",
+    "primaryExchange": "NYSE",
+    "longName": "DUPONT DE NEMOURS INC",
+    "stockType": "COMMON",
+    "head": "2017-09-01"
+   }
+  ]
+ },
+ {
+  "ticker": "EA",
+  "first": "2015-01-01",
+  "last": "2026-07-01",
+  "pinned_days": 2490,
+  "latest_days": 2470,
+  "own": []
+ },
+ {
+  "ticker": "EMC",
+  "first": "2015-01-01",
+  "last": "2016-07-01",
+  "pinned_days": 10,
+  "latest_days": 0,
+  "own": [
+   {
+    "conId": 630724899,
+    "symbol": "EMC",
+    "primaryExchange": "ARCA",
+    "longName": "GLB X EMRG MRKT GRT CNSUMR",
+    "stockType": "ETF",
+    "head": "2023-05-15"
+   }
+  ]
+ },
+ {
+  "ticker": "ENDP",
+  "first": "2015-04-01",
+  "last": "2017-01-01",
+  "pinned_days": 135,
+  "latest_days": 115,
+  "own": []
+ },
+ {
+  "ticker": "EQR",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 2510,
+  "latest_days": 2510,
+  "own": []
+ },
+ {
+  "ticker": "ESRX",
+  "first": "2015-01-01",
+  "last": "2019-01-01",
+  "pinned_days": 636,
+  "latest_days": 616,
+  "own": []
+ },
+ {
+  "ticker": "ETFC",
+  "first": "2015-01-01",
+  "last": "2020-10-01",
+  "pinned_days": 1080,
+  "latest_days": 1060,
+  "own": []
+ },
+ {
+  "ticker": "EVHC",
+  "first": "2017-01-01",
+  "last": "2018-10-01",
+  "pinned_days": 502,
+  "latest_days": 502,
+  "own": []
+ },
+ {
+  "ticker": "EXPD",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 1,
+  "latest_days": 1,
+  "own": [
+   {
+    "conId": 269082,
+    "symbol": "EXPD",
+    "primaryExchange": "NYSE",
+    "longName": "EXPEDITORS INTL WASH INC",
+    "stockType": "COMMON",
+    "head": "1984-09-26"
+   }
+  ]
+ },
+ {
+  "ticker": "FB",
+  "first": "2015-01-01",
+  "last": "2022-04-01",
+  "pinned_days": 1456,
+  "latest_days": 1436,
+  "own": [
+   {
+    "conId": 794639762,
+    "symbol": "FB",
+    "primaryExchange": "BATS",
+    "longName": "PROSHARES S&P DYNAMIC BUFFER",
+    "stockType": "ETF",
+    "head": "2025-06-26"
+   }
+  ],
+  "candidate": "META",
+  "candidate_details": [
+   {
+    "conId": 107113386,
+    "symbol": "META",
+    "primaryExchange": "NASDAQ",
+    "longName": "META PLATFORMS INC-CLASS A",
+    "stockType": "COMMON",
+    "head": "2012-05-18"
+   }
+  ]
+ },
+ {
+  "ticker": "FBHS",
+  "first": "2016-07-01",
+  "last": "2022-10-01",
+  "pinned_days": 1583,
+  "latest_days": 1563,
+  "own": [],
+  "candidate": "FBIN",
+  "candidate_details": [
+   {
+    "conId": 94078796,
+    "symbol": "FBIN",
+    "primaryExchange": "NYSE",
+    "longName": "FORTUNE BRANDS INNOVATIONS I",
+    "stockType": "COMMON",
+    "head": "2011-09-16"
+   }
+  ]
+ },
+ {
+  "ticker": "FI",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 1,
+  "latest_days": 1,
+  "own": []
+ },
+ {
+  "ticker": "FITB",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 1,
+  "latest_days": 1,
+  "own": [
+   {
+    "conId": 269318,
+    "symbol": "FITB",
+    "primaryExchange": "NYSE",
+    "longName": "FIFTH THIRD BANCORP",
+    "stockType": "COMMON",
+    "head": "1980-03-17"
+   }
+  ]
+ },
+ {
+  "ticker": "FL",
+  "first": "2016-07-01",
+  "last": "2019-07-01",
+  "pinned_days": 763,
+  "latest_days": 743,
+  "own": []
+ },
+ {
+  "ticker": "FLIR",
+  "first": "2015-01-01",
+  "last": "2021-04-01",
+  "pinned_days": 1204,
+  "latest_days": 1184,
+  "own": []
+ },
+ {
+  "ticker": "FLT",
+  "first": "2018-07-01",
+  "last": "2024-01-01",
+  "pinned_days": 1445,
+  "latest_days": 1445,
+  "own": [],
+  "candidate": "CPAY",
+  "candidate_details": [
+   {
+    "conId": 691994611,
+    "symbol": "CPAY",
+    "primaryExchange": "NYSE",
+    "longName": "CORPAY INC",
+    "stockType": "COMMON",
+    "head": "2010-12-15"
+   }
+  ]
+ },
+ {
+  "ticker": "FOX",
+  "first": "2015-10-01",
+  "last": "2026-08-16",
+  "pinned_days": 623,
+  "latest_days": 603,
+  "own": [
+   {
+    "conId": 356858007,
+    "symbol": "FOX",
+    "primaryExchange": "NASDAQ",
+    "longName": "FOX CORP - CLASS B",
+    "stockType": "COMMON",
+    "head": "2019-03-13"
+   }
+  ]
+ },
+ {
+  "ticker": "FOXA",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 623,
+  "latest_days": 603,
+  "own": [
+   {
+    "conId": 356858008,
+    "symbol": "FOXA",
+    "primaryExchange": "NASDAQ",
+    "longName": "FOX CORP - CLASS A",
+    "stockType": "COMMON",
+    "head": "2019-03-13"
+   }
+  ]
+ },
+ {
+  "ticker": "FRC",
+  "first": "2019-04-01",
+  "last": "2023-04-01",
+  "pinned_days": 1071,
+  "latest_days": 1071,
+  "own": []
+ },
+ {
+  "ticker": "FTR",
+  "first": "2015-01-01",
+  "last": "2017-01-01",
+  "pinned_days": 135,
+  "latest_days": 115,
+  "own": []
+ },
+ {
+  "ticker": "GGP",
+  "first": "2015-01-01",
+  "last": "2018-07-01",
+  "pinned_days": 512,
+  "latest_days": 492,
+  "own": []
+ },
+ {
+  "ticker": "GPS",
+  "first": "2015-01-01",
+  "last": "2022-01-01",
+  "pinned_days": 1394,
+  "latest_days": 1374,
+  "own": [],
+  "candidate": "GAP",
+  "candidate_details": [
+   {
+    "conId": 7765,
+    "symbol": "GAP",
+    "primaryExchange": "NYSE",
+    "longName": "GAP INC/THE",
+    "stockType": "COMMON",
+    "head": "1980-03-17"
+   }
+  ]
+ },
+ {
+  "ticker": "HAR",
+  "first": "2015-01-01",
+  "last": "2017-01-01",
+  "pinned_days": 135,
+  "latest_days": 115,
+  "own": []
+ },
+ {
+  "ticker": "HBI",
+  "first": "2015-04-01",
+  "last": "2021-10-01",
+  "pinned_days": 1332,
+  "latest_days": 1312,
+  "own": []
+ },
+ {
+  "ticker": "HCN",
+  "first": "2015-01-01",
+  "last": "2018-01-01",
+  "pinned_days": 385,
+  "latest_days": 365,
+  "own": [],
+  "candidate": "WELL",
+  "candidate_details": [
+   {
+    "conId": 207739931,
+    "symbol": "WELL",
+    "primaryExchange": "NYSE",
+    "longName": "WELLTOWER INC",
+    "stockType": "REIT",
+    "head": "1980-03-19"
+   }
+  ]
+ },
+ {
+  "ticker": "HCP",
+  "first": "2015-01-01",
+  "last": "2019-10-01",
+  "pinned_days": 827,
+  "latest_days": 807,
+  "own": [],
+  "candidate": "DOC",
+  "candidate_details": [
+   {
+    "conId": 389700396,
+    "symbol": "DOC",
+    "primaryExchange": "NYSE",
+    "longName": "HEALTHPEAK PROPERTIES INC",
+    "stockType": "REIT",
+    "head": "1985-05-23"
+   }
+  ]
+ },
+ {
+  "ticker": "HES",
+  "first": "2015-01-01",
+  "last": "2025-07-01",
+  "pinned_days": 2271,
+  "latest_days": 2251,
+  "own": []
+ },
+ {
+  "ticker": "HFC",
+  "first": "2018-07-01",
+  "last": "2021-04-01",
+  "pinned_days": 755,
+  "latest_days": 755,
+  "own": [],
+  "candidate": "DINO",
+  "candidate_details": [
+   {
+    "conId": 550324178,
+    "symbol": "DINO",
+    "primaryExchange": "NYSE",
+    "longName": "HF SINCLAIR CORP",
+    "stockType": "COMMON",
+    "head": "1980-03-17"
+   }
+  ]
+ },
+ {
+  "ticker": "HOLX",
+  "first": "2016-04-01",
+  "last": "2026-04-01",
+  "pinned_days": 2458,
+  "latest_days": 2438,
+  "own": []
+ },
+ {
+  "ticker": "HOT",
+  "first": "2015-01-01",
+  "last": "2016-07-01",
+  "pinned_days": 10,
+  "latest_days": 0,
+  "own": []
+ },
+ {
+  "ticker": "HRS",
+  "first": "2015-01-01",
+  "last": "2019-04-01",
+  "pinned_days": 699,
+  "latest_days": 679,
+  "own": [],
+  "candidate": "LHX",
+  "candidate_details": [
+   {
+    "conId": 371886040,
+    "symbol": "LHX",
+    "primaryExchange": "NYSE",
+    "longName": "L3HARRIS TECHNOLOGIES INC",
+    "stockType": "COMMON",
+    "head": "1980-03-17"
+   }
+  ]
+ },
+ {
+  "ticker": "INFO",
+  "first": "2017-07-01",
+  "last": "2022-01-01",
+  "pinned_days": 1196,
+  "latest_days": 1196,
+  "own": [
+   {
+    "conId": 734184075,
+    "symbol": "INFO",
+    "primaryExchange": "NYSE",
+    "longName": "HARBOR PANAGORA DYC LCC ETF",
+    "stockType": "ETF",
+    "head": "2024-10-10"
+   }
+  ]
+ },
+ {
+  "ticker": "IPG",
+  "first": "2015-01-01",
+  "last": "2025-10-01",
+  "pinned_days": 2335,
+  "latest_days": 2315,
+  "own": []
+ },
+ {
+  "ticker": "IR",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 163,
+  "latest_days": 143,
+  "own": [
+   {
+    "conId": 404509190,
+    "symbol": "IR",
+    "primaryExchange": "NYSE",
+    "longName": "INGERSOLL-RAND INC",
+    "stockType": "COMMON",
+    "head": "2017-05-12"
+   }
+  ],
+  "candidate": "TT",
+  "candidate_details": [
+   {
+    "conId": 406709270,
+    "symbol": "TT",
+    "primaryExchange": "NYSE",
+    "longName": "TRANE TECHNOLOGIES PLC",
+    "stockType": "COMMON",
+    "head": "1980-03-17"
+   }
+  ]
+ },
+ {
+  "ticker": "JEC",
+  "first": "2015-01-01",
+  "last": "2019-10-01",
+  "pinned_days": 827,
+  "latest_days": 807,
+  "own": [],
+  "candidate": "J",
+  "candidate_details": [
+   {
+    "conId": 582332987,
+    "symbol": "J",
+    "primaryExchange": "NYSE",
+    "longName": "JACOBS SOLUTIONS INC",
+    "stockType": "COMMON",
+    "head": "1980-03-17"
+   }
+  ]
+ },
+ {
+  "ticker": "JNPR",
+  "first": "2015-01-01",
+  "last": "2025-07-01",
+  "pinned_days": 2271,
+  "latest_days": 2251,
+  "own": []
+ },
+ {
+  "ticker": "JWN",
+  "first": "2015-01-01",
+  "last": "2020-07-01",
+  "pinned_days": 1016,
+  "latest_days": 996,
+  "own": []
+ },
+ {
+  "ticker": "K",
+  "first": "2015-01-01",
+  "last": "2025-10-01",
+  "pinned_days": 2335,
+  "latest_days": 2315,
+  "own": []
+ },
+ {
+  "ticker": "KORS",
+  "first": "2015-01-01",
+  "last": "2019-01-01",
+  "pinned_days": 636,
+  "latest_days": 616,
+  "own": [],
+  "candidate": "CPRI",
+  "candidate_details": [
+   {
+    "conId": 347409760,
+    "symbol": "CPRI",
+    "primaryExchange": "NYSE",
+    "longName": "CAPRI HOLDINGS LTD",
+    "stockType": "COMMON",
+    "head": "2011-12-15"
+   }
+  ]
+ },
+ {
+  "ticker": "KSU",
+  "first": "2015-01-01",
+  "last": "2021-10-01",
+  "pinned_days": 1332,
+  "latest_days": 1312,
+  "own": []
+ },
+ {
+  "ticker": "LB",
+  "first": "2015-01-01",
+  "last": "2021-07-01",
+  "pinned_days": 1268,
+  "latest_days": 1248,
+  "own": [
+   {
+    "conId": 712414332,
+    "symbol": "LB",
+    "primaryExchange": "NYSE",
+    "longName": "LANDBRIDGE CORP",
+    "stockType": "COMMON",
+    "head": "2024-06-28"
+   }
+  ],
+  "candidate": "BBWI",
+  "candidate_details": [
+   {
+    "conId": 502252263,
+    "symbol": "BBWI",
+    "primaryExchange": "NYSE",
+    "longName": "BATH & BODY WORKS INC",
+    "stockType": "COMMON",
+    "head": "1982-04-01"
+   }
+  ]
+ },
+ {
+  "ticker": "LEG",
+  "first": "2015-01-01",
+  "last": "2021-10-01",
+  "pinned_days": 1332,
+  "latest_days": 1312,
+  "own": []
+ },
+ {
+  "ticker": "LLL",
+  "first": "2015-01-01",
+  "last": "2019-04-01",
+  "pinned_days": 699,
+  "latest_days": 679,
+  "own": []
+ },
+ {
+  "ticker": "LLTC",
+  "first": "2015-01-01",
+  "last": "2017-01-01",
+  "pinned_days": 135,
+  "latest_days": 115,
+  "own": []
+ },
+ {
+  "ticker": "LM",
+  "first": "2015-01-01",
+  "last": "2016-10-01",
+  "pinned_days": 73,
+  "latest_days": 53,
+  "own": []
+ },
+ {
+  "ticker": "LUK",
+  "first": "2015-01-01",
+  "last": "2018-04-01",
+  "pinned_days": 449,
+  "latest_days": 429,
+  "own": [],
+  "candidate": "JEF",
+  "candidate_details": [
+   {
+    "conId": 318911976,
+    "symbol": "JEF",
+    "primaryExchange": "NYSE",
+    "longName": "JEFFERIES FINANCIAL GROUP IN",
+    "stockType": "COMMON",
+    "head": "1980-03-17"
+   }
+  ]
+ },
+ {
+  "ticker": "LUMN",
+  "first": "2020-10-01",
+  "last": "2023-01-01",
+  "pinned_days": 1,
+  "latest_days": 1,
+  "own": [
+   {
+    "conId": 446613345,
+    "symbol": "LUMN",
+    "primaryExchange": "NASDAQ",
+    "longName": "LUMEN TECHNOLOGIES INC",
+    "stockType": "COMMON",
+    "head": "2006-11-16"
+   }
+  ]
+ },
+ {
+  "ticker": "LVLT",
+  "first": "2015-01-01",
+  "last": "2017-10-01",
+  "pinned_days": 324,
+  "latest_days": 304,
+  "own": []
+ },
+ {
+  "ticker": "MJN",
+  "first": "2015-01-01",
+  "last": "2017-04-01",
+  "pinned_days": 198,
+  "latest_days": 178,
+  "own": []
+ },
+ {
+  "ticker": "MNK",
+  "first": "2015-01-01",
+  "last": "2017-07-01",
+  "pinned_days": 261,
+  "latest_days": 241,
+  "own": []
+ },
+ {
+  "ticker": "MON",
+  "first": "2015-01-01",
+  "last": "2018-04-01",
+  "pinned_days": 449,
+  "latest_days": 429,
+  "own": []
+ },
+ {
+  "ticker": "MRO",
+  "first": "2015-01-01",
+  "last": "2024-10-01",
+  "pinned_days": 2085,
+  "latest_days": 2065,
+  "own": []
+ },
+ {
+  "ticker": "MXIM",
+  "first": "2019-01-01",
+  "last": "2021-07-01",
+  "pinned_days": 693,
+  "latest_days": 693,
+  "own": []
+ },
+ {
+  "ticker": "MYL",
+  "first": "2015-01-01",
+  "last": "2020-10-01",
+  "pinned_days": 1080,
+  "latest_days": 1060,
+  "own": [],
+  "candidate": "VTRS",
+  "candidate_details": [
+   {
+    "conId": 454859695,
+    "symbol": "VTRS",
+    "primaryExchange": "NASDAQ",
+    "longName": "VIATRIS INC",
+    "stockType": "COMMON",
+    "head": null
+   }
+  ]
+ },
+ {
+  "ticker": "NBL",
+  "first": "2015-01-01",
+  "last": "2020-10-01",
+  "pinned_days": 1080,
+  "latest_days": 1060,
+  "own": []
+ },
+ {
+  "ticker": "NFX",
+  "first": "2015-01-01",
+  "last": "2019-01-01",
+  "pinned_days": 636,
+  "latest_days": 616,
+  "own": [
+   {
+    "conId": 898286451,
+    "symbol": "NFX",
+    "primaryExchange": "BATS",
+    "longName": "CORGI NFLX 2X DAILY ETF",
+    "stockType": "ETF",
+    "head": "2026-07-07"
+   }
+  ]
+ },
+ {
+  "ticker": "NLOK",
+  "first": "2020-01-01",
+  "last": "2022-10-01",
+  "pinned_days": 756,
+  "latest_days": 756,
+  "own": [],
+  "candidate": "GEN",
+  "candidate_details": [
+   {
+    "conId": 390332324,
+    "symbol": "GEN",
+    "primaryExchange": "NASDAQ",
+    "longName": "GEN DIGITAL INC",
+    "stockType": "COMMON",
+    "head": "1989-06-23"
+   }
+  ]
+ },
+ {
+  "ticker": "NLSN",
+  "first": "2015-01-01",
+  "last": "2022-10-01",
+  "pinned_days": 1583,
+  "latest_days": 1563,
+  "own": []
+ },
+ {
+  "ticker": "NWL",
+  "first": "2015-01-01",
+  "last": "2023-07-01",
+  "pinned_days": 561,
+  "latest_days": 541,
+  "own": [
+   {
+    "conId": 10627,
+    "symbol": "NWL",
+    "primaryExchange": "NASDAQ",
+    "longName": "NEWELL BRANDS INC",
+    "stockType": "COMMON",
+    "head": null
+   }
+  ]
+ },
+ {
+  "ticker": "ODFL",
+  "first": "2020-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 1093,
+  "latest_days": 1093,
+  "own": [
+   {
+    "conId": 272667,
+    "symbol": "ODFL",
+    "primaryExchange": "NASDAQ",
+    "longName": "OLD DOMINION FREIGHT LINE",
+    "stockType": "COMMON",
+    "head": "1991-10-24"
+   }
+  ]
+ },
+ {
+  "ticker": "PARA",
+  "first": "2022-04-01",
+  "last": "2025-07-01",
+  "pinned_days": 388,
+  "latest_days": 0,
+  "own": [
+   {
+    "conId": 880582719,
+    "symbol": "PARA",
+    "primaryExchange": "NASDAQ",
+    "longName": "BANZAI INTERNATIONAL INC",
+    "stockType": "COMMON",
+    "head": "2021-02-12"
+   }
+  ],
+  "candidate": "PSKY",
+  "candidate_details": []
+ },
+ {
+  "ticker": "PBCT",
+  "first": "2015-01-01",
+  "last": "2022-04-01",
+  "pinned_days": 1456,
+  "latest_days": 1436,
+  "own": []
+ },
+ {
+  "ticker": "PCLN",
+  "first": "2015-01-01",
+  "last": "2018-01-01",
+  "pinned_days": 385,
+  "latest_days": 365,
+  "own": [
+   {
+    "conId": 822733785,
+    "symbol": "PCLN",
+    "primaryExchange": "ARCA",
+    "longName": "PICTET CLEANER PLANET",
+    "stockType": "ETF",
+    "head": "2025-10-16"
+   }
+  ],
+  "candidate": "BKNG",
+  "candidate_details": [
+   {
+    "conId": 308728373,
+    "symbol": "BKNG",
+    "primaryExchange": "NASDAQ",
+    "longName": "BOOKING HOLDINGS INC",
+    "stockType": "COMMON",
+    "head": "1999-03-30"
+   }
+  ]
+ },
+ {
+  "ticker": "PDCO",
+  "first": "2015-01-01",
+  "last": "2018-01-01",
+  "pinned_days": 385,
+  "latest_days": 365,
+  "own": []
+ },
+ {
+  "ticker": "PEAK",
+  "first": "2020-01-01",
+  "last": "2024-01-01",
+  "pinned_days": 1067,
+  "latest_days": 1067,
+  "own": [],
+  "candidate": "DOC",
+  "candidate_details": [
+   {
+    "conId": 389700396,
+    "symbol": "DOC",
+    "primaryExchange": "NYSE",
+    "longName": "HEALTHPEAK PROPERTIES INC",
+    "stockType": "REIT",
+    "head": "1985-05-23"
+   }
+  ]
+ },
+ {
+  "ticker": "PEP",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 317,
+  "latest_days": 297,
+  "own": [
+   {
+    "conId": 11017,
+    "symbol": "PEP",
+    "primaryExchange": "NASDAQ",
+    "longName": "PEPSICO INC",
+    "stockType": "COMMON",
+    "head": null
+   }
+  ]
+ },
+ {
+  "ticker": "PFG",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 315,
+  "latest_days": 295,
+  "own": [
+   {
+    "conId": 11032,
+    "symbol": "PFG",
+    "primaryExchange": "NASDAQ",
+    "longName": "PRINCIPAL FINANCIAL GROUP",
+    "stockType": "COMMON",
+    "head": null
+   }
+  ]
+ },
+ {
+  "ticker": "PKI",
+  "first": "2015-01-01",
+  "last": "2023-04-01",
+  "pinned_days": 1707,
+  "latest_days": 1687,
+  "own": [],
+  "candidate": "RVTY",
+  "candidate_details": [
+   {
+    "conId": 6737,
+    "symbol": "RVTY",
+    "primaryExchange": "NYSE",
+    "longName": "REVVITY INC",
+    "stockType": "COMMON",
+    "head": "1980-03-17"
+   }
+  ]
+ },
+ {
+  "ticker": "PSKY",
+  "first": "2025-10-01",
+  "last": "2026-08-16",
+  "pinned_days": 0,
+  "latest_days": 259,
+  "own": []
+ },
+ {
+  "ticker": "PX",
+  "first": "2015-01-01",
+  "last": "2018-10-01",
+  "pinned_days": 575,
+  "latest_days": 555,
+  "own": [],
+  "candidate": "LIN",
+  "candidate_details": [
+   {
+    "conId": 617155599,
+    "symbol": "LIN",
+    "primaryExchange": "NASDAQ",
+    "longName": "LINDE PLC",
+    "stockType": "COMMON",
+    "head": "2018-10-31"
+   }
+  ]
+ },
+ {
+  "ticker": "PXD",
+  "first": "2015-01-01",
+  "last": "2024-04-01",
+  "pinned_days": 1957,
+  "latest_days": 1937,
+  "own": []
+ },
+ {
+  "ticker": "Q",
+  "first": "2017-10-01",
+  "last": "2026-08-16",
+  "pinned_days": 63,
+  "latest_days": 63,
+  "own": [
+   {
+    "conId": 824788107,
+    "symbol": "Q",
+    "primaryExchange": "NYSE",
+    "longName": "QNITY ELECTRONICS INC",
+    "stockType": "COMMON",
+    "head": "2025-10-27"
+   }
+  ],
+  "candidate": "IQV",
+  "candidate_details": [
+   {
+    "conId": 295757261,
+    "symbol": "IQV",
+    "primaryExchange": "NYSE",
+    "longName": "IQVIA HOLDINGS INC",
+    "stockType": "COMMON",
+    "head": "2013-05-09"
+   }
+  ]
+ },
+ {
+  "ticker": "QRVO",
+  "first": "2015-07-01",
+  "last": "2024-10-01",
+  "pinned_days": 0,
+  "latest_days": 2065,
+  "own": []
+ },
+ {
+  "ticker": "RAI",
+  "first": "2015-01-01",
+  "last": "2017-07-01",
+  "pinned_days": 261,
+  "latest_days": 241,
+  "own": []
+ },
+ {
+  "ticker": "RE",
+  "first": "2017-07-01",
+  "last": "2023-07-01",
+  "pinned_days": 1572,
+  "latest_days": 1572,
+  "own": [],
+  "candidate": "EG",
+  "candidate_details": [
+   {
+    "conId": 6477725,
+    "symbol": "EG",
+    "primaryExchange": "NYSE",
+    "longName": "EVEREST GROUP LTD",
+    "stockType": "COMMON",
+    "head": "1995-10-03"
+   }
+  ]
+ },
+ {
+  "ticker": "RHT",
+  "first": "2015-01-01",
+  "last": "2019-07-01",
+  "pinned_days": 763,
+  "latest_days": 743,
+  "own": []
+ },
+ {
+  "ticker": "RTN",
+  "first": "2015-01-01",
+  "last": "2020-04-01",
+  "pinned_days": 952,
+  "latest_days": 932,
+  "own": []
+ },
+ {
+  "ticker": "SATS",
+  "first": "2026-04-01",
+  "last": "2026-04-01",
+  "pinned_days": 62,
+  "latest_days": 62,
+  "own": []
+ },
+ {
+  "ticker": "SCG",
+  "first": "2015-01-01",
+  "last": "2019-01-01",
+  "pinned_days": 636,
+  "latest_days": 616,
+  "own": []
+ },
+ {
+  "ticker": "SE",
+  "first": "2015-01-01",
+  "last": "2017-01-01",
+  "pinned_days": 135,
+  "latest_days": 115,
+  "own": [
+   {
+    "conId": 292735472,
+    "symbol": "SE",
+    "primaryExchange": "NYSE",
+    "longName": "SEA LTD-ADR",
+    "stockType": "ADR",
+    "head": "2017-10-20"
+   }
+  ]
+ },
+ {
+  "ticker": "SEE",
+  "first": "2015-01-01",
+  "last": "2023-10-01",
+  "pinned_days": 1833,
+  "latest_days": 1813,
+  "own": []
+ },
+ {
+  "ticker": "SIVB",
+  "first": "2018-04-01",
+  "last": "2023-01-01",
+  "pinned_days": 1260,
+  "latest_days": 1260,
+  "own": []
+ },
+ {
+  "ticker": "SLG",
+  "first": "2015-04-01",
+  "last": "2021-01-01",
+  "pinned_days": 1,
+  "latest_days": 1,
+  "own": [
+   {
+    "conId": 537789289,
+    "symbol": "SLG",
+    "primaryExchange": "NYSE",
+    "longName": "SL GREEN REALTY CORP",
+    "stockType": "REIT",
+    "head": "1997-08-15"
+   }
+  ]
+ },
+ {
+  "ticker": "SNI",
+  "first": "2015-01-01",
+  "last": "2018-01-01",
+  "pinned_days": 385,
+  "latest_days": 365,
+  "own": []
+ },
+ {
+  "ticker": "SPLS",
+  "first": "2015-01-01",
+  "last": "2017-07-01",
+  "pinned_days": 261,
+  "latest_days": 241,
+  "own": [
+   {
+    "conId": 845913334,
+    "symbol": "SPLS",
+    "primaryExchange": "BATS",
+    "longName": "PIMCO US STCK ACTV BOND ETF",
+    "stockType": "ETF",
+    "head": "2026-01-16"
+   }
+  ]
+ },
+ {
+  "ticker": "SRCL",
+  "first": "2015-01-01",
+  "last": "2018-10-01",
+  "pinned_days": 575,
+  "latest_days": 555,
+  "own": []
+ },
+ {
+  "ticker": "STI",
+  "first": "2015-01-01",
+  "last": "2019-10-01",
+  "pinned_days": 827,
+  "latest_days": 807,
+  "own": [
+   {
+    "conId": 782964354,
+    "symbol": "STI",
+    "primaryExchange": "NASDAQ",
+    "longName": "SOLIDION TECHNOLOGY INC",
+    "stockType": "COMMON",
+    "head": null
+   }
+  ],
+  "candidate": "TFC",
+  "candidate_details": [
+   {
+    "conId": 393460310,
+    "symbol": "TFC",
+    "primaryExchange": "NYSE",
+    "longName": "TRUIST FINANCIAL CORP",
+    "stockType": "COMMON",
+    "head": null
+   }
+  ]
+ },
+ {
+  "ticker": "STJ",
+  "first": "2015-01-01",
+  "last": "2017-01-01",
+  "pinned_days": 135,
+  "latest_days": 115,
+  "own": []
+ },
+ {
+  "ticker": "SWN",
+  "first": "2015-01-01",
+  "last": "2017-04-01",
+  "pinned_days": 198,
+  "latest_days": 178,
+  "own": []
+ },
+ {
+  "ticker": "SYMC",
+  "first": "2015-01-01",
+  "last": "2019-10-01",
+  "pinned_days": 827,
+  "latest_days": 807,
+  "own": [],
+  "candidate": "GEN",
+  "candidate_details": [
+   {
+    "conId": 390332324,
+    "symbol": "GEN",
+    "primaryExchange": "NASDAQ",
+    "longName": "GEN DIGITAL INC",
+    "stockType": "COMMON",
+    "head": "1989-06-23"
+   }
+  ]
+ },
+ {
+  "ticker": "TGNA",
+  "first": "2015-07-01",
+  "last": "2017-04-01",
+  "pinned_days": 198,
+  "latest_days": 178,
+  "own": []
+ },
+ {
+  "ticker": "TIF",
+  "first": "2015-01-01",
+  "last": "2021-01-01",
+  "pinned_days": 1141,
+  "latest_days": 1121,
+  "own": []
+ },
+ {
+  "ticker": "TMK",
+  "first": "2015-01-01",
+  "last": "2019-07-01",
+  "pinned_days": 763,
+  "latest_days": 743,
+  "own": [],
+  "candidate": "GL",
+  "candidate_details": [
+   {
+    "conId": 375868349,
+    "symbol": "GL",
+    "primaryExchange": "NYSE",
+    "longName": "GLOBE LIFE INC",
+    "stockType": "COMMON",
+    "head": null
+   }
+  ]
+ },
+ {
+  "ticker": "TSO",
+  "first": "2015-01-01",
+  "last": "2017-07-01",
+  "pinned_days": 261,
+  "latest_days": 241,
+  "own": [],
+  "candidate": "ANDV",
+  "candidate_details": []
+ },
+ {
+  "ticker": "TSS",
+  "first": "2015-01-01",
+  "last": "2019-07-01",
+  "pinned_days": 763,
+  "latest_days": 743,
+  "own": []
+ },
+ {
+  "ticker": "TWTR",
+  "first": "2018-07-01",
+  "last": "2022-10-01",
+  "pinned_days": 1134,
+  "latest_days": 1134,
+  "own": []
+ },
+ {
+  "ticker": "TWX",
+  "first": "2015-01-01",
+  "last": "2018-04-01",
+  "pinned_days": 449,
+  "latest_days": 429,
+  "own": []
+ },
+ {
+  "ticker": "TYC",
+  "first": "2015-01-01",
+  "last": "2016-07-01",
+  "pinned_days": 10,
+  "latest_days": 0,
+  "own": []
+ },
+ {
+  "ticker": "UA C",
+  "first": "2016-10-01",
+  "last": "2016-10-01",
+  "pinned_days": 63,
+  "latest_days": 53,
+  "own": [],
+  "candidate": "UA",
+  "candidate_details": [
+   {
+    "conId": 225590118,
+    "symbol": "UA",
+    "primaryExchange": "NYSE",
+    "longName": "UNDER ARMOUR INC-CLASS C",
+    "stockType": "COMMON",
+    "head": null
+   }
+  ]
+ },
+ {
+  "ticker": "UAL",
+  "first": "2015-10-01",
+  "last": "2026-08-16",
+  "pinned_days": 497,
+  "latest_days": 477,
+  "own": [
+   {
+    "conId": 79498203,
+    "symbol": "UAL",
+    "primaryExchange": "NASDAQ",
+    "longName": "UNITED AIRLINES HOLDINGS INC",
+    "stockType": "COMMON",
+    "head": null
+   }
+  ]
+ },
+ {
+  "ticker": "UTX",
+  "first": "2015-01-01",
+  "last": "2020-04-01",
+  "pinned_days": 952,
+  "latest_days": 932,
+  "own": [],
+  "candidate": "RTX",
+  "candidate_details": [
+   {
+    "conId": 415342104,
+    "symbol": "RTX",
+    "primaryExchange": "NYSE",
+    "longName": "RTX CORP",
+    "stockType": "COMMON",
+    "head": null
+   }
+  ]
+ },
+ {
+  "ticker": "VAR",
+  "first": "2015-01-01",
+  "last": "2021-04-01",
+  "pinned_days": 1204,
+  "latest_days": 1184,
+  "own": []
+ },
+ {
+  "ticker": "VIAB",
+  "first": "2015-01-01",
+  "last": "2019-10-01",
+  "pinned_days": 827,
+  "latest_days": 807,
+  "own": []
+ },
+ {
+  "ticker": "VIAC",
+  "first": "2020-01-01",
+  "last": "2022-01-01",
+  "pinned_days": 567,
+  "latest_days": 567,
+  "own": [],
+  "candidate": "PARA",
+  "candidate_details": [
+   {
+    "conId": 880582719,
+    "symbol": "PARA",
+    "primaryExchange": "NASDAQ",
+    "longName": "BANZAI INTERNATIONAL INC",
+    "stockType": "COMMON",
+    "head": "2021-02-12"
+   }
+  ]
+ },
+ {
+  "ticker": "WBA",
+  "first": "2015-04-01",
+  "last": "2025-07-01",
+  "pinned_days": 2271,
+  "latest_days": 2251,
+  "own": []
+ },
+ {
+  "ticker": "WBD",
+  "first": "2022-07-01",
+  "last": "2026-08-16",
+  "pinned_days": 0,
+  "latest_days": 1074,
+  "own": []
+ },
+ {
+  "ticker": "WCG",
+  "first": "2018-10-01",
+  "last": "2020-01-01",
+  "pinned_days": 377,
+  "latest_days": 377,
+  "own": []
+ },
+ {
+  "ticker": "WFM",
+  "first": "2015-01-01",
+  "last": "2017-07-01",
+  "pinned_days": 261,
+  "latest_days": 241,
+  "own": []
+ },
+ {
+  "ticker": "WLTW",
+  "first": "2016-04-01",
+  "last": "2022-01-01",
+  "pinned_days": 1394,
+  "latest_days": 1374,
+  "own": [],
+  "candidate": "WTW",
+  "candidate_details": [
+   {
+    "conId": 217947855,
+    "symbol": "WTW",
+    "primaryExchange": "NASDAQ",
+    "longName": "WILLIS TOWERS WATSON PLC",
+    "stockType": "COMMON",
+    "head": null
+   }
+  ]
+ },
+ {
+  "ticker": "WRK",
+  "first": "2015-10-01",
+  "last": "2024-07-01",
+  "pinned_days": 2021,
+  "latest_days": 2001,
+  "own": []
+ },
+ {
+  "ticker": "WYN",
+  "first": "2015-01-01",
+  "last": "2018-04-01",
+  "pinned_days": 449,
+  "latest_days": 429,
+  "own": [],
+  "candidate": "TNL",
+  "candidate_details": [
+   {
+    "conId": 469015035,
+    "symbol": "TNL",
+    "primaryExchange": "NYSE",
+    "longName": "TRAVEL + LEISURE CO",
+    "stockType": "COMMON",
+    "head": null
+   }
+  ]
+ },
+ {
+  "ticker": "XEC",
+  "first": "2015-01-01",
+  "last": "2020-01-01",
+  "pinned_days": 889,
+  "latest_days": 869,
+  "own": [],
+  "candidate": "CTRA",
+  "candidate_details": []
+ },
+ {
+  "ticker": "XEL",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 324,
+  "latest_days": 304,
+  "own": [
+   {
+    "conId": 10517,
+    "symbol": "XEL",
+    "primaryExchange": "NASDAQ",
+    "longName": "XCEL ENERGY INC",
+    "stockType": "COMMON",
+    "head": null
+   }
+  ]
+ },
+ {
+  "ticker": "XL",
+  "first": "2015-01-01",
+  "last": "2018-07-01",
+  "pinned_days": 512,
+  "latest_days": 492,
+  "own": []
+ },
+ {
+  "ticker": "XLNX",
+  "first": "2015-01-01",
+  "last": "2022-01-01",
+  "pinned_days": 1394,
+  "latest_days": 1374,
+  "own": []
+ },
+ {
+  "ticker": "YHOO",
+  "first": "2015-01-01",
+  "last": "2017-04-01",
+  "pinned_days": 198,
+  "latest_days": 178,
+  "own": [],
+  "candidate": "AABA",
+  "candidate_details": []
+ }
+]

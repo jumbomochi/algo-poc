@@ -1,0 +1,282 @@
+{
+ "ABC": {
+  "category": "renamed: aliased",
+  "evidence": "COR conId 1714996 CENCORA INC; until 2023-10-01; covers 1747/1750 member sessions; largest daily move 13% (2016-10-28)"
+ },
+ "ANTM": {
+  "category": "renamed: aliased",
+  "evidence": "ELV conId 173962302 ELEVANCE HEALTH INC; until 2022-07-01; covers 1433/1436 member sessions; largest daily move 17% (2020-03-16)"
+ },
+ "ARNC": {
+  "category": "renamed: aliased",
+  "evidence": "HWM conId 403121976 HOWMET AEROSPACE INC; until 2020-07-01; covers 879/879 member sessions; largest daily move 26% (2020-03-24)"
+ },
+ "BHGE": {
+  "category": "renamed: aliased",
+  "evidence": "BKR conId 281316445 BAKER HUGHES CO; until 2020-01-01; covers 566/566 member sessions; largest daily move 9% (2017-11-06)"
+ },
+ "BK": {
+  "category": "renamed: aliased",
+  "evidence": "BNY conId 44986804 BANK OF NEW YORK MELLON CORP; until 2026-07-01; covers 2435/2438 member sessions; largest daily move 16% (2020-03-13)"
+ },
+ "BLL": {
+  "category": "renamed: aliased",
+  "evidence": "BALL conId 5052 BALL CORP; until 2022-07-01; covers 1433/1436 member sessions; largest daily move 12% (2020-03-24)"
+ },
+ "CBG": {
+  "category": "renamed: aliased",
+  "evidence": "CBRE conId 95514904 CBRE GROUP INC - A; until 2018-04-01; covers 362/365 member sessions; largest daily move 8% (2017-02-10)"
+ },
+ "COH": {
+  "category": "renamed: aliased",
+  "evidence": "TPR conId 292491487 TAPESTRY INC; until 2018-01-01; covers 301/304 member sessions; largest daily move 15% (2017-08-15)"
+ },
+ "CTL": {
+  "category": "renamed: aliased",
+  "evidence": "LUMN conId 446613345 LUMEN TECHNOLOGIES INC; until 2020-10-01; covers 991/996 member sessions; largest daily move 14% (2020-03-24)"
+ },
+ "DLPH": {
+  "category": "renamed: aliased",
+  "evidence": "APTV conId 748351585 APTIV PLC; until 2018-01-01; covers 301/304 member sessions; largest daily move 11% (2017-05-03)"
+ },
+ "FB": {
+  "category": "renamed: aliased",
+  "evidence": "META conId 107113386 META PLATFORMS INC-CLASS A; until 2022-07-01; covers 1433/1436 member sessions; largest daily move 26% (2022-02-03)"
+ },
+ "FBHS": {
+  "category": "renamed: aliased",
+  "evidence": "FBIN conId 94078796 FORTUNE BRANDS INNOVATIONS I; until None; covers 1560/1563 member sessions; largest daily move 16% (2020-03-24)"
+ },
+ "FLT": {
+  "category": "renamed: aliased",
+  "evidence": "CPAY conId 691994611 CORPAY INC; until 2024-04-01; covers 1445/1445 member sessions; largest daily move 16% (2020-11-09)"
+ },
+ "GPS": {
+  "category": "renamed: aliased",
+  "evidence": "GAP conId 7765 GAP INC/THE; until None; covers 1371/1374 member sessions; largest daily move 30% (2020-03-24)"
+ },
+ "HCN": {
+  "category": "renamed: aliased",
+  "evidence": "WELL conId 207739931 WELLTOWER INC; until 2018-04-01; covers 361/365 member sessions; largest daily move 4% (2017-12-19)"
+ },
+ "HCP": {
+  "category": "renamed: aliased",
+  "evidence": "DOC conId 389700396 HEALTHPEAK PROPERTIES INC; until 2024-04-01; covers 804/807 member sessions; largest daily move 5% (2018-12-24)"
+ },
+ "HFC": {
+  "category": "renamed: aliased",
+  "evidence": "DINO conId 550324178 HF SINCLAIR CORP; until None; covers 755/755 member sessions; largest daily move 28% (2020-11-09)"
+ },
+ "HRS": {
+  "category": "renamed: aliased",
+  "evidence": "LHX conId 371886040 L3HARRIS TECHNOLOGIES INC; until 2019-07-01; covers 676/679 member sessions; largest daily move 12% (2018-10-15)"
+ },
+ "JEC": {
+  "category": "renamed: aliased",
+  "evidence": "J conId 582332987 JACOBS SOLUTIONS INC; until 2020-01-01; covers 804/807 member sessions; largest daily move 11% (2018-11-20)"
+ },
+ "KORS": {
+  "category": "renamed: aliased",
+  "evidence": "CPRI conId 347409760 CAPRI HOLDINGS LTD; until 2019-04-01; covers 613/616 member sessions; largest daily move 22% (2017-08-08)"
+ },
+ "LB": {
+  "category": "renamed: aliased",
+  "evidence": "BBWI conId 502252263 BATH & BODY WORKS INC; until 2021-10-01; covers 1245/1248 member sessions; largest daily move 39% (2020-03-24)"
+ },
+ "LUK": {
+  "category": "renamed: aliased",
+  "evidence": "JEF conId 318911976 JEFFERIES FINANCIAL GROUP IN; until 2018-07-01; covers 426/429 member sessions; largest daily move 12% (2018-04-09)"
+ },
+ "MYL": {
+  "category": "renamed: aliased",
+  "evidence": "VTRS conId 454859695 VIATRIS INC; until 2021-01-01; covers 1057/1060 member sessions; largest daily move 24% (2019-05-07)"
+ },
+ "PCLN": {
+  "category": "renamed: aliased",
+  "evidence": "BKNG conId 308728373 BOOKING HOLDINGS INC; until 2018-04-01; covers 361/365 member sessions; largest daily move 14% (2017-11-07)"
+ },
+ "PEAK": {
+  "category": "renamed: aliased",
+  "evidence": "DOC conId 389700396 HEALTHPEAK PROPERTIES INC; until 2024-04-01; covers 1067/1067 member sessions; largest daily move 23% (2020-03-16)"
+ },
+ "PKI": {
+  "category": "renamed: aliased",
+  "evidence": "RVTY conId 6737 REVVITY INC; until 2023-07-01; covers 1684/1687 member sessions; largest daily move 10% (2020-03-16)"
+ },
+ "RE": {
+  "category": "renamed: aliased",
+  "evidence": "EG conId 6477725 EVEREST GROUP LTD; until 2023-10-01; covers 1572/1572 member sessions; largest daily move 14% (2020-03-16)"
+ },
+ "SATS": {
+  "category": "renamed: aliased",
+  "evidence": "ECHO conId 47965865 ECHOSTAR CORP; until 2026-07-01; IB ECHO conId prices all 62 member sessions (1y fetch); no move above 10%"
+ },
+ "SYMC": {
+  "category": "renamed: aliased",
+  "evidence": "GEN conId 390332324 GEN DIGITAL INC; until 2023-01-01; covers 804/807 member sessions; largest daily move 33% (2018-05-11)"
+ },
+ "TMK": {
+  "category": "renamed: aliased",
+  "evidence": "GL conId 375868349 GLOBE LIFE INC; until 2019-10-01; covers 740/743 member sessions; largest daily move 5% (2018-12-04)"
+ },
+ "UTX": {
+  "category": "renamed: aliased",
+  "evidence": "RTX conId 415342104 RTX CORP; until 2020-07-01; covers 929/932 member sessions; largest daily move 16% (2020-03-24)"
+ },
+ "WLTW": {
+  "category": "renamed: aliased",
+  "evidence": "WTW conId 217947855 WILLIS TOWERS WATSON PLC; until 2022-04-01; covers 1371/1374 member sessions; largest daily move 15% (2020-03-24)"
+ },
+ "WYN": {
+  "category": "renamed: aliased",
+  "evidence": "TNL conId 469015035 TRAVEL + LEISURE CO; until None; covers 426/429 member sessions; largest daily move 9% (2017-04-26)"
+ },
+ "AA": {
+  "category": "IB series is another company: unpriced",
+  "evidence": "IB AA is conId 251962528 ALCOA CORP, history from 2016-10-18 (the 2016 separation); the member until 2016 was Alcoa Inc, now HWM, whose series falls 34% at the 2016-11-01 separation, so it is not aliased either"
+ },
+ "IR": {
+  "category": "IB series is another company: unpriced",
+  "evidence": "IB IR is conId 404509190 INGERSOLL-RAND INC (Gardner Denver), history from 2017-05-12 at 21.10 while the member, Ingersoll-Rand plc (now TT, conId 406709270), traded at 68.28; IR is that company from the first snapshot listing TT"
+ },
+ "PARA": {
+  "category": "IB series is another company: unpriced",
+  "evidence": "IB PARA is conId 880582719 BANZAI INTERNATIONAL INC, history from 2021-02-12, closing 98,000 -> 130 (split-adjusted) across Paramount's 2022-04..2025-07 membership; PSKY returns Error 200"
+ },
+ "CBS": {
+  "category": "renamed: refused",
+  "evidence": "candidate PARA resolves to conId 880582719 BANZAI INTERNATIONAL INC, not Paramount; PSKY returns Error 200"
+ },
+ "VIAC": {
+  "category": "renamed: refused",
+  "evidence": "candidate PARA resolves to conId 880582719 BANZAI INTERNATIONAL INC, not Paramount; PSKY returns Error 200"
+ },
+ "DISCA": {
+  "category": "renamed: refused",
+  "evidence": "successor WBD returns Error 200; symbol search lists WBD only on VALUE (conId 554208351)"
+ },
+ "DISCK": {
+  "category": "renamed: refused",
+  "evidence": "successor WBD returns Error 200 (VALUE); class C converted into a different share line in 2022"
+ },
+ "CDAY": {
+  "category": "renamed: refused",
+  "evidence": "successor DAY returns Error 200; symbol search lists DAY only on VALUE (conId 315543544)"
+ },
+ "COG": {
+  "category": "renamed: refused",
+  "evidence": "successor CTRA returns Error 200; symbol search lists CTRA (USD) only on VALUE (conId 5946)"
+ },
+ "XEC": {
+  "category": "renamed: refused",
+  "evidence": "merged into Coterra (CTRA), itself on VALUE (Error 200)"
+ },
+ "TSO": {
+  "category": "renamed: refused",
+  "evidence": "successor ANDV returns Error 200 (acquired by MPC)"
+ },
+ "YHOO": {
+  "category": "renamed: refused",
+  "evidence": "successor AABA returns Error 200"
+ },
+ "DPS": {
+  "category": "renamed: refused",
+  "evidence": "KDP conId 324057162 prices the window, but falls 82% at the merger (2018-07-09 123.66 -> 07-10 22.19, the unadjusted special dividend)"
+ },
+ "NLOK": {
+  "category": "renamed: refused",
+  "evidence": "GEN conId 390332324 prices the window, but falls 40% inside it (2020-01-31 28.42 -> 02-03 17.15, the unadjusted special dividend)"
+ },
+ "ADS": {
+  "category": "renamed: refused",
+  "evidence": "successor BFH conId 12362013: HMDS returns no data for any member session (Error 162)"
+ },
+ "DWDP": {
+  "category": "renamed: refused",
+  "evidence": "DD conId 887235923 is DowDuPont, but the membership file uses DD for E. I. du Pont before 2017; the merger window also spans the Dow and Corteva separations"
+ },
+ "UA C": {
+  "category": "renamed: refused",
+  "evidence": "UA conId 225590118 (UNDER ARMOUR INC-CLASS C) returns no bars; the membership file's UA is a different share class in that quarter"
+ },
+ "Q": {
+  "category": "renamed: refused",
+  "evidence": "Q is QNITY ELECTRONICS today (conId 824788107, history from 2025-10-27, correct for its 2025-26 membership); the 2017 Quintiles IMS quarter would need IQV spliced in front, refused (see unpriced IR)"
+ },
+ "BHI": {
+  "category": "renamed: refused",
+  "evidence": "BKR conId 281316445 history starts 2017-07-05 (the BHGE merger); Baker Hughes Inc's own series is not served"
+ },
+ "PX": {
+  "category": "renamed: refused",
+  "evidence": "merged into Linde plc; LIN conId 617155599 history starts 2018-10-31"
+ },
+ "STI": {
+  "category": "renamed: refused",
+  "evidence": "merged into BB&T, renamed Truist (TFC); TFC is BB&T's series. IB's STI today is SOLIDION TECHNOLOGY (after the membership)"
+ },
+ "CHK": {
+  "category": "renamed: refused",
+  "evidence": "equity cancelled in the 2020 bankruptcy; EXE conId 470458975 is the new equity, history from 2021-02-10"
+ },
+ "PSKY": {
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search finds no Paramount Skydance US listing"
+ },
+ "EQR": {
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search for Equity Residential returns nothing"
+ },
+ "LUMN": {
+  "category": "isolated missing session",
+  "evidence": "priced; one membership session without a bar"
+ },
+ "FOX": {
+  "category": "different entity under the ticker",
+  "evidence": "IB FOX is conId 356858007 FOX CORP - CLASS B from 2019-03-13; Twenty-First Century Fox's days (acquired by Disney) are not served"
+ },
+ "FOXA": {
+  "category": "different entity under the ticker",
+  "evidence": "IB FOXA is conId 356858008 FOX CORP - CLASS A from 2019-03-13; Twenty-First Century Fox's days (acquired by Disney) are not served"
+ },
+ "DOW": {
+  "category": "different entity under the ticker",
+  "evidence": "IB DOW is conId 356576040 DOW INC from 2019-03-20; Dow Chemical's days (merged into DowDuPont 2017) are not served"
+ },
+ "DD": {
+  "category": "different entity under the ticker",
+  "evidence": "IB DD is conId 887235923 DUPONT DE NEMOURS INC from 2017-09-01 (DowDuPont); E. I. du Pont's days are not served"
+ },
+ "WBD": {
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search lists WBD (USD) only on VALUE (conId 554208351)"
+ },
+ "EA": {
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search lists EA (USD) only on VALUE (conId 268995)"
+ },
+ "HOLX": {
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search lists HOLX (USD) only on VALUE (conId 270188)"
+ },
+ "IPG": {
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search lists IPG (USD) only on VALUE (conId 8514)"
+ },
+ "K": {
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search lists K (USD) only on VALUE (conId 8758)"
+ },
+ "SEE": {
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search lists SEE (USD) only on VALUE (conId 4082282)"
+ },
+ "CTRA": {
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search lists CTRA (USD) only on VALUE (conId 5946)"
+ },
+ "DAY": {
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search lists DAY (USD) only on VALUE (conId 315543544)"
+ }
+}

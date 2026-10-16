@@ -1,0 +1,1346 @@
+[
+ {
+  "ticker": "AA",
+  "pinned_days": 21,
+  "latest_days": 1,
+  "own": "251962528 ALCOA CORP (history from 2016-10-18)",
+  "category": "IB series is another company: unpriced",
+  "evidence": "IB AA is conId 251962528 ALCOA CORP, history from 2016-10-18 (the 2016 separation); the member until 2016 was Alcoa Inc, now HWM, whose series falls 34% at the 2016-11-01 separation, so it is not aliased either"
+ },
+ {
+  "ticker": "ABC",
+  "pinned_days": 1770,
+  "latest_days": 1750,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "COR conId 1714996 CENCORA INC; until 2023-10-01; covers 1747/1750 member sessions; largest daily move 13% (2016-10-28)"
+ },
+ {
+  "ticker": "ABMD",
+  "pinned_days": 1134,
+  "latest_days": 1134,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "ADS",
+  "pinned_days": 1016,
+  "latest_days": 996,
+  "own": "Error 200",
+  "category": "renamed: refused",
+  "evidence": "successor BFH conId 12362013: HMDS returns no data for any member session (Error 162)"
+ },
+ {
+  "ticker": "AET",
+  "pinned_days": 575,
+  "latest_days": 555,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "AGN",
+  "pinned_days": 952,
+  "latest_days": 932,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "ALXN",
+  "pinned_days": 1268,
+  "latest_days": 1248,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "ANDV",
+  "pinned_days": 251,
+  "latest_days": 251,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "ANSS",
+  "pinned_days": 2073,
+  "latest_days": 2073,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "ANTM",
+  "pinned_days": 1456,
+  "latest_days": 1436,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "ELV conId 173962302 ELEVANCE HEALTH INC; until 2022-07-01; covers 1433/1436 member sessions; largest daily move 17% (2020-03-16)"
+ },
+ {
+  "ticker": "APC",
+  "pinned_days": 763,
+  "latest_days": 743,
+  "own": "854080544 ARKO PETROLEUM CORP (history from 2026-02-12)",
+  "category": "acquired",
+  "evidence": "IB: 854080544 ARKO PETROLEUM CORP (history from 2026-02-12)"
+ },
+ {
+  "ticker": "ARNC",
+  "pinned_days": 879,
+  "latest_days": 879,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "HWM conId 403121976 HOWMET AEROSPACE INC; until 2020-07-01; covers 879/879 member sessions; largest daily move 26% (2020-03-24)"
+ },
+ {
+  "ticker": "ATVI",
+  "pinned_days": 1833,
+  "latest_days": 1813,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "AVB",
+  "pinned_days": 2510,
+  "latest_days": 2510,
+  "own": "Error 200",
+  "category": "delisted per IB",
+  "evidence": "symbol search lists AVB only on VALUE (conId 5026974)"
+ },
+ {
+  "ticker": "AVGO",
+  "pinned_days": 1,
+  "latest_days": 1,
+  "own": "313130367 BROADCOM INC (history from 2016-02-02)",
+  "category": "isolated missing session",
+  "evidence": "priced; one membership session without a bar"
+ },
+ {
+  "ticker": "BBBY",
+  "pinned_days": 261,
+  "latest_days": 241,
+  "own": "Error 200",
+  "category": "failed",
+  "evidence": "bankruptcy / wind-down; IB: Error 200"
+ },
+ {
+  "ticker": "BCR",
+  "pinned_days": 385,
+  "latest_days": 365,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "BHGE",
+  "pinned_days": 566,
+  "latest_days": 566,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "BKR conId 281316445 BAKER HUGHES CO; until 2020-01-01; covers 566/566 member sessions; largest daily move 9% (2017-11-06)"
+ },
+ {
+  "ticker": "BHI",
+  "pinned_days": 261,
+  "latest_days": 241,
+  "own": "Error 200",
+  "category": "renamed: refused",
+  "evidence": "BKR conId 281316445 history starts 2017-07-05 (the BHGE merger); Baker Hughes Inc's own series is not served"
+ },
+ {
+  "ticker": "BK",
+  "pinned_days": 2458,
+  "latest_days": 2438,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "BNY conId 44986804 BANK OF NEW YORK MELLON CORP; until 2026-07-01; covers 2435/2438 member sessions; largest daily move 16% (2020-03-13)"
+ },
+ {
+  "ticker": "BLL",
+  "pinned_days": 1456,
+  "latest_days": 1436,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "BALL conId 5052 BALL CORP; until 2022-07-01; covers 1433/1436 member sessions; largest daily move 12% (2020-03-24)"
+ },
+ {
+  "ticker": "CA",
+  "pinned_days": 575,
+  "latest_days": 555,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "CBG",
+  "pinned_days": 385,
+  "latest_days": 365,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "CBRE conId 95514904 CBRE GROUP INC - A; until 2018-04-01; covers 362/365 member sessions; largest daily move 8% (2017-02-10)"
+ },
+ {
+  "ticker": "CBS",
+  "pinned_days": 827,
+  "latest_days": 807,
+  "own": "Error 200",
+  "category": "renamed: refused",
+  "evidence": "candidate PARA resolves to conId 880582719 BANZAI INTERNATIONAL INC, not Paramount; PSKY returns Error 200"
+ },
+ {
+  "ticker": "CDAY",
+  "pinned_days": 626,
+  "latest_days": 626,
+  "own": "Error 200",
+  "category": "renamed: refused",
+  "evidence": "successor DAY returns Error 200; symbol search lists DAY only on VALUE (conId 315543544)"
+ },
+ {
+  "ticker": "CELG",
+  "pinned_days": 827,
+  "latest_days": 807,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "CERN",
+  "pinned_days": 1456,
+  "latest_days": 1436,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "CHK",
+  "pinned_days": 385,
+  "latest_days": 365,
+  "own": "Error 200",
+  "category": "renamed: refused",
+  "evidence": "equity cancelled in the 2020 bankruptcy; EXE conId 470458975 is the new equity, history from 2021-02-10"
+ },
+ {
+  "ticker": "CMA",
+  "pinned_days": 1957,
+  "latest_days": 1937,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "COG",
+  "pinned_days": 1332,
+  "latest_days": 1312,
+  "own": "Error 200",
+  "category": "renamed: refused",
+  "evidence": "successor CTRA returns Error 200; symbol search lists CTRA (USD) only on VALUE (conId 5946)"
+ },
+ {
+  "ticker": "COH",
+  "pinned_days": 324,
+  "latest_days": 304,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "TPR conId 292491487 TAPESTRY INC; until 2018-01-01; covers 301/304 member sessions; largest daily move 15% (2017-08-15)"
+ },
+ {
+  "ticker": "COL",
+  "pinned_days": 575,
+  "latest_days": 555,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "COO",
+  "pinned_days": 1756,
+  "latest_days": 1746,
+  "own": "685217803 COOPER COS INC/THE (history from 2023-09-26)",
+  "category": "history cut-off",
+  "evidence": "current conId served only from 2023-09-26; earlier 1-year and 1-month requests return no data"
+ },
+ {
+  "ticker": "CPGX",
+  "pinned_days": 10,
+  "latest_days": 0,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "CSRA",
+  "pinned_days": 449,
+  "latest_days": 429,
+  "own": "910132626 COHEN & STERS RL AST ACT ETF (history from 2026-08-12)",
+  "category": "acquired",
+  "evidence": "IB: 910132626 COHEN & STERS RL AST ACT ETF (history from 2026-08-12)"
+ },
+ {
+  "ticker": "CTL",
+  "pinned_days": 1016,
+  "latest_days": 996,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "LUMN conId 446613345 LUMEN TECHNOLOGIES INC; until 2020-10-01; covers 991/996 member sessions; largest daily move 14% (2020-03-24)"
+ },
+ {
+  "ticker": "CTLT",
+  "pinned_days": 1005,
+  "latest_days": 1005,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "CTRA",
+  "pinned_days": 1126,
+  "latest_days": 1126,
+  "own": "Error 200",
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search lists CTRA (USD) only on VALUE (conId 5946)"
+ },
+ {
+  "ticker": "CTXS",
+  "pinned_days": 1520,
+  "latest_days": 1500,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "CXO",
+  "pinned_days": 1141,
+  "latest_days": 1121,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "DAY",
+  "pinned_days": 502,
+  "latest_days": 502,
+  "own": "Error 200",
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search lists DAY (USD) only on VALUE (conId 315543544)"
+ },
+ {
+  "ticker": "DD",
+  "pinned_days": 241,
+  "latest_days": 221,
+  "own": "887235923 DUPONT DE NEMOURS INC (history from 2017-09-01)",
+  "category": "different entity under the ticker",
+  "evidence": "IB DD is conId 887235923 DUPONT DE NEMOURS INC from 2017-09-01 (DowDuPont); E. I. du Pont's days are not served"
+ },
+ {
+  "ticker": "DFS",
+  "pinned_days": 2207,
+  "latest_days": 2187,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "DISCA",
+  "pinned_days": 1456,
+  "latest_days": 1436,
+  "own": "Error 200",
+  "category": "renamed: refused",
+  "evidence": "successor WBD returns Error 200; symbol search lists WBD only on VALUE (conId 554208351)"
+ },
+ {
+  "ticker": "DISCK",
+  "pinned_days": 1456,
+  "latest_days": 1436,
+  "own": "Error 200",
+  "category": "renamed: refused",
+  "evidence": "successor WBD returns Error 200 (VALUE); class C converted into a different share line in 2022"
+ },
+ {
+  "ticker": "DISH",
+  "pinned_days": 1572,
+  "latest_days": 1572,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "DLPH",
+  "pinned_days": 324,
+  "latest_days": 304,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "APTV conId 748351585 APTIV PLC; until 2018-01-01; covers 301/304 member sessions; largest daily move 11% (2017-05-03)"
+ },
+ {
+  "ticker": "DNB",
+  "pinned_days": 198,
+  "latest_days": 178,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "DO",
+  "pinned_days": 10,
+  "latest_days": 0,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "DOW",
+  "pinned_days": 261,
+  "latest_days": 241,
+  "own": "356576040 DOW INC (history from 2019-03-20)",
+  "category": "different entity under the ticker",
+  "evidence": "IB DOW is conId 356576040 DOW INC from 2019-03-20; Dow Chemical's days (merged into DowDuPont 2017) are not served"
+ },
+ {
+  "ticker": "DPS",
+  "pinned_days": 512,
+  "latest_days": 492,
+  "own": "Error 200",
+  "category": "renamed: refused",
+  "evidence": "KDP conId 324057162 prices the window, but falls 82% at the merger (2018-07-09 123.66 -> 07-10 22.19, the unadjusted special dividend)"
+ },
+ {
+  "ticker": "DRE",
+  "pinned_days": 1322,
+  "latest_days": 1322,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "DWDP",
+  "pinned_days": 438,
+  "latest_days": 438,
+  "own": "Error 200",
+  "category": "renamed: refused",
+  "evidence": "DD conId 887235923 is DowDuPont, but the membership file uses DD for E. I. du Pont before 2017; the merger window also spans the Dow and Corteva separations"
+ },
+ {
+  "ticker": "EA",
+  "pinned_days": 2490,
+  "latest_days": 2470,
+  "own": "Error 200",
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search lists EA (USD) only on VALUE (conId 268995)"
+ },
+ {
+  "ticker": "EMC",
+  "pinned_days": 10,
+  "latest_days": 0,
+  "own": "630724899 GLB X EMRG MRKT GRT CNSUMR (history from 2023-05-15)",
+  "category": "acquired",
+  "evidence": "IB: 630724899 GLB X EMRG MRKT GRT CNSUMR (history from 2023-05-15)"
+ },
+ {
+  "ticker": "ENDP",
+  "pinned_days": 135,
+  "latest_days": 115,
+  "own": "Error 200",
+  "category": "failed",
+  "evidence": "bankruptcy / wind-down; IB: Error 200"
+ },
+ {
+  "ticker": "EQR",
+  "pinned_days": 2510,
+  "latest_days": 2510,
+  "own": "Error 200",
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search for Equity Residential returns nothing"
+ },
+ {
+  "ticker": "ESRX",
+  "pinned_days": 636,
+  "latest_days": 616,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "ETFC",
+  "pinned_days": 1080,
+  "latest_days": 1060,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "EVHC",
+  "pinned_days": 502,
+  "latest_days": 502,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "EXPD",
+  "pinned_days": 1,
+  "latest_days": 1,
+  "own": "269082 EXPEDITORS INTL WASH INC (history from 1984-09-26)",
+  "category": "isolated missing session",
+  "evidence": "priced; one membership session without a bar"
+ },
+ {
+  "ticker": "FB",
+  "pinned_days": 1456,
+  "latest_days": 1436,
+  "own": "794639762 PROSHARES S&P DYNAMIC BUFFER (history from 2025-06-26)",
+  "category": "renamed: aliased",
+  "evidence": "META conId 107113386 META PLATFORMS INC-CLASS A; until 2022-07-01; covers 1433/1436 member sessions; largest daily move 26% (2022-02-03)"
+ },
+ {
+  "ticker": "FBHS",
+  "pinned_days": 1583,
+  "latest_days": 1563,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "FBIN conId 94078796 FORTUNE BRANDS INNOVATIONS I; until None; covers 1560/1563 member sessions; largest daily move 16% (2020-03-24)"
+ },
+ {
+  "ticker": "FI",
+  "pinned_days": 1,
+  "latest_days": 1,
+  "own": "Error 200",
+  "category": "isolated missing session",
+  "evidence": "priced; one membership session without a bar"
+ },
+ {
+  "ticker": "FITB",
+  "pinned_days": 1,
+  "latest_days": 1,
+  "own": "269318 FIFTH THIRD BANCORP (history from 1980-03-17)",
+  "category": "isolated missing session",
+  "evidence": "priced; one membership session without a bar"
+ },
+ {
+  "ticker": "FL",
+  "pinned_days": 763,
+  "latest_days": 743,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "FLIR",
+  "pinned_days": 1204,
+  "latest_days": 1184,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "FLT",
+  "pinned_days": 1445,
+  "latest_days": 1445,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "CPAY conId 691994611 CORPAY INC; until 2024-04-01; covers 1445/1445 member sessions; largest daily move 16% (2020-11-09)"
+ },
+ {
+  "ticker": "FOX",
+  "pinned_days": 623,
+  "latest_days": 603,
+  "own": "356858007 FOX CORP - CLASS B (history from 2019-03-13)",
+  "category": "different entity under the ticker",
+  "evidence": "IB FOX is conId 356858007 FOX CORP - CLASS B from 2019-03-13; Twenty-First Century Fox's days (acquired by Disney) are not served"
+ },
+ {
+  "ticker": "FOXA",
+  "pinned_days": 623,
+  "latest_days": 603,
+  "own": "356858008 FOX CORP - CLASS A (history from 2019-03-13)",
+  "category": "different entity under the ticker",
+  "evidence": "IB FOXA is conId 356858008 FOX CORP - CLASS A from 2019-03-13; Twenty-First Century Fox's days (acquired by Disney) are not served"
+ },
+ {
+  "ticker": "FRC",
+  "pinned_days": 1071,
+  "latest_days": 1071,
+  "own": "Error 200",
+  "category": "failed",
+  "evidence": "bankruptcy / wind-down; IB: Error 200"
+ },
+ {
+  "ticker": "FTR",
+  "pinned_days": 135,
+  "latest_days": 115,
+  "own": "Error 200",
+  "category": "failed",
+  "evidence": "bankruptcy / wind-down; IB: Error 200"
+ },
+ {
+  "ticker": "GGP",
+  "pinned_days": 512,
+  "latest_days": 492,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "GPS",
+  "pinned_days": 1394,
+  "latest_days": 1374,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "GAP conId 7765 GAP INC/THE; until None; covers 1371/1374 member sessions; largest daily move 30% (2020-03-24)"
+ },
+ {
+  "ticker": "HAR",
+  "pinned_days": 135,
+  "latest_days": 115,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "HBI",
+  "pinned_days": 1332,
+  "latest_days": 1312,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "HCN",
+  "pinned_days": 385,
+  "latest_days": 365,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "WELL conId 207739931 WELLTOWER INC; until 2018-04-01; covers 361/365 member sessions; largest daily move 4% (2017-12-19)"
+ },
+ {
+  "ticker": "HCP",
+  "pinned_days": 827,
+  "latest_days": 807,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "DOC conId 389700396 HEALTHPEAK PROPERTIES INC; until 2024-04-01; covers 804/807 member sessions; largest daily move 5% (2018-12-24)"
+ },
+ {
+  "ticker": "HES",
+  "pinned_days": 2271,
+  "latest_days": 2251,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "HFC",
+  "pinned_days": 755,
+  "latest_days": 755,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "DINO conId 550324178 HF SINCLAIR CORP; until None; covers 755/755 member sessions; largest daily move 28% (2020-11-09)"
+ },
+ {
+  "ticker": "HOLX",
+  "pinned_days": 2458,
+  "latest_days": 2438,
+  "own": "Error 200",
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search lists HOLX (USD) only on VALUE (conId 270188)"
+ },
+ {
+  "ticker": "HOT",
+  "pinned_days": 10,
+  "latest_days": 0,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "HRS",
+  "pinned_days": 699,
+  "latest_days": 679,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "LHX conId 371886040 L3HARRIS TECHNOLOGIES INC; until 2019-07-01; covers 676/679 member sessions; largest daily move 12% (2018-10-15)"
+ },
+ {
+  "ticker": "INFO",
+  "pinned_days": 1196,
+  "latest_days": 1196,
+  "own": "734184075 HARBOR PANAGORA DYC LCC ETF (history from 2024-10-10)",
+  "category": "acquired",
+  "evidence": "IB: 734184075 HARBOR PANAGORA DYC LCC ETF (history from 2024-10-10)"
+ },
+ {
+  "ticker": "IPG",
+  "pinned_days": 2335,
+  "latest_days": 2315,
+  "own": "Error 200",
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search lists IPG (USD) only on VALUE (conId 8514)"
+ },
+ {
+  "ticker": "IR",
+  "pinned_days": 163,
+  "latest_days": 143,
+  "own": "404509190 INGERSOLL-RAND INC (history from 2017-05-12)",
+  "category": "IB series is another company: unpriced",
+  "evidence": "IB IR is conId 404509190 INGERSOLL-RAND INC (Gardner Denver), history from 2017-05-12 at 21.10 while the member, Ingersoll-Rand plc (now TT, conId 406709270), traded at 68.28; IR is that company from the first snapshot listing TT"
+ },
+ {
+  "ticker": "JEC",
+  "pinned_days": 827,
+  "latest_days": 807,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "J conId 582332987 JACOBS SOLUTIONS INC; until 2020-01-01; covers 804/807 member sessions; largest daily move 11% (2018-11-20)"
+ },
+ {
+  "ticker": "JNPR",
+  "pinned_days": 2271,
+  "latest_days": 2251,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "JWN",
+  "pinned_days": 1016,
+  "latest_days": 996,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "K",
+  "pinned_days": 2335,
+  "latest_days": 2315,
+  "own": "Error 200",
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search lists K (USD) only on VALUE (conId 8758)"
+ },
+ {
+  "ticker": "KORS",
+  "pinned_days": 636,
+  "latest_days": 616,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "CPRI conId 347409760 CAPRI HOLDINGS LTD; until 2019-04-01; covers 613/616 member sessions; largest daily move 22% (2017-08-08)"
+ },
+ {
+  "ticker": "KSU",
+  "pinned_days": 1332,
+  "latest_days": 1312,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "LB",
+  "pinned_days": 1268,
+  "latest_days": 1248,
+  "own": "712414332 LANDBRIDGE CORP (history from 2024-06-28)",
+  "category": "renamed: aliased",
+  "evidence": "BBWI conId 502252263 BATH & BODY WORKS INC; until 2021-10-01; covers 1245/1248 member sessions; largest daily move 39% (2020-03-24)"
+ },
+ {
+  "ticker": "LEG",
+  "pinned_days": 1332,
+  "latest_days": 1312,
+  "own": "Error 200",
+  "category": "delisted per IB",
+  "evidence": "symbol search lists LEG only on VALUE (conId 9081)"
+ },
+ {
+  "ticker": "LLL",
+  "pinned_days": 699,
+  "latest_days": 679,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "LLTC",
+  "pinned_days": 135,
+  "latest_days": 115,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "LM",
+  "pinned_days": 73,
+  "latest_days": 53,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "LUK",
+  "pinned_days": 449,
+  "latest_days": 429,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "JEF conId 318911976 JEFFERIES FINANCIAL GROUP IN; until 2018-07-01; covers 426/429 member sessions; largest daily move 12% (2018-04-09)"
+ },
+ {
+  "ticker": "LUMN",
+  "pinned_days": 1,
+  "latest_days": 1,
+  "own": "446613345 LUMEN TECHNOLOGIES INC (history from 2006-11-16)",
+  "category": "isolated missing session",
+  "evidence": "priced; one membership session without a bar"
+ },
+ {
+  "ticker": "LVLT",
+  "pinned_days": 324,
+  "latest_days": 304,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "MJN",
+  "pinned_days": 198,
+  "latest_days": 178,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "MNK",
+  "pinned_days": 261,
+  "latest_days": 241,
+  "own": "Error 200",
+  "category": "failed",
+  "evidence": "bankruptcy / wind-down; IB: Error 200"
+ },
+ {
+  "ticker": "MON",
+  "pinned_days": 449,
+  "latest_days": 429,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "MRO",
+  "pinned_days": 2085,
+  "latest_days": 2065,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "MXIM",
+  "pinned_days": 693,
+  "latest_days": 693,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "MYL",
+  "pinned_days": 1080,
+  "latest_days": 1060,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "VTRS conId 454859695 VIATRIS INC; until 2021-01-01; covers 1057/1060 member sessions; largest daily move 24% (2019-05-07)"
+ },
+ {
+  "ticker": "NBL",
+  "pinned_days": 1080,
+  "latest_days": 1060,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "NFX",
+  "pinned_days": 636,
+  "latest_days": 616,
+  "own": "898286451 CORGI NFLX 2X DAILY ETF (history from 2026-07-07)",
+  "category": "acquired",
+  "evidence": "IB: 898286451 CORGI NFLX 2X DAILY ETF (history from 2026-07-07)"
+ },
+ {
+  "ticker": "NLOK",
+  "pinned_days": 756,
+  "latest_days": 756,
+  "own": "Error 200",
+  "category": "renamed: refused",
+  "evidence": "GEN conId 390332324 prices the window, but falls 40% inside it (2020-01-31 28.42 -> 02-03 17.15, the unadjusted special dividend)"
+ },
+ {
+  "ticker": "NLSN",
+  "pinned_days": 1583,
+  "latest_days": 1563,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "NWL",
+  "pinned_days": 561,
+  "latest_days": 541,
+  "own": "10627 NEWELL BRANDS INC (history from ?)",
+  "category": "history cut-off",
+  "evidence": "current conId served only from 2018-12-11; earlier 1-year and 1-month requests return no data"
+ },
+ {
+  "ticker": "ODFL",
+  "pinned_days": 1093,
+  "latest_days": 1093,
+  "own": "272667 OLD DOMINION FREIGHT LINE (history from 1991-10-24)",
+  "category": "history cut-off",
+  "evidence": "current conId served only from 2024-05-07; earlier 1-year and 1-month requests return no data"
+ },
+ {
+  "ticker": "PARA",
+  "pinned_days": 388,
+  "latest_days": 0,
+  "own": "880582719 BANZAI INTERNATIONAL INC (history from 2021-02-12)",
+  "category": "IB series is another company: unpriced",
+  "evidence": "IB PARA is conId 880582719 BANZAI INTERNATIONAL INC, history from 2021-02-12, closing 98,000 -> 130 (split-adjusted) across Paramount's 2022-04..2025-07 membership; PSKY returns Error 200"
+ },
+ {
+  "ticker": "PBCT",
+  "pinned_days": 1456,
+  "latest_days": 1436,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "PCLN",
+  "pinned_days": 385,
+  "latest_days": 365,
+  "own": "822733785 PICTET CLEANER PLANET (history from 2025-10-16)",
+  "category": "renamed: aliased",
+  "evidence": "BKNG conId 308728373 BOOKING HOLDINGS INC; until 2018-04-01; covers 361/365 member sessions; largest daily move 14% (2017-11-07)"
+ },
+ {
+  "ticker": "PDCO",
+  "pinned_days": 385,
+  "latest_days": 365,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "PEAK",
+  "pinned_days": 1067,
+  "latest_days": 1067,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "DOC conId 389700396 HEALTHPEAK PROPERTIES INC; until 2024-04-01; covers 1067/1067 member sessions; largest daily move 23% (2020-03-16)"
+ },
+ {
+  "ticker": "PEP",
+  "pinned_days": 317,
+  "latest_days": 297,
+  "own": "11017 PEPSICO INC (history from ?)",
+  "category": "history cut-off",
+  "evidence": "current conId served only from 2017-12-20; earlier 1-year and 1-month requests return no data"
+ },
+ {
+  "ticker": "PFG",
+  "pinned_days": 315,
+  "latest_days": 295,
+  "own": "11032 PRINCIPAL FINANCIAL GROUP (history from ?)",
+  "category": "history cut-off",
+  "evidence": "current conId served only from 2017-12-18; earlier 1-year and 1-month requests return no data"
+ },
+ {
+  "ticker": "PKI",
+  "pinned_days": 1707,
+  "latest_days": 1687,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "RVTY conId 6737 REVVITY INC; until 2023-07-01; covers 1684/1687 member sessions; largest daily move 10% (2020-03-16)"
+ },
+ {
+  "ticker": "PSKY",
+  "pinned_days": 0,
+  "latest_days": 259,
+  "own": "Error 200",
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search finds no Paramount Skydance US listing"
+ },
+ {
+  "ticker": "PX",
+  "pinned_days": 575,
+  "latest_days": 555,
+  "own": "Error 200",
+  "category": "renamed: refused",
+  "evidence": "merged into Linde plc; LIN conId 617155599 history starts 2018-10-31"
+ },
+ {
+  "ticker": "PXD",
+  "pinned_days": 1957,
+  "latest_days": 1937,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "Q",
+  "pinned_days": 63,
+  "latest_days": 63,
+  "own": "824788107 QNITY ELECTRONICS INC (history from 2025-10-27)",
+  "category": "renamed: refused",
+  "evidence": "Q is QNITY ELECTRONICS today (conId 824788107, history from 2025-10-27, correct for its 2025-26 membership); the 2017 Quintiles IMS quarter would need IQV spliced in front, refused (see unpriced IR)"
+ },
+ {
+  "ticker": "QRVO",
+  "pinned_days": 0,
+  "latest_days": 2065,
+  "own": "Error 200",
+  "category": "delisted per IB",
+  "evidence": "symbol search lists QRVO only on VALUE (conId 179002152)"
+ },
+ {
+  "ticker": "RAI",
+  "pinned_days": 261,
+  "latest_days": 241,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "RE",
+  "pinned_days": 1572,
+  "latest_days": 1572,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "EG conId 6477725 EVEREST GROUP LTD; until 2023-10-01; covers 1572/1572 member sessions; largest daily move 14% (2020-03-16)"
+ },
+ {
+  "ticker": "RHT",
+  "pinned_days": 763,
+  "latest_days": 743,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "RTN",
+  "pinned_days": 952,
+  "latest_days": 932,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "SATS",
+  "pinned_days": 62,
+  "latest_days": 62,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "ECHO conId 47965865 ECHOSTAR CORP; until 2026-07-01; IB ECHO conId prices all 62 member sessions (1y fetch); no move above 10%"
+ },
+ {
+  "ticker": "SCG",
+  "pinned_days": 636,
+  "latest_days": 616,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "SE",
+  "pinned_days": 135,
+  "latest_days": 115,
+  "own": "292735472 SEA LTD-ADR (history from 2017-10-20)",
+  "category": "acquired",
+  "evidence": "IB: 292735472 SEA LTD-ADR (history from 2017-10-20)"
+ },
+ {
+  "ticker": "SEE",
+  "pinned_days": 1833,
+  "latest_days": 1813,
+  "own": "Error 200",
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search lists SEE (USD) only on VALUE (conId 4082282)"
+ },
+ {
+  "ticker": "SIVB",
+  "pinned_days": 1260,
+  "latest_days": 1260,
+  "own": "Error 200",
+  "category": "failed",
+  "evidence": "bankruptcy / wind-down; IB: Error 200"
+ },
+ {
+  "ticker": "SLG",
+  "pinned_days": 1,
+  "latest_days": 1,
+  "own": "537789289 SL GREEN REALTY CORP (history from 1997-08-15)",
+  "category": "isolated missing session",
+  "evidence": "priced; one membership session without a bar"
+ },
+ {
+  "ticker": "SNI",
+  "pinned_days": 385,
+  "latest_days": 365,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "SPLS",
+  "pinned_days": 261,
+  "latest_days": 241,
+  "own": "845913334 PIMCO US STCK ACTV BOND ETF (history from 2026-01-16)",
+  "category": "acquired",
+  "evidence": "IB: 845913334 PIMCO US STCK ACTV BOND ETF (history from 2026-01-16)"
+ },
+ {
+  "ticker": "SRCL",
+  "pinned_days": 575,
+  "latest_days": 555,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "STI",
+  "pinned_days": 827,
+  "latest_days": 807,
+  "own": "782964354 SOLIDION TECHNOLOGY INC (history from ?)",
+  "category": "renamed: refused",
+  "evidence": "merged into BB&T, renamed Truist (TFC); TFC is BB&T's series. IB's STI today is SOLIDION TECHNOLOGY (after the membership)"
+ },
+ {
+  "ticker": "STJ",
+  "pinned_days": 135,
+  "latest_days": 115,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "SWN",
+  "pinned_days": 198,
+  "latest_days": 178,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "SYMC",
+  "pinned_days": 827,
+  "latest_days": 807,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "GEN conId 390332324 GEN DIGITAL INC; until 2023-01-01; covers 804/807 member sessions; largest daily move 33% (2018-05-11)"
+ },
+ {
+  "ticker": "TGNA",
+  "pinned_days": 198,
+  "latest_days": 178,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "TIF",
+  "pinned_days": 1141,
+  "latest_days": 1121,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "TMK",
+  "pinned_days": 763,
+  "latest_days": 743,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "GL conId 375868349 GLOBE LIFE INC; until 2019-10-01; covers 740/743 member sessions; largest daily move 5% (2018-12-04)"
+ },
+ {
+  "ticker": "TSO",
+  "pinned_days": 261,
+  "latest_days": 241,
+  "own": "Error 200",
+  "category": "renamed: refused",
+  "evidence": "successor ANDV returns Error 200 (acquired by MPC)"
+ },
+ {
+  "ticker": "TSS",
+  "pinned_days": 763,
+  "latest_days": 743,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "TWTR",
+  "pinned_days": 1134,
+  "latest_days": 1134,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "TWX",
+  "pinned_days": 449,
+  "latest_days": 429,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "TYC",
+  "pinned_days": 10,
+  "latest_days": 0,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "UA C",
+  "pinned_days": 63,
+  "latest_days": 53,
+  "own": "Error 200",
+  "category": "renamed: refused",
+  "evidence": "UA conId 225590118 (UNDER ARMOUR INC-CLASS C) returns no bars; the membership file's UA is a different share class in that quarter"
+ },
+ {
+  "ticker": "UAL",
+  "pinned_days": 497,
+  "latest_days": 477,
+  "own": "79498203 UNITED AIRLINES HOLDINGS INC (history from ?)",
+  "category": "history cut-off",
+  "evidence": "current conId served only from 2018-09-10; earlier 1-year and 1-month requests return no data"
+ },
+ {
+  "ticker": "UTX",
+  "pinned_days": 952,
+  "latest_days": 932,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "RTX conId 415342104 RTX CORP; until 2020-07-01; covers 929/932 member sessions; largest daily move 16% (2020-03-24)"
+ },
+ {
+  "ticker": "VAR",
+  "pinned_days": 1204,
+  "latest_days": 1184,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "VIAB",
+  "pinned_days": 827,
+  "latest_days": 807,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "VIAC",
+  "pinned_days": 567,
+  "latest_days": 567,
+  "own": "Error 200",
+  "category": "renamed: refused",
+  "evidence": "candidate PARA resolves to conId 880582719 BANZAI INTERNATIONAL INC, not Paramount; PSKY returns Error 200"
+ },
+ {
+  "ticker": "WBA",
+  "pinned_days": 2271,
+  "latest_days": 2251,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "WBD",
+  "pinned_days": 0,
+  "latest_days": 1074,
+  "own": "Error 200",
+  "category": "delisted per IB",
+  "evidence": "Error 200; symbol search lists WBD (USD) only on VALUE (conId 554208351)"
+ },
+ {
+  "ticker": "WCG",
+  "pinned_days": 377,
+  "latest_days": 377,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "WFM",
+  "pinned_days": 261,
+  "latest_days": 241,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "WLTW",
+  "pinned_days": 1394,
+  "latest_days": 1374,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "WTW conId 217947855 WILLIS TOWERS WATSON PLC; until 2022-04-01; covers 1371/1374 member sessions; largest daily move 15% (2020-03-24)"
+ },
+ {
+  "ticker": "WRK",
+  "pinned_days": 2021,
+  "latest_days": 2001,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "WYN",
+  "pinned_days": 449,
+  "latest_days": 429,
+  "own": "Error 200",
+  "category": "renamed: aliased",
+  "evidence": "TNL conId 469015035 TRAVEL + LEISURE CO; until None; covers 426/429 member sessions; largest daily move 9% (2017-04-26)"
+ },
+ {
+  "ticker": "XEC",
+  "pinned_days": 889,
+  "latest_days": 869,
+  "own": "Error 200",
+  "category": "renamed: refused",
+  "evidence": "merged into Coterra (CTRA), itself on VALUE (Error 200)"
+ },
+ {
+  "ticker": "XEL",
+  "pinned_days": 324,
+  "latest_days": 304,
+  "own": "10517 XCEL ENERGY INC (history from ?)",
+  "category": "history cut-off",
+  "evidence": "current conId served only from 2018-01-02; earlier 1-year and 1-month requests return no data"
+ },
+ {
+  "ticker": "XL",
+  "pinned_days": 512,
+  "latest_days": 492,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "XLNX",
+  "pinned_days": 1394,
+  "latest_days": 1374,
+  "own": "Error 200",
+  "category": "acquired",
+  "evidence": "IB: Error 200"
+ },
+ {
+  "ticker": "YHOO",
+  "pinned_days": 198,
+  "latest_days": 178,
+  "own": "Error 200",
+  "category": "renamed: refused",
+  "evidence": "successor AABA returns Error 200"
+ }
+]

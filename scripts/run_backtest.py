@@ -37,9 +37,12 @@ if str(REPO_ROOT) not in sys.path:
 from backtest.portfolio_context import PortfolioContext, RunnerBook
 from backtest.symbol_aliases import (
     BACKTEST_ALIASES,
+    BACKTEST_UNPRICED,
     BacktestAlias,
+    Unpriced,
     backtest_contract,
     clip_to_alias,
+    drop_unpriced,
 )
 from backtest.ranked_selection import (
     ReplacementPolicy,
@@ -473,6 +476,7 @@ def fetch_bars_from_ib(
     port: int = 7497,
     client_id: int = 10,
     aliases: Mapping[str, BacktestAlias] | None = None,
+    unpriced: Mapping[str, Unpriced] | None = None,
 ) -> dict[str, list[dict]]:
     """Fetch daily OHLCV bars from IB Gateway.
 
@@ -480,7 +484,8 @@ def fetch_bars_from_ib(
     For 10 years of daily bars, we request in 1-year chunks.
 
     ``aliases`` (KAN-119): former members priced under the conId they trade
-    as today, stored under the membership ticker. Only this script's own
+    as today, stored under the membership ticker; ``unpriced``: members whose
+    IB series is another company, stored with no bars. Only this script's own
     backtest passes them; the paper run calls this function too and must not.
     """
     import asyncio as _asyncio
@@ -497,54 +502,64 @@ def fetch_bars_from_ib(
     bars_by_ticker: dict[str, list[dict]] = {}
     failed: list[str] = []
 
+    def _series(contract) -> list[dict]:
+        """Up to ``years`` of daily bars for one contract, oldest first."""
+        ib.qualifyContracts(contract)
+
+        # Request in 1-year chunks to stay within IB limits
+        all_bars: list[dict] = []
+        chunk_end = end_date
+        for _ in range(years):
+            duration = "1 Y"
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime=chunk_end.strftime("%Y%m%d 23:59:59"),
+                durationStr=duration,
+                barSizeSetting="1 day",
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
+            )
+            for b in bars:
+                bar_date = b.date if isinstance(b.date, date) else date.fromisoformat(str(b.date))
+                all_bars.append({
+                    "date": bar_date,
+                    "open": float(b.open),
+                    "high": float(b.high),
+                    "low": float(b.low),
+                    "close": float(b.close),
+                    "volume": int(b.volume),
+                })
+            # Move back for next chunk
+            chunk_end = chunk_end - timedelta(days=365)
+            ib.sleep(0.5)  # pace requests
+
+        # Deduplicate and sort by date
+        seen_dates = set()
+        unique: list[dict] = []
+        for bar in sorted(all_bars, key=lambda b: b["date"]):
+            if bar["date"] not in seen_dates:
+                seen_dates.add(bar["date"])
+                unique.append(bar)
+
+        # Filter to requested range
+        return [b for b in unique if b["date"] >= start_date]
+
     for i, ticker in enumerate(tickers):
         print(f"  [{i+1}/{len(tickers)}] Fetching {ticker}...", end=" ", flush=True)
         t0 = time.time()
 
         try:
-            contract = backtest_contract(ticker, aliases)
-            ib.qualifyContracts(contract)
-
-            # Request in 1-year chunks to stay within IB limits
-            all_bars: list[dict] = []
-            chunk_end = end_date
-            for _ in range(years):
-                duration = "1 Y"
-                bars = ib.reqHistoricalData(
-                    contract,
-                    endDateTime=chunk_end.strftime("%Y%m%d 23:59:59"),
-                    durationStr=duration,
-                    barSizeSetting="1 day",
-                    whatToShow="TRADES",
-                    useRTH=True,
-                    formatDate=1,
+            entry = (unpriced or {}).get(ticker)
+            if entry is not None and entry.before is None:
+                # Its IB series is another company: no bars, counted excluded.
+                print("UNPRICED (KAN-119)", end=" ")
+                unique_bars: list[dict] = []
+            else:
+                unique_bars = clip_to_alias(
+                    ticker, _series(backtest_contract(ticker, aliases)), aliases
                 )
-                for b in bars:
-                    bar_date = b.date if isinstance(b.date, date) else date.fromisoformat(str(b.date))
-                    all_bars.append({
-                        "date": bar_date,
-                        "open": float(b.open),
-                        "high": float(b.high),
-                        "low": float(b.low),
-                        "close": float(b.close),
-                        "volume": int(b.volume),
-                    })
-                # Move back for next chunk
-                chunk_end = chunk_end - timedelta(days=365)
-                ib.sleep(0.5)  # pace requests
-
-            # Deduplicate and sort by date
-            seen_dates = set()
-            unique_bars = []
-            for bar in sorted(all_bars, key=lambda b: b["date"]):
-                if bar["date"] not in seen_dates:
-                    seen_dates.add(bar["date"])
-                    unique_bars.append(bar)
-
-            # Filter to requested range
-            unique_bars = [b for b in unique_bars if b["date"] >= start_date]
-            # An alias stops where the membership file lists the new ticker.
-            unique_bars = clip_to_alias(ticker, unique_bars, aliases)
+                unique_bars = drop_unpriced(ticker, unique_bars, unpriced)
 
             elapsed = time.time() - t0
             print(f"{len(unique_bars)} bars ({elapsed:.1f}s)")
@@ -2765,6 +2780,7 @@ def main():
             host=args.ib_host,
             port=args.ib_port,
             aliases=BACKTEST_ALIASES,
+            unpriced=BACKTEST_UNPRICED,
         )
 
     if not bars_by_ticker:
