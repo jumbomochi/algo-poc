@@ -69,6 +69,7 @@ from scripts.run_backtest import (
 )
 from scripts.fetch_fundamentals import (
     build_fundamentals_lookup,
+    history_coverage_problem,
     SECTOR_MAP,
 )
 from scripts.fetch_earnings import build_earnings_lookup
@@ -83,6 +84,7 @@ from backtest.portfolio_context import PortfolioContext, RunnerBook
 from backtest.ranked_selection import ReplacementPolicy
 from backtest.aggregate_risk import AggregateRiskMonitor
 from backtest.divergence import DEFAULT_WINDOW_DAYS
+from backtest.runner import collect_sorted_dates
 from backtest.shadow_artifact import dump_shadow, load_shadow, shadow_id_for
 from backtest.shadow_series import (
     SHADOW_LOOKBACK_SESSIONS,
@@ -247,6 +249,50 @@ def capital_flow_steps_by_sleeve(
         if steps:
             out[name] = steps
     return out
+
+
+def shadow_data_degraded(
+    data_degraded: Mapping[str, str] | None,
+    *,
+    fundamentals: Mapping[str, list[dict]],
+    bars_by_ticker: dict[str, list[dict]],
+    sessions_back: int,
+    max_missing_fraction: float,
+) -> dict[str, str]:
+    """The live run's degraded sleeves, plus quality_value when its fundamentals
+    history starts after the shadow's warm-up could (KAN-110).
+
+    The live run reads only the newest quarter, so a cache kept as first seen
+    is fit to trade on long before it can replay a warm-up that opens
+    ``sessions_back`` sessions ago. Grading a replay that ranked on nothing for
+    its first months would grade the data gap, not the model, so the sleeve is
+    left ungraded (NO_DATA) instead, as when it had no cache at all.
+    """
+    degraded = dict(data_degraded or {})
+    if "quality_value" in degraded:
+        return degraded
+    def day(value: Any) -> date:
+        if isinstance(value, datetime):
+            return value.date()
+        return value if isinstance(value, date) else date.fromisoformat(str(value)[:10])
+
+    sessions = sorted({day(d) for d in collect_sorted_dates(bars_by_ticker)})
+    if not sessions:
+        return degraded
+    start = sessions[max(len(sessions) - sessions_back, 0)]
+    present = [
+        t for t in UNIVERSE_REGISTRY["quality_value"]
+        if bars_by_ticker.get(t) and day(bars_by_ticker[t][0]["date"]) <= start
+    ]
+    problem = history_coverage_problem(
+        fundamentals,
+        start=start,
+        tickers=present,
+        max_missing_fraction=max_missing_fraction,
+    )
+    if problem:
+        degraded["quality_value"] = problem
+    return degraded
 
 
 def produce_shadow_artifact(
@@ -2581,7 +2627,16 @@ def main() -> int | None:
                     window_sessions=SHADOW_WINDOW_SESSIONS,
                     bars_session=bars_session,
                     priced_at=fetch_started_at,
-                    data_degraded=data_degraded,
+                    data_degraded=shadow_data_degraded(
+                        data_degraded,
+                        fundamentals=caches.fundamentals.data,
+                        bars_by_ticker=bars_by_ticker,
+                        sessions_back=SHADOW_WINDOW_SESSIONS
+                        + _config.divergence.shadow_warmup_sessions,
+                        max_missing_fraction=(
+                            _config.data.fundamentals.max_stale_ticker_fraction
+                        ),
+                    ),
                     cash_buffer_bps=_config.currency.sleeve_cash_buffer_bps,
                     warmup_sessions=_config.divergence.shadow_warmup_sessions,
                 )

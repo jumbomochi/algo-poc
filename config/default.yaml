@@ -231,19 +231,34 @@ data:
   # and its shadow is not graded. A cache written
   # before fetched_at existed has an unknown age and counts as stale.
   fundamentals:
-    max_fetch_age_days: 14         # weekly refresh, one miss tolerated
+    max_fetch_age_days: 14         # daily refresh; 2 weeks of paged failures
     max_period_age_days: 167       # longest quarter (92d) + 75d 10-K deadline
     max_stale_ticker_fraction: 0.2 # sleeve-kill-criteria.md's 20% bound
+    # Alpha Vantage refresh (KAN-110, scripts/fetch_fundamentals.py): the
+    # second step of the 04:45 earnings full run, same lock. 2 requests per
+    # ticker (INCOME_STATEMENT + BALANCE_SHEET). A quarter is kept only if
+    # first seen within capture_window_days of its period end and is never
+    # overwritten: Alpha Vantage serves restated figures, so this is how the
+    # cache stays as first reported.
+    refresh:
+      calls_per_run: 6
+      min_interval_seconds: 13
+      capture_window_days: 135
+      statement_lag_days: 3
+      retry_days: 3
+      aging_days: 100
+      aging_retry_days: 7
   earnings:
     max_fetch_age_days: 2          # = the lookup window: refresh daily
     # Alpha Vantage refresh (KAN-110, scripts/fetch_earnings.py): a full run
     # at 04:45 SGT and a top-up at 05:05 (local.algo-earnings-refresh /
     # local.algo-earnings-topup), every day. Sized for the FREE tier (25
-    # requests/day): 1 calendar + 16 EARNINGS at 04:45, at most 4 at 05:05 —
-    # 21, leaving 4 for a hand-run. For a paid plan raise calls_per_run and
-    # drop min_interval_seconds to the plan's per-minute limit (75/min -> 0.9).
+    # requests/day): 1 calendar + 12 EARNINGS at 04:45, at most 4 at 05:05,
+    # and the fundamentals step's 6 — 23, leaving 2 for a hand-run. For a paid
+    # plan raise calls_per_run and drop min_interval_seconds to the plan's
+    # per-minute limit (75/min -> 0.9).
     refresh:
-      calls_per_run: 16
+      calls_per_run: 12
       topup_calls: 4
       topup_recent_days: 1
       topup_refetch_minutes: 10

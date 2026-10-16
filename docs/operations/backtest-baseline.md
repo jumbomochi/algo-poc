@@ -610,6 +610,8 @@ python scripts/run_backtest.py \
     --output-dir output
 
 # 2. Refresh fundamentals / earnings caches if the universe changed.
+#    fundamentals.json keeps each quarter as first seen (KAN-110): its history
+#    starts in 2026, so a backtest starting earlier marks quality_value SHALLOW.
 python scripts/fetch_fundamentals.py
 python scripts/fetch_earnings.py --universe pit   # Alpha Vantage, budgeted: see KAN-110
 

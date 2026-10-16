@@ -208,7 +208,7 @@ signal decay. That changes the remedy, not the trigger.
 |---|---|
 | Divergence | `BREACH` for 10 consecutive sessions against the epoch manifest's baseline id |
 | Drawdown | sleeve equity decline exceeds **16.70%** |
-| Signal staleness | **the yfinance quarterly-fundamentals feed** (`scripts/fetch_fundamentals.py` → `data/cache/fundamentals.json`) failing to refresh, or returning no ROE / D/E / margin for ≥20% of `SP500_TOP100`, for **more than 5 consecutive** sessions. yfinance is an unofficial scraper with no contract; this and `earnings_drift` are the only sleeves whose signal can die while every price still prints |
+| Signal staleness | **the Alpha Vantage quarterly-statements feed** (`scripts/fetch_fundamentals.py` → `data/cache/fundamentals.json`, daily since KAN-110) failing to refresh, or returning no ROE / D/E / margin for ≥20% of `SP500_TOP100`, for **more than 5 consecutive** sessions. It is a free tier with no service commitment; this and `earnings_drift` are the only sleeves whose signal can die while every price still prints |
 | Safety incident | any halt, unattributed order, or silent failure traced to this sleeve |
 
 **Demotion:** one stage. Re-promotion via the pipeline.

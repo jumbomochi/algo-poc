@@ -38,8 +38,15 @@ def _exec(path: Path, body: str) -> Path:
     return path
 
 
+FUND_CURRENT = (
+    "FUNDAMENTALS_REFRESH status=CURRENT calls=6 fetched=3 quarters_added=3 behind=0 "
+    "live_unfetched=0 errors=0 fetched_at=2026-10-08T20:47:00+00:00"
+)
+
+
 def _drive(tmp_path: Path, *, exit_code: int, output: str = "", av_key: bool = True,
-           args: tuple[str, ...] = ()):
+           args: tuple[str, ...] = (), fund_exit_code: int = 0,
+           fund_output: str = FUND_CURRENT):
     tree = tmp_path / "algo-dir"
     shutil.copytree(DEPLOY_DIR, tree / "deploy" / "launchd")
     argv_log = tmp_path / "python-argv.log"
@@ -50,6 +57,10 @@ def _drive(tmp_path: Path, *, exit_code: int, output: str = "", av_key: bool = T
         f'printf "%s\\n" "$*" >> "{argv_log}"\n'
         # Record only whether the key arrived, never its value.
         f'[ -n "${{ALPHAVANTAGE_API_KEY:-}}" ] && echo KEY_PRESENT >> "{env_log}"\n'
+        'case "$*" in *fetch_fundamentals.py*)\n'
+        f"cat <<'EOF'\n{fund_output}\nEOF\n"
+        f"exit {fund_exit_code} ;;\n"
+        "esac\n"
         f"cat <<'EOF'\n{output}\nEOF\n"
         f"exit {exit_code}\n",
     )
@@ -80,6 +91,7 @@ def _drive(tmp_path: Path, *, exit_code: int, output: str = "", av_key: bool = T
         "ALGO_CAFFEINATE_BIN": str(tmp_path / "no-caffeinate"),
         "ALGO_DEADMAN_EARNINGS_URL": PING_URL,
         "ALGO_BOUNDED_POLL_SECONDS": "1",
+        "ALGO_FUNDAMENTALS_START_DELAY_SECONDS": "0",
     }
     result = subprocess.run(
         ["/bin/bash", str(tree / "deploy" / "launchd" / WRAPPER.name), *args],
@@ -361,11 +373,91 @@ def test_the_top_up_job_runs_daily_at_05_05_with_the_flag():
 
 
 def test_the_documented_daily_budget_fits_the_free_tier():
-    """Full (1 calendar + calls_per_run) plus the top-up, with headroom."""
+    """Full (1 calendar + calls_per_run), its fundamentals step and the
+    top-up, with two requests of the free tier's 25 left for a hand-run."""
     from shared.config import load_config
 
-    cfg = load_config("config/default.yaml").data.earnings.refresh
-    assert 1 + cfg.calls_per_run + cfg.topup_calls <= 21
+    data = load_config("config/default.yaml").data
+    cfg = data.earnings.refresh
+    fundamentals = data.fundamentals.refresh.calls_per_run
+    assert 1 + cfg.calls_per_run + fundamentals + cfg.topup_calls <= 23
+    assert fundamentals >= 2, "a ticker needs two statements"
+
+
+# --- KAN-110 fundamentals step ----------------------------------------------
+
+
+def _fund_argv(run) -> list[str]:
+    return [line for line in run["argv"].splitlines() if "fetch_fundamentals.py" in line]
+
+
+@pytest.mark.parametrize("code", [0, 3])
+def test_the_full_run_refreshes_fundamentals_after_earnings(tmp_path, code):
+    run = _drive(tmp_path, exit_code=code, output=CURRENT)
+    lines = run["argv"].splitlines()
+    assert lines[0].startswith("scripts/fetch_earnings.py")
+    assert lines[1] == "scripts/fetch_fundamentals.py", "fundamentals must run second"
+    assert "fundamentals refresh OK" in run["log"]
+    assert run["rc"] == code, "the fundamentals step must not change the job's exit code"
+
+
+@pytest.mark.parametrize("code", [1, 2, 75, 124])
+def test_fundamentals_are_not_attempted_after_an_earnings_failure(tmp_path, code):
+    run = _drive(tmp_path, exit_code=code, output="EARNINGS_REFRESH status=X")
+    assert _fund_argv(run) == []
+    assert f"fundamentals refresh SKIPPED (earnings exit {code})" in run["log"]
+
+
+def test_the_top_up_never_refreshes_fundamentals(tmp_path):
+    run = _drive(tmp_path, exit_code=0, output=CURRENT, args=("--top-up",))
+    assert _fund_argv(run) == []
+
+
+def test_a_fundamentals_failure_pages_but_leaves_the_earnings_ping_alone(tmp_path):
+    run = _drive(tmp_path, exit_code=0, output=CURRENT, fund_exit_code=2,
+                 fund_output="FUNDAMENTALS_REFRESH status=FAILED stopped='limit'")
+    assert run["rc"] == 0
+    assert len(_pings(run)) == 1, "the dead-man belongs to the earnings run"
+    [message] = _telegrams(run)
+    assert "Fundamentals refresh FAILED" in message and "status=FAILED" in message
+
+
+@pytest.mark.parametrize(
+    "code, marker", [(1, "could not run"), (75, "SKIPPED"), (124, "TIMED OUT"), (9, "could not run")]
+)
+def test_every_other_fundamentals_failure_pages(tmp_path, code, marker):
+    run = _drive(tmp_path, exit_code=0, output=CURRENT, fund_exit_code=code,
+                 fund_output="FUNDAMENTALS_REFRESH status=X")
+    [message] = _telegrams(run)
+    assert "Fundamentals refresh" in message and marker in message
+
+
+def test_the_initial_fill_is_logged_not_paged(tmp_path):
+    run = _drive(tmp_path, exit_code=0, output=CURRENT, fund_exit_code=3,
+                 fund_output="FUNDAMENTALS_REFRESH status=INCOMPLETE live_unfetched=90")
+    assert _telegrams(run) == []
+    assert "fundamentals refresh INCOMPLETE" in run["log"]
+
+
+def test_fundamentals_standing_warnings_are_paged(tmp_path):
+    output = (
+        "LIVE_NO_DATA: Alpha Vantage has no usable statements for ZZZ\n"
+        "LIVE_REFUSED: Alpha Vantage has refused the statements of YYY\n" + FUND_CURRENT
+    )
+    run = _drive(tmp_path, exit_code=0, output=CURRENT, fund_output=output)
+    messages = _telegrams(run)
+    assert len(messages) == 2
+    assert any("ZZZ" in m for m in messages) and any("YYY" in m for m in messages)
+
+
+def test_the_fundamentals_step_ends_before_the_top_up():
+    """Worst case: earnings bounded at 15 min from 04:45, a gap, then the step."""
+    text = WRAPPER.read_text()
+    earnings = int(text.split('ALGO_EARNINGS_TIMEOUT_SECONDS:-')[1].split('}')[0])
+    step = int(text.split('ALGO_FUNDAMENTALS_TIMEOUT_SECONDS:-')[1].split('}')[0])
+    gap = int(text.split('ALGO_FUNDAMENTALS_START_DELAY_SECONDS:-')[1].split('}')[0])
+    kill_grace = 20
+    assert earnings + kill_grace + gap + step + kill_grace < 20 * 60
 
 
 @pytest.mark.parametrize(

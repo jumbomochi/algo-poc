@@ -122,7 +122,11 @@ def _context_exit_quantity(
         0.0,
     )
     return uncovered if uncovered > 0 else None
-from scripts.fetch_fundamentals import build_fundamentals_lookup, SECTOR_MAP
+from scripts.fetch_fundamentals import (
+    SECTOR_MAP,
+    build_fundamentals_lookup,
+    history_coverage_problem,
+)
 from scripts.fetch_earnings import build_earnings_lookup
 from shared.data_cache import (
     EARNINGS_WINDOW_DAYS,
@@ -216,6 +220,10 @@ def load_backtest_caches(
         rows = len(caches.document(verdict.cache).data)
         print(f"  {verdict.describe()} — {rows} tickers, {verdict.path}")
     degraded = health.degraded_sleeves(sleeves)
+    shallow = _shallow_fundamentals(caches, bars_by_ticker, config)
+    if shallow and "quality_value" in sleeves and "quality_value" not in degraded:
+        print(f"  {shallow}")
+        degraded["quality_value"] = shallow
     if not degraded:
         return caches, degraded
 
@@ -236,6 +244,34 @@ def load_backtest_caches(
             f"(KAN-109)."
         )
     return caches, degraded
+
+
+def _shallow_fundamentals(
+    caches: DataCaches, bars_by_ticker: dict[str, list[dict]], config: Any
+) -> str | None:
+    """``SHALLOW`` when the fundamentals history starts after this backtest does.
+
+    Freshness is judged at the newest bar, which an as-first-seen cache
+    (KAN-110) passes while holding nothing for the years before it began.
+    The names judged are quality_value's universe among those with bars
+    within 30 days of the backtest's first session.
+    """
+    firsts = {
+        t: _bar_day(bars[0]["date"]) for t, bars in bars_by_ticker.items() if bars
+    }
+    if not firsts:
+        return None
+    start = min(firsts.values())
+    present = [
+        t for t in UNIVERSE_REGISTRY["quality_value"]
+        if t in firsts and firsts[t] <= start + timedelta(days=30)
+    ]
+    return history_coverage_problem(
+        caches.fundamentals.data,
+        start=start,
+        tickers=present,
+        max_missing_fraction=config.fundamentals.max_stale_ticker_fraction,
+    )
 
 
 def absent_cache_sleeves(

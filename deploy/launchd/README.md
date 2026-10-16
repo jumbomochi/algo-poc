@@ -907,7 +907,7 @@ Two jobs, one wrapper, **every day, weekends included**:
 
 | Job | Slot (SGT) | Runs | Requests (free tier) |
 |---|---|---|---|
-| `local.algo-earnings-refresh` | 04:45 | `scripts/fetch_earnings.py --universe pit` | 1 calendar + ≤16 EARNINGS |
+| `local.algo-earnings-refresh` | 04:45 | `scripts/fetch_earnings.py --universe pit`, then `scripts/fetch_fundamentals.py` | 1 calendar + ≤12 EARNINGS, then ≤6 statements |
 | `local.algo-earnings-topup` | 05:05 | `scripts/fetch_earnings.py --top-up` | ≤4 EARNINGS, no calendar |
 
 Both merge atomically into `data.cache_dir/earnings.json` (plus
@@ -928,10 +928,22 @@ rationale in the wrapper header.
   `secrets.sh --check` lists it under its own heading without failing on it,
   `--import` prompts for it, `--export`/`--env-file` never emit it. Missing →
   the job aborts with ❌ + `ALERTS.log`.
-- **Budget (free tier, 25 requests/day):** 17 + 4 = 21 a day, 13 s apart,
-  retries included (`data.earnings.refresh` in `config/default.yaml`). A paid
-  plan is a config change: raise `calls_per_run`, lower
-  `min_interval_seconds`.
+- **Budget (free tier, 25 requests/day):** 13 + 6 + 4 = 23 a day, 13 s apart,
+  retries included (`data.earnings.refresh` and `data.fundamentals.refresh` in
+  `config/default.yaml`), 2 left for a hand-run. A paid plan is a config
+  change: raise both `calls_per_run`, lower `min_interval_seconds`.
+- **Fundamentals step (04:45 only):** after the earnings fetch, the same run
+  refreshes `fundamentals.json` for quality_value — Alpha Vantage
+  INCOME_STATEMENT + BALANCE_SHEET for at most 3 tickers, under the same lock.
+  Each quarter is kept **as first seen** (only within 135 days of its period
+  end) and never overwritten, because Alpha Vantage serves restated figures;
+  so the history is shallow and grows forward, and a backtest or shadow that
+  starts before it marks quality_value `SHALLOW` (degraded) rather than grading
+  it on empty lookups. The initial fill takes ~33 runs (99 tickers, 3 a run);
+  quality_value stays DATA-DEGRADED until it completes. Its outcome never
+  changes the job's exit code or the dead-man ping; 1, 2, 75 and 124
+  Telegram, 3 (the fill) is logged only, and KAN-109 degrades the sleeve once
+  `fetched_at` is 14 days old. Bookkeeping in `fundamentals_fetch_state.json`.
 - **Failures:** a transport error is retried once, then that ticker is
   skipped; 3 in a row stop the run. A live ticker Alpha Vantage refuses
   (`Error Message`) on 3 consecutive days stops gating freshness and is
@@ -945,8 +957,8 @@ rationale in the wrapper header.
 - **Logs:** `~/ibc/logs/earnings_refresh_YYYYMMDD.log` (both runs, pruned after
   30 days), launchd stdout/stderr to `~/ibc/logs/earnings-refresh-launchd.log`.
 - **By hand:** `.venv/bin/python scripts/fetch_earnings.py --dry-run [--top-up]`
-  prints the plan without a request; the script reads the key from the
-  keychain itself.
+  and `.venv/bin/python scripts/fetch_fundamentals.py --dry-run` print the plan
+  without a request; both read the key from the keychain themselves.
 
 ## Daily paper-DB backup
 

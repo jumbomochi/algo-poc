@@ -385,16 +385,27 @@ class AlphaVantageClient:
 
     def earnings(self, symbol: str) -> dict | None:
         """The EARNINGS payload, or ``None`` when Alpha Vantage knows no such symbol."""
-        text = self._get({"function": "EARNINGS", "symbol": symbol})
+        return self._symbol_json("EARNINGS", symbol)
+
+    def statement(self, function: str, symbol: str) -> dict | None:
+        """An INCOME_STATEMENT or BALANCE_SHEET payload (KAN-110 fundamentals),
+        or ``None`` when Alpha Vantage has nothing for the symbol (a delisted
+        name: ATVI and CELG answer ``{}``, 2026-10-16)."""
+        if function not in ("INCOME_STATEMENT", "BALANCE_SHEET"):
+            raise ValueError(f"not a statement function: {function}")
+        return self._symbol_json(function, symbol)
+
+    def _symbol_json(self, function: str, symbol: str) -> dict | None:
+        text = self._get({"function": function, "symbol": symbol})
         try:
             payload = json.loads(text)
         except ValueError:
             raise AlphaVantageError(
-                "malformed", self.scrub(f"EARNINGS {symbol}: not JSON: {text[:120]!r}")
+                "malformed", self.scrub(f"{function} {symbol}: not JSON: {text[:120]!r}")
             ) from None
         self._notice(payload)
         if not isinstance(payload, dict):
-            raise AlphaVantageError("malformed", f"EARNINGS {symbol}: not an object")
+            raise AlphaVantageError("malformed", f"{function} {symbol}: not an object")
         # An unknown symbol is answered with ``{}`` (MMC, 2026-10-08).
         if not payload:
             return None
@@ -1267,7 +1278,11 @@ class LockHeld(RuntimeError):
 
 
 class _CacheLock:
-    """One refresh at a time per cache directory (flock, released on exit)."""
+    """One refresh at a time per cache directory (flock, released on exit).
+
+    The fundamentals refresh (``scripts/fetch_fundamentals.py``) takes the same
+    lock: both spend one Alpha Vantage quota and must never overlap.
+    """
 
     def __init__(self, cache_dir: Path):
         self.path = cache_dir / ".earnings_refresh.lock"
