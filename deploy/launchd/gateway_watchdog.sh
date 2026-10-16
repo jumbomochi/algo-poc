@@ -35,6 +35,13 @@
 # about their own symptom, none naming the cause. Stack liveness is now checked
 # on this job's 300s cycle. It ALERTS ONLY — never restarts docker.
 #
+# KAN-118 (2026-10-16): a 1100 does not always self-heal. On 2026-10-14 the
+# Gateway sat on "Connecting to server..." for 7h11m with one page. A validated
+# 1100 that lasts CONN_RESTART_SECS, with execution up, now gets ONE guarded
+# kickstart. It never runs into a rejected login, IBC's own restarts, the paper
+# slot or a running IB-client job, and it never runs twice for one outage.
+# While a 1100 lasts, the re-alert is hourly during US market hours.
+#
 # Wire via launchd with StartInterval (300s). See deploy/launchd/.
 #
 # NO DEAD-MAN: covered by others, at both ends (KAN-56 coverage review). This
@@ -76,6 +83,31 @@ CONN_SUSTAINED_SECS=180        # ignore a 1100 that self-heals within one cycle
 # had ended hours earlier. Past this the duration is reported as a floor, not a
 # measurement (KAN-63 part 3).
 CONN_AGE_CAP_SECS=$((24 * 3600))
+# KAN-118: a 1100 that outlives this is not going to self-heal. On 2026-10-14
+# the Gateway sat on "Connecting to server..." for 7h11m and recovered only when
+# a human restarted it. Past this, with the latch validated and execution up,
+# the watchdog restarts the Gateway ONCE (see conn_restart_decision).
+CONN_RESTART_SECS=1800
+# The restart record: which Gateway was restarted, when, and how it turned out.
+# Never deleted; its rules are self-limiting (see conn_restart_decision).
+CONN_RESTART_MARKER="$HOME/ibc/.gateway_connectivity_restarted"
+# A Gateway that started within this long after our kickstart is the one the
+# kickstart produced. A sustained 1100 on it is not restarted again.
+CONN_RESTART_BORN_SECS=900
+# How long a restarted Gateway gets to reopen its port before the outcome is
+# paged as "still down".
+CONN_RESTART_VERIFY_SECS=900
+# launchd jobs that hold an IB API session of their own. A restart under them
+# would break a paper run mid-decision or a 5h refresh fetch.
+IB_CLIENT_JOBS="local.algo-paper-trading local.algo-backtest-refresh"
+# Scheduled Gateway restarts the watchdog must not race. They mirror
+# ~/ibc/config.ini (AutoRestartTime=2:00 PM, ColdRestartTime=08:00 on Sundays),
+# recorded in deploy/launchd/README.md and asserted by the test suite.
+IBC_AUTO_RESTART_HOUR=14
+IBC_AUTO_RESTART_MIN=0
+IBC_COLD_RESTART_WDAY=0
+IBC_COLD_RESTART_HOUR=8
+IBC_COLD_RESTART_MIN=0
 DOCKER_ALERT_MARKER="$HOME/ibc/.docker_stack_alerted"
 DOCKER_STRIKE_MARKER="$HOME/ibc/.docker_stack_strike"
 REALERT_MAX_SECS=$((12 * 3600))
@@ -256,6 +288,31 @@ auth_realert_secs() {
     else echo "$REALERT_MAX_SECS"; fi                       # else  → every 12h
 }
 
+# KAN-118: true while a US regular session can be open, in SGT. The union of
+# both seasons (21:30–04:00 under EDT, 22:30–05:00 under EST), so it needs no
+# DST table: an evening on Mon–Fri, or the small hours of Tue–Sat. Exchange
+# holidays are not modelled; an extra hourly page on one is harmless.
+in_us_market_hours() {
+    local whms w h m s sod
+    whms="$(algo_local_wday_hms "$(now_epoch)")" || return 1
+    read -r w h m s <<< "$whms"
+    sod=$(( 10#$h * 3600 + 10#$m * 60 ))
+    if [ "$sod" -ge $(( 21 * 3600 + 30 * 60 )) ]; then
+        [ "$w" -ge 1 ] && [ "$w" -le 5 ]
+    elif [ "$sod" -lt $(( 5 * 3600 )) ]; then
+        [ "$w" -ge 2 ] && [ "$w" -le 6 ]
+    else
+        return 1
+    fi
+}
+
+# KAN-118: how often to re-alert while the Gateway cannot route orders but its
+# port is up. One page in seven hours (2026-10-14) is too quiet for an outage
+# that overlaps a session; outside one, the 12h cadence is unchanged.
+conn_realert_secs() {
+    if in_us_market_hours; then echo 3600; else echo "$REALERT_MAX_SECS"; fi
+}
+
 # --------------------------------------------------------------------------
 # KAN-66: docker engine + compose stack liveness
 # --------------------------------------------------------------------------
@@ -337,6 +394,147 @@ stamp_conn_marker() {
         "$pid" "$started" >> "$CONN_MARKER" 2>/dev/null || true
 }
 
+# True when the newest IBC log shows IB rejecting the login. Any kickstart into
+# that state loops failed logins toward a lockout (2026-07-01, 30 rejections),
+# so both restart paths ask this first.
+ibc_login_rejected() {
+    local latest
+    latest=$(ls -t "$LOG_DIR"/ibc-*.txt 2>/dev/null | head -1)
+    [ -n "$latest" ] && tail -80 "$latest" 2>/dev/null \
+        | grep -qE "Unrecognized Username or Password|Too many failed login attempts"
+}
+
+# --------------------------------------------------------------------------
+# KAN-118: restart a Gateway stuck in a sustained Error 1100, once
+# --------------------------------------------------------------------------
+# `key=value` out of the restart record, or "" if absent.
+restart_marker_field() {
+    sed -n "s/^$1=//p" "$CONN_RESTART_MARKER" 2>/dev/null | head -1
+}
+
+# Set one field of the restart record in place, keeping the others.
+set_restart_marker_field() {
+    local key="$1" value="$2" tmp
+    [ -f "$CONN_RESTART_MARKER" ] || return 0
+    tmp="$CONN_RESTART_MARKER.tmp.$$"
+    { grep -v "^$key=" "$CONN_RESTART_MARKER" 2>/dev/null; printf '%s=%s\n' "$key" "$value"; } \
+        > "$tmp" && mv "$tmp" "$CONN_RESTART_MARKER"
+}
+
+# "HH:MM" of an epoch, for pages. Falls back to the bare epoch.
+hhmm_of() {
+    local hms h m _s
+    if hms="$(algo_local_hms "$1")"; then
+        read -r h m _s <<< "$hms"; echo "$h:$m"
+    else
+        echo "$1"
+    fi
+}
+
+# Is any launchd job that holds its own IB session running right now? A job is
+# running when `launchctl list` shows a numeric PID for it.
+ib_client_job_running() {
+    "$ALGO_LAUNCHCTL_BIN" list 2>/dev/null | awk -v jobs=" $IB_CLIENT_JOBS " '
+        index(jobs, " " $NF " ") && $1 ~ /^[0-9]+$/ { print $NF; found = 1; exit }
+        END { exit !found }'
+}
+
+# Prints why a restart must wait right now, or nothing (exit 1) when it may go
+# ahead. Deferral, not refusal: the next cycle asks again. An unreadable clock
+# defers, because every window below is a time-of-day.
+restart_blackout_reason() {
+    local whms w h m s sod job win rd
+    if ! whms="$(algo_local_wday_hms "$(now_epoch)")"; then
+        echo "the local time of day cannot be read"; return 0
+    fi
+    read -r w h m s <<< "$whms"
+    sod=$(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+
+    # IBC's own daily restart, and its weekly cold restart: 10 min before to
+    # 15 min after, so the two can never stack.
+    win=$(( IBC_AUTO_RESTART_HOUR * 3600 + IBC_AUTO_RESTART_MIN * 60 ))
+    if [ "$sod" -ge $(( win - 600 )) ] && [ "$sod" -lt $(( win + 900 )) ]; then
+        echo "IBC's daily auto-restart ($(printf '%02d:%02d' "$IBC_AUTO_RESTART_HOUR" "$IBC_AUTO_RESTART_MIN")) is due or in progress"; return 0
+    fi
+    win=$(( IBC_COLD_RESTART_HOUR * 3600 + IBC_COLD_RESTART_MIN * 60 ))
+    if [ "$w" -eq "$IBC_COLD_RESTART_WDAY" ] && [ "$sod" -ge $(( win - 600 )) ] && [ "$sod" -lt $(( win + 900 )) ]; then
+        echo "IBC's weekly cold restart (Sun $(printf '%02d:%02d' "$IBC_COLD_RESTART_HOUR" "$IBC_COLD_RESTART_MIN")) is due or in progress"; return 0
+    fi
+
+    # The paper run's slot: 5 min before it to 15 min after, on the days it
+    # runs. The running-job check below covers a run that goes long.
+    win=$(( PAPER_RUN_HOUR * 3600 + PAPER_RUN_MIN * 60 ))
+    for rd in $PAPER_RUN_WEEKDAYS; do
+        if [ $(( rd % 7 )) -eq "$w" ] && [ "$sod" -ge $(( win - 300 )) ] && [ "$sod" -lt $(( win + 900 )) ]; then
+            echo "the $(printf '%02d:%02d' "$PAPER_RUN_HOUR" "$PAPER_RUN_MIN") paper run's slot is open"; return 0
+        fi
+    done
+
+    if job="$(ib_client_job_running)"; then
+        echo "$job is running and holds its own IB session"; return 0
+    fi
+    return 1
+}
+
+# Decide what to do about a VALIDATED, sustained 1100 with execution up. Prints
+# one of:
+#   restart            kickstart now
+#   wait <text>        not yet (under CONN_RESTART_SECS, or a blackout)
+#   refuse <text>      never for this outage (already restarted, or login
+#                      rejected); the alert says a human is needed
+# Arguments: latch age, running Gateway pid, running Gateway start epoch.
+conn_restart_decision() {
+    local age="$1" gw_pid="$2" gw_started="$3" r_pid r_at born reason
+    r_pid="$(restart_marker_field restarted_pid)"
+    r_at="$(restart_marker_field restarted_at)"
+    case "$r_at" in ''|*[!0-9]*) r_at="" ;; esac
+
+    # Once per outage, keyed on the Gateway process. Same pid: the kickstart
+    # did not replace the process. A Gateway born just after our kickstart:
+    # the restart produced it, and it went straight back into a 1100.
+    if [ -n "$r_pid" ] && [ "$r_pid" = "$gw_pid" ]; then
+        echo "refuse the watchdog already restarted this Gateway (pid $gw_pid) at $(hhmm_of "${r_at:-0}") and the same process is still in Error 1100"; return 0
+    fi
+    if [ -n "$r_at" ]; then
+        born=$(( gw_started - r_at ))
+        if [ "$born" -ge -5 ] && [ "$born" -le "$CONN_RESTART_BORN_SECS" ]; then
+            echo "refuse the watchdog restarted the Gateway at $(hhmm_of "$r_at") and the new one (pid $gw_pid) went back into Error 1100"; return 0
+        fi
+    fi
+    if ibc_login_rejected; then
+        echo "refuse the IBC log shows IB rejecting the login, and a restart would loop failed logins toward a lockout"; return 0
+    fi
+    if [ "$age" -lt "$CONN_RESTART_SECS" ]; then
+        echo "wait it will restart the Gateway if this lasts $((CONN_RESTART_SECS / 60)) min"; return 0
+    fi
+    if reason="$(restart_blackout_reason)"; then
+        echo "wait restart deferred: $reason"; return 0
+    fi
+    echo "restart"
+}
+
+# Kickstart the Gateway for a sustained 1100 and record it. The record is
+# written BEFORE the kickstart, so a watchdog killed mid-call can never restart
+# the same outage twice.
+conn_restart_gateway() {
+    local age="$1" gw_pid="$2" lost_at="$3" now
+    now="$(now_epoch)"
+    printf 'restarted_pid=%s\nrestarted_at=%s\nlost_at=%s\noutcome=pending\n' \
+        "$gw_pid" "$now" "$lost_at" > "$CONN_RESTART_MARKER"
+    echo "$(ts): IB Error 1100 sustained ${age}s (port $PORT up, execution up, latch validated for pid $gw_pid) — kickstarting $GW_LABEL (KAN-118, once per outage)" >> "$LOG_FILE"
+    "$ALGO_LAUNCHCTL_BIN" kickstart -k "gui/$(id -u)/$GW_LABEL" >> "$LOG_FILE" 2>&1
+    telegram "⚠️ IB Gateway was in Error 1100 (no server connectivity) for ~$((age / 60)) min with port $PORT up — the watchdog has RESTARTED it, once for this outage. It will report whether it came back."
+}
+
+# KAN-118: page how a restart turned out, once. $1 = recovered | failed,
+# $2 = the page. No-op unless a restart is awaiting its outcome.
+conn_restart_outcome() {
+    [ "$(restart_marker_field outcome)" = "pending" ] || return 1
+    set_restart_marker_field outcome "$1"
+    echo "$(ts): KAN-118 restart outcome: $1" >> "$LOG_FILE"
+    telegram "$2"
+}
+
 if nc -z -G 3 127.0.0.1 "$PORT" 2>/dev/null; then
     # Up — clear pending strikes. Only log/alert on a state change.
     if [ -f "$MARKER" ] || [ -f "$AUTH_MARKER" ]; then
@@ -347,8 +545,9 @@ if nc -z -G 3 127.0.0.1 "$PORT" 2>/dev/null; then
 
     # Port is up, but is IB *server* connectivity up? The execution service
     # drops CONN_MARKER (epoch of the loss) on Error 1100 and removes it on
-    # recovery (1101/1102). Alert on a SUSTAINED 1100 — no kickstart, since a
-    # 1100 usually self-heals and restarting would disrupt the session.
+    # recovery (1101/1102) or on any reconnect. Alert on a SUSTAINED 1100; a
+    # short one usually self-heals, but one that outlives CONN_RESTART_SECS
+    # gets ONE guarded restart (KAN-118).
     if [ -f "$CONN_MARKER" ]; then
         LOST_AT=$(head -1 "$CONN_MARKER" 2>/dev/null | tr -d ' ')
         case "$LOST_AT" in ''|*[!0-9]*) LOST_AT=0 ;; esac   # unreadable → very old
@@ -358,6 +557,9 @@ if nc -z -G 3 127.0.0.1 "$PORT" 2>/dev/null; then
         # this one survived a full Gateway process replacement while its writer
         # was dead in a stopped container.
         STALE_REASON=""
+        # Set only when the latch carries a stamp that matches the running
+        # Gateway: the one state in which a restart may be considered.
+        LATCH_VALIDATED=""
         if IDENT="$(gateway_identity)"; then
             read -r GW_PID GW_STARTED <<< "$IDENT"
             MARK_PID="$(conn_marker_field gateway_pid)"
@@ -369,6 +571,8 @@ if nc -z -G 3 127.0.0.1 "$PORT" 2>/dev/null; then
                 DRIFT=$(( MARK_STARTED - GW_STARTED )); [ "$DRIFT" -lt 0 ] && DRIFT=$(( -DRIFT ))
                 if [ "$MARK_PID" != "$GW_PID" ] || [ "$DRIFT" -gt 5 ]; then
                     STALE_REASON="it was recorded for Gateway pid $MARK_PID (started $MARK_STARTED), and the running Gateway is pid $GW_PID (started $GW_STARTED)"
+                else
+                    LATCH_VALIDATED=1
                 fi
             elif [ "$GW_STARTED" -gt $(( LOST_AT + 5 )) ]; then
                 # Unstamped or legacy bare-epoch marker: the Gateway started
@@ -384,7 +588,12 @@ if nc -z -G 3 127.0.0.1 "$PORT" 2>/dev/null; then
         if [ -n "$STALE_REASON" ]; then
             echo "$(ts): STALE Error 1100 latch dropped — $STALE_REASON" >> "$LOG_FILE"
             rm -f "$CONN_MARKER"
-            if [ -f "$CONN_ALERT_MARKER" ]; then
+            # After a KAN-118 restart this is the expected way the old latch
+            # goes: the Gateway it named was replaced, and the port is back.
+            if [ -n "$MARK_PID" ] && [ "$MARK_PID" = "$(restart_marker_field restarted_pid)" ] \
+                && conn_restart_outcome recovered "✅ IB Gateway is back after the watchdog's Error 1100 restart: port $PORT is up on a new Gateway session (pid $GW_PID), and the old session's latch has been dropped. Execution reconnects on its own timer."; then
+                rm -f "$CONN_ALERT_MARKER"
+            elif [ -f "$CONN_ALERT_MARKER" ]; then
                 telegram "✅ IB Gateway server connectivity: the Error 1100 latch was STALE and has been dropped — $STALE_REASON. No outage is in progress."
                 rm -f "$CONN_ALERT_MARKER"
             fi
@@ -409,19 +618,53 @@ if nc -z -G 3 127.0.0.1 "$PORT" 2>/dev/null; then
                     fi ;;
             esac
 
-            if need_alert "$CONN_ALERT_MARKER" "$REALERT_MAX_SECS"; then
+            # KAN-118: only a latch validated against the running Gateway, with
+            # its writer up and a readable loss time, is ever restarted for.
+            # Every other state keeps the alert-only behaviour.
+            if [ -n "$LATCH_VALIDATED" ] && [ "$EXEC_STATE" = "up" ] && [ "$LOST_AT" -gt 0 ]; then
+                DECISION="$(conn_restart_decision "$AGE" "$GW_PID" "$GW_STARTED")"
+            elif [ "$EXEC_STATE" = "up" ]; then
+                DECISION="wait it will restart the Gateway only once this latch is confirmed against the running Gateway"
+            else
+                DECISION="wait execution is $EXEC_STATE"
+            fi
+            if [ "$DECISION" = "restart" ]; then
+                conn_restart_gateway "$AGE" "$GW_PID" "$LOST_AT"
+                touch "$CONN_ALERT_MARKER"
+                exit 0
+            fi
+            RESTART_NOTE="${DECISION#* }"
+
+            REALERT_SECS="$(conn_realert_secs)"
+            if [ "$REALERT_SECS" -lt "$REALERT_MAX_SECS" ]; then
+                REPEAT_TEXT="Repeats hourly during US market hours, otherwise every 12h"
+            else
+                REPEAT_TEXT="Repeats every 12h, hourly during US market hours"
+            fi
+            if need_alert "$CONN_ALERT_MARKER" "$REALERT_SECS"; then
                 if [ "$EXEC_STATE" = "down" ]; then
                     echo "$(ts): Error 1100 latch present but the execution service is DOWN — reporting execution, not a 1100 duration" >> "$LOG_FILE"
                     algo_alert_local "execution service is down; the Error 1100 latch cannot be trusted or cleared"
-                    telegram "🚨 The execution service is DOWN. An IB Error 1100 latch is present, but execution is the only thing that writes or clears it, so its age means nothing — not reporting a 1100 duration. Fix the execution service. (Repeats every 12h.)"
+                    telegram "🚨 The execution service is DOWN. An IB Error 1100 latch is present, but execution is the only thing that writes or clears it, so its age means nothing — not reporting a 1100 duration. Fix the execution service. ($REPEAT_TEXT.)"
                 else
                     if [ "$AGE" -gt "$CONN_AGE_CAP_SECS" ]; then
                         AGE_TEXT="over $((CONN_AGE_CAP_SECS / 3600))h — the latch is older than this cap, so treat the duration as a floor, not a measurement"
                     else
                         AGE_TEXT="~$((AGE / 60)) min"
                     fi
-                    echo "$(ts): IB Error 1100 sustained ${AGE}s (port $PORT up, execution $EXEC_STATE) — alerting; NOT restarting" >> "$LOG_FILE"
-                    telegram "🚨 IB Gateway lost server connectivity (Error 1100) for $AGE_TEXT — port $PORT is up but no market data / order routing. Watchdog will NOT restart (a 1100 usually self-heals). Check the Gateway. (Repeats every 12h until it recovers.)"
+                    case "$DECISION" in
+                        refuse\ *)
+                            # A restart already failed, or would hammer a
+                            # rejected login: say plainly that it is a human's.
+                            echo "$(ts): IB Error 1100 sustained ${AGE}s (port $PORT up, execution $EXEC_STATE) — alerting; NOT restarting: $RESTART_NOTE" >> "$LOG_FILE"
+                            # This page IS the outcome page; record it so no
+                            # later branch reports this restart again.
+                            [ "$(restart_marker_field outcome)" = "pending" ] && set_restart_marker_field outcome failed
+                            telegram "🚨 IB Gateway lost server connectivity (Error 1100) for $AGE_TEXT — port $PORT is up but no market data / order routing. NOT restarting: $RESTART_NOTE. A human needs to look at the Gateway. ($REPEAT_TEXT until it recovers.)" ;;
+                        *)
+                            echo "$(ts): IB Error 1100 sustained ${AGE}s (port $PORT up, execution $EXEC_STATE) — alerting; not restarting yet: $RESTART_NOTE" >> "$LOG_FILE"
+                            telegram "🚨 IB Gateway lost server connectivity (Error 1100) for $AGE_TEXT — port $PORT is up but no market data / order routing. Watchdog: $RESTART_NOTE. ($REPEAT_TEXT until it recovers.)" ;;
+                    esac
                 fi
                 touch "$CONN_ALERT_MARKER"
             fi
@@ -434,6 +677,10 @@ if nc -z -G 3 127.0.0.1 "$PORT" 2>/dev/null; then
                 stamp_conn_marker "$GW_PID" "$GW_STARTED"
             fi
         fi
+    elif conn_restart_outcome recovered "✅ IB Gateway is back after the watchdog's Error 1100 restart (restarted at $(hhmm_of "$(restart_marker_field restarted_at)")): port $PORT is up and execution has cleared the latch."; then
+        # KAN-118: execution reconnected to the restarted Gateway and cleared
+        # the latch. That message replaces the generic all-clear below.
+        rm -f "$CONN_ALERT_MARKER"
     elif [ -f "$CONN_ALERT_MARKER" ]; then
         # 1100 cleared (execution removed CONN_MARKER on 1102) after we alerted.
         echo "$(ts): IB connectivity restored (Error 1100 cleared)" >> "$LOG_FILE"
@@ -443,11 +690,18 @@ if nc -z -G 3 127.0.0.1 "$PORT" 2>/dev/null; then
     exit 0
 fi
 
+# KAN-118: a restarted Gateway that never reopened its port. Paged once; the
+# two-strike port-down path below still applies on its own terms.
+R_AT="$(restart_marker_field restarted_at)"
+case "$R_AT" in ''|*[!0-9]*) R_AT="" ;; esac
+if [ -n "$R_AT" ] && [ $(( $(now_epoch) - R_AT )) -ge "$CONN_RESTART_VERIFY_SECS" ]; then
+    conn_restart_outcome failed "🚨 The watchdog restarted the IB Gateway at $(hhmm_of "$R_AT") for a sustained Error 1100, and port $PORT is still DOWN $(( ($(now_epoch) - R_AT) / 60 )) min later. The port-down path takes over from here; check the Gateway." || true
+fi
+
 # Port is down. FIRST: is the Gateway stuck on a login rejection? Restarting
 # into that state hammers IB with failed logins — refuse and alert instead.
 LATEST_GW_LOG=$(ls -t "$LOG_DIR"/ibc-*.txt 2>/dev/null | head -1)
-if [ -n "$LATEST_GW_LOG" ] && tail -80 "$LATEST_GW_LOG" 2>/dev/null \
-        | grep -qE "Unrecognized Username or Password|Too many failed login attempts"; then
+if ibc_login_rejected; then
     # Alert immediately, then RE-ALERT on the escalating schedule while
     # unresolved — a single missed message cost two paper-record days
     # (2026-07-07..09), and a flat 12h cadence cost the 2026-08-21 session.
