@@ -26,7 +26,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 # When invoked as ``python scripts/run_backtest.py``, prefer this worktree over
 # any editable-package path installed from the primary checkout.
@@ -35,6 +35,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from backtest.portfolio_context import PortfolioContext, RunnerBook
+from backtest.symbol_aliases import (
+    BACKTEST_ALIASES,
+    BacktestAlias,
+    backtest_contract,
+    clip_to_alias,
+)
 from backtest.ranked_selection import (
     ReplacementPolicy,
     rank_complete_universe,
@@ -466,11 +472,16 @@ def fetch_bars_from_ib(
     host: str = "127.0.0.1",
     port: int = 7497,
     client_id: int = 10,
+    aliases: Mapping[str, BacktestAlias] | None = None,
 ) -> dict[str, list[dict]]:
     """Fetch daily OHLCV bars from IB Gateway.
 
     IB limits historical data requests, so we pace them carefully.
     For 10 years of daily bars, we request in 1-year chunks.
+
+    ``aliases`` (KAN-119): former members priced under the conId they trade
+    as today, stored under the membership ticker. Only this script's own
+    backtest passes them; the paper run calls this function too and must not.
     """
     import asyncio as _asyncio
 
@@ -491,7 +502,7 @@ def fetch_bars_from_ib(
         t0 = time.time()
 
         try:
-            contract = make_stock_contract(ticker)
+            contract = backtest_contract(ticker, aliases)
             ib.qualifyContracts(contract)
 
             # Request in 1-year chunks to stay within IB limits
@@ -532,6 +543,8 @@ def fetch_bars_from_ib(
 
             # Filter to requested range
             unique_bars = [b for b in unique_bars if b["date"] >= start_date]
+            # An alias stops where the membership file lists the new ticker.
+            unique_bars = clip_to_alias(ticker, unique_bars, aliases)
 
             elapsed = time.time() - t0
             print(f"{len(unique_bars)} bars ({elapsed:.1f}s)")
@@ -2751,6 +2764,7 @@ def main():
             years=args.years,
             host=args.ib_host,
             port=args.ib_port,
+            aliases=BACKTEST_ALIASES,
         )
 
     if not bars_by_ticker:
