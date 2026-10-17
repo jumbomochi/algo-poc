@@ -584,7 +584,9 @@ With this direction, the 12-month ideal ("live capital at whatever rung the crit
 - Gate machinery: 8-gate checklist + `go_live_gate.py` — adopted, amended (D14 substitute), not rebuilt
 - Divergence monitor + T5 rebaseline tooling — becomes the ladder's measurement instrument (window re-pinned per D11)
 - `run_pipeline_report` launchd job + verified Telegram bot — the digest rides them
-- Shadow scoring (2026-08) — the promotion pipeline's SHADOW stage already runs
+- Shadow scoring (2026-08) — the promotion pipeline's SHADOW stage. Built in 2026-08 but not
+  passed to the scheduled paper run until 2026-10-18 (`--research-shadow` in `run_paper.sh`), so it
+  recorded nothing before then
 - Decision log + TODOS.md — the amendment and deferral record
 - IPS §§5–9 — superseded/amended where named, governing everywhere else
 

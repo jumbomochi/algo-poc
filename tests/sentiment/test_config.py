@@ -16,7 +16,8 @@ def test_sentiment_defaults():
 def test_default_yaml_enables_phase1_sources():
     config = load_config("config/default.yaml")
     assert config.sentiment.finnhub_news.enabled is True
-    assert config.sentiment.stocktwits.enabled is True
+    # Off: Cloudflare-challenged, 403 to any non-browser client (2026-10-18)
+    assert config.sentiment.stocktwits.enabled is False
     assert config.sentiment.reddit.enabled is True
     # Discord waits for a confirmed server/channel list (spec open item)
     assert config.sentiment.discord.enabled is False

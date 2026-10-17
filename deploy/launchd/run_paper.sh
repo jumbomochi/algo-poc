@@ -213,8 +213,15 @@ LOG_LINES_BEFORE_RUN=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
 # that cannot finish stops before it collides with tomorrow's.
 PAPER_TIMEOUT="${ALGO_PAPER_TIMEOUT_SECONDS:-10800}"   # 3h
 
+# --research-shadow records every raw buy candidate, with its factor values,
+# in research_candidates: the forward record the factor research is graded on.
+# It never changes a signal, a quantity or a risk decision, and every failure
+# in it is logged and swallowed (scripts/run_paper.py, _create_research_shadow
+# and the observe call). It was built in 2026-08 but never passed here, so no
+# record accumulated until this flag landed.
 algo_run_bounded "$PAPER_TIMEOUT" \
-    "$VENV" scripts/run_paper.py --publish --no-entries-disabled >> "$LOG_FILE" 2>&1
+    "$VENV" scripts/run_paper.py --publish --no-entries-disabled --research-shadow \
+    >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
 
 echo "$(date): Paper trading run completed (exit code: $EXIT_CODE)" >> "$LOG_FILE"

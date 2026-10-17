@@ -60,6 +60,7 @@ PLISTS = (
     DEPLOY_DIR / "local.algo-gateway-watchdog.plist",
     PAPER_PLIST,
     DEPLOY_DIR / "local.algo-pipeline-report.plist",
+    DEPLOY_DIR / "local.algo-sentiment-collect.plist",
 )
 
 
