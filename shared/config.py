@@ -277,6 +277,41 @@ class DivergenceConfig(BaseModel):
     shadow_warmup_sessions: int = Field(default=160, ge=0)
 
 
+class FundamentalsRefreshConfig(BaseModel):
+    """How ``scripts/fetch_fundamentals.py`` spends its Alpha Vantage quota (KAN-110).
+
+    It runs as the second step of the 04:45 earnings full run, after the
+    earnings fetch, under the same lock, so the two never overlap. Each
+    ticker costs two requests (INCOME_STATEMENT and BALANCE_SHEET). Alpha
+    Vantage symbols come from ``data.earnings.refresh.symbol_overrides``.
+    """
+
+    #: Requests per run: 6 = three tickers. The free tier's 25 a day is shared
+    #: with the earnings refresh (13 + 4); see EarningsRefreshConfig.
+    calls_per_run: int = Field(default=6, ge=0)
+    min_interval_seconds: float = Field(default=13.0, ge=0)
+    request_timeout_seconds: float = Field(default=30.0, gt=0)
+    #: A quarter is stored only if it is first seen within this many days of
+    #: its period end, and is never overwritten afterwards. Alpha Vantage
+    #: serves the LATEST restated figures (GE's 2024-Q1 revenue: 8.955B, against
+    #: 16.053B as first filed), so a quarter captured after the next quarter's
+    #: filing may already be recast. 135 days is one quarter plus the 10-Q
+    #: deadline: before then nothing later can have restated it.
+    capture_window_days: int = Field(default=135, gt=0)
+    #: Days after an earnings release before the statements are asked for.
+    #: Alpha Vantage builds them from the filing, a few days later.
+    statement_lag_days: int = Field(default=3, ge=0)
+    #: A ticker whose earnings show a newer quarter than its cached statements
+    #: is re-asked at most this often until the quarter appears.
+    retry_days: int = Field(default=3, ge=1)
+    #: Fallback for a report the earnings cache never carried: a ticker whose
+    #: newest stored quarter is older than this is re-asked weekly.
+    aging_days: int = Field(default=100, gt=0)
+    aging_retry_days: int = Field(default=7, ge=1)
+    refusal_exclude_after_days: int = Field(default=3, ge=1)
+    max_consecutive_errors: int = Field(default=3, ge=1)
+
+
 class FundamentalsCacheConfig(BaseModel):
     """When ``fundamentals.json`` stops being fit to trade quality_value on.
 
@@ -287,7 +322,9 @@ class FundamentalsCacheConfig(BaseModel):
     ``fetched_at`` can still be judged on.
     """
 
-    #: A weekly refresh may miss one run; two missed is a broken job.
+    #: The refresh runs daily (KAN-110) but a quarter changes four times a
+    #: year: two weeks of Alpha Vantage failures, each paged, before the sleeve
+    #: degrades. The period rule below is the one that matters to the sleeve.
     max_fetch_age_days: float = Field(default=14.0, gt=0)
     #: The longest calendar quarter (92 days) plus 75 days for the filing that
     #: reports the NEXT period. 75, not the lookup's 45-day 10-Q lag, because
@@ -306,6 +343,9 @@ class FundamentalsCacheConfig(BaseModel):
     #: universe" bound in docs/operations/sleeve-kill-criteria.md; below it a
     #: late filer or two must not take the sleeve out.
     max_stale_ticker_fraction: float = Field(default=0.20, ge=0.0, le=1.0)
+    refresh: FundamentalsRefreshConfig = Field(
+        default_factory=FundamentalsRefreshConfig
+    )
 
 
 class EarningsRefreshConfig(BaseModel):
@@ -313,15 +353,17 @@ class EarningsRefreshConfig(BaseModel):
 
     The defaults fit the FREE tier: 25 requests a day. The 04:45 full run is
     one EARNINGS_CALENDAR call plus at most ``calls_per_run`` EARNINGS
-    requests (16 -> 17), and the 05:05 top-up at most ``topup_calls`` (4):
-    21 a day, leaving 4 for a hand-run. Retries spend from the same budgets.
+    requests (12 -> 13), and the 05:05 top-up at most ``topup_calls`` (4).
+    The same 04:45 run then spends the fundamentals refresh's
+    ``data.fundamentals.refresh.calls_per_run`` (6): 23 a day, leaving 2 for a
+    hand-run. Retries spend from the same budgets.
     A paid tier is a config change only: raise ``calls_per_run`` (e.g. 1000)
     and lower ``min_interval_seconds`` to the plan's per-minute limit
     (75/min -> 0.9).
     """
 
     #: EARNINGS requests per full run, after the one calendar call.
-    calls_per_run: int = Field(default=16, ge=0)
+    calls_per_run: int = Field(default=12, ge=0)
     #: EARNINGS requests per 05:05 top-up run (no calendar call).
     topup_calls: int = Field(default=4, ge=0)
     #: The top-up asks reports dated today or within this many days before.

@@ -9,10 +9,11 @@
 # fetched_at is advanced — is in that script's docstring.
 #
 # Two launchd jobs run this one wrapper:
-#   local.algo-earnings-refresh  04:45  full run: calendar + up to 16 EARNINGS
+#   local.algo-earnings-refresh  04:45  full run: calendar + up to 12 EARNINGS
 #                                       requests; the ONLY run that can advance
 #                                       fetched_at, and the one the dead-man
-#                                       switch watches.
+#                                       switch watches. Then the fundamentals
+#                                       step (below), up to 6 more requests.
 #   local.algo-earnings-topup    05:05  `--top-up`: no calendar call, at most 4
 #                                       requests, live tickers whose report is
 #                                       dated today/yesterday (ET) and still
@@ -48,10 +49,11 @@
 #
 # Nothing else is running at either slot (paper 05:15, divergence 05:45, report
 # 05:52, backup 06:15, Tuesday refresh 06:30, Monday digest 08:00), and neither
-# run touches IB or the database. Both end before 05:15: the full run is ~4
-# min on the free tier (17 requests, 13 s apart), bounded at 15 min (+20 s kill
-# grace → by 05:00:20, before the top-up); the top-up is under a minute,
-# bounded at 8 min (→ by 05:13:20). If either is cut short the paper run reads
+# run touches IB or the database. Both end before 05:15: the full run is ~3
+# min on the free tier (13 requests, 13 s apart), bounded at 15 min (+20 s kill
+# grace → by 05:00:20), and its fundamentals step ~1.5 min, bounded at 4 min
+# after a 13 s gap (+20 s → by 05:04:53, before the top-up); the top-up is
+# under a minute, bounded at 8 min (→ by 05:13:20). If either is cut short the paper run reads
 # the previous file — every write is atomic, never a torn one. Should the full
 # run still hold the lock at 05:05, the top-up skips (exit 75, logged only).
 #
@@ -65,6 +67,23 @@
 #   75  = another refresh held the lock; nothing was done.
 #   124 = killed by the timeout below (progress saved; the fetcher exits 124
 #         itself on SIGTERM, and lib/bounded.sh maps a hard kill to 124 too).
+#
+# FUNDAMENTALS STEP (full run only)
+# ---------------------------------
+# After the earnings fetch, the same run refreshes fundamentals.json for
+# quality_value: scripts/fetch_fundamentals.py, Alpha Vantage INCOME_STATEMENT
+# and BALANCE_SHEET for at most three tickers (data.fundamentals.refresh), each
+# quarter kept as first seen and never overwritten (that script's docstring).
+# It runs here rather than as its own job so the two never overlap on the one
+# free-tier quota and the shared cache lock. The free tier's 25 a day: 13 +
+# 6 here, 4 at 05:05, 2 left for a hand-run.
+#
+# Its outcome never changes this wrapper's exit code or the dead-man ping: the
+# earnings check watches the job, and a fundamentals cache that stops being
+# refreshed is caught at 05:15 by KAN-109 (quality_value DATA-DEGRADED once
+# fetched_at is 14 days old). Its failures (2, 1, 75, 124) Telegram here, each
+# run. INCOMPLETE (3) is logged only: it is the initial fill, weeks long, and
+# the 05:15 run already reports quality_value degraded for every day of it.
 #
 # DEAD-MAN SWITCH
 # ---------------
@@ -95,9 +114,12 @@ if [ "$TOP_UP" = "1" ]; then
 else
     MODE="full"
     FETCH_ARGS="--universe pit"
-    # 15 min: ~4 min of work, and it must be done before the 05:05 top-up.
+    # 15 min: ~3 min of work, and it must be done before the 05:05 top-up.
     EARNINGS_TIMEOUT="${ALGO_EARNINGS_TIMEOUT_SECONDS:-900}"
 fi
+# The fundamentals step (full run only): ~1.5 min of work, bounded at 4 min.
+FUNDAMENTALS_TIMEOUT="${ALGO_FUNDAMENTALS_TIMEOUT_SECONDS:-240}"
+FUNDAMENTALS_START_DELAY="${ALGO_FUNDAMENTALS_START_DELAY_SECONDS:-13}"
 # Secrets come from the macOS login keychain via the shared loader, sourced by
 # path from the repo (never from the deployed ~/ibc copy) so there is exactly
 # one implementation of the lookup and it cannot drift.
@@ -139,6 +161,47 @@ CANON="$ALGO_DIR/deploy/launchd/$(basename "$0")"
 if [ -f "$CANON" ] && ! cmp -s "$0" "$CANON"; then
     echo "$(ts): WARNING - $(basename "$0") differs from repo canonical ($CANON); run deploy/launchd/deploy.sh to resync" >> "$LOG_FILE"
 fi
+
+run_fundamentals_step() {
+    # Spaced from the earnings run's last request: the free tier limits bursts.
+    sleep "$FUNDAMENTALS_START_DELAY"
+    local offset run_output summary fund_exit no_data refused
+    offset=$(wc -c < "$LOG_FILE" | tr -d ' ')
+    echo "$(ts): Starting fundamentals refresh (Alpha Vantage statements)" >> "$LOG_FILE"
+    algo_run_bounded "$FUNDAMENTALS_TIMEOUT" \
+        "$VENV" scripts/fetch_fundamentals.py >> "$LOG_FILE" 2>&1
+    fund_exit=$?
+    run_output=$(tail -c "+$((offset + 1))" "$LOG_FILE" 2>/dev/null)
+    summary=$(printf '%s\n' "$run_output" | grep '^FUNDAMENTALS_REFRESH ' | tail -1)
+    summary="${summary:-no summary line (crashed before reporting)}"
+    no_data=$(printf '%s\n' "$run_output" | grep '^LIVE_NO_DATA: ' | tail -1)
+    refused=$(printf '%s\n' "$run_output" | grep '^LIVE_REFUSED: ' | tail -1)
+    case "$fund_exit" in
+        0)
+            echo "$(ts): fundamentals refresh OK — $summary" >> "$LOG_FILE"
+            [ -n "$no_data" ] && telegram "⚠️ Fundamentals refresh: ${no_data#LIVE_NO_DATA: }. See $LOG_REF."
+            ;;
+        3)
+            # The initial fill takes weeks at three tickers a run, and the
+            # 05:15 run already reports quality_value DATA-DEGRADED every day
+            # it lasts. A page here would repeat that daily; the log is enough.
+            echo "$(ts): fundamentals refresh INCOMPLETE — $summary" >> "$LOG_FILE" ;;
+        2)
+            echo "$(ts): fundamentals refresh FAILED — $summary" >> "$LOG_FILE"
+            telegram "❌ Fundamentals refresh FAILED: Alpha Vantage refused or errored, or after a full pass too many live names have no stored quarter (THIN). Progress saved; fundamentals.json's fetched_at NOT advanced (quality_value degrades once it is 14 days old). $summary. See $LOG_REF." ;;
+        75)
+            echo "$(ts): fundamentals refresh SKIPPED — another refresh holds the lock" >> "$LOG_FILE"
+            telegram "⚠️ Fundamentals refresh SKIPPED: another Alpha Vantage refresh (a hand-run?) held the cache lock. $summary. See $LOG_REF." ;;
+        124)
+            echo "$(ts): fundamentals refresh TIMED OUT after ${FUNDAMENTALS_TIMEOUT}s" >> "$LOG_FILE"
+            telegram "⏱️ Fundamentals refresh TIMED OUT after ${FUNDAMENTALS_TIMEOUT}s and was killed (progress saved; fetched_at NOT advanced). $summary. See $LOG_REF." ;;
+        *)
+            echo "$(ts): fundamentals refresh ERROR (exit $fund_exit) — $summary" >> "$LOG_FILE"
+            telegram "❌ Fundamentals refresh could not run (exit $fund_exit): $summary. See $LOG_REF." ;;
+    esac
+    [ -n "$refused" ] && telegram "⚠️ Fundamentals refresh: ${refused#LIVE_REFUSED: }. See $LOG_REF."
+    return 0
+}
 
 finish() {
     find "$LOG_DIR" -name "earnings_refresh_*.log" -mtime "+$RETENTION_DAYS" -delete 2>/dev/null
@@ -243,5 +306,15 @@ esac
 if [ -n "$REFUSED" ]; then
     telegram "⚠️ Earnings refresh: ${REFUSED#LIVE_REFUSED: }. See $LOG_REF."
 fi
+
+# Step 2: the fundamentals refresh (see FUNDAMENTALS STEP above). Only after
+# an earnings outcome in which Alpha Vantage answered normally: 0 or 3. After
+# 2 the quota or the key is the likely problem and the fundamentals calls
+# would fail the same way; after 1, 75 or 124 there is no key, someone else
+# holds the lock, or the time is gone.
+case "$EXIT_CODE" in
+    0|3) run_fundamentals_step ;;
+    *)   echo "$(ts): fundamentals refresh SKIPPED (earnings exit $EXIT_CODE)" >> "$LOG_FILE" ;;
+esac
 
 finish "$EXIT_CODE"

@@ -50,6 +50,7 @@ __all__ = [
     "EARNINGS_WINDOW_DAYS",
     "FUNDAMENTALS",
     "FUNDAMENTALS_FILE",
+    "FUNDAMENTALS_STATE_FILE",
     "REPO_ROOT",
     "SLEEVE_CACHE",
     "CacheDocument",
@@ -85,6 +86,8 @@ EARNINGS_FILE = "earnings.json"
 EARNINGS_CALENDAR_FILE = "earnings_calendar.json"
 #: Per-ticker fetch bookkeeping for the incremental earnings refresh (KAN-110).
 EARNINGS_STATE_FILE = "earnings_fetch_state.json"
+#: The same for the fundamentals refresh (scripts/fetch_fundamentals.py).
+FUNDAMENTALS_STATE_FILE = "fundamentals_fetch_state.json"
 _FILES = {FUNDAMENTALS: FUNDAMENTALS_FILE, EARNINGS: EARNINGS_FILE}
 
 #: Days after an announcement that ``build_earnings_lookup`` still returns it.
