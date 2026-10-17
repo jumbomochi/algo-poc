@@ -42,22 +42,29 @@ ALGO_SECRETS_ENV_FILE="$ALGO_DIR/.env"   # regular-file fallback only
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
+# Logged, not alerted: a locked keychain already pages through the paper run,
+# and this job would repeat the desktop alert 24 times a day.
 if ! algo_load_secrets POSTGRES_PASSWORD; then
     echo "$(ts): ERROR - $ALGO_SECRETS_ERROR" >&2
-    algo_alert_local "sentiment collect aborted — $ALGO_SECRETS_ERROR"
     exit 1
 fi
 # The paper DB is the dockerized postgres on a machine-local port (see
 # docker-compose.override.yml).
 export ALGO_DATABASE_URL="postgresql://algo:${POSTGRES_PASSWORD}@localhost:55432/algo_poc"
 
-# Source keys: exported when present, named when absent, never printed.
+# Source keys: exported when present, named when absent, never printed. An
+# absent key is normal (that source is skipped); any other reason a key could
+# not be read, such as a locked keychain, is logged as itself.
 keyed="" missing=""
 for name in FINNHUB_API_KEY REDDIT_CLIENT_ID REDDIT_CLIENT_SECRET; do
-    if algo_load_secrets "$name" 2>/dev/null; then
+    if algo_load_secrets "$name"; then
         keyed="$keyed $name"
     else
         missing="$missing $name"
+        case "$ALGO_SECRETS_ERROR" in
+            *"has no item for"*) ;;   # not imported (with or without a .env)
+            *) echo "$(ts): WARNING - $name unreadable: $ALGO_SECRETS_ERROR" >&2 ;;
+        esac
     fi
 done
 echo "$(ts): sentiment collect — keys present:${keyed:- none}; absent:${missing:- none}"

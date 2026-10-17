@@ -305,6 +305,8 @@ def test_sql_recorder_is_idempotent():
     recorder.observe(**kwargs)
     recorder.observe(**kwargs)
     assert len(session.scalars(select(ResearchCandidate)).all()) == 1
+    # The paper run logs this count, so a re-observed candidate must not inflate it.
+    assert recorder.recorded == 1
 
 
 def test_sql_recorder_persists_provenance_and_distinct_snapshots():

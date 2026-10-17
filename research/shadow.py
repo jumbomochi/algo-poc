@@ -118,6 +118,8 @@ class SQLShadowRecorder:
     def __init__(self, session: Session, snapshots: FactorSnapshotIndex) -> None:
         self._session = session
         self._snapshots = snapshots
+        #: Rows this recorder committed; a re-observed candidate is not counted.
+        self.recorded = 0
 
     def observe(
         self,
@@ -162,6 +164,7 @@ class SQLShadowRecorder:
                 )
             )
             self._session.commit()
+            self.recorded += 1
         except Exception:
             self._session.rollback()
             raise

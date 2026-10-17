@@ -49,7 +49,12 @@ def _drive(tmp_path: Path, *, keychain: dict[str, str]) -> dict:
         "done\n"
         "exit 0\n",
     )
-    lines = "".join(f"  {name}) echo '{value}' ;;\n" for name, value in keychain.items())
+    lines = "".join(
+        f"  {name}) echo 'security: interaction is not allowed' >&2; exit 36 ;;\n"
+        if value == "LOCKED"
+        else f"  {name}) echo '{value}' ;;\n"
+        for name, value in keychain.items()
+    )
     security = _exec(
         tmp_path / "stubs" / "security",
         "#!/bin/bash\n"
@@ -90,6 +95,14 @@ def test_present_keys_reach_the_collector_and_absent_ones_are_named(tmp_path: Pa
     assert "keys present: FINNHUB_API_KEY;" in run["out"]
     assert "absent: REDDIT_CLIENT_ID REDDIT_CLIENT_SECRET" in run["out"]
     assert FINNHUB_KEY not in run["out"], "the wrapper printed a key"
+
+
+def test_a_locked_keychain_is_named_not_reported_as_absent(tmp_path: Path) -> None:
+    run = _drive(tmp_path, keychain={"POSTGRES_PASSWORD": "pg", "FINNHUB_API_KEY": "LOCKED"})
+    assert run["rc"] == 0, run
+    assert "WARNING - FINNHUB_API_KEY unreadable: login keychain is LOCKED" in run["out"]
+    # Keys that were simply never imported stay quiet.
+    assert "REDDIT_CLIENT_ID unreadable" not in run["out"]
 
 
 def test_no_paper_db_password_stops_the_job_before_python(tmp_path: Path) -> None:
