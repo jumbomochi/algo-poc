@@ -27,6 +27,8 @@ output/
 .DS_Store
 .worktrees/
 data/cache/*.json
+# The earnings refresh's single-run lock (scripts/fetch_earnings.py, KAN-121).
+data/cache/.earnings_refresh.lock
 .superpowers/
 *.private.md
 
