@@ -34,6 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from backtest.bar_corrections import BACKTEST_BAR_CORRECTIONS, Correction, correct_bars
 from backtest.portfolio_context import PortfolioContext, RunnerBook
 from backtest.symbol_aliases import (
     BACKTEST_ALIASES,
@@ -513,6 +514,7 @@ def fetch_bars_from_ib(
     client_id: int = 10,
     aliases: Mapping[str, BacktestAlias] | None = None,
     unpriced: Mapping[str, Unpriced] | None = None,
+    corrections: Mapping[str, Correction] | None = None,
 ) -> dict[str, list[dict]]:
     """Fetch daily OHLCV bars from IB Gateway.
 
@@ -521,8 +523,10 @@ def fetch_bars_from_ib(
 
     ``aliases`` (KAN-119): former members priced under the conId they trade
     as today, stored under the membership ticker; ``unpriced``: members whose
-    IB series is another company, stored with no bars. Only this script's own
-    backtest passes them; the paper run calls this function too and must not.
+    IB series is another company, stored with no bars; ``corrections``
+    (KAN-120): split artefacts in IB's history, repaired. Only this script's
+    own backtest passes them; the paper run calls this function too and must
+    not.
     """
     import asyncio as _asyncio
 
@@ -596,6 +600,7 @@ def fetch_bars_from_ib(
                     ticker, _series(backtest_contract(ticker, aliases)), aliases
                 )
                 unique_bars = drop_unpriced(ticker, unique_bars, unpriced)
+                unique_bars = correct_bars(ticker, unique_bars, corrections)
 
             elapsed = time.time() - t0
             print(f"{len(unique_bars)} bars ({elapsed:.1f}s)")
@@ -629,18 +634,31 @@ def apply_symbol_tables_to_cache(
     bars_by_ticker: dict[str, list[dict]],
     aliases: Mapping[str, BacktestAlias],
     unpriced: Mapping[str, Unpriced],
+    corrections: Mapping[str, Correction] | None = None,
 ) -> list[str]:
-    """Apply the fetch's KAN-119 tables to bars loaded from a cache, in place.
+    """Apply the fetch's KAN-119 tables and KAN-120 corrections to bars
+    loaded from a cache, in place.
 
-    Both are idempotent, so a cache written after KAN-119 is unchanged. An
+    All three are idempotent, so a cache written after them is unchanged. An
     older one loses the bars that are another company's (PARA, IR, AA)
     instead of grading on them, and the own-symbol bars an alias would have
     replaced (IB's FB is a 2025 ETF). Returns the aliased tickers left with
     no bars: the cache predates the aliases and needs a re-fetch.
     """
+    repaired = []
     for ticker in list(bars_by_ticker):
-        bars_by_ticker[ticker] = drop_unpriced(
+        tabled = drop_unpriced(
             ticker, clip_to_alias(ticker, bars_by_ticker[ticker], aliases), unpriced
+        )
+        bars_by_ticker[ticker] = correct_bars(ticker, tabled, corrections)
+        if bars_by_ticker[ticker] is not tabled:
+            repaired.append(ticker)
+    if repaired:
+        # An artifact written before KAN-120 no longer replays to its own
+        # figures: say so rather than diverge from a pin silently.
+        print(
+            f"  NOTE: repaired IB split artefacts in {', '.join(sorted(repaired))} "
+            "(KAN-120); results will differ from the cached artifact's own"
         )
     return sorted(t for t in aliases if t in bars_by_ticker and not bars_by_ticker[t])
 
@@ -2826,7 +2844,8 @@ def main():
             if ticker in all_set
         }
         stale = apply_symbol_tables_to_cache(
-            bars_by_ticker, BACKTEST_ALIASES, BACKTEST_UNPRICED
+            bars_by_ticker, BACKTEST_ALIASES, BACKTEST_UNPRICED,
+            BACKTEST_BAR_CORRECTIONS,
         )
         if stale:
             print(
@@ -2846,6 +2865,7 @@ def main():
             port=args.ib_port,
             aliases=BACKTEST_ALIASES,
             unpriced=BACKTEST_UNPRICED,
+            corrections=BACKTEST_BAR_CORRECTIONS,
         )
 
     if not bars_by_ticker:

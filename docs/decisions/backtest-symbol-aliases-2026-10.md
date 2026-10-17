@@ -110,7 +110,8 @@ Scanned for more: every ticker in the 10-13 artifact for a daily move above
 March 2020 crash and rebound, PCG, SBNY, GL 2024-04-11, FI 2025-10-29, DXCM,
 EPAM, CNC, BIIB) plus two one-bar glitches that are not KAN-119's:
 `CMCSA` 2017-02-17 (−50% then +101% the next session, the 2:1 split) and
-`RJF` 2021-09-22 (+52%, the 3:2 split). Both are follow-ups.
+`RJF` 2021-09-22 (+52%, the 3:2 split). Both are repaired by KAN-120
+(`backtest-split-artefacts-2026-10.md`).
 
 The "different entity" names (`FOX`, `FOXA`, `DOW`, `DD`) are correct as they
 stand: IB serves the current company from its own listing, and the earlier
