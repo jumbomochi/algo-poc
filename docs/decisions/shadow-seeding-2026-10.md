@@ -334,11 +334,31 @@ Earlier windows straddle the 07-25 bulk close and the 08-01 restart.
    refresh and the D10 series behind KAN-33. The principled fix is to drive
    the replay's signal functions from a `PortfolioContext` built from the
    runner's own positions, as live does.
-2. **Data oddity (unverified).** `equity_snapshots` shows live momentum about
-   16% invested and sector_rotation about 45% invested from 08-05 to 09-17.
-   Yet `positions` has no momentum or sector_rotation row opened between
-   07-25 and 09-18. This is the under-investment the warm shadow now grades,
-   so it is worth a look.
+2. **Data oddity: resolved, no data error (KAN-117, 2026-10-17).**
+   `equity_snapshots` shows live momentum about 16% invested and
+   sector_rotation about 45% invested from 08-05 to 09-17. Yet `positions` has
+   no momentum or sector_rotation row opened between 07-25 and 09-18.
+   - **Why the rows are missing.** A sell that closes a lot fully deletes its
+     `positions` row (`scripts/paper_state.py`). The lots behind those
+     snapshots were opened on 07-30 and later sold: momentum CSCO 12 and UNH 6;
+     sector_rotation PANW 9, LLY 2 and HUM 4. They survive only in `trades`,
+     with `entry_date` 2026-07-30.
+   - **The snapshots are right.** Rebuilding each sleeve from the open
+     `positions` rows plus `trades` (`entry_date` up to `executed_at`), priced
+     at `ohlcv_daily` closes, reproduces `market_value` to the dollar on every
+     day where both have prices. That is 16.1% and 45.7% on 08-18, so the
+     under-investment the warm shadow grades is real.
+   - **Where they disagree, a fill or exit was booked late.** A snapshot values
+     the book as it stands at 05:15, and a later repair back-dates
+     `executed_at` or `opened_at`. This applies to:
+     - the sector_rotation PANW and LLY exits, reconstructed from IB
+       statements;
+     - TLT's absent-expiry exit;
+     - the 09-18 entries;
+     - XLC and ARKW.
+   - **Size of the error.** It was largest for PANW, at 1.6% of the sleeve's
+     equity, and it reverses in one step on the day the repair is booked.
+     Snapshots are as-of records, so they are not rewritten.
 3. **Bar persistence.** `ohlcv_daily` already holds the universe from 08-18.
    Once it has about 400 sessions, the shadow could read its warm-up from
    there instead of the 2-year IB fetch, and N = 250 would become affordable.
