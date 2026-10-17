@@ -93,6 +93,11 @@ def test_a_repair_is_a_noop_where_its_glitch_is_absent():
     assert bc.correct_bars("CMCSA", clean, table) == clean
     # A window that does not reach the seam cannot be checked, so is left alone.
     assert bc.correct_bars("RJF", RJF[:3], table) == RJF[:3]
+    # A missing ex-date bar: the seam is checked against the next session.
+    gapped = RJF[:3] + RJF[4:]
+    assert bc.correct_bars("RJF", gapped, table) == gapped  # 91.60 / 57.27 is not 1.5
+    shifted = RJF[:3] + [{**RJF[4], "open": RJF[2]["close"] * 1.5}]
+    assert bc.correct_bars("RJF", shifted, table)[2]["close"] == RJF[2]["close"] * 1.5
     assert bc.correct_bars("RJF", RJF[3:], table) == RJF[3:]
     assert bc.correct_bars("CMCSA", CMCSA[:2], table) == CMCSA[:2]
     assert bc.correct_bars("AAPL", RJF, table) == RJF
@@ -170,12 +175,14 @@ def test_the_fetch_applies_the_corrections_it_is_given(monkeypatch):
     assert seen == [("RJF", table), ("AAPL", table)]
 
 
-def test_a_cached_run_applies_the_corrections_once():
+def test_a_cached_run_applies_the_corrections_once(capsys):
     from scripts.run_backtest import apply_symbol_tables_to_cache
 
-    cache = {"RJF": list(RJF), "CMCSA": list(CMCSA)}
+    cache = {"RJF": list(RJF), "CMCSA": list(CMCSA), "AAPL": RJF[:2]}
     apply_symbol_tables_to_cache(cache, {}, {}, bc.BACKTEST_BAR_CORRECTIONS)
+    assert "repaired IB split artefacts in CMCSA, RJF (KAN-120)" in capsys.readouterr().out
     once = {k: list(v) for k, v in cache.items()}
     assert _largest_move(once["RJF"]) < 0.06 and _largest_move(once["CMCSA"]) < 0.02
     apply_symbol_tables_to_cache(cache, {}, {}, bc.BACKTEST_BAR_CORRECTIONS)
     assert cache == once
+    assert "repaired" not in capsys.readouterr().out

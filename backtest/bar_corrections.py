@@ -72,7 +72,8 @@ BACKTEST_BAR_CORRECTIONS: dict[str, Correction] = {
         "RJF", date(2021, 9, 22), 1.5,
         "IB conId 11656: 2021-09-21 close 57.2667 -> 09-22 open 86.55 (x1.511) on "
         "the 3:2 split's ex-date, intraday range 1.4%, never reversed; volumes "
-        "before 09-22 are multiples of 0.25 (x2.25), after it integers",
+        "as IB serves them (floats; artifacts store ints) are multiples of 0.25 "
+        "(x2.25) before 09-22 and integers after",
     ),
 }
 
@@ -117,8 +118,10 @@ def _repair_bar(entry: RepairBar, bars: list[dict[str, Any]]) -> list[dict[str, 
 
 def _scale_before(entry: ScaleBefore, bars: list[dict[str, Any]]) -> list[dict[str, Any]]:
     days = [_day(b["date"]) for b in bars]
+    # The first bar on or after the ex-date; a window that does not straddle
+    # it cannot be checked, so is left alone.
     split = next((i for i, d in enumerate(days) if d >= entry.before), None)
-    if split is None or split == 0 or days[split] != entry.before:
+    if split is None or split == 0:
         return bars
     last, first = bars[split - 1], bars[split]
     # Present only while the series still jumps by ``factor`` at the seam.

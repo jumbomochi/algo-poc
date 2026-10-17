@@ -645,13 +645,20 @@ def apply_symbol_tables_to_cache(
     replaced (IB's FB is a 2025 ETF). Returns the aliased tickers left with
     no bars: the cache predates the aliases and needs a re-fetch.
     """
+    repaired = []
     for ticker in list(bars_by_ticker):
-        bars_by_ticker[ticker] = correct_bars(
-            ticker,
-            drop_unpriced(
-                ticker, clip_to_alias(ticker, bars_by_ticker[ticker], aliases), unpriced
-            ),
-            corrections,
+        tabled = drop_unpriced(
+            ticker, clip_to_alias(ticker, bars_by_ticker[ticker], aliases), unpriced
+        )
+        bars_by_ticker[ticker] = correct_bars(ticker, tabled, corrections)
+        if bars_by_ticker[ticker] is not tabled:
+            repaired.append(ticker)
+    if repaired:
+        # An artifact written before KAN-120 no longer replays to its own
+        # figures: say so rather than diverge from a pin silently.
+        print(
+            f"  NOTE: repaired IB split artefacts in {', '.join(sorted(repaired))} "
+            "(KAN-120); results will differ from the cached artifact's own"
         )
     return sorted(t for t in aliases if t in bars_by_ticker and not bars_by_ticker[t])
 

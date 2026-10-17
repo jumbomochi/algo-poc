@@ -98,7 +98,12 @@ So it is idempotent across cache reloads. It is also a no-op if IB fixes its
 data, or if a window does not reach the seam.
 
 The fetch (`fetch_bars_from_ib(corrections=...)`) and the `--bars-from-json`
-cache path both apply the repairs. The paper run calls the same fetch without
+cache path both apply the repairs. Replaying an artifact written before this
+change therefore does not reproduce its own figures. Momentum, for example,
+gives 0.570 rather than 0.587 on the 10-13 artifact. The cache path prints a
+`NOTE` naming the repaired tickers when that happens. The 0.25-multiple volumes
+are as IB serves them, as floats (`assets/kan-120/probe.py`). Artifacts store
+volumes as ints, so the evidence is not visible in them. The paper run calls the same fetch without
 them. No module under `shared/` or `services/`, nor `run_paper.py` or
 `reconcile_paper.py`, references them, and a test pins this.
 
