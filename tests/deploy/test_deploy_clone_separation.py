@@ -101,14 +101,13 @@ def test_no_launchd_file_names_the_development_checkout() -> None:
     Not redundant with the test above: that one only sees the column-0
     ``ALGO_DIR="${ALGO_DIR:-…}"`` form in ``deploy/launchd/*.sh``. This one
     searches every non-doc file a launchd job executes or reads — wrappers,
-    ``lib/``, plists, and ``ops/launchd/`` — for the dev path in *any* form,
+    ``lib/`` and plists — for the dev path in *any* form,
     including a hardcoded ``ALGO_DIR="…"`` (the sentiment wrapper's shape) or a
     fallback like ``secrets.sh``'s env-file default.
     """
     offenders = sorted(
         str(p.relative_to(REPO))
-        for root in (DEPLOY_DIR, REPO / "ops")
-        for p in root.rglob("*")
+        for p in DEPLOY_DIR.rglob("*")
         if p.is_file() and p.suffix != ".md" and DEV_CHECKOUT in p.read_text()
     )
     assert not offenders, (

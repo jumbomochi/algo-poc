@@ -68,7 +68,10 @@ sentiment:
   finnhub_news:
     enabled: true
   stocktwits:
-    enabled: true
+    # Off: the public API sits behind a Cloudflare challenge and returns 403
+    # to any non-browser client from this host (checked 2026-10-18), so it
+    # would only log a failure every hour. It never collected a message.
+    enabled: false
   reddit:
     enabled: true
     subreddits: [wallstreetbets, stocks, investing]

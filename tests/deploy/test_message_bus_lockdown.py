@@ -125,7 +125,7 @@ def test_override_example_preserves_loopback_binding_and_documents_migration():
 
 LAUNCHD_SCRIPTS_WITH_DB_ONLY = (
     Path("deploy/launchd/run_divergence.sh"),
-    Path("ops/launchd/run_sentiment_collect.sh"),
+    Path("deploy/launchd/run_sentiment_collect.sh"),
 )
 LAUNCHD_SCRIPT_WITH_DB_AND_REDIS = Path("deploy/launchd/run_paper.sh")
 
