@@ -1,0 +1,519 @@
+{
+ "AVB": [
+  {
+   "symbol": "AVB",
+   "conId": 5026974,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "AVALONBAY COMMUNITIES INC"
+  }
+ ],
+ "EQR": [],
+ "LEG": [
+  {
+   "symbol": "LEG1",
+   "conId": 618945966,
+   "primaryExchange": "MEXI",
+   "secType": "STK",
+   "currency": "MXN",
+   "desc": "LEGGETT & PLATT INC"
+  },
+  {
+   "symbol": "LEG",
+   "conId": 9081,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "LEGGETT & PLATT INC"
+  },
+  {
+   "symbol": "LP1",
+   "conId": 80743514,
+   "primaryExchange": "FWB",
+   "secType": "STK",
+   "currency": "EUR",
+   "desc": "LEGGETT & PLATT INC"
+  }
+ ],
+ "SEE": [
+  {
+   "symbol": "SEE",
+   "conId": 4082282,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "SEALED AIR CORP"
+  },
+  {
+   "symbol": "SDA",
+   "conId": 81578542,
+   "primaryExchange": "GETTEX2",
+   "secType": "STK",
+   "currency": "EUR",
+   "desc": "SEALED AIR CORP"
+  },
+  {
+   "symbol": "SEE.OLD",
+   "conId": 541452167,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "MXN",
+   "desc": "SEALED AIR CORP"
+  }
+ ],
+ "K": [
+  {
+   "symbol": "K",
+   "conId": 8758,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "KELLANOVA"
+  },
+  {
+   "symbol": "KUSD.OLD",
+   "conId": 835599924,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "KELLANOVA"
+  },
+  {
+   "symbol": "K.OLD",
+   "conId": 369005290,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "MXN",
+   "desc": "KELLANOVA"
+  },
+  {
+   "symbol": "K",
+   "conId": 172604111,
+   "primaryExchange": "EBS",
+   "secType": "STK",
+   "currency": "CHF",
+   "desc": "KELLANOVA"
+  },
+  {
+   "symbol": "KEL",
+   "conId": 79891336,
+   "primaryExchange": "FWB",
+   "secType": "STK",
+   "currency": "EUR",
+   "desc": "KELLANOVA"
+  }
+ ],
+ "EA": [
+  {
+   "symbol": "EA",
+   "conId": 268995,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "ELECTRONIC ARTS INC"
+  },
+  {
+   "symbol": "EAUSD.OLD",
+   "conId": 835397121,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "ELECTRONIC ARTS INC"
+  },
+  {
+   "symbol": "EA",
+   "conId": 295338948,
+   "primaryExchange": "MEXI",
+   "secType": "STK",
+   "currency": "MXN",
+   "desc": "ELECTRONIC ARTS INC"
+  },
+  {
+   "symbol": "ERT",
+   "conId": 13049058,
+   "primaryExchange": "FWB",
+   "secType": "STK",
+   "currency": "EUR",
+   "desc": "ELECTRONIC ARTS INC"
+  }
+ ],
+ "HOLX": [
+  {
+   "symbol": "HOLX",
+   "conId": 270188,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "HOLOGIC INC"
+  },
+  {
+   "symbol": "HOLX",
+   "conId": 337618814,
+   "primaryExchange": "MEXI",
+   "secType": "STK",
+   "currency": "MXN",
+   "desc": "HOLOGIC INC"
+  },
+  {
+   "symbol": "HOLX.CVR",
+   "conId": 871886589,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "HOLOGIC INC - CVR"
+  },
+  {
+   "symbol": "HO1.CVR",
+   "conId": 872433108,
+   "primaryExchange": "CORPACT",
+   "secType": "STK",
+   "currency": "EUR",
+   "desc": "HOLOGIC INC - CVR"
+  },
+  {
+   "symbol": "HOLX.CVR1",
+   "conId": 874768771,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "MXN",
+   "desc": "HOLOGIC INC CVR"
+  }
+ ],
+ "IPG": [
+  {
+   "symbol": "IPG",
+   "conId": 8514,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "INTERPUBLIC GROUP OF COS INC"
+  },
+  {
+   "symbol": "IPG",
+   "conId": 81447523,
+   "primaryExchange": "SWB",
+   "secType": "STK",
+   "currency": "EUR",
+   "desc": "INTERPUBLIC GROUP OF COS INC"
+  }
+ ],
+ "CTRA": [
+  {
+   "symbol": "CTRA",
+   "conId": 129362975,
+   "primaryExchange": "MEXI",
+   "secType": "STK",
+   "currency": "MXN",
+   "desc": "COTERRA ENERGY INC"
+  },
+  {
+   "symbol": "CTRA",
+   "conId": 5946,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "COTERRA ENERGY INC"
+  },
+  {
+   "symbol": "XCQ",
+   "conId": 80814095,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "EUR",
+   "desc": "COTERRA ENERGY INC"
+  }
+ ],
+ "DAY": [
+  {
+   "symbol": "DAY",
+   "conId": 315543544,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "DAYFORCE INC"
+  },
+  {
+   "symbol": "DAY.OLD",
+   "conId": 316025641,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "CAD",
+   "desc": "DAYFORCE INC"
+  },
+  {
+   "symbol": "DAY",
+   "conId": 462892006,
+   "primaryExchange": "MEXI",
+   "secType": "STK",
+   "currency": "MXN",
+   "desc": "DAYFORCE INC"
+  }
+ ],
+ "QRVO": [
+  {
+   "symbol": "QRVO",
+   "conId": 179002152,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "QORVO INC"
+  },
+  {
+   "symbol": "2QO",
+   "conId": 178799078,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "EUR",
+   "desc": "QORVO INC"
+  }
+ ],
+ "WBD": [
+  {
+   "symbol": "WBD",
+   "conId": 554208351,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "WARNER BROS DISCOVERY INC"
+  },
+  {
+   "symbol": "WBD",
+   "conId": 555915906,
+   "primaryExchange": "MEXI",
+   "secType": "STK",
+   "currency": "MXN",
+   "desc": "WARNER BROS DISCOVERY INC"
+  },
+  {
+   "symbol": "WBDUSD",
+   "conId": 835397244,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "WARNER BROS DISCOVERY INC"
+  },
+  {
+   "symbol": "J5A",
+   "conId": 555132281,
+   "primaryExchange": "IBIS",
+   "secType": "STK",
+   "currency": "EUR",
+   "desc": "WARNER BROS DISCOVERY INC"
+  },
+  {
+   "symbol": "J5A.TEN",
+   "conId": 846740617,
+   "primaryExchange": "CORPACT",
+   "secType": "STK",
+   "currency": "EUR",
+   "desc": "WARNER BROS DISCOVERY INC - TENDER"
+  },
+  {
+   "symbol": "WBD.TEN",
+   "conId": 848233820,
+   "primaryExchange": "CORPACT",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "WARNER BROS DISCOVERY INC - TENDER"
+  }
+ ],
+ "PSKY": [
+  {
+   "symbol": "PARAMOUNT",
+   "conId": 733969313,
+   "primaryExchange": "NSE",
+   "secType": "STK",
+   "currency": "INR",
+   "desc": "PARAMOUNT DYE TEC LTD"
+  },
+  {
+   "symbol": "PARA.OLD",
+   "conId": 417532212,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "MXN",
+   "desc": "PARAMOUNT GLOBAL-CLASS B"
+  },
+  {
+   "symbol": "PRMRF",
+   "conId": 35648494,
+   "primaryExchange": "PINK",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "PARAMOUNT RESOURCES LTD -A"
+  },
+  {
+   "symbol": "POU",
+   "conId": 14893089,
+   "primaryExchange": "TSE",
+   "secType": "STK",
+   "currency": "CAD",
+   "desc": "PARAMOUNT RESOURCES LTD -A"
+  },
+  {
+   "symbol": "PGRE",
+   "conId": 173803851,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "PARAMOUNT GROUP INC"
+  },
+  {
+   "symbol": "7817",
+   "conId": 95441356,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "JPY",
+   "desc": "PARAMOUNT BED HOLDINGS CO LT"
+  },
+  {
+   "symbol": "0VV",
+   "conId": 393979351,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "EUR",
+   "desc": "PARAMOUNT GLOBAL-CLASS A"
+  },
+  {
+   "symbol": "PARACABLE",
+   "conId": 56987030,
+   "primaryExchange": "NSE",
+   "secType": "STK",
+   "currency": "INR",
+   "desc": "PARAMOUNT COMMUNICATION LTD"
+  },
+  {
+   "symbol": "PARAMON",
+   "conId": 705926266,
+   "primaryExchange": "BURSAMY",
+   "secType": "STK",
+   "currency": "MYR",
+   "desc": "PARAMOUNT CORP BHD"
+  },
+  {
+   "symbol": "PZG",
+   "conId": 190022380,
+   "primaryExchange": "AMEX",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "PARAMOUNT GOLD NEVADA CORP"
+  },
+  {
+   "symbol": "PSFL",
+   "conId": 731677798,
+   "primaryExchange": "NSE",
+   "secType": "STK",
+   "currency": "INR",
+   "desc": "PARAMOUNT SPECIALITY FORGING"
+  },
+  {
+   "symbol": "PQ51",
+   "conId": 603528393,
+   "primaryExchange": "FWB",
+   "secType": "STK",
+   "currency": "EUR",
+   "desc": "PARAMOUNT RESOURCES LTD -A"
+  },
+  {
+   "symbol": "P9G",
+   "conId": 192376948,
+   "primaryExchange": "FWB",
+   "secType": "STK",
+   "currency": "EUR",
+   "desc": "PARAMOUNT GOLD NEVADA CORP"
+  },
+  {
+   "symbol": "PRMRY",
+   "conId": 799571415,
+   "primaryExchange": "PINK",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "PARAMOUNT RESOURCES LTD"
+  },
+  {
+   "symbol": "PCP.AUD",
+   "conId": 44204685,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "AUD",
+   "desc": "PARAMOUNT MINING CORP LTD"
+  },
+  {
+   "symbol": "0VVB.TEN",
+   "conId": 772758975,
+   "primaryExchange": "CORPACT",
+   "secType": "STK",
+   "currency": "EUR",
+   "desc": "PARAMOUNT GLOBAL-CLASS B - TENDER"
+  }
+ ],
+ "SATS": [
+  {
+   "symbol": "ECHO",
+   "conId": 47965865,
+   "primaryExchange": "NASDAQ",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "ECHOSTAR CORP-A"
+  },
+  {
+   "symbol": "ECHO",
+   "conId": 675413194,
+   "primaryExchange": "MEXI",
+   "secType": "STK",
+   "currency": "MXN",
+   "desc": "ECHOSTAR CORP-A"
+  },
+  {
+   "symbol": "E20",
+   "conId": 145914322,
+   "primaryExchange": "IBIS",
+   "secType": "STK",
+   "currency": "EUR",
+   "desc": "ECHOSTAR CORP-A"
+  }
+ ],
+ "BK": [
+  {
+   "symbol": "BNY",
+   "conId": 44986804,
+   "primaryExchange": "NYSE",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "BANK OF NEW YORK MELLON CORP"
+  },
+  {
+   "symbol": "BK PRC",
+   "conId": 113965981,
+   "primaryExchange": "VALUE",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "BANK OF NEW YORK MELLON"
+  },
+  {
+   "symbol": "BNY PRK",
+   "conId": 767284805,
+   "primaryExchange": "NYSE",
+   "secType": "STK",
+   "currency": "USD",
+   "desc": "BANK OF NEW YORK MELLON CORP"
+  },
+  {
+   "symbol": "BN9",
+   "conId": 80789115,
+   "primaryExchange": "FWB",
+   "secType": "STK",
+   "currency": "EUR",
+   "desc": "BANK OF NEW YORK MELLON CORP"
+  },
+  {
+   "symbol": "BNY",
+   "conId": 287304237,
+   "primaryExchange": "MEXI",
+   "secType": "STK",
+   "currency": "MXN",
+   "desc": "BANK OF NEW YORK MELLON CORP"
+  }
+ ]
+}

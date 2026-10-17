@@ -881,6 +881,32 @@ the floor, so it is not a baseline of record** — see
 [rung0-economics.md](rung0-economics.md) §1 for what may and may not be quoted
 from it.
 
+**Re-measured 2026-10-17 (KAN-119): 11.25% → 8.85%, still BLOCKED.** The
+"no active listing" reading above was wrong for about a third of the days.
+Many of those names were **renamed**, not delisted: IB knows `FB` only as
+`META`, so the fetch got Error 200. `backtest/symbol_aliases.py` now prices 33
+verified former members under the conId they trade as today, and stores the
+bars under the membership ticker. Only `run_backtest.py`'s own entry point
+passes the table. Live trading and the paper run never see it.
+
+The same probe found three members graded on a **different company's** prices
+(`PARA` on Banzai International, `IR` before 2020 on Gardner Denver, `AA` in
+late 2016 on Alcoa Corp). `BACKTEST_UNPRICED` drops those bars, so the days
+count as excluded instead.
+
+Measured on the 2026-10-13 refresh's bars, the result goes from 142,331 to
+111,972 of 1,265,341 membership-days (**8.85%**). The residual is
+acquisitions (5.19%), names IB lists only on `VALUE` (1.79%), refused renames
+(0.97%), and same-ticker names whose IB history starts late (PEP, XEL, PFG,
+UAL and NWL from 2017–18; COO from 2023; ODFL from 2024).
+
+The per-ticker record, the evidence for every alias, and each refusal are in
+[backtest-symbol-aliases-2026-10.md](../decisions/backtest-symbol-aliases-2026-10.md).
+The first scheduled refresh after deploy records the figure in its own
+artifact. Pinning that artifact needs its own bias acceptance (see
+*Re-pinning at a rung change*), and the pins are unchanged until the operator
+decides.
+
 ### Comparing old to new
 
 Expect the rebaselined numbers to be **worse** than the pre-2026-08-06 figures,

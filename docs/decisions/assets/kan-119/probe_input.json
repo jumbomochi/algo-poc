@@ -1,0 +1,1178 @@
+[
+ {
+  "ticker": "AA",
+  "first": "2015-01-01",
+  "last": "2016-10-01",
+  "pinned_days": 21,
+  "latest_days": 1
+ },
+ {
+  "ticker": "ABC",
+  "first": "2015-01-01",
+  "last": "2023-07-01",
+  "pinned_days": 1770,
+  "latest_days": 1750
+ },
+ {
+  "ticker": "ABMD",
+  "first": "2018-07-01",
+  "last": "2022-10-01",
+  "pinned_days": 1134,
+  "latest_days": 1134
+ },
+ {
+  "ticker": "ADS",
+  "first": "2015-01-01",
+  "last": "2020-07-01",
+  "pinned_days": 1016,
+  "latest_days": 996
+ },
+ {
+  "ticker": "AET",
+  "first": "2015-01-01",
+  "last": "2018-10-01",
+  "pinned_days": 575,
+  "latest_days": 555
+ },
+ {
+  "ticker": "AGN",
+  "first": "2015-01-01",
+  "last": "2020-04-01",
+  "pinned_days": 952,
+  "latest_days": 932
+ },
+ {
+  "ticker": "ALXN",
+  "first": "2015-01-01",
+  "last": "2021-07-01",
+  "pinned_days": 1268,
+  "latest_days": 1248
+ },
+ {
+  "ticker": "ANDV",
+  "first": "2017-10-01",
+  "last": "2018-07-01",
+  "pinned_days": 251,
+  "latest_days": 251
+ },
+ {
+  "ticker": "ANSS",
+  "first": "2017-07-01",
+  "last": "2025-07-01",
+  "pinned_days": 2073,
+  "latest_days": 2073
+ },
+ {
+  "ticker": "ANTM",
+  "first": "2015-01-01",
+  "last": "2022-04-01",
+  "pinned_days": 1456,
+  "latest_days": 1436
+ },
+ {
+  "ticker": "APC",
+  "first": "2015-01-01",
+  "last": "2019-07-01",
+  "pinned_days": 763,
+  "latest_days": 743
+ },
+ {
+  "ticker": "ARNC",
+  "first": "2017-01-01",
+  "last": "2020-04-01",
+  "pinned_days": 879,
+  "latest_days": 879
+ },
+ {
+  "ticker": "ATVI",
+  "first": "2015-10-01",
+  "last": "2023-10-01",
+  "pinned_days": 1833,
+  "latest_days": 1813
+ },
+ {
+  "ticker": "AVB",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 2510,
+  "latest_days": 2510
+ },
+ {
+  "ticker": "AVGO",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 1,
+  "latest_days": 1
+ },
+ {
+  "ticker": "BBBY",
+  "first": "2015-01-01",
+  "last": "2017-07-01",
+  "pinned_days": 261,
+  "latest_days": 241
+ },
+ {
+  "ticker": "BCR",
+  "first": "2015-01-01",
+  "last": "2018-01-01",
+  "pinned_days": 385,
+  "latest_days": 365
+ },
+ {
+  "ticker": "BHGE",
+  "first": "2017-10-01",
+  "last": "2019-10-01",
+  "pinned_days": 566,
+  "latest_days": 566
+ },
+ {
+  "ticker": "BHI",
+  "first": "2015-01-01",
+  "last": "2017-07-01",
+  "pinned_days": 261,
+  "latest_days": 241
+ },
+ {
+  "ticker": "BK",
+  "first": "2015-01-01",
+  "last": "2026-04-01",
+  "pinned_days": 2458,
+  "latest_days": 2438
+ },
+ {
+  "ticker": "BLL",
+  "first": "2015-01-01",
+  "last": "2022-04-01",
+  "pinned_days": 1456,
+  "latest_days": 1436
+ },
+ {
+  "ticker": "CA",
+  "first": "2015-01-01",
+  "last": "2018-10-01",
+  "pinned_days": 575,
+  "latest_days": 555
+ },
+ {
+  "ticker": "CBG",
+  "first": "2015-01-01",
+  "last": "2018-01-01",
+  "pinned_days": 385,
+  "latest_days": 365
+ },
+ {
+  "ticker": "CBS",
+  "first": "2015-01-01",
+  "last": "2019-10-01",
+  "pinned_days": 827,
+  "latest_days": 807
+ },
+ {
+  "ticker": "CDAY",
+  "first": "2021-10-01",
+  "last": "2024-01-01",
+  "pinned_days": 626,
+  "latest_days": 626
+ },
+ {
+  "ticker": "CELG",
+  "first": "2015-01-01",
+  "last": "2019-10-01",
+  "pinned_days": 827,
+  "latest_days": 807
+ },
+ {
+  "ticker": "CERN",
+  "first": "2015-01-01",
+  "last": "2022-04-01",
+  "pinned_days": 1456,
+  "latest_days": 1436
+ },
+ {
+  "ticker": "CHK",
+  "first": "2015-01-01",
+  "last": "2018-01-01",
+  "pinned_days": 385,
+  "latest_days": 365
+ },
+ {
+  "ticker": "CMA",
+  "first": "2015-01-01",
+  "last": "2024-04-01",
+  "pinned_days": 1957,
+  "latest_days": 1937
+ },
+ {
+  "ticker": "COG",
+  "first": "2015-01-01",
+  "last": "2021-10-01",
+  "pinned_days": 1332,
+  "latest_days": 1312
+ },
+ {
+  "ticker": "COH",
+  "first": "2015-01-01",
+  "last": "2017-10-01",
+  "pinned_days": 324,
+  "latest_days": 304
+ },
+ {
+  "ticker": "COL",
+  "first": "2015-01-01",
+  "last": "2018-10-01",
+  "pinned_days": 575,
+  "latest_days": 555
+ },
+ {
+  "ticker": "COO",
+  "first": "2016-10-01",
+  "last": "2026-08-16",
+  "pinned_days": 1756,
+  "latest_days": 1746
+ },
+ {
+  "ticker": "CPGX",
+  "first": "2015-10-01",
+  "last": "2016-07-01",
+  "pinned_days": 10,
+  "latest_days": 0
+ },
+ {
+  "ticker": "CSRA",
+  "first": "2016-01-01",
+  "last": "2018-04-01",
+  "pinned_days": 449,
+  "latest_days": 429
+ },
+ {
+  "ticker": "CTL",
+  "first": "2015-01-01",
+  "last": "2020-07-01",
+  "pinned_days": 1016,
+  "latest_days": 996
+ },
+ {
+  "ticker": "CTLT",
+  "first": "2021-01-01",
+  "last": "2024-10-01",
+  "pinned_days": 1005,
+  "latest_days": 1005
+ },
+ {
+  "ticker": "CTRA",
+  "first": "2022-01-01",
+  "last": "2026-04-01",
+  "pinned_days": 1126,
+  "latest_days": 1126
+ },
+ {
+  "ticker": "CTXS",
+  "first": "2015-01-01",
+  "last": "2022-07-01",
+  "pinned_days": 1520,
+  "latest_days": 1500
+ },
+ {
+  "ticker": "CXO",
+  "first": "2016-04-01",
+  "last": "2021-01-01",
+  "pinned_days": 1141,
+  "latest_days": 1121
+ },
+ {
+  "ticker": "DAY",
+  "first": "2024-04-01",
+  "last": "2026-01-01",
+  "pinned_days": 502,
+  "latest_days": 502
+ },
+ {
+  "ticker": "DD",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 241,
+  "latest_days": 221
+ },
+ {
+  "ticker": "DFS",
+  "first": "2015-01-01",
+  "last": "2025-04-01",
+  "pinned_days": 2207,
+  "latest_days": 2187
+ },
+ {
+  "ticker": "DISCA",
+  "first": "2015-01-01",
+  "last": "2022-04-01",
+  "pinned_days": 1456,
+  "latest_days": 1436
+ },
+ {
+  "ticker": "DISCK",
+  "first": "2015-01-01",
+  "last": "2022-04-01",
+  "pinned_days": 1456,
+  "latest_days": 1436
+ },
+ {
+  "ticker": "DISH",
+  "first": "2017-04-01",
+  "last": "2023-04-01",
+  "pinned_days": 1572,
+  "latest_days": 1572
+ },
+ {
+  "ticker": "DLPH",
+  "first": "2015-01-01",
+  "last": "2017-10-01",
+  "pinned_days": 324,
+  "latest_days": 304
+ },
+ {
+  "ticker": "DNB",
+  "first": "2015-01-01",
+  "last": "2017-04-01",
+  "pinned_days": 198,
+  "latest_days": 178
+ },
+ {
+  "ticker": "DO",
+  "first": "2015-01-01",
+  "last": "2016-07-01",
+  "pinned_days": 10,
+  "latest_days": 0
+ },
+ {
+  "ticker": "DOW",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 261,
+  "latest_days": 241
+ },
+ {
+  "ticker": "DPS",
+  "first": "2015-01-01",
+  "last": "2018-07-01",
+  "pinned_days": 512,
+  "latest_days": 492
+ },
+ {
+  "ticker": "DRE",
+  "first": "2017-10-01",
+  "last": "2022-10-01",
+  "pinned_days": 1322,
+  "latest_days": 1322
+ },
+ {
+  "ticker": "DWDP",
+  "first": "2017-10-01",
+  "last": "2019-04-01",
+  "pinned_days": 438,
+  "latest_days": 438
+ },
+ {
+  "ticker": "EA",
+  "first": "2015-01-01",
+  "last": "2026-07-01",
+  "pinned_days": 2490,
+  "latest_days": 2470
+ },
+ {
+  "ticker": "EMC",
+  "first": "2015-01-01",
+  "last": "2016-07-01",
+  "pinned_days": 10,
+  "latest_days": 0
+ },
+ {
+  "ticker": "ENDP",
+  "first": "2015-04-01",
+  "last": "2017-01-01",
+  "pinned_days": 135,
+  "latest_days": 115
+ },
+ {
+  "ticker": "EQR",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 2510,
+  "latest_days": 2510
+ },
+ {
+  "ticker": "ESRX",
+  "first": "2015-01-01",
+  "last": "2019-01-01",
+  "pinned_days": 636,
+  "latest_days": 616
+ },
+ {
+  "ticker": "ETFC",
+  "first": "2015-01-01",
+  "last": "2020-10-01",
+  "pinned_days": 1080,
+  "latest_days": 1060
+ },
+ {
+  "ticker": "EVHC",
+  "first": "2017-01-01",
+  "last": "2018-10-01",
+  "pinned_days": 502,
+  "latest_days": 502
+ },
+ {
+  "ticker": "EXPD",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 1,
+  "latest_days": 1
+ },
+ {
+  "ticker": "FB",
+  "first": "2015-01-01",
+  "last": "2022-04-01",
+  "pinned_days": 1456,
+  "latest_days": 1436
+ },
+ {
+  "ticker": "FBHS",
+  "first": "2016-07-01",
+  "last": "2022-10-01",
+  "pinned_days": 1583,
+  "latest_days": 1563
+ },
+ {
+  "ticker": "FI",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 1,
+  "latest_days": 1
+ },
+ {
+  "ticker": "FITB",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 1,
+  "latest_days": 1
+ },
+ {
+  "ticker": "FL",
+  "first": "2016-07-01",
+  "last": "2019-07-01",
+  "pinned_days": 763,
+  "latest_days": 743
+ },
+ {
+  "ticker": "FLIR",
+  "first": "2015-01-01",
+  "last": "2021-04-01",
+  "pinned_days": 1204,
+  "latest_days": 1184
+ },
+ {
+  "ticker": "FLT",
+  "first": "2018-07-01",
+  "last": "2024-01-01",
+  "pinned_days": 1445,
+  "latest_days": 1445
+ },
+ {
+  "ticker": "FOX",
+  "first": "2015-10-01",
+  "last": "2026-08-16",
+  "pinned_days": 623,
+  "latest_days": 603
+ },
+ {
+  "ticker": "FOXA",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 623,
+  "latest_days": 603
+ },
+ {
+  "ticker": "FRC",
+  "first": "2019-04-01",
+  "last": "2023-04-01",
+  "pinned_days": 1071,
+  "latest_days": 1071
+ },
+ {
+  "ticker": "FTR",
+  "first": "2015-01-01",
+  "last": "2017-01-01",
+  "pinned_days": 135,
+  "latest_days": 115
+ },
+ {
+  "ticker": "GGP",
+  "first": "2015-01-01",
+  "last": "2018-07-01",
+  "pinned_days": 512,
+  "latest_days": 492
+ },
+ {
+  "ticker": "GPS",
+  "first": "2015-01-01",
+  "last": "2022-01-01",
+  "pinned_days": 1394,
+  "latest_days": 1374
+ },
+ {
+  "ticker": "HAR",
+  "first": "2015-01-01",
+  "last": "2017-01-01",
+  "pinned_days": 135,
+  "latest_days": 115
+ },
+ {
+  "ticker": "HBI",
+  "first": "2015-04-01",
+  "last": "2021-10-01",
+  "pinned_days": 1332,
+  "latest_days": 1312
+ },
+ {
+  "ticker": "HCN",
+  "first": "2015-01-01",
+  "last": "2018-01-01",
+  "pinned_days": 385,
+  "latest_days": 365
+ },
+ {
+  "ticker": "HCP",
+  "first": "2015-01-01",
+  "last": "2019-10-01",
+  "pinned_days": 827,
+  "latest_days": 807
+ },
+ {
+  "ticker": "HES",
+  "first": "2015-01-01",
+  "last": "2025-07-01",
+  "pinned_days": 2271,
+  "latest_days": 2251
+ },
+ {
+  "ticker": "HFC",
+  "first": "2018-07-01",
+  "last": "2021-04-01",
+  "pinned_days": 755,
+  "latest_days": 755
+ },
+ {
+  "ticker": "HOLX",
+  "first": "2016-04-01",
+  "last": "2026-04-01",
+  "pinned_days": 2458,
+  "latest_days": 2438
+ },
+ {
+  "ticker": "HOT",
+  "first": "2015-01-01",
+  "last": "2016-07-01",
+  "pinned_days": 10,
+  "latest_days": 0
+ },
+ {
+  "ticker": "HRS",
+  "first": "2015-01-01",
+  "last": "2019-04-01",
+  "pinned_days": 699,
+  "latest_days": 679
+ },
+ {
+  "ticker": "INFO",
+  "first": "2017-07-01",
+  "last": "2022-01-01",
+  "pinned_days": 1196,
+  "latest_days": 1196
+ },
+ {
+  "ticker": "IPG",
+  "first": "2015-01-01",
+  "last": "2025-10-01",
+  "pinned_days": 2335,
+  "latest_days": 2315
+ },
+ {
+  "ticker": "IR",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 163,
+  "latest_days": 143
+ },
+ {
+  "ticker": "JEC",
+  "first": "2015-01-01",
+  "last": "2019-10-01",
+  "pinned_days": 827,
+  "latest_days": 807
+ },
+ {
+  "ticker": "JNPR",
+  "first": "2015-01-01",
+  "last": "2025-07-01",
+  "pinned_days": 2271,
+  "latest_days": 2251
+ },
+ {
+  "ticker": "JWN",
+  "first": "2015-01-01",
+  "last": "2020-07-01",
+  "pinned_days": 1016,
+  "latest_days": 996
+ },
+ {
+  "ticker": "K",
+  "first": "2015-01-01",
+  "last": "2025-10-01",
+  "pinned_days": 2335,
+  "latest_days": 2315
+ },
+ {
+  "ticker": "KORS",
+  "first": "2015-01-01",
+  "last": "2019-01-01",
+  "pinned_days": 636,
+  "latest_days": 616
+ },
+ {
+  "ticker": "KSU",
+  "first": "2015-01-01",
+  "last": "2021-10-01",
+  "pinned_days": 1332,
+  "latest_days": 1312
+ },
+ {
+  "ticker": "LB",
+  "first": "2015-01-01",
+  "last": "2021-07-01",
+  "pinned_days": 1268,
+  "latest_days": 1248
+ },
+ {
+  "ticker": "LEG",
+  "first": "2015-01-01",
+  "last": "2021-10-01",
+  "pinned_days": 1332,
+  "latest_days": 1312
+ },
+ {
+  "ticker": "LLL",
+  "first": "2015-01-01",
+  "last": "2019-04-01",
+  "pinned_days": 699,
+  "latest_days": 679
+ },
+ {
+  "ticker": "LLTC",
+  "first": "2015-01-01",
+  "last": "2017-01-01",
+  "pinned_days": 135,
+  "latest_days": 115
+ },
+ {
+  "ticker": "LM",
+  "first": "2015-01-01",
+  "last": "2016-10-01",
+  "pinned_days": 73,
+  "latest_days": 53
+ },
+ {
+  "ticker": "LUK",
+  "first": "2015-01-01",
+  "last": "2018-04-01",
+  "pinned_days": 449,
+  "latest_days": 429
+ },
+ {
+  "ticker": "LUMN",
+  "first": "2020-10-01",
+  "last": "2023-01-01",
+  "pinned_days": 1,
+  "latest_days": 1
+ },
+ {
+  "ticker": "LVLT",
+  "first": "2015-01-01",
+  "last": "2017-10-01",
+  "pinned_days": 324,
+  "latest_days": 304
+ },
+ {
+  "ticker": "MJN",
+  "first": "2015-01-01",
+  "last": "2017-04-01",
+  "pinned_days": 198,
+  "latest_days": 178
+ },
+ {
+  "ticker": "MNK",
+  "first": "2015-01-01",
+  "last": "2017-07-01",
+  "pinned_days": 261,
+  "latest_days": 241
+ },
+ {
+  "ticker": "MON",
+  "first": "2015-01-01",
+  "last": "2018-04-01",
+  "pinned_days": 449,
+  "latest_days": 429
+ },
+ {
+  "ticker": "MRO",
+  "first": "2015-01-01",
+  "last": "2024-10-01",
+  "pinned_days": 2085,
+  "latest_days": 2065
+ },
+ {
+  "ticker": "MXIM",
+  "first": "2019-01-01",
+  "last": "2021-07-01",
+  "pinned_days": 693,
+  "latest_days": 693
+ },
+ {
+  "ticker": "MYL",
+  "first": "2015-01-01",
+  "last": "2020-10-01",
+  "pinned_days": 1080,
+  "latest_days": 1060
+ },
+ {
+  "ticker": "NBL",
+  "first": "2015-01-01",
+  "last": "2020-10-01",
+  "pinned_days": 1080,
+  "latest_days": 1060
+ },
+ {
+  "ticker": "NFX",
+  "first": "2015-01-01",
+  "last": "2019-01-01",
+  "pinned_days": 636,
+  "latest_days": 616
+ },
+ {
+  "ticker": "NLOK",
+  "first": "2020-01-01",
+  "last": "2022-10-01",
+  "pinned_days": 756,
+  "latest_days": 756
+ },
+ {
+  "ticker": "NLSN",
+  "first": "2015-01-01",
+  "last": "2022-10-01",
+  "pinned_days": 1583,
+  "latest_days": 1563
+ },
+ {
+  "ticker": "NWL",
+  "first": "2015-01-01",
+  "last": "2023-07-01",
+  "pinned_days": 561,
+  "latest_days": 541
+ },
+ {
+  "ticker": "ODFL",
+  "first": "2020-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 1093,
+  "latest_days": 1093
+ },
+ {
+  "ticker": "PARA",
+  "first": "2022-04-01",
+  "last": "2025-07-01",
+  "pinned_days": 388,
+  "latest_days": 0
+ },
+ {
+  "ticker": "PBCT",
+  "first": "2015-01-01",
+  "last": "2022-04-01",
+  "pinned_days": 1456,
+  "latest_days": 1436
+ },
+ {
+  "ticker": "PCLN",
+  "first": "2015-01-01",
+  "last": "2018-01-01",
+  "pinned_days": 385,
+  "latest_days": 365
+ },
+ {
+  "ticker": "PDCO",
+  "first": "2015-01-01",
+  "last": "2018-01-01",
+  "pinned_days": 385,
+  "latest_days": 365
+ },
+ {
+  "ticker": "PEAK",
+  "first": "2020-01-01",
+  "last": "2024-01-01",
+  "pinned_days": 1067,
+  "latest_days": 1067
+ },
+ {
+  "ticker": "PEP",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 317,
+  "latest_days": 297
+ },
+ {
+  "ticker": "PFG",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 315,
+  "latest_days": 295
+ },
+ {
+  "ticker": "PKI",
+  "first": "2015-01-01",
+  "last": "2023-04-01",
+  "pinned_days": 1707,
+  "latest_days": 1687
+ },
+ {
+  "ticker": "PSKY",
+  "first": "2025-10-01",
+  "last": "2026-08-16",
+  "pinned_days": 0,
+  "latest_days": 259
+ },
+ {
+  "ticker": "PX",
+  "first": "2015-01-01",
+  "last": "2018-10-01",
+  "pinned_days": 575,
+  "latest_days": 555
+ },
+ {
+  "ticker": "PXD",
+  "first": "2015-01-01",
+  "last": "2024-04-01",
+  "pinned_days": 1957,
+  "latest_days": 1937
+ },
+ {
+  "ticker": "Q",
+  "first": "2017-10-01",
+  "last": "2026-08-16",
+  "pinned_days": 63,
+  "latest_days": 63
+ },
+ {
+  "ticker": "QRVO",
+  "first": "2015-07-01",
+  "last": "2024-10-01",
+  "pinned_days": 0,
+  "latest_days": 2065
+ },
+ {
+  "ticker": "RAI",
+  "first": "2015-01-01",
+  "last": "2017-07-01",
+  "pinned_days": 261,
+  "latest_days": 241
+ },
+ {
+  "ticker": "RE",
+  "first": "2017-07-01",
+  "last": "2023-07-01",
+  "pinned_days": 1572,
+  "latest_days": 1572
+ },
+ {
+  "ticker": "RHT",
+  "first": "2015-01-01",
+  "last": "2019-07-01",
+  "pinned_days": 763,
+  "latest_days": 743
+ },
+ {
+  "ticker": "RTN",
+  "first": "2015-01-01",
+  "last": "2020-04-01",
+  "pinned_days": 952,
+  "latest_days": 932
+ },
+ {
+  "ticker": "SATS",
+  "first": "2026-04-01",
+  "last": "2026-04-01",
+  "pinned_days": 62,
+  "latest_days": 62
+ },
+ {
+  "ticker": "SCG",
+  "first": "2015-01-01",
+  "last": "2019-01-01",
+  "pinned_days": 636,
+  "latest_days": 616
+ },
+ {
+  "ticker": "SE",
+  "first": "2015-01-01",
+  "last": "2017-01-01",
+  "pinned_days": 135,
+  "latest_days": 115
+ },
+ {
+  "ticker": "SEE",
+  "first": "2015-01-01",
+  "last": "2023-10-01",
+  "pinned_days": 1833,
+  "latest_days": 1813
+ },
+ {
+  "ticker": "SIVB",
+  "first": "2018-04-01",
+  "last": "2023-01-01",
+  "pinned_days": 1260,
+  "latest_days": 1260
+ },
+ {
+  "ticker": "SLG",
+  "first": "2015-04-01",
+  "last": "2021-01-01",
+  "pinned_days": 1,
+  "latest_days": 1
+ },
+ {
+  "ticker": "SNI",
+  "first": "2015-01-01",
+  "last": "2018-01-01",
+  "pinned_days": 385,
+  "latest_days": 365
+ },
+ {
+  "ticker": "SPLS",
+  "first": "2015-01-01",
+  "last": "2017-07-01",
+  "pinned_days": 261,
+  "latest_days": 241
+ },
+ {
+  "ticker": "SRCL",
+  "first": "2015-01-01",
+  "last": "2018-10-01",
+  "pinned_days": 575,
+  "latest_days": 555
+ },
+ {
+  "ticker": "STI",
+  "first": "2015-01-01",
+  "last": "2019-10-01",
+  "pinned_days": 827,
+  "latest_days": 807
+ },
+ {
+  "ticker": "STJ",
+  "first": "2015-01-01",
+  "last": "2017-01-01",
+  "pinned_days": 135,
+  "latest_days": 115
+ },
+ {
+  "ticker": "SWN",
+  "first": "2015-01-01",
+  "last": "2017-04-01",
+  "pinned_days": 198,
+  "latest_days": 178
+ },
+ {
+  "ticker": "SYMC",
+  "first": "2015-01-01",
+  "last": "2019-10-01",
+  "pinned_days": 827,
+  "latest_days": 807
+ },
+ {
+  "ticker": "TGNA",
+  "first": "2015-07-01",
+  "last": "2017-04-01",
+  "pinned_days": 198,
+  "latest_days": 178
+ },
+ {
+  "ticker": "TIF",
+  "first": "2015-01-01",
+  "last": "2021-01-01",
+  "pinned_days": 1141,
+  "latest_days": 1121
+ },
+ {
+  "ticker": "TMK",
+  "first": "2015-01-01",
+  "last": "2019-07-01",
+  "pinned_days": 763,
+  "latest_days": 743
+ },
+ {
+  "ticker": "TSO",
+  "first": "2015-01-01",
+  "last": "2017-07-01",
+  "pinned_days": 261,
+  "latest_days": 241
+ },
+ {
+  "ticker": "TSS",
+  "first": "2015-01-01",
+  "last": "2019-07-01",
+  "pinned_days": 763,
+  "latest_days": 743
+ },
+ {
+  "ticker": "TWTR",
+  "first": "2018-07-01",
+  "last": "2022-10-01",
+  "pinned_days": 1134,
+  "latest_days": 1134
+ },
+ {
+  "ticker": "TWX",
+  "first": "2015-01-01",
+  "last": "2018-04-01",
+  "pinned_days": 449,
+  "latest_days": 429
+ },
+ {
+  "ticker": "TYC",
+  "first": "2015-01-01",
+  "last": "2016-07-01",
+  "pinned_days": 10,
+  "latest_days": 0
+ },
+ {
+  "ticker": "UA C",
+  "first": "2016-10-01",
+  "last": "2016-10-01",
+  "pinned_days": 63,
+  "latest_days": 53
+ },
+ {
+  "ticker": "UAL",
+  "first": "2015-10-01",
+  "last": "2026-08-16",
+  "pinned_days": 497,
+  "latest_days": 477
+ },
+ {
+  "ticker": "UTX",
+  "first": "2015-01-01",
+  "last": "2020-04-01",
+  "pinned_days": 952,
+  "latest_days": 932
+ },
+ {
+  "ticker": "VAR",
+  "first": "2015-01-01",
+  "last": "2021-04-01",
+  "pinned_days": 1204,
+  "latest_days": 1184
+ },
+ {
+  "ticker": "VIAB",
+  "first": "2015-01-01",
+  "last": "2019-10-01",
+  "pinned_days": 827,
+  "latest_days": 807
+ },
+ {
+  "ticker": "VIAC",
+  "first": "2020-01-01",
+  "last": "2022-01-01",
+  "pinned_days": 567,
+  "latest_days": 567
+ },
+ {
+  "ticker": "WBA",
+  "first": "2015-04-01",
+  "last": "2025-07-01",
+  "pinned_days": 2271,
+  "latest_days": 2251
+ },
+ {
+  "ticker": "WBD",
+  "first": "2022-07-01",
+  "last": "2026-08-16",
+  "pinned_days": 0,
+  "latest_days": 1074
+ },
+ {
+  "ticker": "WCG",
+  "first": "2018-10-01",
+  "last": "2020-01-01",
+  "pinned_days": 377,
+  "latest_days": 377
+ },
+ {
+  "ticker": "WFM",
+  "first": "2015-01-01",
+  "last": "2017-07-01",
+  "pinned_days": 261,
+  "latest_days": 241
+ },
+ {
+  "ticker": "WLTW",
+  "first": "2016-04-01",
+  "last": "2022-01-01",
+  "pinned_days": 1394,
+  "latest_days": 1374
+ },
+ {
+  "ticker": "WRK",
+  "first": "2015-10-01",
+  "last": "2024-07-01",
+  "pinned_days": 2021,
+  "latest_days": 2001
+ },
+ {
+  "ticker": "WYN",
+  "first": "2015-01-01",
+  "last": "2018-04-01",
+  "pinned_days": 449,
+  "latest_days": 429
+ },
+ {
+  "ticker": "XEC",
+  "first": "2015-01-01",
+  "last": "2020-01-01",
+  "pinned_days": 889,
+  "latest_days": 869
+ },
+ {
+  "ticker": "XEL",
+  "first": "2015-01-01",
+  "last": "2026-08-16",
+  "pinned_days": 324,
+  "latest_days": 304
+ },
+ {
+  "ticker": "XL",
+  "first": "2015-01-01",
+  "last": "2018-07-01",
+  "pinned_days": 512,
+  "latest_days": 492
+ },
+ {
+  "ticker": "XLNX",
+  "first": "2015-01-01",
+  "last": "2022-01-01",
+  "pinned_days": 1394,
+  "latest_days": 1374
+ },
+ {
+  "ticker": "YHOO",
+  "first": "2015-01-01",
+  "last": "2017-04-01",
+  "pinned_days": 198,
+  "latest_days": 178
+ }
+]
