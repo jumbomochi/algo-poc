@@ -74,3 +74,67 @@ def test_symbol_mapping_for_class_shares():
     source.fetch(["BRK B"], since=SINCE)
     _, params = client.calls[0]
     assert params["symbol"] == "BRK.B"
+
+
+class ScriptedClient:
+    """Answers each call with the next status in ``statuses``."""
+
+    def __init__(self, statuses, headers=None):
+        self._statuses = list(statuses)
+        self._headers = headers or {}
+        self.calls = []
+
+    def get(self, url, params=None):
+        self.calls.append(params["symbol"])
+        response = FakeResponse([], status_code=self._statuses.pop(0))
+        response.headers = self._headers
+        return response
+
+
+class FakeTime:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def clock(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(round(seconds, 3))
+        self.now += seconds
+
+
+def _source(client, fake_time, **kwargs):
+    return FinnhubNewsSource(
+        api_key="k", http_client=client, sleep=fake_time.sleep, clock=fake_time.clock, **kwargs
+    )
+
+
+def test_calls_are_paced_under_the_free_tier_limit():
+    """The first live cycle sent ~140 calls unpaced and was refused with 429
+    after about 17 seconds."""
+    fake_time = FakeTime()
+    client = ScriptedClient([200, 200, 200])
+    _source(client, fake_time).fetch(["AAPL", "MSFT", "XLU"], since=SINCE)
+    assert client.calls == ["AAPL", "MSFT", "XLU"]
+    assert fake_time.sleeps == [1.1, 1.1]  # none before the first call
+
+
+def test_a_429_is_waited_out_and_retried():
+    fake_time = FakeTime()
+    client = ScriptedClient([429, 200], headers={"Retry-After": "7"})
+    _source(client, fake_time).fetch(["AAPL"], since=SINCE)
+    assert client.calls == ["AAPL", "AAPL"]
+    assert 7.0 in fake_time.sleeps
+
+
+def test_a_persistent_429_still_fails_the_source():
+    fake_time = FakeTime()
+    client = ScriptedClient([429, 429, 429])
+    try:
+        _source(client, fake_time, max_retries=2, retry_wait_s=5).fetch(["AAPL"], since=SINCE)
+    except RuntimeError as exc:
+        assert "429" in str(exc)
+    else:
+        raise AssertionError("a persistent 429 must fail the source")
+    assert client.calls == ["AAPL"] * 3
