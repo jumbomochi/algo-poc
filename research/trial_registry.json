@@ -13,6 +13,12 @@
       "what": "Native factor catalog: four price-only factors specified and scored (price_momentum_126d, high_52w, low_volatility_63d, liquidity_20d)",
       "n_trials": 4,
       "source": "research/factors/catalog.py"
+    },
+    {
+      "searched_at": "2026-10-19",
+      "what": "Momentum v2: regime passed to the momentum sleeve (regime-adaptive stops, inverse ETFs only in bear) plus a rank exit outside the top 10. One pre-registered candidate; rank band fixed at 2 x top_n, not swept",
+      "n_trials": 1,
+      "source": "docs/decisions/momentum-v2-2026-10.md"
     }
   ]
 }
