@@ -103,3 +103,18 @@ def test_the_variants_are_the_pre_registered_ones():
     """Changing v2 here is a new trial, not an edit (the decision doc)."""
     assert MOMENTUM_VARIANTS["v1"] == (False, None)
     assert MOMENTUM_VARIANTS["v2"] == (True, 10)
+
+
+def test_a_held_inverse_etf_in_a_bear_regime_is_still_subject_to_the_rank_exit():
+    """In a bear regime an inverse ETF is a momentum holding like any other: v2
+    sells it when it falls out of the top 10: the pre-registered rule names no
+    exception for it."""
+    bars = dict(LADDER, PSQ=_bars(200, -0.002))  # ranks last of 13
+    today = bars["PSQ"][DAY - 1]
+    fn = make_momentum_signals_fn(
+        bars_by_ticker=bars, top_n=5, lookback_days=126, bear_tickers={"PSQ"},
+        regime_by_date={b["date"]: "bear" for b in bars["PSQ"]}, rank_exit_n=10,
+        portfolio_context=holding("PSQ", entry_price=today["close"], entry_date=today["date"]),
+    )
+    signal = fn("PSQ", bars["PSQ"][:DAY])
+    assert signal is not None and signal["exit_reason"] == "rank_exit"

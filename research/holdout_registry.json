@@ -25,7 +25,7 @@
       "horizon": 21,
       "embargo": 21,
       "registered_at": "2026-10-19T00:00:00+00:00",
-      "note": "Forward split for momentum_v2 ONLY (docs/decisions/momentum-v2-2026-10.md), registered before v2 was designed into a backtest result and before the session 2026-10-20 existed. forward_2026h2 cannot serve: its scope is searches that predate 2026-08-29, and v2 was specified on 2026-10-19. Out-of-search-sample, not out-of-sight-sample (the paper book trades this window). Spending it needs a baseline artifact that reaches past the boundary and runs v2; min_sessions 60 lands around mid-January 2027.",
+      "note": "Forward split for momentum_v2 ONLY (docs/decisions/momentum-v2-2026-10.md), registered on 2026-10-19, with the pre-registration and before the session 2026-10-20 existed. forward_2026h2 cannot serve: its scope is searches that predate 2026-08-29, and v2 was specified on 2026-10-19. Out-of-search-sample, not out-of-sight-sample (the paper book trades this window). Spending it needs a baseline artifact that reaches past the boundary and runs v2; min_sessions 60 lands around mid-January 2027.",
       "min_sessions": 60
     }
   ],

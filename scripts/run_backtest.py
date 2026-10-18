@@ -1144,9 +1144,11 @@ def make_momentum_signals_fn(
                 }
 
         # === Entry logic: buy if in top N and not already held ===
-        top_tickers = rankings_by_date.get(current_date, [])[:top_n]
+        # v2 only (regime given). Every sell has been decided above, so this
+        # suppresses nothing but an inverse-ETF entry outside a bear regime.
         if regime_by_date and bear_tickers and ticker in bear_tickers and regime != "bear":
             return None
+        top_tickers = rankings_by_date.get(current_date, [])[:top_n]
         pending_buy_quantity = portfolio_context.pending_quantity(ticker, "buy")
         if not lots and pending_buy_quantity <= 0 and ticker in top_tickers:
             quantity = _entry_quantity(

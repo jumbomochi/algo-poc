@@ -101,18 +101,27 @@ other parameters.
 | diag: regime only | 0.660 | 202.3% | 26.0% | 640 | 35.5% | 63.0 d | 3 (−$325) | trailing 480, max loss 159 |
 | diag: rank exit only | 0.486 | 110.6% | 23.5% | 999 | 41.2% | 21.9 d | 10 (−$43) | rank 538, trailing 341, max loss 109 |
 
-- **The regime fix works as designed.** The bought-then-force-sold inverse-ETF
-  churn is gone (10 round trips to 3–4, now held through a bear regime). The
-  regime-adaptive stops hold winners longer (63 vs 50 days). Alone, it
-  improves every return figure.
+- **The regime fix removes the churn, but not the losses on inverse ETFs.**
+  The bought-then-force-sold round trips fall from 10 to 3–4, now held through
+  a bear regime. The ones that remain lose more: −$325 regime-only and −$279
+  in v2, against −$51 for v1's ten. The regime-adaptive stops hold winners
+  longer (63 vs 50 days). Alone, the fix raises Sharpe (0.660) and return
+  (202%), while max drawdown is flat (26.0% vs 25.6%).
 - **The rank exit is what costs.** It halves the holding period and sells
   winners on rank noise. It wins more often (41% vs 36%) but on smaller moves,
   and it gives up more than the regime fix gains. On these bars, momentum's
   edge is in letting winners run past the point where they stop ranking top 10.
 
 ### What this does and does not license
+- **How many trials this really was.** The headline n = 9 counts the 8
+  sleeve-selection trials and v2, as pre-registered. Three more momentum
+  configurations were then run (two diagnostics, and v1 again as the control).
+  The two diagnostics are registered in `research/trial_registry.json` as
+  well, because one of them is now proposed for adoption. Counted, n = 11:
+  v2's DSR is **0.34**, and regime-only's is **0.45**. Both FAIL either way.
 - **The regime-only variant is not a candidate.** It was a pre-declared
-  diagnostic. Its DSR at 10 trials (counting it) is **0.48**: still a FAIL,
+  diagnostic. Its DSR at 10 trials (counting it) is **0.48**, and 0.45 at 11:
+  still a FAIL,
   and its in-sample figure is now selection-contaminated, because it was
   picked after seeing these results. Adopting it means a new trial entry, and
   only a forward window can judge it.
@@ -126,9 +135,10 @@ other parameters.
   | DSR | 0.46 | 0.70 | 0.87 | 0.93 | 0.96 | 0.98 |
 
   A momentum-like sleeve needs a Sharpe of about **1.15–1.2** over this
-  history to clear 0.95. The best configuration seen here is 0.66. Fixing
-  defects in the incumbents will not get any of them there; that takes a
-  different return source, or a combination that diversifies.
+  history to clear 0.95. The best momentum configuration seen here is 0.66,
+  so defect fixes will not get momentum there. The other sleeves were not
+  tested here. Their full-sample Sharpes (0.36–0.63, all D10 FAIL) suggest
+  the same gap, but that is an inference, not a result.
 - **Adoption in paper is the operator's call** (decision rule above). The
   defensible version is the regime fix alone, as a correctness change, not an
   edge claim. The 2022-style inverse-ETF churn is a real bug in the live
