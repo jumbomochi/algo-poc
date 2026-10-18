@@ -60,8 +60,8 @@ services:
 #    pick up the new ALGO_DATABASE_URL from `.env`.
 #
 # 4. Any HOST-side script that hardcodes a DB/Redis URL outside of docker
-#    compose (this repo's launchd wrappers under deploy/launchd/ and
-#    ops/launchd/, and their deployed copies under ~/ibc/) must be updated
+#    compose (this repo's launchd wrappers under deploy/launchd/, and
+#    their deployed copies under ~/ibc/) must be updated
 #    with the same new credentials, or the nightly paper-trading / monitoring
 #    jobs will start failing auth after step 3. Check for the literal string
 #    "algo:algo" and any un-authenticated "redis://localhost:<port>" URL.

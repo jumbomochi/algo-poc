@@ -122,7 +122,10 @@ ALGO_OPTIONAL_SECRET_NAMES="${ALGO_OPTIONAL_SECRET_NAMES:-DEADMAN_WATCHDOG_URL A
 #   * --export / --env-file do NOT emit it: docker compose has no use for a
 #     network credential, and scripts/fetch_earnings.py reads the keychain
 #     itself when run by hand.
-ALGO_JOB_SECRET_NAMES="${ALGO_JOB_SECRET_NAMES:-ALPHAVANTAGE_API_KEY}"
+# The sentiment collector's source keys are job credentials on the same terms
+# (run_sentiment_collect.sh; source of truth 1Password). Each one absent skips
+# only its own source; the job stops only when none is present.
+ALGO_JOB_SECRET_NAMES="${ALGO_JOB_SECRET_NAMES:-ALPHAVANTAGE_API_KEY FINNHUB_API_KEY REDDIT_CLIENT_ID REDDIT_CLIENT_SECRET}"
 
 # Human-readable reason the last lookup failed. Callers log this verbatim; it
 # names the operator action, which is the whole point of separating the failure

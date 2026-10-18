@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Disabled</key>
+	<false/>
+	<key>Label</key>
+	<string>local.algo-sentiment-collect</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/huiliang/ibc/run_sentiment_collect.sh</string>
+	</array>
+	<!-- No EnvironmentVariables: the source keys are in the login keychain and
+	     the wrapper loads them (run_sentiment_collect.sh). This plist used to
+	     carry them in plaintext. -->
+	<key>StandardErrorPath</key>
+	<string>/Users/huiliang/ibc/logs/sentiment-collect.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/huiliang/ibc/logs/sentiment-collect.log</string>
+	<!-- Hourly, every day: social posts do not wait for the session, and the
+	     collector reads with an hour of overlap so a missed cycle loses
+	     nothing. Uses neither IB nor Alpha Vantage. -->
+	<key>StartInterval</key>
+	<integer>3600</integer>
+</dict>
+</plist>

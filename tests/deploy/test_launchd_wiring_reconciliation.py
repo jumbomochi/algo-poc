@@ -41,6 +41,7 @@ ALL_JOBS = [
     "local.algo-gateway-watchdog",
     "local.algo-paper-trading",
     "local.algo-pipeline-report",
+    "local.algo-sentiment-collect",
 ]
 
 

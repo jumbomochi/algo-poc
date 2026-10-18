@@ -601,12 +601,12 @@ def test_full_import_walks_every_known_name_and_skips_on_enter(kc, tmp_path):
     s = _session(kc, tmp_path)
     s.expect(r"POSTGRES_PASSWORD already set .*overwrite\? \[y/N\] ")
     s.send("\n")
-    for _ in range(12):
+    for _ in range(15):
         s.secret("")
     assert s.finish() == 0, s.text
     assert kc.get("POSTGRES_PASSWORD") == "real-pg-password"
     assert kc.writes() == []
-    assert s.text.count("skipped ") == 12
+    assert s.text.count("skipped ") == 15
     assert "Nothing to write." in s.text
 
 

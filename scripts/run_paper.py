@@ -2676,6 +2676,14 @@ def main() -> int | None:
     finally:
         # Only the research shadow session is closed here; the paper `session`
         # stays open for the publish bridge below and is closed at the end.
+        if candidate_observer is not None:
+            # The count makes an empty evidence clock visible in the log: an
+            # observe failure is swallowed per candidate, so a broken shadow
+            # would otherwise look like a quiet day.
+            print(
+                "Research shadow: "
+                f"{getattr(candidate_observer, 'recorded', '?')} candidates recorded"
+            )
         if research_session is not None:
             try:
                 research_session.close()

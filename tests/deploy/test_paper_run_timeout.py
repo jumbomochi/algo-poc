@@ -319,3 +319,26 @@ def test_every_exit_after_the_run_goes_through_the_single_exit_helper() -> None:
         if re.match(r"^\s*exit\s", line) and line.strip() != 'exit "$1"'
     ]
     assert not bare, "exits that bypass paper_exit(): " + "; ".join(bare)
+
+
+# ---------------------------------------------------------------------------
+# The research shadow is on in production
+# ---------------------------------------------------------------------------
+
+
+def test_the_scheduled_run_records_the_research_shadow(tmp_path: Path) -> None:
+    """The factor shadow was built in 2026-08 and never switched on: the
+    wrapper did not pass ``--research-shadow``, so ``research_candidates``
+    stayed empty and no forward record of the factors accumulated. Driven
+    through the shipped wrapper, so the flag is checked where launchd runs it,
+    not as text in a file."""
+    argv_log = tmp_path / "paper-argv.log"
+    res = _run_wrapper(
+        tmp_path,
+        paper_run=f'#!/bin/bash\nprintf "%s\\n" "$*" >> {argv_log}\nexit 0\n',
+        deadline=NORMAL_DEADLINE,
+    )
+    assert res.returncode == 0, f"exit {res.returncode}\n{res.log}"
+    runs = [line for line in argv_log.read_text().splitlines() if "run_paper.py" in line]
+    assert len(runs) == 1, runs
+    assert "--research-shadow" in runs[0].split(), runs[0]

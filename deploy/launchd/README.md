@@ -19,6 +19,8 @@ host. The **live** copies are deployed outside the repo:
 | `run_earnings_refresh.sh` | `~/ibc/run_earnings_refresh.sh` (chmod +x) — 04:45 SGT **daily** Alpha Vantage earnings refresh (KAN-110) |
 | `local.algo-earnings-refresh.plist` | `~/Library/LaunchAgents/local.algo-earnings-refresh.plist` |
 | `local.algo-earnings-topup.plist` | `~/Library/LaunchAgents/local.algo-earnings-topup.plist` — 05:05 SGT daily `run_earnings_refresh.sh --top-up` |
+| `run_sentiment_collect.sh` | `~/ibc/run_sentiment_collect.sh` (chmod +x) — hourly sentiment collector (research only; `docs/operations/sentiment-research.md`) |
+| `local.algo-sentiment-collect.plist` | `~/Library/LaunchAgents/local.algo-sentiment-collect.plist` |
 
 ### The schedule, and why it is 05:15 (KAN-104)
 
@@ -437,6 +439,7 @@ canonical` line if it was launched from a drifted copy.
 | `run_evidence_digest.sh` | evidence digest |
 | `run_paper.sh` | daily paper trading run, 05:15 |
 | `run_pipeline_report.sh` | daily pipeline report, 05:52 |
+| `run_sentiment_collect.sh` | sentiment collector, hourly |
 
 `deploy.sh` itself is not deployed — it is the deployer.
 
