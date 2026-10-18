@@ -48,8 +48,8 @@ class FakeClient:
         self._payload = payload
         self.calls = []
 
-    def get(self, url, params=None):
-        self.calls.append((url, params))
+    def get(self, url, params=None, headers=None):
+        self.calls.append((url, params, headers))
         return FakeResponse(self._payload)
 
 
@@ -72,8 +72,20 @@ def test_symbol_mapping_for_class_shares():
     client = FakeClient([])
     source = FinnhubNewsSource(api_key="k", http_client=client)
     source.fetch(["BRK B"], since=SINCE)
-    _, params = client.calls[0]
+    _, params, _ = client.calls[0]
     assert params["symbol"] == "BRK.B"
+
+
+def test_the_key_is_a_header_never_in_the_url():
+    """A failed request's exception message carries the full URL, and the
+    collector logs that traceback: the first live cycle wrote the key into
+    ~/ibc/logs/sentiment-collect.log that way."""
+    client = FakeClient([])
+    FinnhubNewsSource(api_key="secret-key", http_client=client).fetch(["AAPL"], since=SINCE)
+    url, params, headers = client.calls[0]
+    assert "secret-key" not in url
+    assert "secret-key" not in str(params)
+    assert headers == {"X-Finnhub-Token": "secret-key"}
 
 
 class ScriptedClient:
@@ -84,7 +96,7 @@ class ScriptedClient:
         self._headers = headers or {}
         self.calls = []
 
-    def get(self, url, params=None):
+    def get(self, url, params=None, headers=None):
         self.calls.append(params["symbol"])
         response = FakeResponse([], status_code=self._statuses.pop(0))
         response.headers = self._headers
@@ -138,3 +150,25 @@ def test_a_persistent_429_still_fails_the_source():
     else:
         raise AssertionError("a persistent 429 must fail the source")
     assert client.calls == ["AAPL"] * 3
+
+
+def test_a_huge_or_unparseable_retry_after_is_bounded():
+    for header, expected in (("3600", 60.0), ("inf", 30.0), ("nan", 30.0), ("Wed, 21 Oct 2026 07:28:00 GMT", 30.0)):
+        fake_time = FakeTime()
+        client = ScriptedClient([429, 200], headers={"Retry-After": header})
+        _source(client, fake_time).fetch(["AAPL"], since=SINCE)
+        assert fake_time.sleeps == [expected], header
+
+
+def test_a_cycle_past_its_deadline_fails_the_source():
+    """launchd never overlaps runs, so an overrun would skip the next cycle."""
+    fake_time = FakeTime()
+    client = ScriptedClient([200] * 5)
+    source = _source(client, fake_time, min_interval_s=10, deadline_s=25)
+    try:
+        source.fetch(["A", "B", "C", "D", "E"], since=SINCE)
+    except RuntimeError as exc:
+        assert "exceeded 25s" in str(exc)
+    else:
+        raise AssertionError("an overrunning cycle must fail")
+    assert client.calls == ["A", "B", "C"]
