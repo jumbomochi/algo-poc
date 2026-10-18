@@ -995,6 +995,7 @@ def make_momentum_signals_fn(
     membership: MembershipCalendar | None = None,
     whole_shares: bool = False,
     skip_ledger: SkipLedger | None = None,
+    rank_exit_n: int | None = None,
 ):
     """Create a momentum signal function based on 6-month relative strength.
 
@@ -1012,8 +1013,19 @@ def make_momentum_signals_fn(
     index members on that date. This matters because the runner blocks entries in
     non-members: without the per-date filter, top-N slots get taken by names the
     sleeve is not allowed to buy and it silently trades nothing.
+
+    Momentum v2 (docs/decisions/momentum-v2-2026-10.md) is two arguments, both
+    off by default so every existing caller is v1:
+
+    * ``regime_by_date`` switches on the regime-adaptive stops and the bear
+      logic, and additionally refuses an entry into a ``bear_tickers`` name
+      unless the regime is ``bear`` -- without that, an inverse ETF that ranks
+      top in a non-bear regime is bought and force-sold the next session.
+    * ``rank_exit_n`` sells a holding that is not in that date's top
+      ``rank_exit_n`` (the same membership-filtered ranking entries use).
     """
     _require_position_source(portfolio_context, "momentum")
+    ranked_depth = max(top_n, rank_exit_n or 0)
     # Pre-compute date -> {ticker: close_price} for ranking
     eligible = set(eligible_tickers or bars_by_ticker)
     price_by_date: dict[Any, dict[str, float]] = {}
@@ -1046,7 +1058,7 @@ def make_momentum_signals_fn(
                 returns.append((ticker, ret))
 
         returns.sort(key=lambda x: x[1], reverse=True)
-        rankings_by_date[d] = [t for t, _ in returns[:top_n]]
+        rankings_by_date[d] = [t for t, _ in returns[:ranked_depth]]
 
 
     def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
@@ -1106,6 +1118,16 @@ def make_momentum_signals_fn(
                     exit_reason = "max_loss"
                     break
 
+            ranking = rankings_by_date.get(current_date)
+            if (
+                not should_sell
+                and rank_exit_n is not None
+                and ranking is not None
+                and ticker not in ranking[:rank_exit_n]
+            ):
+                should_sell = True
+                exit_reason = "rank_exit"
+
             if should_sell:
                 exit_quantity = _context_exit_quantity(
                     portfolio_context, ticker, held.quantity
@@ -1122,7 +1144,9 @@ def make_momentum_signals_fn(
                 }
 
         # === Entry logic: buy if in top N and not already held ===
-        top_tickers = rankings_by_date.get(current_date, [])
+        top_tickers = rankings_by_date.get(current_date, [])[:top_n]
+        if regime_by_date and bear_tickers and ticker in bear_tickers and regime != "bear":
+            return None
         pending_buy_quantity = portfolio_context.pending_quantity(ticker, "buy")
         if not lots and pending_buy_quantity <= 0 and ticker in top_tickers:
             quantity = _entry_quantity(
@@ -1152,6 +1176,17 @@ def make_momentum_signals_fn(
         return None
 
     return signals_fn
+
+
+#: Momentum variants for --momentum-variant: (pass the regime?, rank exit band).
+#: v2 and its band are pre-registered in docs/decisions/momentum-v2-2026-10.md;
+#: changing either here is a new trial, not an edit.
+MOMENTUM_VARIANTS: dict[str, tuple[bool, int | None]] = {
+    "v1": (False, None),
+    "v2": (True, 10),
+    "diag-regime": (True, None),
+    "diag-rank-exit": (False, 10),
+}
 
 
 def make_combined_signals_fn(
@@ -2743,6 +2778,15 @@ def main():
         help="Minimum incoming score improvement for score_margin (default: 0.25)",
     )
     parser.add_argument(
+        "--momentum-variant",
+        choices=list(MOMENTUM_VARIANTS),
+        default="v1",
+        help="Research only (docs/decisions/momentum-v2-2026-10.md). v1 is the "
+             "incumbent the paper run trades; v2 is the pre-registered "
+             "candidate; diag-* are single-fix diagnostics, never candidates. "
+             "A non-v1 run is recorded in the artifact's config.",
+    )
+    parser.add_argument(
         "--universe-snapshots",
         default=None,
         help="Path to a point-in-time index membership JSON "
@@ -2964,7 +3008,12 @@ def main():
     # KAN-116: each sleeve reads its own replayed book, as live reads the real one.
     books = {name: RunnerBook() for name in skip_ledgers}
 
+    mom_regime, mom_rank_exit_n = MOMENTUM_VARIANTS[args.momentum_variant]
+    if args.momentum_variant != "v1":
+        print(f"  Momentum variant {args.momentum_variant} (research; not the paper run's v1)")
     mom_signals_fn = make_momentum_signals_fn(
+        regime_by_date=regime_by_date if mom_regime else None,
+        rank_exit_n=mom_rank_exit_n,
         whole_shares=args.whole_shares,
         skip_ledger=skip_ledgers["momentum"],
         portfolio_context=books["momentum"],
@@ -3283,6 +3332,10 @@ def main():
         # clean run carries no key, so an absent key never reads as unknown.
         # The go-live gate refuses an artifact that carries it.
         base_config["data_degraded"] = dict(sorted(data_degraded.items()))
+    if args.momentum_variant != "v1":
+        # Present only when not the incumbent, like data_degraded: an artifact
+        # without the key is v1, the strategy the paper run trades.
+        base_config["momentum_variant"] = args.momentum_variant
     if args.ml_filter:
         base_config["ml_filter"] = {
             "model": args.ml_filter,

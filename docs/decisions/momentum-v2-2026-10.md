@@ -75,5 +75,64 @@ trial.
 - **Nothing changes in paper or live in this work.** The variant is a backtest
   flag; `run_paper.py` is untouched.
 
-## Results
-(Appended after the runs.)
+## Results (2026-10-19)
+
+All four runs use the bars of `output/backtest_multi_20261013_114528.json` and
+the refresh's flags. v1 reproduces KAN-120's figures exactly (0.570 / 157.7% /
+25.6%), so the comparison runs on the same footing as the record.
+
+### Verdict: v2 FAILS D10
+| | Sharpe | Return | Max DD | DSR (n=9) | Verdict |
+|---|---|---|---|---|---|
+| v1 (incumbent) | 0.570 | 157.7% | 25.6% | 0.41 | FAIL |
+| **v2 (candidate)** | **0.548** | **135.4%** | **26.1%** | **0.39** | **FAIL** |
+
+The evaluation is gate-invalid (coverage below the floor, no acceptance pinned
+to these artifacts) and ran against a scratch copy of the holdout registry, so
+no split was spent. A gate-valid run would change neither verdict: both DSRs are
+less than half the 0.95 bar. Per the decision rule, v2 is not re-run with
+other parameters.
+
+### Where it went: the two fixes pull in opposite directions
+| Momentum | Sharpe | Return | Max DD | Round trips | Win rate | Avg hold | Inverse-ETF trips (P&L) | Exits |
+|---|---|---|---|---|---|---|---|---|
+| v1 | 0.570 | 157.7% | 25.6% | 764 | 35.9% | 49.6 d | 10 (−$51) | trailing 611, max loss 142, regime change 10 |
+| v2 | 0.548 | 135.4% | 26.1% | 951 | 41.3% | 23.3 d | 4 (−$279) | rank 571, trailing 249, max loss 130 |
+| diag: regime only | 0.660 | 202.3% | 26.0% | 640 | 35.5% | 63.0 d | 3 (−$325) | trailing 480, max loss 159 |
+| diag: rank exit only | 0.486 | 110.6% | 23.5% | 999 | 41.2% | 21.9 d | 10 (−$43) | rank 538, trailing 341, max loss 109 |
+
+- **The regime fix works as designed.** The bought-then-force-sold inverse-ETF
+  churn is gone (10 round trips to 3–4, now held through a bear regime). The
+  regime-adaptive stops hold winners longer (63 vs 50 days). Alone, it
+  improves every return figure.
+- **The rank exit is what costs.** It halves the holding period and sells
+  winners on rank noise. It wins more often (41% vs 36%) but on smaller moves,
+  and it gives up more than the regime fix gains. On these bars, momentum's
+  edge is in letting winners run past the point where they stop ranking top 10.
+
+### What this does and does not license
+- **The regime-only variant is not a candidate.** It was a pre-declared
+  diagnostic. Its DSR at 10 trials (counting it) is **0.48**: still a FAIL,
+  and its in-sample figure is now selection-contaminated, because it was
+  picked after seeing these results. Adopting it means a new trial entry, and
+  only a forward window can judge it.
+- **The bar.** At 9 trials, the Sharpe that a pure-noise search of this size
+  wins (SR*) is **0.64** annualised. That is above every incumbent except
+  thematic. Holding v2's length, skew (−0.3) and kurtosis (5.1), and the other
+  sleeves' spread, fixed:
+
+  | Annualised Sharpe | 0.6 | 0.8 | 1.0 | 1.1 | 1.2 | 1.3 |
+  |---|---|---|---|---|---|---|
+  | DSR | 0.46 | 0.70 | 0.87 | 0.93 | 0.96 | 0.98 |
+
+  A momentum-like sleeve needs a Sharpe of about **1.15–1.2** over this
+  history to clear 0.95. The best configuration seen here is 0.66. Fixing
+  defects in the incumbents will not get any of them there; that takes a
+  different return source, or a combination that diversifies.
+- **Adoption in paper is the operator's call** (decision rule above). The
+  defensible version is the regime fix alone, as a correctness change, not an
+  edge claim. The 2022-style inverse-ETF churn is a real bug in the live
+  sleeve today.
+- **`momentum_v2_forward` stays registered and unspent.** Spending a forward
+  window on a candidate that already fails in-sample confirms nothing. It is
+  spent only if v2 is adopted into paper.
