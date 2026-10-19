@@ -27,6 +27,15 @@
       "registered_at": "2026-10-19T00:00:00+00:00",
       "note": "Forward split for momentum_v2 ONLY (docs/decisions/momentum-v2-2026-10.md), registered on 2026-10-19, with the pre-registration and before the session 2026-10-20 existed. forward_2026h2 cannot serve: its scope is searches that predate 2026-08-29, and v2 was specified on 2026-10-19. Out-of-search-sample, not out-of-sight-sample (the paper book trades this window). Spending it needs a baseline artifact that reaches past the boundary and runs v2; min_sessions 60 lands around mid-January 2027.",
       "min_sessions": 60
+    },
+    {
+      "split_id": "cross_asset_trend_forward",
+      "holdout_start": "2026-10-20",
+      "horizon": 21,
+      "embargo": 21,
+      "registered_at": "2026-10-20T00:00:00+00:00",
+      "note": "Forward split for cross_asset_trend ONLY (docs/decisions/cross-asset-trend-2026-10.md), registered with its pre-registration before the US session of 2026-10-20 existed and before any return of the sleeve was computed. No earlier split covers it: forward_2026h2 is scoped to searches before 2026-08-29 and momentum_v2_forward to momentum v2. Out-of-search-sample; the sleeve is not traded in paper, so also out-of-sight unless it is promoted. Spending it needs bars past the boundary for VTI/EFA/AGG/VNQ/DBC; min_sessions 60 lands around mid-January 2027.",
+      "min_sessions": 60
     }
   ],
   "evaluations": [

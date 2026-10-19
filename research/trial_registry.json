@@ -25,6 +25,12 @@
       "what": "Momentum v2 diagnostics run beside the candidate: regime only, rank exit only. Declared as non-candidates before the run, registered after it because regime-only is proposed for adoption as a correctness change",
       "n_trials": 2,
       "source": "docs/decisions/momentum-v2-2026-10.md"
+    },
+    {
+      "searched_at": "2026-10-20",
+      "what": "Cross-asset trend: Faber 10-month SMA timing over VTI/EFA/AGG/VNQ/DBC (the candidate) and the 12-month time-series-momentum sign rule on the same universe (a declared non-candidate). Published parameters, none swept",
+      "n_trials": 2,
+      "source": "docs/decisions/cross-asset-trend-2026-10.md"
     }
   ]
 }

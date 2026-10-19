@@ -109,7 +109,7 @@ def test_flag_off_preserves_fractional_quantity_on_weighted_site():
 
 
 def test_every_sizing_site_routes_through_the_helper():
-    """All nine sizing sites use ``_entry_quantity``.
+    """All ten sizing sites use ``_entry_quantity``.
 
     A site left on the inline ``round(max(0.0001, ...))`` form would silently
     ignore --whole-shares, making the flag's behaviour depend on which factory
@@ -120,8 +120,8 @@ def test_every_sizing_site_routes_through_the_helper():
     # The one surviving inline formula is inside ``_entry_quantity`` itself.
     assert source.count("round(max(0.0001,") == 1
     call_sites = re.findall(r"_entry_quantity\(", source)
-    # nine call sites plus the definition
-    assert len(call_sites) == 10, f"expected 9 call sites, found {len(call_sites) - 1}"
+    # ten call sites plus the definition
+    assert len(call_sites) == 11, f"expected 10 call sites, found {len(call_sites) - 1}"
 
 
 # --- AC1: flag on truncates toward zero -------------------------------------
