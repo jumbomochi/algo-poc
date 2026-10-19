@@ -1327,6 +1327,106 @@ def make_sector_rotation_signals_fn(
     return signals_fn
 
 
+#: Research only (docs/decisions/cross-asset-trend-2026-10.md): Faber's five
+#: asset classes, AGG standing in for IEF, whose IB history starts 2017-08.
+CROSS_ASSET_ETFS = ("VTI", "EFA", "AGG", "VNQ", "DBC")
+CROSS_ASSET_RULES = ("sma", "tsmom")
+
+
+def make_cross_asset_trend_signals_fn(
+    bars_by_ticker: dict[str, list[dict]],
+    eligible_tickers: list[str] | None = None,
+    rule: str = "sma",
+    sma_days: int = 210,
+    tsmom_days: int = 252,
+    position_size_pct: float = 0.19,
+    initial_capital: float = 100_000,
+    portfolio_context: PortfolioContext | RunnerBook | None = None,
+    whole_shares: bool = False,
+    skip_ledger: SkipLedger | None = None,
+):
+    """Create the cross-asset trend signal function (research only).
+
+    On the first session of each calendar month, holds each eligible asset
+    whose close is above its ``sma_days`` average (``rule="sma"``, the
+    candidate) or above its close ``tsmom_days`` sessions back
+    (``rule="tsmom"``, the declared second trial), and holds none of it
+    otherwise. Between decision days it does nothing: the trend rule is the
+    only exit, so there is no trailing or max-loss stop.
+
+    A first session is one whose predecessor in the bar series falls in
+    another month, which needs no knowledge of dates that have not happened.
+    """
+    _require_position_source(portfolio_context, "cross_asset_trend")
+    if rule not in CROSS_ASSET_RULES:
+        raise ValueError(f"rule must be one of {CROSS_ASSET_RULES}, got {rule!r}")
+    eligible = set(eligible_tickers or bars_by_ticker)
+    sessions = sorted({
+        bar["date"]
+        for ticker, bars in bars_by_ticker.items() if ticker in eligible
+        for bar in bars
+    })
+    decision_days = {
+        d for prev, d in zip(sessions, sessions[1:])
+        if (prev.year, prev.month) != (d.year, d.month)
+    }
+    history = sma_days if rule == "sma" else tsmom_days + 1
+
+    def in_trend(bars: list[dict]) -> bool:
+        close = bars[-1]["close"]
+        if rule == "sma":
+            return close > sum(b["close"] for b in bars[-sma_days:]) / sma_days
+        return close > bars[-1 - tsmom_days]["close"]
+
+    def signals_fn(ticker: str, bars: list[dict]) -> dict | None:
+        if ticker not in eligible or len(bars) < history:
+            return None
+        current_date = bars[-1]["date"]
+        if current_date not in decision_days:
+            return None
+        current_price = bars[-1]["close"]
+        on = in_trend(bars)
+        held = portfolio_context.positions.get(ticker)
+
+        if held and not on:
+            exit_quantity = _context_exit_quantity(portfolio_context, ticker, held.quantity)
+            if exit_quantity is None:
+                return None
+            return {
+                "action": "sell",
+                "ticker": ticker,
+                "limit_price": current_price,
+                "quantity": exit_quantity,
+                "sector": "Unknown",
+                "exit_reason": "trend_off",
+            }
+
+        if not held and on and portfolio_context.pending_quantity(ticker, "buy") <= 0:
+            quantity = _entry_quantity(
+                initial_capital=initial_capital,
+                position_size_pct=position_size_pct,
+                current_price=current_price,
+                whole_shares=whole_shares,
+                skip_ledger=skip_ledger,
+                ticker=ticker,
+                current_date=current_date,
+            )
+            if quantity is None:
+                return None
+            return {
+                "action": "buy",
+                "ticker": ticker,
+                "limit_price": current_price,
+                "quantity": quantity,
+                "sector": "Unknown",
+                "signals": {"strategy": "cross_asset_trend", "rule": rule},
+            }
+
+        return None
+
+    return signals_fn
+
+
 def make_short_term_mr_signals_fn(
     position_size_pct: float = 0.08,
     initial_capital: float = 100_000,

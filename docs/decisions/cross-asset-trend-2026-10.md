@@ -135,3 +135,72 @@ Disclosed because it bears on how out-of-sample this is:
   tested on the 2022 kind of year.
 - **No return from `VTI`, `EFA`, `AGG`, `VNQ` or `DBC` had been computed** when
   this was written.
+
+## Results (2026-10-20)
+
+Run with `scripts/run_cross_asset_trend.py`, as specified above. The bars are
+`TRADES` daily bars fetched 2026-10-20, and the incumbents' returns come from
+the momentum-v2 control run. No holdout split was touched.
+
+### Verdict: the candidate FAILS D10
+| | Sharpe | Return (10 y) | Max DD | Round trips | DSR (n = 13) | Verdict |
+|---|---|---|---|---|---|---|
+| **cross_asset_trend (candidate)** | **0.641** | **46.1%** | **10.6%** | 50 | **0.52** | **FAIL** |
+| cross_asset_tsmom (second trial) | 0.448 | 35.4% | 18.2% | 35 | 0.29 | FAIL |
+
+Per the decision rule, it is not re-run with other parameters, assets or
+decision days. Its in-sample PSR against zero is 0.976, so it passes BH-FDR. It
+fails on the deflation alone: a Sharpe of 0.64 is SR\*'s size, not 0.52 above
+it.
+
+### The pre-registered reports (not the verdict)
+1. **Without the insurance sleeve in the spread: DSR 0.92, still below 0.95.**
+   This is the lenient rule the operator has not adopted, and the candidate
+   misses even under it. The second trial scores 0.80.
+2. **Total return (`ADJUSTED_LAST` bars):**
+   - Sharpe 0.714, return 60.9%, max DD 16.7%;
+   - DSR 0.59 (primary), 0.947 under the lenient rule. Still a FAIL, by 0.003.
+
+   The adjusted series moves every moving-average crossing, so this is a
+   different set of trades, not just the same trades with dividends added.
+3. **Diversification: less than hoped.**
+   - **Correlation with the incumbents:**
+
+     | sector_rotation | momentum | thematic | earnings_drift | quality_value | tail_risk_hedge |
+     |---|---|---|---|---|---|
+     | 0.72 | 0.58 | 0.46 | 0.36 | 0.24 | −0.09 |
+
+     In a decade when US equities trended up, the trend rule mostly held
+     `VTI` and `EFA`.
+   - **Against SPY** (a deviation from the stated −`SH` proxy, since `SPY`'s
+     own bars were fetched): correlation 0.67, beta 0.23, alpha 0.6% a year,
+     information ratio 0.13.
+   - **Blends:**
+     - with the five return-seeking incumbents: 0.769, against 0.757 without it;
+     - with momentum alone: 0.636.
+4. **Rung 0 fit is good.**
+   - At USD 3,700 with whole shares, **no signal was unfillable** (0 of 75).
+   - Commission was USD 100 over ten years, about 0.27% a year.
+   - Sharpe 0.613, max DD 9.9%.
+5. **Drawdown: shallow but slow.**
+   - The worst decline is 10.6%, against momentum's 25.6% and the S&P's 34%
+     over the same window.
+   - But from the January 2018 peak it took **747 sessions (about 3 years)**
+     to make a new high, through the 2020 trough. The longest stretch
+     underwater is 847 sessions.
+
+### What this does and does not license
+- **No sleeve on record clears D10, and neither does this one.** The candidate
+  is the first new return source since the incumbents were judged. Its Sharpe
+  sits at the incumbents' level (0.64), not above it.
+- **The near-miss under the lenient rule is not a pass.** That rule is not
+  adopted, and adopting it now to reach this sleeve would be exactly the
+  after-the-fact goalpost move the framework forbids. If the operator adopts
+  it on principle, the figure of record is the primary `TRADES` run (0.92),
+  not the adjusted 0.947. That run is still a FAIL.
+- **What the run does show is a drawdown profile.** A max DD of about 10% at
+  Rung 0 sits inside the IPS's 10% pause and 20% circuit breaker in a way
+  momentum's 25.6% does not. That is a risk property, not edge, and D10 does
+  not grade it.
+- **`cross_asset_trend_forward` stays registered and unspent.** It is spent
+  only if the operator promotes the candidate.
