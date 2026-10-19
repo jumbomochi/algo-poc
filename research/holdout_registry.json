@@ -18,6 +18,15 @@
       "registered_at": "2026-09-14T00:00:00+00:00",
       "note": "Forward split registered 2026-09-14, BEFORE any evaluation looked at a single session inside it, and boundary-dated after the 2026-08-28 burn of incumbent_sleeves_2026. Registered now because today is the last day this window is unlooked-at: registration is free, and a boundary written down after someone has seen the bars it covers is not a pre-registration. SCOPE. Valid for any candidate whose search predates 2026-08-29. The two known cases are the sentiment thread's gate evaluation (merged 2026-08-04, clock set for 2026-11) and the native factor catalog (specified 2026-08-02, four factors, trial_registry.json). It is SINGLE-USE, so spending it on one forecloses the other -- decide which before running, and register a second split for the other rather than arguing this one covers both after the fact. NOT valid for the six incumbent sleeves. They were judged on 2026-08-28 (all six FAIL) and their re-judgement under the corrected benchmark-relative null spends NO holdout: the corrected null can only strengthen a FAIL, and a split spent re-confirming a negative is a split gone. See docs/operations/incumbent-edge-evaluation.md. TWO LIMITS, both binding. (1) Out-of-SEARCH-sample, not out-of-sight-sample. The paper book trades this window daily and is watched daily, so no live-overlapping window can ever be out-of-sight; out-of-search is the honest ceiling and this split reaches it. (2) NO ADMISSIBLE BASELINE REACHES PAST THE BOUNDARY YET. The pinned, bias-accepted artifact backtest_multi_20260819_183451.json ends 2026-08-18, so resolve() raises against it rather than returning an empty window. The only artifact that reaches further, backtest_multi_20260910_235624.json, carries coverage 17.39% excluded against a 5.00% floor -- worse than the 11.28% D18 accepted, and bias_acceptances.json pins an acceptance to one sha256 and never widens. Spending this split therefore needs either a clean baseline or a new, deliberate bias acceptance larger than D18's. min_sessions 60 is the driver's own significance bar, now enforced before the burn instead of printed after it. 60 sessions from the boundary lands around late November 2026; the split cannot be spent before then and the attempt costs nothing.",
       "min_sessions": 60
+    },
+    {
+      "split_id": "cross_asset_trend_forward",
+      "holdout_start": "2026-10-20",
+      "horizon": 21,
+      "embargo": 21,
+      "registered_at": "2026-10-20T00:00:00+00:00",
+      "note": "Forward split for cross_asset_trend ONLY (docs/decisions/cross-asset-trend-2026-10.md), registered with its pre-registration before the US session of 2026-10-20 existed and before any return of the sleeve was computed. No earlier split covers it: forward_2026h2 is scoped to searches before 2026-08-29 and momentum_v2_forward to momentum v2. Out-of-search-sample; the sleeve is not traded in paper, so also out-of-sight unless it is promoted. Spending it needs bars past the boundary for VTI/EFA/AGG/VNQ/DBC; min_sessions 60 lands around mid-January 2027.",
+      "min_sessions": 60
     }
   ],
   "evaluations": [

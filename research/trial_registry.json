@@ -13,6 +13,12 @@
       "what": "Native factor catalog: four price-only factors specified and scored (price_momentum_126d, high_52w, low_volatility_63d, liquidity_20d)",
       "n_trials": 4,
       "source": "research/factors/catalog.py"
+    },
+    {
+      "searched_at": "2026-10-20",
+      "what": "Cross-asset trend: Faber 10-month SMA timing over VTI/EFA/AGG/VNQ/DBC (the candidate) and the 12-month time-series-momentum sign rule on the same universe (a declared non-candidate). Published parameters, none swept",
+      "n_trials": 2,
+      "source": "docs/decisions/cross-asset-trend-2026-10.md"
     }
   ]
 }
