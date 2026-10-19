@@ -59,3 +59,28 @@ def test_the_verdict_deflates_against_every_candidate_and_the_lenient_figure_dro
     assert seen[1] == (sorted(set(everyone) - {"tail_risk_hedge"}), 13)
     assert set(result["primary"]) == set(everyone)
     assert result["primary"][driver.CANDIDATE]["verdict"] in {"PASS", "FAIL"}
+
+
+def test_the_window_aligns_each_return_to_its_own_session():
+    """values[i + 1] is the close of dates[i]; an off-by-one would shift every Sharpe."""
+    from datetime import date
+
+    dates = [date(2016, 10, 13), date(2016, 10, 14), date(2016, 10, 17), date(2016, 10, 18)]
+    values = [100.0, 100.0, 110.0, 121.0, 108.9]  # initial capital, then one close per date
+    window = driver.window_from_result(values, dates)
+    assert window["dates"] == ["2016-10-17", "2016-10-18"]
+    assert window["returns"] == pytest.approx([0.10, -0.10])
+    assert window["values"] == [110.0, 121.0, 108.9]
+
+
+def test_a_curve_without_the_initial_point_is_refused():
+    from datetime import date
+
+    with pytest.raises(ValueError):
+        driver.window_from_result([100.0, 101.0], [date(2016, 10, 17), date(2016, 10, 18)])
+
+
+def test_a_loss_on_the_first_day_counts_as_drawdown():
+    profile = driver.drawdown_profile([-0.05, 0.10], ["2020-01-01", "2020-01-02"])
+    assert profile["max_drawdown"] == pytest.approx(-0.05)
+    assert profile["peak"] == "start"

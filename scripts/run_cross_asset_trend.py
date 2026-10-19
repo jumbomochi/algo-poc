@@ -84,11 +84,23 @@ def replay(
         skip_ledger=ledger,
     )
     runner = BacktestRunner(
-        executor=SimulatedExecutor(build_cost_model()), initial_capital=capital
+        executor=SimulatedExecutor(build_cost_model()),
+        initial_capital=capital,
+        whole_shares=whole_shares,
+        skip_ledger=ledger,
     )
+    entries_signalled = 0
+
+    def counting_signals_fn(ticker: str, bars_so_far: list[dict]) -> dict | None:
+        nonlocal entries_signalled
+        signal = signals_fn(ticker, bars_so_far)
+        if signal and signal["action"] == "buy" and bars_so_far[-1]["date"] >= TRADE_START:
+            entries_signalled += 1
+        return signal
+
     result = runner.run(
         bars,
-        signals_fn,
+        counting_signals_fn,
         RiskEngine(
             position_entry_limit_pct=20.0,
             sector_concentration_pct=100.0,
@@ -99,24 +111,44 @@ def replay(
         portfolio_name=NAMES[rule],
         book=book,
     )
-    values = result.portfolio_values
-    dates = list(result.dates)
-    returns = [values[i + 1] / values[i] - 1.0 for i in range(len(dates))]
-    keep = [i for i, d in enumerate(dates) if d >= TRADE_START]
-    window_values = [values[keep[0]]] + [values[i + 1] for i in keep]
+    window = window_from_result(result.portfolio_values, list(result.dates))
     trades = result.trades
+    opened = len(trades) + len(result.open_positions)
     return {
         "rule": rule,
-        "dates": [dates[i].isoformat() for i in keep],
-        "returns": [returns[i] for i in keep],
-        "metrics": BacktestMetrics.compute(window_values, trades),
+        "dates": window["dates"],
+        "returns": window["returns"],
+        "metrics": BacktestMetrics.compute(window["values"], trades),
         "round_trips": len(trades),
-        "commission": float(sum(
-            t.get("entry_commission", 0.0) + t.get("exit_commission", 0.0) for t in trades
-        )),
+        # Closed round trips both ways, plus the entry leg of lots still open.
+        "commission": float(
+            sum(t.get("entry_commission", 0.0) + t.get("exit_commission", 0.0) for t in trades)
+            + sum(p.get("entry_commission", 0.0) for p in result.open_positions)
+        ),
         "open_positions": result.open_positions,
-        "entries_sized": ledger.sized,
-        "skipped_signals": ledger.to_dict()["count"],
+        # The entry funnel. Entries are DAY limits at the decision close (the
+        # house fill model), so a signal can expire unfilled and leave its slot
+        # in cash until the next month's decision.
+        "entries_signalled_in_window": entries_signalled,
+        "entries_filled": opened,
+        "entries_below_one_share": ledger.to_dict()["count"],
+    }
+
+
+def window_from_result(values: list[float], dates: list) -> dict:
+    """Slice a runner curve to sessions from TRADE_START, returns aligned.
+
+    ``values`` is one longer than ``dates``: ``values[0]`` is the initial
+    capital and ``values[i + 1]`` the close of ``dates[i]``. The window's
+    curve starts from the close before TRADE_START.
+    """
+    if len(values) != len(dates) + 1:
+        raise ValueError(f"{len(values)} values for {len(dates)} dates; expected one more")
+    keep = [i for i, d in enumerate(dates) if TRADE_START <= d <= WINDOW_END]
+    return {
+        "dates": [dates[i].isoformat() for i in keep],
+        "returns": [values[i + 1] / values[i] - 1.0 for i in keep],
+        "values": [values[keep[0]]] + [values[i + 1] for i in keep],
     }
 
 
@@ -132,7 +164,9 @@ def _annual_sharpe(r: np.ndarray) -> float:
 
 
 def drawdown_profile(returns: list[float], dates: list[str]) -> dict:
-    equity = np.cumprod(1.0 + np.asarray(returns))
+    """Depth and timing of the worst decline, measured from the starting capital."""
+    equity = np.concatenate([[1.0], np.cumprod(1.0 + np.asarray(returns))])
+    labels = ["start"] + list(dates)
     peak = np.maximum.accumulate(equity)
     under = equity / peak - 1.0
     trough = int(under.argmin())
@@ -144,9 +178,9 @@ def drawdown_profile(returns: list[float], dates: list[str]) -> dict:
         longest = max(longest, run)
     return {
         "max_drawdown": float(under.min()),
-        "peak": dates[peak_at],
-        "trough": dates[trough],
-        "recovered": dates[recovered] if recovered is not None else None,
+        "peak": labels[peak_at],
+        "trough": labels[trough],
+        "recovered": labels[recovered] if recovered is not None else None,
         "sessions_peak_to_recovery": (recovered - peak_at) if recovered is not None else None,
         "longest_underwater_sessions": longest,
     }

@@ -27,7 +27,7 @@ def _weekdays(start: date, n: int) -> list[date]:
     return days
 
 
-DATES = _weekdays(date(2023, 1, 2), 320)
+DATES = _weekdays(date(2023, 1, 2), 400)
 
 
 def _bars(closes: list[float]) -> list[dict]:
@@ -142,3 +142,34 @@ def test_an_ineligible_ticker_is_ignored():
 def test_an_unknown_rule_is_refused():
     with pytest.raises(ValueError):
         _fn({"VTI": RISING}, empty_context(), rule="ema")
+
+
+def test_the_decision_day_is_the_first_session_not_the_first_of_the_month():
+    """June 2024 opens on Monday the 3rd: that, not the 31st or the 4th, decides."""
+    index = {d: i for i, d in enumerate(DATES)}
+    fn = _fn({"VTI": RISING}, empty_context())
+    assert fn("VTI", RISING[: index[date(2024, 6, 3)] + 1]) is not None
+    assert fn("VTI", RISING[: index[date(2024, 5, 31)] + 1]) is None
+    assert fn("VTI", RISING[: index[date(2024, 6, 4)] + 1]) is None
+
+
+def test_the_average_is_210_sessions_long():
+    """Above a 200-session mean but below the 210-session one: no buy."""
+    day = _first_of_month_after(250)
+    closes = [100.0] * len(DATES)
+    for i in range(day - 209, day - 199):  # the ten sessions only a 210 window sees
+        closes[i] = 200.0
+    closes[day] = 101.0
+    bars = _bars(closes)
+    assert sum(closes[day - 199: day + 1]) / 200 < 101.0 < sum(closes[day - 209: day + 1]) / 210
+    assert _fn({"VTI": bars}, empty_context())("VTI", bars[: day + 1]) is None
+
+
+def test_the_tsmom_lookback_is_252_sessions():
+    """Above the close 252 sessions back, below the one 253 back: buy."""
+    day = _first_of_month_after(260)
+    closes = [100.0] * len(DATES)
+    closes[day - 252], closes[day - 253] = 90.0, 110.0
+    bars = _bars(closes)
+    signal = _fn({"VTI": bars}, empty_context(), rule="tsmom")("VTI", bars[: day + 1])
+    assert signal is not None and signal["action"] == "buy"
