@@ -271,6 +271,23 @@ class Session:
     def send(self, data: str) -> None:
         os.write(self.fd, data.encode())
 
+    def interrupt(self, typed: str = "") -> None:
+        """Press Ctrl-C at a prompt, and again if the first one is held.
+
+        A SIGINT that lands after the prompt is printed but before bash's
+        `read` blocks is caught, and its trap stays pending until that read
+        returns (bash 5.2 on Linux, about 1 in 150 under load; ISIG was on and
+        the trap fired at the next key). A second Ctrl-C ends the read, which
+        is also what an operator would do. Nothing is written either way.
+        """
+        self.send(typed + "\x03")
+        deadline = time.monotonic() + 2
+        while b"Interrupted" not in self.out[self.cursor:] and time.monotonic() < deadline:
+            if not self._pump(0.05):
+                return
+        if b"Interrupted" not in self.out[self.cursor:]:
+            self.send("\x03")
+
     def secret(self, value: str) -> None:
         """Type a value at a hidden prompt."""
         self.expect(r"\(input hidden, empty to skip\): |to confirm: ")
@@ -433,7 +450,7 @@ def test_ctrl_c_at_a_hidden_prompt_aborts_writes_nothing_and_restores_echo(kc, t
     s.send("y\n")
     s.expect(r"\(input hidden, empty to skip\): ")
     s.echo_off()
-    s.send("half-typ\x03")
+    s.interrupt("half-typ")
     assert s.finish() == 130, s.text
     assert kc.get("POSTGRES_PASSWORD") == "real-pg-password"
     assert kc.writes() == []
@@ -446,7 +463,7 @@ def test_ctrl_c_at_the_confirmation_prompt_aborts(kc, tmp_path):
     s.secret("k" * 48 + ":admin")
     s.expect(r"to confirm: ")
     s.echo_off()
-    s.send("\x03")
+    s.interrupt()
     assert s.finish() == 130, s.text
     assert kc.writes() == []
     assert s.echo_restored
@@ -460,7 +477,7 @@ def test_ctrl_c_after_an_earlier_name_was_answered_writes_nothing_at_all(kc, tmp
     s.secret("123:bot-token")
     s.expect(r"Enter TELEGRAM_CHAT_ID \(input hidden, empty to skip\): ")
     s.echo_off()
-    s.send("\x03")
+    s.interrupt()
     assert s.finish() == 130, s.text
     assert kc.get("TELEGRAM_BOT_TOKEN") is None
     assert kc.writes() == []
@@ -470,7 +487,7 @@ def test_ctrl_c_at_the_overwrite_question_aborts(kc, tmp_path):
     kc.put("REDIS_PASSWORD", "real-redis")
     s = _session(kc, tmp_path, "--only", "REDIS_PASSWORD")
     s.expect(r"overwrite\? \[y/N\] ")
-    s.send("\x03")
+    s.interrupt()
     assert s.finish() == 130, s.text
     assert kc.get("REDIS_PASSWORD") == "real-redis"
     assert kc.writes() == []
