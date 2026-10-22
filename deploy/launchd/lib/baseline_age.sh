@@ -22,10 +22,14 @@
 #
 # STATE VERSUS EVENT
 # ------------------
-# The pin's age is a STATE: reported daily, alerting once it passes the
-# monitor's comparison window, past which live and backtest stop overlapping
-# meaningfully (the monitor already hints at this with "Only 22 overlapping days
-# available (requested 30)").
+# The pin's age is a STATE: reported daily, and NOT paged. It used to page once
+# past the monitor's 30-day comparison window, because the monitor graded live
+# against the pin. D19 (2026-09-04) moved nightly drift to the rolling shadow,
+# so the pin is only the edge-evidence baseline of record and its age blinds
+# nothing nightly. Paging it every morning (2026-10-16 onward) taught the reader
+# to skip the page, and re-pinning a BLOCKED artifact is a bias-acceptance
+# decision, not a reaction to an alert. Whether the refresh ran is the dead-man's
+# job (above). MISSING and UNPINNED still page: those do blind the monitor.
 #
 # An unusable refresh is an EVENT: it alerts on the day it is produced, and is
 # reported as state thereafter. Alerting every morning that the newest artifact
@@ -231,7 +235,7 @@ algo_baseline_age_check() {
 
     if [ "$page" -ge "$ALGO_BASELINE_PIN_MAX_DAYS" ]; then
         ALGO_BASELINE_STATUS="stale"
-        ALGO_BASELINE_DETAIL="${pin_part} — past the ${ALGO_BASELINE_PIN_MAX_DAYS}d comparison window, so live and backtest no longer overlap meaningfully${newest_part}"
+        ALGO_BASELINE_DETAIL="${pin_part} — over ${ALGO_BASELINE_PIN_MAX_DAYS}d; this is the edge-evidence baseline only (nightly drift grades against the rolling shadow, D19), and moving it needs a bias-acceptance entry${newest_part}"
         return 0
     fi
 
@@ -254,7 +258,6 @@ algo_baseline_age_check() {
 # the launchd-wiring and branch-guard sections.
 algo_baseline_alert_body() {
     case "$ALGO_BASELINE_STATUS" in
-        stale)      printf '🚨 divergence baseline PIN STALE — %s\n' "$ALGO_BASELINE_DETAIL" ;;
         missing)    printf '🚨 divergence baseline PIN MISSING — %s\n' "$ALGO_BASELINE_DETAIL" ;;
         unresolved) printf '🚨 divergence baseline UNPINNED — %s\n' "$ALGO_BASELINE_DETAIL" ;;
         unusable)   printf '🚨 the weekly refresh produced an UNUSABLE baseline — %s\n' "$ALGO_BASELINE_DETAIL" ;;
