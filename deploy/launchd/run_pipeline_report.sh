@@ -245,11 +245,10 @@ if [ -n "$WIRING" ]; then
     telegram "$WIRING"
 fi
 
-# A stale baseline is alert-worthy for the same reason the wiring is: the
-# refresh's own "getting stale" line requires the refresh to have run, so the
-# case where it never ran — 2026-08-11, and 2026-08-25 to 2026-09-08 — is
-# precisely the case nothing reported. Escalated through both paths rather than
-# printed into the body above, on the KAN-64 precedent.
+# A missing, unpinned or freshly-unusable baseline is alert-worthy for the same
+# reason the wiring is: the failure mode is silence. (A merely OLD pin is body
+# only since D19 — see lib/baseline_age.sh.) Escalated through both paths
+# rather than printed into the body above, on the KAN-64 precedent.
 BASELINE_MSG=$(algo_baseline_alert_body)
 if [ -n "$BASELINE_MSG" ]; then
     algo_alert_local "$BASELINE_MSG"

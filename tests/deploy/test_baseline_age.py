@@ -159,9 +159,8 @@ def test_the_pin_is_judged_not_the_newest_artifact(output_dir):
     _artifact(output_dir / "backtest_multi_20260910_235624.json",
               age_days=0, state="BLOCKED", excluded_pct=17.39)
     got = _run(output_dir, pin=pin, pin_max_days=20)
-    assert got["STATUS"] != "ok", got
+    assert got["STATUS"] == "stale", got
     assert "backtest_multi_20260819" in got["DETAIL"], got["DETAIL"]
-    assert got["ALERT"] != "", got
 
 
 def test_the_body_reports_both_the_pin_and_the_newest(output_dir):
@@ -215,14 +214,16 @@ def test_a_usable_refresh_newer_than_the_pin_is_quiet(output_dir):
     assert got["ALERT"] == "", got
 
 
-def test_a_pin_past_the_window_alerts(output_dir):
-    """Past the monitor's comparison window live and backtest stop overlapping
-    meaningfully — which the monitor already hints at with "Only 22 overlapping
-    days available (requested 30)"."""
+def test_a_pin_past_the_window_is_reported_but_not_paged(output_dir):
+    """D19 moved nightly drift to the rolling shadow, so an old pin blinds
+    nothing nightly. Paged daily from 2026-10-16 for a condition only a
+    bias-acceptance decision can change."""
     pin = _artifact(output_dir / "backtest_multi_old.json", age_days=45, state="OK")
     got = _run(output_dir, pin=pin, pin_max_days=30)
     assert got["STATUS"] == "stale", got
-    assert "45d" in got["ALERT"], got["ALERT"]
+    assert "45d" in got["DETAIL"], got["DETAIL"]
+    assert "D19" in got["DETAIL"], got["DETAIL"]
+    assert got["ALERT"] == "", got
 
 
 def test_a_pin_inside_the_window_does_not_alert(output_dir):

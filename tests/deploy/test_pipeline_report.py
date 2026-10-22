@@ -1155,10 +1155,10 @@ def test_a_healthy_pin_adds_no_extra_message(tmp_path):
     assert "pin is" in log, log
 
 
-def test_a_stale_pin_escalates_rather_than_only_logging(tmp_path):
+def test_a_stale_pin_is_logged_but_not_escalated(tmp_path):
+    """The pin is edge evidence only since D19; its age stays in the body."""
     _, sends, log = _drive_wrapper(tmp_path, baseline="stale")
-    bodies = _bodies(sends)
-    assert any("PIN STALE" in b and "45d old" in b for b in bodies), bodies
+    assert len(sends) == 1, _bodies(sends)
     assert "45d old" in log, log
 
 
@@ -1188,10 +1188,10 @@ def test_an_unpinned_config_alerts(tmp_path):
 def test_the_baseline_alert_also_reaches_the_local_path(tmp_path):
     """Telegram needs a working network and a resolvable credential. The local
     ALERTS.log is what survives when it does not — the 2026-08-13 lesson."""
-    _drive_wrapper(tmp_path, baseline="stale")
+    _drive_wrapper(tmp_path, baseline="missing")
     alerts = (tmp_path / "home" / "ibc" / "logs" / "ALERTS.log")
     assert alerts.exists(), "no ALERTS.log written"
-    assert "PIN STALE" in alerts.read_text(), alerts.read_text()
+    assert "PIN MISSING" in alerts.read_text(), alerts.read_text()
 
 
 # ---------------------------------------------------------------------------

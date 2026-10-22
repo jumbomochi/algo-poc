@@ -1029,7 +1029,7 @@ assumption each of these was added to break:
 |---|---|---|
 | launchd wiring (KAN-64) | `lib/launchd_wiring.sh` | a plist is installed but not loaded, or loaded with no plist in the repo |
 | deploy branch (KAN-73) | `lib/branch_guard.sh` | the tree is not contained in `origin/main` |
-| divergence baseline age (KAN-71) | `lib/baseline_age.sh` | the pin is stale, missing or unpinned, or a fresh refresh is unusable |
+| divergence baseline age (KAN-71) | `lib/baseline_age.sh` | the pin is missing or unpinned, or a fresh refresh is unusable (an old pin is reported, not escalated: D19) |
 | reconciliation (KAN-86) | `lib/reconciliation.sh` | entries have been blocked for ≥2 consecutive sessions, or the reading is stale/missing/unreadable |
 
 Each escalates through **both** `algo_alert_local` and `telegram`, because
