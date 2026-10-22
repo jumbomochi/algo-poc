@@ -1,12 +1,54 @@
 {
   "version": 1,
-  "note": "Declared search history for deflated-Sharpe correction (KAN-38). Every search that could have produced a candidate now under evaluation gets an entry here, before that candidate is scored. Adding a strategy, a factor, or a parameterization sweep means adding to this file in the same commit -- see docs/operations/edge-validation-framework.md.",
+  "note": "Declared search history for deflated-Sharpe correction (KAN-38). Every search that could have produced a candidate now under evaluation gets an entry here, before that candidate is scored. Adding a strategy, a factor, or a parameterization sweep means adding to this file in the same commit -- see docs/operations/edge-validation-framework.md. Each sleeve-level entry also lists its trials with the annualised full-sample Sharpe each scored at its own verdict of record and its objective ('return' or 'insurance'): D22 estimates SR*'s spread from every return-objective trial on record, not only the survivors in a run (docs/decisions/sr-star-spread-2026-10.md). A new candidate is listed here, objective included, before it is scored; its Sharpe is filled in at its verdict.",
   "entries": [
     {
       "searched_at": "2026-05-26",
       "what": "Sleeve selection for the live portfolio: eight candidate sleeves searched, six retained after mean_reversion and short_term_mr were dropped",
       "n_trials": 8,
-      "source": "docs/strategies/mean-reversion-failure-analysis.md"
+      "source": "docs/strategies/mean-reversion-failure-analysis.md",
+      "trials": [
+        {
+          "name": "momentum",
+          "sharpe": 0.5877,
+          "objective": "return"
+        },
+        {
+          "name": "sector_rotation",
+          "sharpe": 0.6238,
+          "objective": "return"
+        },
+        {
+          "name": "thematic_momentum",
+          "sharpe": 0.6825,
+          "objective": "return"
+        },
+        {
+          "name": "quality_value",
+          "sharpe": 0.3238,
+          "objective": "return"
+        },
+        {
+          "name": "earnings_drift",
+          "sharpe": 0.5008,
+          "objective": "return"
+        },
+        {
+          "name": "tail_risk_hedge",
+          "sharpe": -0.5982,
+          "objective": "insurance"
+        },
+        {
+          "name": "mean_reversion",
+          "sharpe": -0.13,
+          "objective": "return"
+        },
+        {
+          "name": "short_term_mr",
+          "sharpe": -0.6,
+          "objective": "return"
+        }
+      ]
     },
     {
       "searched_at": "2026-08-02",
@@ -18,19 +60,50 @@
       "searched_at": "2026-10-19",
       "what": "Momentum v2: regime passed to the momentum sleeve (regime-adaptive stops, inverse ETFs only in bear) plus a rank exit outside the top 10. One pre-registered candidate; rank band fixed at 2 x top_n, not swept",
       "n_trials": 1,
-      "source": "docs/decisions/momentum-v2-2026-10.md"
+      "source": "docs/decisions/momentum-v2-2026-10.md",
+      "trials": [
+        {
+          "name": "momentum_v2",
+          "sharpe": 0.548,
+          "objective": "return"
+        }
+      ]
     },
     {
       "searched_at": "2026-10-19",
       "what": "Momentum v2 diagnostics run beside the candidate: regime only, rank exit only. Declared as non-candidates before the run, registered after it because regime-only is proposed for adoption as a correctness change",
       "n_trials": 2,
-      "source": "docs/decisions/momentum-v2-2026-10.md"
+      "source": "docs/decisions/momentum-v2-2026-10.md",
+      "trials": [
+        {
+          "name": "momentum_v2_regime_only",
+          "sharpe": 0.66,
+          "objective": "return"
+        },
+        {
+          "name": "momentum_v2_rank_exit_only",
+          "sharpe": 0.486,
+          "objective": "return"
+        }
+      ]
     },
     {
       "searched_at": "2026-10-20",
       "what": "Cross-asset trend: Faber 10-month SMA timing over VTI/EFA/AGG/VNQ/DBC (the candidate) and the 12-month time-series-momentum sign rule on the same universe (a declared non-candidate). Published parameters, none swept",
       "n_trials": 2,
-      "source": "docs/decisions/cross-asset-trend-2026-10.md"
+      "source": "docs/decisions/cross-asset-trend-2026-10.md",
+      "trials": [
+        {
+          "name": "cross_asset_trend",
+          "sharpe": 0.641,
+          "objective": "return"
+        },
+        {
+          "name": "cross_asset_tsmom",
+          "sharpe": 0.448,
+          "objective": "return"
+        }
+      ]
     }
   ]
 }
