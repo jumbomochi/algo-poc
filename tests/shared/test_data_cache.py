@@ -200,6 +200,20 @@ def test_an_unknown_fetch_time_is_stale(tmp_path):
     verdict = assess_fundamentals(doc, as_of=NOW)
     assert not verdict.fresh
     assert "fetch time unknown" in verdict.describe()
+    assert "written before KAN-109" in verdict.describe()
+
+
+def test_an_unstamped_envelope_names_the_unfinished_pass_not_kan109(tmp_path):
+    """2026-10-22: the AV fundamentals cache (15 of 99 tickers, initial fill
+    under way) was reported as "written before KAN-109" -- a wrong cause with
+    a wrong remedy."""
+    path = tmp_path / "fundamentals.json"
+    write_cache_document(path, _fundamentals({"AAA": "2026-06-30"}),
+                         fetch_time_unknown=True, source="alphavantage")
+    text = assess_fundamentals(read_cache_document(path), as_of=NOW).describe()
+    assert "fetch time unknown" in text
+    assert "full pass of the live universe" in text
+    assert "KAN-109" not in text
 
 
 def test_an_old_fetch_is_stale(tmp_path):

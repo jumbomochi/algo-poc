@@ -177,6 +177,9 @@ class CacheDocument:
     #: Set when the file exists but could not be read as a cache.
     error: str | None = None
     source: str | None = None
+    #: Written in the KAN-109 envelope. An envelope with ``fetched_at: null``
+    #: is a refresh that has not finished a full pass (KAN-110), not a legacy file.
+    enveloped: bool = False
 
 
 def _parse_instant(value: Any) -> datetime | None:
@@ -214,7 +217,8 @@ def read_cache_document(path: str | os.PathLike[str]) -> CacheDocument:
         return CacheDocument(path=path, data={}, fetched_at=None, exists=False)
     try:
         with open(path) as f:
-            data, fetched_at, source = unwrap_cache(json.load(f))
+            raw = json.load(f)
+        data, fetched_at, source = unwrap_cache(raw)
     except (OSError, ValueError, TypeError) as exc:
         return CacheDocument(
             path=path,
@@ -224,7 +228,8 @@ def read_cache_document(path: str | os.PathLike[str]) -> CacheDocument:
             error=f"{type(exc).__name__}: {exc}",
         )
     return CacheDocument(
-        path=path, data=data, fetched_at=fetched_at, exists=True, source=source
+        path=path, data=data, fetched_at=fetched_at, exists=True, source=source,
+        enveloped="format_version" in raw,
     )
 
 
@@ -373,10 +378,13 @@ def _fetch_age(
     doc: CacheDocument, *, as_of: datetime, limit_days: float
 ) -> tuple[float | None, list[str]]:
     if doc.fetched_at is None:
+        why = (
+            "the refresh has not yet completed a full pass of the live universe"
+            if doc.enveloped else "no fetched_at — written before KAN-109"
+        )
         return None, [
-            "STALE: fetch time unknown (no fetched_at — written before "
-            "KAN-109), so its age cannot be shown to be within "
-            f"{limit_days:g} days"
+            f"STALE: fetch time unknown ({why}), so its age cannot be shown "
+            f"to be within {limit_days:g} days"
         ]
     age = (_as_utc(as_of) - doc.fetched_at).total_seconds() / 86400.0
     if age > limit_days:
