@@ -70,8 +70,12 @@ exact failure the argument exists to prevent.
    counted in `m` and absent from the sample, so the estimated spread is
    truncated, `SR*` is too small, and the correction still **under**-deflates.
    The direction of the residual error is at least the safe one to know about.
-   Carrying per-entry SR dispersion in the registry would fix this properly;
-   it is not built.
+   **Addressed for sleeve candidates from D22 (2026-10-22):** the registry
+   records each sleeve trial's Sharpe and objective, and
+   `trial_registry.spread_sharpes()` feeds `control(..., spread_srs=...)` the
+   whole return-objective record. Insurance trials leave the spread but stay
+   in the count. Earlier verdicts used the survivor spread and are not
+   re-graded. See `docs/decisions/sr-star-spread-2026-10.md`.
 2. **Two candidates is a one-degree-of-freedom variance.** With a small
    candidate set, `SR*` is dominated by sampling noise and a large `n_trials`
    merely scales that noise. Declaring a count against fewer than two

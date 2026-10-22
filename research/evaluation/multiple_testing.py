@@ -102,6 +102,7 @@ def control(
     q: float = 0.10,
     dsr_threshold: float = 0.95,
     n_trials: int | None = None,
+    spread_srs: list[float] | None = None,
 ) -> dict[str, MultipleTestingVerdict]:
     """Deflated-Sharpe + BH-FDR verdicts for one evaluation run.
 
@@ -110,6 +111,11 @@ def control(
     count smaller than the number of candidates scored here is rejected rather
     than silently honoured: under-declaring the search is exactly the failure
     this argument exists to prevent.
+
+    ``spread_srs`` replaces the run's own Sharpes as SR*'s spread sample. D22
+    (candidates registered from 2026-10-22) passes
+    :func:`~research.evaluation.trial_registry.spread_sharpes`; the default
+    keeps every earlier verdict's rule.
     """
     if n_trials is not None and n_trials < len(per_factor):
         raise ValueError(
@@ -117,7 +123,8 @@ def control(
             "candidates scored in this run; add the missing search to "
             "research/trial_registry.json"
         )
-    sr_star = expected_max_sharpe([v["sr"] for v in per_factor.values()], n_trials)
+    sample = [v["sr"] for v in per_factor.values()] if spread_srs is None else spread_srs
+    sr_star = expected_max_sharpe(sample, n_trials)
     fdr = benjamini_hochberg({fid: v["ic_p"] for fid, v in per_factor.items()}, q)
     verdicts: dict[str, MultipleTestingVerdict] = {}
     for fid, v in per_factor.items():
