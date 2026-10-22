@@ -976,3 +976,40 @@ def test_source_is_truthful_on_a_mixed_cache(tmp_path):
     assert _doc(tmp_path).source == "alphavantage+yfinance-legacy"
     _run(tmp_path, FakeAV(), live=["A", "Z"], now=NOW + timedelta(days=1))
     assert _doc(tmp_path).source == "alphavantage"
+
+
+# --- in season, live reporters may borrow the fundamentals step's calls ------
+
+
+def _plan(*, live, universe, budget, live_borrow):
+    calendar = {t: [{"report_date": "2026-10-07", "timing": "pre-market"}] for t in live}
+    state = {t: {"last_success_at": "2026-10-01T00:00:00+00:00"} for t in universe}
+    return fe.plan_refresh(
+        live=live, universe=universe, cache={}, state=state, calendar=calendar,
+        now=NOW, budget=budget, recent_days=4, refetch_after_hours=20.0,
+        live_borrow=live_borrow,
+    )
+
+
+def test_borrowed_calls_go_only_to_live_recent_reporters():
+    plan = _plan(live=["A", "B", "C", "D"], universe=["A", "B", "C", "D", "P"],
+                 budget=2, live_borrow=6)
+    assert plan.selected == ["A", "B", "C", "D"]
+    assert plan.borrowed == 2, "two reporters were past the budget; P is never borrowed for"
+
+
+def test_nothing_is_borrowed_when_the_budget_covers_the_reporters():
+    plan = _plan(live=["A"], universe=["A", "P"], budget=2, live_borrow=6)
+    assert plan.borrowed == 0
+    assert plan.selected == ["A", "P"]
+
+
+def test_borrowing_is_capped():
+    plan = _plan(live=[f"L{i}" for i in range(10)], universe=[f"L{i}" for i in range(10)],
+                 budget=2, live_borrow=3)
+    assert len(plan.selected) == 5 and plan.borrowed == 3
+
+
+def test_the_summary_reports_what_was_borrowed(tmp_path):
+    result = _run(tmp_path, FakeAV(), live=["A"])
+    assert " borrowed=0 " in result.summary_line()

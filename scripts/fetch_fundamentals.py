@@ -931,6 +931,8 @@ def main(
                         help="--source yfinance only: output JSON path")
     parser.add_argument("--budget", type=int, default=None,
                         help="Requests this run (default: data.fundamentals.refresh.calls_per_run)")
+    parser.add_argument("--yield-calls", type=int, default=0,
+                        help="requests the earnings run borrowed from this step's budget today")
     parser.add_argument("--min-interval", type=float, default=None,
                         help="Seconds between requests (default: min_interval_seconds)")
     parser.add_argument("--dry-run", action="store_true",
@@ -967,6 +969,8 @@ def main(
     overrides = data_cfg.earnings.refresh.symbol_overrides
     cache_dir = resolve_cache_dir(args.cache_dir or data_cfg.cache_dir)
     budget = cfg.calls_per_run if args.budget is None else args.budget
+    # Calls the earnings run already spent on live reporters (its borrowed=).
+    budget = max(budget - args.yield_calls, 0)
     interval = cfg.min_interval_seconds if args.min_interval is None else args.min_interval
     print(f"Fundamentals refresh: {len(live)} live tickers, budget {budget} request(s) "
           f"(2 per ticker), {interval:g}s apart, cache {cache_dir}")

@@ -168,8 +168,12 @@ run_fundamentals_step() {
     local offset run_output summary fund_exit no_data refused
     offset=$(wc -c < "$LOG_FILE" | tr -d ' ')
     echo "$(ts): Starting fundamentals refresh (Alpha Vantage statements)" >> "$LOG_FILE"
+    # Calls the earnings run borrowed for live reporters come out of this
+    # step's budget, so the day stays inside the free tier's 25.
+    local borrowed
+    borrowed=$(printf '%s\n' "$SUMMARY" | sed -n 's/.* borrowed=\([0-9][0-9]*\).*/\1/p')
     algo_run_bounded "$FUNDAMENTALS_TIMEOUT" \
-        "$VENV" scripts/fetch_fundamentals.py >> "$LOG_FILE" 2>&1
+        "$VENV" scripts/fetch_fundamentals.py --yield-calls "${borrowed:-0}" >> "$LOG_FILE" 2>&1
     fund_exit=$?
     run_output=$(tail -c "+$((offset + 1))" "$LOG_FILE" 2>/dev/null)
     summary=$(printf '%s\n' "$run_output" | grep '^FUNDAMENTALS_REFRESH ' | tail -1)

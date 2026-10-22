@@ -396,7 +396,7 @@ def test_the_full_run_refreshes_fundamentals_after_earnings(tmp_path, code):
     run = _drive(tmp_path, exit_code=code, output=CURRENT)
     lines = run["argv"].splitlines()
     assert lines[0].startswith("scripts/fetch_earnings.py")
-    assert lines[1] == "scripts/fetch_fundamentals.py", "fundamentals must run second"
+    assert lines[1] == "scripts/fetch_fundamentals.py --yield-calls 0", "fundamentals must run second"
     assert "fundamentals refresh OK" in run["log"]
     assert run["rc"] == code, "the fundamentals step must not change the job's exit code"
 
@@ -469,3 +469,12 @@ def test_the_after_market_divergence_is_documented(doc):
     text = Path(doc).read_text()
     assert "KAN-110" in text
     assert "after-market" in text and "Friday" in text
+
+
+def test_fundamentals_yield_what_the_earnings_run_borrowed(tmp_path):
+    """The day's total stays inside the free tier: calls the earnings run spent
+    on live reporters come out of the fundamentals step."""
+    out = CURRENT.replace("recent_reporters=", "borrowed=4 recent_reporters=")
+    assert "borrowed=4" in out
+    run = _drive(tmp_path, exit_code=3, output=out)
+    assert _fund_argv(run) == ["scripts/fetch_fundamentals.py --yield-calls 4"]

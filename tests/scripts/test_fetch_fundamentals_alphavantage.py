@@ -608,3 +608,13 @@ def test_a_retried_income_statement_leaves_no_room_for_the_balance_sheet(tmp_pat
     result = _run(tmp_path, av, ["A"], budget=2)
     assert len(av.urls) == 2, "the balance sheet would be the third request"
     assert result.fetched == [] and not _cache(tmp_path).data
+
+
+def test_calls_the_earnings_run_borrowed_come_out_of_the_budget(tmp_path, capsys):
+    av = FakeAV()
+    code = ff.main(["--tickers", "A", "--cache-dir", str(tmp_path), "--min-interval", "0",
+                    "--budget", "6", "--yield-calls", "6"],
+                   transport=av, env={"ALPHAVANTAGE_API_KEY": KEY})
+    assert av.urls == [], "a fully borrowed budget asks nothing"
+    assert "budget 0 request(s)" in capsys.readouterr().out
+    assert code != fe.EXIT_ERROR
