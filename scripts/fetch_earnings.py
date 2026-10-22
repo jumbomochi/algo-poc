@@ -663,6 +663,9 @@ class RefreshPlan:
     excluded_live: list[str] = field(default_factory=list)
     #: Due dates per ticker, for the report.
     due_dates: dict[str, list[str]] = field(default_factory=dict)
+    #: Live recent reporters selected beyond ``budget``, on calls borrowed from
+    #: the fundamentals step that follows (it yields the same number).
+    borrowed: int = 0
 
 
 def us_session_date(moment: datetime) -> date:
@@ -693,11 +696,17 @@ def plan_refresh(
     refetch_after_hours: float,
     refusal_limit: int = 3,
     top_up: bool = False,
+    live_borrow: int = 0,
 ) -> RefreshPlan:
     """Which tickers to fetch this run, in priority order, capped at ``budget``.
 
     ``top_up`` selects live recent reporters only, newest report first: the
     05:05 run exists to catch actuals published after the 04:45 run asked.
+
+    ``live_borrow`` extra calls may go to live recent reporters the budget did
+    not reach, and to nothing else. In season the free tier left 7-9 of them
+    unfetched a day (2026-10-22: META, TSLA, IBM ...), and an earnings_drift
+    entry expires 2 days after the report; quality_value's slower fill can wait.
     """
     today = us_session_date(now)
     window_start = today - timedelta(days=recent_days)
@@ -812,6 +821,8 @@ def plan_refresh(
         if ticker not in seen:
             seen.add(ticker)
             selected.append(ticker)
+    borrowed = [t for t in due_live if t not in seen][:max(live_borrow, 0)]
+    selected += borrowed
     return RefreshPlan(
         due_live=due_live,
         never_live=never_live,
@@ -822,6 +833,7 @@ def plan_refresh(
         selected=selected,
         excluded_live=sorted(excluded & live_set),
         due_dates={t: [d for d, _ in v] for t, v in due.items()},
+        borrowed=len(borrowed),
     )
 
 
@@ -915,6 +927,7 @@ class RefreshResult:
         ]
         if self.plan is not None:
             parts.append(f"recent_reporters={len(self.plan.due_live)}")
+            parts.append(f"borrowed={self.plan.borrowed}")
         parts += [
             f"live_unfetched={len(self.live_without_fetch)}",
             f"recent_missed={len(self.critical_missed)}",
@@ -973,6 +986,7 @@ def run_refresh(
     refusal_limit: int = 3,
     max_consecutive_errors: int = 3,
     top_up: bool = False,
+    live_borrow: int = 0,
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     log: Callable[[str], None] = print,
     termination: _Termination | None = None,
@@ -1067,6 +1081,7 @@ def run_refresh(
             refetch_after_hours=refetch_after_hours,
             refusal_limit=refusal_limit,
             top_up=top_up,
+            live_borrow=live_borrow,
         )
         log(
             f"plan ({'top-up' if top_up else 'full'}): {len(plan.due_live)} live recent "
@@ -1344,6 +1359,9 @@ def main(
         budget = cfg.topup_calls if args.top_up else cfg.calls_per_run
     interval = cfg.min_interval_seconds if args.min_interval is None else args.min_interval
     recent_days = cfg.topup_recent_days if args.top_up else cfg.recent_days
+    # The full run may borrow the fundamentals step's calls for live reporters;
+    # run_earnings_refresh.sh hands the borrowed count to that step to yield.
+    live_borrow = 0 if args.top_up or args.tickers else data_cfg.fundamentals.refresh.calls_per_run
     refetch_hours = cfg.topup_refetch_minutes / 60.0 if args.top_up else cfg.refetch_after_hours
 
     if args.tickers:
@@ -1367,6 +1385,7 @@ def main(
             calendar=calendar, now=datetime.now(timezone.utc), budget=budget,
             recent_days=recent_days, refetch_after_hours=refetch_hours,
             refusal_limit=cfg.refusal_exclude_after_days, top_up=args.top_up,
+            live_borrow=live_borrow,
         )
         print(f"recent reporters (live): {plan.due_live}")
         print(f"never fetched (live): {len(plan.never_live)}; other recent: "
@@ -1407,6 +1426,7 @@ def main(
                 refusal_limit=cfg.refusal_exclude_after_days,
                 max_consecutive_errors=cfg.max_consecutive_errors,
                 top_up=args.top_up,
+                live_borrow=live_borrow,
             )
     except LockHeld as exc:
         print(f"SKIPPED: {exc}")
