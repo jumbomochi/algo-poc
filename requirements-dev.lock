@@ -105,14 +105,14 @@ numpy==1.26.4
     #   pandas
     #   scikit-learn
     #   scipy
-opentelemetry-api==1.44.0
+opentelemetry-api==1.45.1
     # via
     #   algo-poc (pyproject.toml)
     #   opentelemetry-sdk
     #   opentelemetry-semantic-conventions
-opentelemetry-sdk==1.44.0
+opentelemetry-sdk==1.45.1
     # via algo-poc (pyproject.toml)
-opentelemetry-semantic-conventions==0.65b0
+opentelemetry-semantic-conventions==0.66b1
     # via opentelemetry-sdk
 packageurl-python==0.17.6
     # via cyclonedx-python-lib
