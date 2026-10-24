@@ -237,14 +237,12 @@ data:
     max_fetch_age_days: 14         # daily refresh; 2 weeks of paged failures
     max_period_age_days: 167       # longest quarter (92d) + 75d 10-K deadline
     max_stale_ticker_fraction: 0.2 # sleeve-kill-criteria.md's 20% bound
-    # Alpha Vantage refresh (KAN-110, scripts/fetch_fundamentals.py): the
-    # second step of the 04:45 earnings full run, same lock. 2 requests per
-    # ticker (INCOME_STATEMENT + BALANCE_SHEET). A quarter is kept only if
-    # first seen within capture_window_days of its period end and is never
-    # overwritten: Alpha Vantage serves restated figures, so this is how the
-    # cache stays as first reported.
+    # The scheduled refresh is SEC EDGAR (scripts/fetch_fundamentals_edgar.py,
+    # second step of the 04:45 earnings run): no quota, every live ticker each
+    # run. The Alpha Vantage path below (scripts/fetch_fundamentals.py) is a
+    # hand-run fallback and spends none of the daily quota (calls_per_run 0).
     refresh:
-      calls_per_run: 6
+      calls_per_run: 0
       min_interval_seconds: 13
       capture_window_days: 135
       statement_lag_days: 3
@@ -256,12 +254,12 @@ data:
     # Alpha Vantage refresh (KAN-110, scripts/fetch_earnings.py): a full run
     # at 04:45 SGT and a top-up at 05:05 (local.algo-earnings-refresh /
     # local.algo-earnings-topup), every day. Sized for the FREE tier (25
-    # requests/day): 1 calendar + 12 EARNINGS at 04:45, at most 4 at 05:05,
-    # and the fundamentals step's 6 — 23, leaving 2 for a hand-run. For a paid
+    # requests/day): 1 calendar + 18 EARNINGS at 04:45 and at most 4 at 05:05
+    # — 23, leaving 2 for a hand-run (fundamentals moved to EDGAR). For a paid
     # plan raise calls_per_run and drop min_interval_seconds to the plan's
     # per-minute limit (75/min -> 0.9).
     refresh:
-      calls_per_run: 12
+      calls_per_run: 18
       topup_calls: 4
       topup_recent_days: 1
       topup_refetch_minutes: 10

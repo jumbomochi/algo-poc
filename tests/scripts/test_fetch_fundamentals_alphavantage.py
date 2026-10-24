@@ -388,7 +388,7 @@ def test_an_unreadable_cache_is_never_overwritten(tmp_path):
 
 def test_the_earnings_lock_also_holds_off_the_fundamentals_refresh(tmp_path, capsys):
     with fe._CacheLock(tmp_path):
-        code = ff.main(["--tickers", "A", "--cache-dir", str(tmp_path), "--min-interval", "0"],
+        code = ff.main(["--tickers", "A", "--cache-dir", str(tmp_path), "--min-interval", "0", "--budget", "6"],
                        transport=FakeAV(), env={"ALPHAVANTAGE_API_KEY": KEY})
     assert code == fe.EXIT_LOCKED
     assert "FUNDAMENTALS_REFRESH status=SKIPPED" in capsys.readouterr().out
@@ -398,7 +398,7 @@ def test_the_key_never_reaches_the_output(tmp_path, capsys):
     def leaky(url, timeout):
         raise OSError(f"connection reset fetching {url}")
 
-    code = ff.main(["--tickers", "A", "--cache-dir", str(tmp_path), "--min-interval", "0"],
+    code = ff.main(["--tickers", "A", "--cache-dir", str(tmp_path), "--min-interval", "0", "--budget", "6"],
                    transport=leaky, env={"ALPHAVANTAGE_API_KEY": KEY})
     out = capsys.readouterr()
     assert code == fe.EXIT_FAILED
@@ -416,7 +416,7 @@ def test_no_key_is_an_error_before_any_request(tmp_path, capsys):
 def test_the_main_entry_writes_a_cache_the_lookup_reads(tmp_path, capsys):
     av = FakeAV()
     av.add("A", {"2026-06-30": {"ni": 50, "eq": 500}})
-    code = ff.main(["--tickers", "A", "--cache-dir", str(tmp_path), "--min-interval", "0"],
+    code = ff.main(["--tickers", "A", "--cache-dir", str(tmp_path), "--min-interval", "0", "--budget", "6"],
                    transport=av, env={"ALPHAVANTAGE_API_KEY": KEY})
     out = capsys.readouterr().out
     assert code == fe.EXIT_CURRENT, out

@@ -286,9 +286,9 @@ class FundamentalsRefreshConfig(BaseModel):
     Vantage symbols come from ``data.earnings.refresh.symbol_overrides``.
     """
 
-    #: Requests per run: 6 = three tickers. The free tier's 25 a day is shared
-    #: with the earnings refresh (13 + 4); see EarningsRefreshConfig.
-    calls_per_run: int = Field(default=6, ge=0)
+    #: Requests per run (2 per ticker). 0: the scheduled refresh is SEC EDGAR
+    #: (scripts/fetch_fundamentals_edgar.py); pass --budget for a hand-run.
+    calls_per_run: int = Field(default=0, ge=0)
     min_interval_seconds: float = Field(default=13.0, ge=0)
     request_timeout_seconds: float = Field(default=30.0, gt=0)
     #: A quarter is stored only if it is first seen within this many days of
@@ -353,17 +353,16 @@ class EarningsRefreshConfig(BaseModel):
 
     The defaults fit the FREE tier: 25 requests a day. The 04:45 full run is
     one EARNINGS_CALENDAR call plus at most ``calls_per_run`` EARNINGS
-    requests (12 -> 13), and the 05:05 top-up at most ``topup_calls`` (4).
-    The same 04:45 run then spends the fundamentals refresh's
-    ``data.fundamentals.refresh.calls_per_run`` (6): 23 a day, leaving 2 for a
-    hand-run. Retries spend from the same budgets.
+    requests (18 -> 19), and the 05:05 top-up at most ``topup_calls`` (4):
+    23 a day, leaving 2 for a hand-run. Fundamentals come from SEC EDGAR and
+    spend none of it. Retries spend from the same budgets.
     A paid tier is a config change only: raise ``calls_per_run`` (e.g. 1000)
     and lower ``min_interval_seconds`` to the plan's per-minute limit
     (75/min -> 0.9).
     """
 
     #: EARNINGS requests per full run, after the one calendar call.
-    calls_per_run: int = Field(default=12, ge=0)
+    calls_per_run: int = Field(default=18, ge=0)
     #: EARNINGS requests per 05:05 top-up run (no calendar call).
     topup_calls: int = Field(default=4, ge=0)
     #: The top-up asks reports dated today or within this many days before.
