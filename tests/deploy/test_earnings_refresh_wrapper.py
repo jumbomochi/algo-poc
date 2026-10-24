@@ -46,7 +46,7 @@ FUND_CURRENT = (
 
 def _drive(tmp_path: Path, *, exit_code: int, output: str = "", av_key: bool = True,
            args: tuple[str, ...] = (), fund_exit_code: int = 0,
-           fund_output: str = FUND_CURRENT):
+           fund_output: str = FUND_CURRENT, sec_agent: bool = True):
     tree = tmp_path / "algo-dir"
     shutil.copytree(DEPLOY_DIR, tree / "deploy" / "launchd")
     argv_log = tmp_path / "python-argv.log"
@@ -57,7 +57,7 @@ def _drive(tmp_path: Path, *, exit_code: int, output: str = "", av_key: bool = T
         f'printf "%s\\n" "$*" >> "{argv_log}"\n'
         # Record only whether the key arrived, never its value.
         f'[ -n "${{ALPHAVANTAGE_API_KEY:-}}" ] && echo KEY_PRESENT >> "{env_log}"\n'
-        'case "$*" in *fetch_fundamentals.py*)\n'
+        'case "$*" in *fetch_fundamentals*)\n'
         f"cat <<'EOF'\n{fund_output}\nEOF\n"
         f"exit {fund_exit_code} ;;\n"
         "esac\n"
@@ -68,6 +68,7 @@ def _drive(tmp_path: Path, *, exit_code: int, output: str = "", av_key: bool = T
     stub_bin = tmp_path / "bin"
     _exec(stub_bin / "curl", f'#!/bin/bash\nprintf "%s\\n" "$*" >> "{curl_log}"\nexit 0\n')
     av_line = f"  ALPHAVANTAGE_API_KEY) echo '{AV_KEY}' ;;\n" if av_key else ""
+    sec_line = "  SEC_USER_AGENT) echo 'algo-poc test@example.com' ;;\n" if sec_agent else ""
     security = _exec(
         tmp_path / "stubs" / "security",
         "#!/bin/bash\n"
@@ -77,6 +78,7 @@ def _drive(tmp_path: Path, *, exit_code: int, output: str = "", av_key: bool = T
         "  TELEGRAM_BOT_TOKEN) echo '123456789:stub' ;;\n"
         "  TELEGRAM_CHAT_ID) echo '-100123' ;;\n"
         f"{av_line}"
+        f"{sec_line}"
         "  *) echo 'could not be found' >&2; exit 44 ;;\n"
         "esac\n",
     )
@@ -381,14 +383,14 @@ def test_the_documented_daily_budget_fits_the_free_tier():
     cfg = data.earnings.refresh
     fundamentals = data.fundamentals.refresh.calls_per_run
     assert 1 + cfg.calls_per_run + fundamentals + cfg.topup_calls <= 23
-    assert fundamentals >= 2, "a ticker needs two statements"
+    assert fundamentals == 0, "the scheduled fundamentals refresh is SEC EDGAR"
 
 
 # --- KAN-110 fundamentals step ----------------------------------------------
 
 
 def _fund_argv(run) -> list[str]:
-    return [line for line in run["argv"].splitlines() if "fetch_fundamentals.py" in line]
+    return [line for line in run["argv"].splitlines() if "fetch_fundamentals" in line]
 
 
 @pytest.mark.parametrize("code", [0, 3])
@@ -396,13 +398,13 @@ def test_the_full_run_refreshes_fundamentals_after_earnings(tmp_path, code):
     run = _drive(tmp_path, exit_code=code, output=CURRENT)
     lines = run["argv"].splitlines()
     assert lines[0].startswith("scripts/fetch_earnings.py")
-    assert lines[1] == "scripts/fetch_fundamentals.py --yield-calls 0", "fundamentals must run second"
+    assert lines[1] == "scripts/fetch_fundamentals_edgar.py", "fundamentals must run second"
     assert "fundamentals refresh OK" in run["log"]
     assert run["rc"] == code, "the fundamentals step must not change the job's exit code"
 
 
-@pytest.mark.parametrize("code", [1, 2, 75, 124])
-def test_fundamentals_are_not_attempted_after_an_earnings_failure(tmp_path, code):
+@pytest.mark.parametrize("code", [75, 124])
+def test_fundamentals_are_not_attempted_after_a_held_lock_or_timeout(tmp_path, code):
     run = _drive(tmp_path, exit_code=code, output="EARNINGS_REFRESH status=X")
     assert _fund_argv(run) == []
     assert f"fundamentals refresh SKIPPED (earnings exit {code})" in run["log"]
@@ -432,11 +434,11 @@ def test_every_other_fundamentals_failure_pages(tmp_path, code, marker):
     assert "Fundamentals refresh" in message and marker in message
 
 
-def test_the_initial_fill_is_logged_not_paged(tmp_path):
-    run = _drive(tmp_path, exit_code=0, output=CURRENT, fund_exit_code=3,
-                 fund_output="FUNDAMENTALS_REFRESH status=INCOMPLETE live_unfetched=90")
-    assert _telegrams(run) == []
-    assert "fundamentals refresh INCOMPLETE" in run["log"]
+@pytest.mark.parametrize("code", [2, 3])
+def test_edgar_runs_whatever_alpha_vantage_did(tmp_path, code):
+    """EDGAR spends no Alpha Vantage quota, so an AV failure does not skip it."""
+    run = _drive(tmp_path, exit_code=code, output="EARNINGS_REFRESH status=X")
+    assert _fund_argv(run) == ["scripts/fetch_fundamentals_edgar.py"]
 
 
 def test_fundamentals_standing_warnings_are_paged(tmp_path):
@@ -471,10 +473,8 @@ def test_the_after_market_divergence_is_documented(doc):
     assert "after-market" in text and "Friday" in text
 
 
-def test_fundamentals_yield_what_the_earnings_run_borrowed(tmp_path):
-    """The day's total stays inside the free tier: calls the earnings run spent
-    on live reporters come out of the fundamentals step."""
-    out = CURRENT.replace("recent_reporters=", "borrowed=4 recent_reporters=")
-    assert "borrowed=4" in out
-    run = _drive(tmp_path, exit_code=3, output=out)
-    assert _fund_argv(run) == ["scripts/fetch_fundamentals.py --yield-calls 4"]
+def test_a_missing_sec_user_agent_skips_fundamentals_and_pages(tmp_path):
+    run = _drive(tmp_path, exit_code=0, output=CURRENT, sec_agent=False)
+    assert _fund_argv(run) == []
+    assert any("SEC_USER_AGENT" in t for t in _telegrams(run))
+    assert run["rc"] == 0, "the earnings outcome is untouched"

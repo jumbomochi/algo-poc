@@ -192,7 +192,7 @@ def test_missing_fundamentals_name_the_path_and_the_fetcher(tmp_path):
     assert not verdict.fresh
     text = verdict.describe()
     assert "MISSING" in text and str(tmp_path) in text
-    assert "fetch_fundamentals.py" in text
+    assert "fetch_fundamentals_edgar.py" in text
 
 
 def test_an_unknown_fetch_time_is_stale(tmp_path):

@@ -71,19 +71,17 @@
 # FUNDAMENTALS STEP (full run only)
 # ---------------------------------
 # After the earnings fetch, the same run refreshes fundamentals.json for
-# quality_value: scripts/fetch_fundamentals.py, Alpha Vantage INCOME_STATEMENT
-# and BALANCE_SHEET for at most three tickers (data.fundamentals.refresh), each
-# quarter kept as first seen and never overwritten (that script's docstring).
-# It runs here rather than as its own job so the two never overlap on the one
-# free-tier quota and the shared cache lock. The free tier's 25 a day: 13 +
-# 6 here, 4 at 05:05, 2 left for a hand-run.
+# quality_value from SEC EDGAR: scripts/fetch_fundamentals_edgar.py, every live
+# ticker, each quarter as first filed (that script's docstring). It needs no
+# Alpha Vantage quota (the free tier's 25 a day: 19 at 04:45, 4 at 05:05, 2
+# for a hand-run) but shares the cache lock, so it runs here, after earnings.
+# SEC fair access requires a contact User-Agent: the job secret SEC_USER_AGENT.
 #
 # Its outcome never changes this wrapper's exit code or the dead-man ping: the
 # earnings check watches the job, and a fundamentals cache that stops being
 # refreshed is caught at 05:15 by KAN-109 (quality_value DATA-DEGRADED once
 # fetched_at is 14 days old). Its failures (2, 1, 75, 124) Telegram here, each
-# run. INCOMPLETE (3) is logged only: it is the initial fill, weeks long, and
-# the 05:15 run already reports quality_value degraded for every day of it.
+# run.
 #
 # DEAD-MAN SWITCH
 # ---------------
@@ -163,17 +161,17 @@ if [ -f "$CANON" ] && ! cmp -s "$0" "$CANON"; then
 fi
 
 run_fundamentals_step() {
-    # Spaced from the earnings run's last request: the free tier limits bursts.
     sleep "$FUNDAMENTALS_START_DELAY"
     local offset run_output summary fund_exit no_data refused
     offset=$(wc -c < "$LOG_FILE" | tr -d ' ')
-    echo "$(ts): Starting fundamentals refresh (Alpha Vantage statements)" >> "$LOG_FILE"
-    # Calls the earnings run borrowed for live reporters come out of this
-    # step's budget, so the day stays inside the free tier's 25.
-    local borrowed
-    borrowed=$(printf '%s\n' "$SUMMARY" | sed -n 's/.* borrowed=\([0-9][0-9]*\).*/\1/p')
+    echo "$(ts): Starting fundamentals refresh (SEC EDGAR)" >> "$LOG_FILE"
+    if ! algo_load_secrets SEC_USER_AGENT; then
+        echo "$(ts): fundamentals refresh SKIPPED — $ALGO_SECRETS_ERROR" >> "$LOG_FILE"
+        telegram "⚠️ Fundamentals refresh SKIPPED: $ALGO_SECRETS_ERROR (deploy/launchd/secrets.sh --import --only SEC_USER_AGENT). quality_value degrades once fundamentals.json is 14 days old."
+        return 0
+    fi
     algo_run_bounded "$FUNDAMENTALS_TIMEOUT" \
-        "$VENV" scripts/fetch_fundamentals.py --yield-calls "${borrowed:-0}" >> "$LOG_FILE" 2>&1
+        "$VENV" scripts/fetch_fundamentals_edgar.py >> "$LOG_FILE" 2>&1
     fund_exit=$?
     run_output=$(tail -c "+$((offset + 1))" "$LOG_FILE" 2>/dev/null)
     summary=$(printf '%s\n' "$run_output" | grep '^FUNDAMENTALS_REFRESH ' | tail -1)
@@ -185,17 +183,12 @@ run_fundamentals_step() {
             echo "$(ts): fundamentals refresh OK — $summary" >> "$LOG_FILE"
             [ -n "$no_data" ] && telegram "⚠️ Fundamentals refresh: ${no_data#LIVE_NO_DATA: }. See $LOG_REF."
             ;;
-        3)
-            # The initial fill takes weeks at three tickers a run, and the
-            # 05:15 run already reports quality_value DATA-DEGRADED every day
-            # it lasts. A page here would repeat that daily; the log is enough.
-            echo "$(ts): fundamentals refresh INCOMPLETE — $summary" >> "$LOG_FILE" ;;
         2)
             echo "$(ts): fundamentals refresh FAILED — $summary" >> "$LOG_FILE"
-            telegram "❌ Fundamentals refresh FAILED: Alpha Vantage refused or errored, or after a full pass too many live names have no stored quarter (THIN). Progress saved; fundamentals.json's fetched_at NOT advanced (quality_value degrades once it is 14 days old). $summary. See $LOG_REF." ;;
+            telegram "❌ Fundamentals refresh FAILED: SEC EDGAR errored for a live ticker twice, or too many live names have no quarter (THIN). Rows saved; fundamentals.json's fetched_at NOT advanced (quality_value degrades once it is 14 days old). $summary. See $LOG_REF." ;;
         75)
             echo "$(ts): fundamentals refresh SKIPPED — another refresh holds the lock" >> "$LOG_FILE"
-            telegram "⚠️ Fundamentals refresh SKIPPED: another Alpha Vantage refresh (a hand-run?) held the cache lock. $summary. See $LOG_REF." ;;
+            telegram "⚠️ Fundamentals refresh SKIPPED: another refresh (a hand-run?) held the cache lock. $summary. See $LOG_REF." ;;
         124)
             echo "$(ts): fundamentals refresh TIMED OUT after ${FUNDAMENTALS_TIMEOUT}s" >> "$LOG_FILE"
             telegram "⏱️ Fundamentals refresh TIMED OUT after ${FUNDAMENTALS_TIMEOUT}s and was killed (progress saved; fetched_at NOT advanced). $summary. See $LOG_REF." ;;
@@ -311,13 +304,11 @@ if [ -n "$REFUSED" ]; then
     telegram "⚠️ Earnings refresh: ${REFUSED#LIVE_REFUSED: }. See $LOG_REF."
 fi
 
-# Step 2: the fundamentals refresh (see FUNDAMENTALS STEP above). Only after
-# an earnings outcome in which Alpha Vantage answered normally: 0 or 3. After
-# 2 the quota or the key is the likely problem and the fundamentals calls
-# would fail the same way; after 1, 75 or 124 there is no key, someone else
-# holds the lock, or the time is gone.
+# Step 2: the fundamentals refresh (see FUNDAMENTALS STEP above). EDGAR does
+# not share Alpha Vantage's fate, so only a held lock (75) or a spent time
+# budget (124) skips it.
 case "$EXIT_CODE" in
-    0|3) run_fundamentals_step ;;
+    0|1|2|3) run_fundamentals_step ;;
     *)   echo "$(ts): fundamentals refresh SKIPPED (earnings exit $EXIT_CODE)" >> "$LOG_FILE" ;;
 esac
 

@@ -910,7 +910,7 @@ Two jobs, one wrapper, **every day, weekends included**:
 
 | Job | Slot (SGT) | Runs | Requests (free tier) |
 |---|---|---|---|
-| `local.algo-earnings-refresh` | 04:45 | `scripts/fetch_earnings.py --universe pit`, then `scripts/fetch_fundamentals.py` | 1 calendar + ≤12 EARNINGS, then ≤6 statements |
+| `local.algo-earnings-refresh` | 04:45 | `scripts/fetch_earnings.py --universe pit`, then `scripts/fetch_fundamentals_edgar.py` | 1 calendar + ≤18 EARNINGS; fundamentals from SEC EDGAR (no Alpha Vantage quota; needs the `SEC_USER_AGENT` job secret) |
 | `local.algo-earnings-topup` | 05:05 | `scripts/fetch_earnings.py --top-up` | ≤4 EARNINGS, no calendar |
 
 Both merge atomically into `data.cache_dir/earnings.json` (plus
@@ -963,8 +963,10 @@ rationale in the wrapper header.
 - **Logs:** `~/ibc/logs/earnings_refresh_YYYYMMDD.log` (both runs, pruned after
   30 days), launchd stdout/stderr to `~/ibc/logs/earnings-refresh-launchd.log`.
 - **By hand:** `.venv/bin/python scripts/fetch_earnings.py --dry-run [--top-up]`
-  and `.venv/bin/python scripts/fetch_fundamentals.py --dry-run` print the plan
-  without a request; both read the key from the keychain themselves.
+  prints the plan without a request, and `.venv/bin/python
+  scripts/fetch_fundamentals_edgar.py [--tickers A,B]` rebuilds fundamentals
+  from SEC EDGAR (about 90 s for the live universe; `--tickers` never stamps).
+  Both read their secret from the keychain themselves.
 
 ## Daily paper-DB backup
 

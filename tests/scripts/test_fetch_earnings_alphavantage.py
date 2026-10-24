@@ -245,8 +245,8 @@ def test_the_shipped_config_carries_the_verified_renames():
     cfg = load_config("config/default.yaml").data.earnings.refresh
     assert cfg.symbol_overrides == {"MMC": "MRSH", "FI": "FISV"}
     # Free tier: the 04:45 run (calendar + budget) and the 05:05 top-up together
-    # must leave headroom under 25 requests/day.
-    assert cfg.calls_per_run + 1 + cfg.topup_calls <= 21
+    # must leave two of the 25 requests/day for a hand-run (fundamentals are EDGAR).
+    assert cfg.calls_per_run + 1 + cfg.topup_calls <= 23
     assert cfg.topup_calls >= 1
     assert cfg.min_interval_seconds >= 12
 

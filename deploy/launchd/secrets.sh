@@ -125,7 +125,9 @@ ALGO_OPTIONAL_SECRET_NAMES="${ALGO_OPTIONAL_SECRET_NAMES:-DEADMAN_WATCHDOG_URL A
 # The sentiment collector's source keys are job credentials on the same terms
 # (run_sentiment_collect.sh; source of truth 1Password). Each one absent skips
 # only its own source; the job stops only when none is present.
-ALGO_JOB_SECRET_NAMES="${ALGO_JOB_SECRET_NAMES:-ALPHAVANTAGE_API_KEY FINNHUB_API_KEY REDDIT_CLIENT_ID REDDIT_CLIENT_SECRET}"
+# SEC_USER_AGENT ("algo-poc <contact email>") is the fundamentals refresh's: SEC
+# fair access requires a contact on every request, kept out of the public repo.
+ALGO_JOB_SECRET_NAMES="${ALGO_JOB_SECRET_NAMES:-ALPHAVANTAGE_API_KEY FINNHUB_API_KEY REDDIT_CLIENT_ID REDDIT_CLIENT_SECRET SEC_USER_AGENT}"
 
 # Human-readable reason the last lookup failed. Callers log this verbatim; it
 # names the operator action, which is the whole point of separating the failure

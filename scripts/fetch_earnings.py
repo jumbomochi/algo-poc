@@ -243,22 +243,22 @@ def scrub(text: Any, secret: str | None = None) -> str:
     return re.sub(r"(?i)(apikey=)[^&\s'\"]+", r"\1***", out)
 
 
-def load_api_key(env: Mapping[str, str] | None = None) -> str | None:
-    """The key from the environment, else the login keychain; never printed.
+def load_api_key(env: Mapping[str, str] | None = None, name: str = API_KEY_VAR) -> str | None:
+    """The secret ``name`` from the environment, else the login keychain; never printed.
 
     The launchd wrapper exports it through ``secrets.sh``. The keychain
     fallback serves a hand-run, read the same way ``secrets.sh`` does, with
     the value on stdout of a child process — never in argv.
     """
     env = os.environ if env is None else env
-    value = (env.get(API_KEY_VAR) or "").strip()
+    value = (env.get(name) or "").strip()
     if value:
         return value
     security = env.get("ALGO_SECURITY_BIN", "/usr/bin/security")
     service = env.get("ALGO_KEYCHAIN_SERVICE", "algo-poc")
     try:
         result = subprocess.run(
-            [security, "find-generic-password", "-s", service, "-a", API_KEY_VAR, "-w"],
+            [security, "find-generic-password", "-s", service, "-a", name, "-w"],
             capture_output=True,
             text=True,
             timeout=15,

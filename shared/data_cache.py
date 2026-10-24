@@ -103,7 +103,7 @@ SLEEVE_CACHE: dict[str, str] = {
 
 #: Fetch scripts to name in a message, so the reader knows what to run.
 _FETCHER = {
-    FUNDAMENTALS: "scripts/fetch_fundamentals.py",
+    FUNDAMENTALS: "scripts/fetch_fundamentals_edgar.py",
     EARNINGS: "scripts/fetch_earnings.py",
 }
 
