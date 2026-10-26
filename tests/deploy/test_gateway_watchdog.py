@@ -1141,7 +1141,7 @@ CONFIG_INI = Path.home() / "ibc" / "config.ini"
 
 
 def _parse_ibc_time(value: str) -> int:
-    """IBC writes `2:00 PM` / `11:55 PM` / `08:00`. Returns minutes past midnight."""
+    """IBC writes `02:00 PM` / `11:55 PM` / `14:30`. Returns minutes past midnight."""
     m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*(AM|PM)?\s*$", value, re.IGNORECASE)
     assert m, f"unparseable IBC time {value!r}"
     hour, minute, meridiem = int(m.group(1)), int(m.group(2)), m.group(3)
@@ -1416,7 +1416,7 @@ def test_an_unvalidated_latch_is_restarted_for_once_the_next_cycle_confirms_it(h
     [
         (datetime(2026, 10, 14, 13, 55), [], "daily auto-restart (14:00)"),
         (datetime(2026, 10, 14, 14, 10), [], "daily auto-restart (14:00)"),
-        (datetime(2026, 10, 18, 8, 5), [], "weekly cold restart (Sun 08:00)"),
+        (datetime(2026, 10, 18, 14, 35), [], "weekly cold restart (Sun 14:30)"),
         (datetime(2026, 10, 14, 5, 12), [], "paper run's slot"),
         (datetime(2026, 10, 14, 5, 25), [], "paper run's slot"),
         (datetime(2026, 10, 14, 6, 10), ["local.algo-paper-trading"],
@@ -1675,6 +1675,12 @@ def _watchdog_int(name: str) -> int:
     m = re.search(rf"^{name}=(\d+)$", WATCHDOG.read_text(), re.MULTILINE)
     assert m, f"gateway_watchdog.sh has no {name}= constant"
     return int(m.group(1))
+
+
+def test_the_recorded_auto_restart_time_is_one_ibc_accepts():
+    """IBC parses AutoRestartTime as `hh:mm a`. `2:00 PM` was rejected at every
+    start and the Gateway kept restarting at 11:55 PM, mid-session (2026-10-27)."""
+    assert re.fullmatch(r"(0[1-9]|1[0-2]):[0-5]\d (AM|PM)", _readme_auto_restart_time())
 
 
 def test_the_restart_blackouts_match_the_recorded_ibc_schedule():

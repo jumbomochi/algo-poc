@@ -105,13 +105,13 @@ CONN_RESTART_SAME_OUTAGE_SECS=3600
 # would break a paper run mid-decision or a 5h refresh fetch.
 IB_CLIENT_JOBS="local.algo-paper-trading local.algo-pipeline-report local.algo-backtest-refresh"
 # Scheduled Gateway restarts the watchdog must not race. They mirror
-# ~/ibc/config.ini (AutoRestartTime=2:00 PM, ColdRestartTime=08:00 on Sundays),
+# ~/ibc/config.ini (AutoRestartTime=02:00 PM, ColdRestartTime=14:30 on Sundays),
 # recorded in deploy/launchd/README.md and asserted by the test suite.
 IBC_AUTO_RESTART_HOUR=14
 IBC_AUTO_RESTART_MIN=0
 IBC_COLD_RESTART_WDAY=0
-IBC_COLD_RESTART_HOUR=8
-IBC_COLD_RESTART_MIN=0
+IBC_COLD_RESTART_HOUR=14
+IBC_COLD_RESTART_MIN=30
 DOCKER_ALERT_MARKER="$HOME/ibc/.docker_stack_alerted"
 DOCKER_STRIKE_MARKER="$HOME/ibc/.docker_stack_strike"
 REALERT_MAX_SECS=$((12 * 3600))

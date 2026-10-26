@@ -662,9 +662,16 @@ Mon 22:15 and then tightens only before the real Tue run (05:15 since KAN-104). 
 is a day or more away the page names it — "The next paper run (Tue 05:15) is in
 2d 11h"; under 24h it keeps the "in N min" wording.
 
-### `AutoRestartTime` — why it is 2:00 PM, not 11:55 PM
+### `AutoRestartTime` — why it is 02:00 PM, not 11:55 PM
 
-`~/ibc/config.ini:52` is **`AutoRestartTime=2:00 PM`** (SGT). This is the other
+**It was not, until 2026-10-27.** IBC parses the value with the strict pattern
+`hh:mm a`, so the `2:00 PM` written here for KAN-62 was rejected at every start
+(no "time set" line followed "Setting Auto restart time"), and the Gateway kept
+its earlier **11:55 PM**: a restart at 11:55 New York time, mid-session, whose
+re-login IB rejected on 10-23 and 10-26 with nobody awake to restart it. The
+hour must have two digits.
+
+`~/ibc/config.ini:52` is **`AutoRestartTime=02:00 PM`** (SGT). This is the other
 half of KAN-62 and it is a host config file, not a repo file, so it is recorded
 here: a future edit that moves it back inside the job window is the failure
 being guarded against, and
@@ -677,11 +684,17 @@ report), 06:15 (DB backup), plus the Tuesday refresh at 06:30, all SGT
 re-login had 4h20m to
 be noticed by a human who was asleep, and no automated path at all — the
 watchdog is forbidden from kickstarting into an auth failure, and
-`ColdRestartTime=08:00` is **weekly, not daily** (the 08-21 session logged "cold
+`ColdRestartTime=14:30` is **weekly, not daily** (the 08-21 session logged "cold
 restarted at 2026/08/23 08:00", a Sunday), so on a weekday there is no automatic
-backstop. 2:00 PM SGT puts a failed re-login in the middle of the operator's
+backstop. 02:00 PM SGT puts a failed re-login in the middle of the operator's
 working day and roughly **15 hours** ahead of the next run that depends on it,
 and it is clear of both the job window and IB's own overnight reset.
+
+`ColdRestartTime` is the week's one full logon with the password, and IBC's
+docs require it to be after 01:00 US/Eastern on Sunday. It was `08:00` until
+2026-10-27, which is Saturday evening in New York, before IB's weekly reset.
+Every Monday token restart on record was rejected (08-10, 10-05, 10-26). 14:30
+SGT is 02:30 EDT / 01:30 EST, after 01:00 ET on both sides of DST.
 
 **Telegram alerts** (best-effort) are sent on: auth-failure refusal, kickstart
 action, and recovery. Credentials come from the login keychain
@@ -758,7 +771,7 @@ The watchdog now restarts the Gateway **once** when all of these hold:
   path makes before it kickstarts.
 - It is outside every blackout:
   - IBC's daily `AutoRestartTime` (14:00), from 10 min before to 15 min after;
-  - the Sunday `ColdRestartTime` (08:00), the same width;
+  - the Sunday `ColdRestartTime` (14:30), the same width;
   - the 05:15 paper slot on run days, from 5 min before to 15 min after;
   - any time `local.algo-paper-trading`, `local.algo-pipeline-report` or
     `local.algo-backtest-refresh` shows a PID in `launchctl list`, because each
@@ -887,7 +900,7 @@ been an hour into a 5–6h IB historical pull when the paper run needed the same
 gateway. Distinct client ids (refresh 10, paper 58/59) avoid a collision, not
 contention for the pacing budget. Starting after the backup keeps the daily
 chain strictly sequential, and the 6h bound ends by 12:30, ahead of the
-2:00 PM `AutoRestartTime`.
+02:00 PM `AutoRestartTime`.
 
 - **Telegram**: ✅ with the headline metrics on success, ❌ on failure or when
   the Gateway is unreachable (baseline going stale is a silent risk otherwise).
