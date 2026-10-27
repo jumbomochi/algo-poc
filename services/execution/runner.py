@@ -80,6 +80,13 @@ DEFERRED_PAST_SESSION_REASON = "deferred past session"
 # long an order placed *after* that first pass can sit live at the broker.
 HALT_SWEEP_INTERVAL_SECONDS: float = 30.0
 
+# Cadence of the unfilled-order sweep. It must land inside the close cancel's
+# 15-minute window: driven on the 60-minute reprice interval it ran at about
+# :36 past each hour and never did, so unfilled entries died at IB's expiry
+# instead. Repricing keeps its own per-order clock (``last_repriced_at``), so
+# sweeping more often does not reprice more often.
+UNFILLED_SWEEP_INTERVAL_SECONDS: float = 300.0
+
 # What marks a sell on ``stream:approved_orders`` as a risk-side exit, and so
 # subject to the oversell guard (KAN-10) — one key per control that risk's
 # exit emitter can publish. An ordinary sleeve sell carries none of them: it is
@@ -230,12 +237,9 @@ class ExecutionServiceRunner:
         else:
             self.ib_port = config.ib.paper_port
 
-        # Periodic unfilled-order sweep (cancel stale limits / free reservations).
-        # Driven on the reprice interval; needs a market calendar (set by the
-        # runner entrypoint) — without one the sweep is skipped.
-        self._reprice_interval_seconds = max(
-            1, int(config.execution.reprice_interval_minutes) * 60
-        )
+        # Periodic unfilled-order sweep (cancel limits at the close / free
+        # reservations). Needs a market calendar (set by the runner
+        # entrypoint) — without one the sweep is skipped.
         self._last_sweep_at: float | None = None
         self._market_calendar: Any = None
 
@@ -2901,17 +2905,18 @@ class ExecutionServiceRunner:
             return None
 
     async def maybe_run_unfilled_sweep(self, now: float) -> bool:
-        """Run the unfilled-order sweep when the reprice interval has elapsed.
+        """Run the unfilled-order sweep every ``UNFILLED_SWEEP_INTERVAL_SECONDS``.
 
         ``now`` is a monotonic timestamp (seconds). No-ops without a market
-        calendar. Execution has no live quote feed, so the sweep cancels stale
-        limits / frees reservations rather than repricing (see
-        OrderManager.sweep_unfilled_orders). Returns True when it ran.
+        calendar. Execution has no live quote feed, so the sweep cancels
+        unfilled limits in the session's last 15 minutes rather than
+        repricing (see OrderManager.sweep_unfilled_orders). Returns True when
+        it ran.
         """
         if self._market_calendar is None:
             return False
         last = self._last_sweep_at
-        if last is not None and (now - last) < self._reprice_interval_seconds:
+        if last is not None and (now - last) < UNFILLED_SWEEP_INTERVAL_SECONDS:
             return False
         self._last_sweep_at = now
         await self._order_manager.sweep_unfilled_orders(

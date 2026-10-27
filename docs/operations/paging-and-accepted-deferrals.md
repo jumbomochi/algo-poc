@@ -115,10 +115,18 @@ including a strategy change that could open a short. The oversell guard
 
 **The gap.** The unfilled-order sweep does not reprice: execution has no live
 quote feed, so `OrderManager.sweep_unfilled_orders` is called with an empty
-quote map and unfilled limits age out and are cancelled, freeing their
-reservations (`services/execution/runner.py` `maybe_run_unfilled_sweep`
-docstring). `reprice_interval_minutes` / `max_reprice_attempts` therefore bound
-the age-out, not a reprice ladder.
+quote map. An unfilled limit works the whole session and is cancelled in its
+last 15 minutes, freeing its reservation (`services/execution/runner.py`
+`maybe_run_unfilled_sweep`, every 5 minutes). `reprice_interval_minutes` /
+`max_reprice_attempts` apply only to an order with a quote, which today is none.
+
+Until 2026-10-27 the sweep counted a quote-less "reprice" toward
+`max_reprice_attempts`, so every unfilled entry was cancelled at about 12:36 ET,
+while the backtest and the rolling shadow let it work the whole session. The
+sweep also ran hourly and so never reached the close cancel. Intraday bars for
+10 entries that went unfilled across 10-05 to 10-26 found one fill lost that
+way (LLY 10-16, limit traded at 14:45). Seven never reached their limit, and two
+reached it before 12:36.
 
 **Why accepted.** The failure mode is a **missed fill, not a loss**: an order
 that does not fill is cancelled honestly and the reservation released.
