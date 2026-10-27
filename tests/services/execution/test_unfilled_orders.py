@@ -192,15 +192,15 @@ class TestUnfilledSweep:
             "recommendation_id": "rec-1",
             "order_type": "limit",
         }
-        applied = await mgr.sweep_unfilled_orders({}, self._calendar())
+        applied = await mgr.sweep_unfilled_orders({"AAPL": 151.0}, self._calendar())
         assert applied == 1
         mgr._executor.cancel_order.assert_awaited_once_with("order-1")
         assert "order-1" not in mgr.open_orders
 
     @pytest.mark.asyncio
-    async def test_sweep_advances_reprice_bookkeeping_without_feed(self):
-        """With no live quote feed, a stale limit can't be repriced to a better
-        price, but its bookkeeping must advance so it eventually cancels."""
+    async def test_sweep_does_not_age_a_limit_it_has_no_quote_for(self):
+        """With no quote a "reprice" leaves the limit where it was; counting it
+        toward the attempt cancel only cut the order's session short."""
         mgr = self._mgr()
         now = datetime.now(timezone.utc)
         mgr.open_orders["order-1"] = {
@@ -213,7 +213,24 @@ class TestUnfilledSweep:
             "recommendation_id": "rec-1",
             "order_type": "limit",
         }
-        await mgr.sweep_unfilled_orders({}, self._calendar())
+        assert await mgr.sweep_unfilled_orders({}, self._calendar()) == 0
+        assert mgr.open_orders["order-1"]["reprice_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_sweep_advances_reprice_bookkeeping_with_a_quote(self):
+        mgr = self._mgr()
+        now = datetime.now(timezone.utc)
+        mgr.open_orders["order-1"] = {
+            "ticker": "AAPL",
+            "quantity": 50,
+            "limit_price": 150.0,
+            "placed_at": now - timedelta(minutes=61),
+            "last_repriced_at": now - timedelta(minutes=61),
+            "reprice_count": 0,
+            "recommendation_id": "rec-1",
+            "order_type": "limit",
+        }
+        await mgr.sweep_unfilled_orders({"AAPL": 151.0}, self._calendar())
         assert mgr.open_orders["order-1"]["reprice_count"] == 1
 
 
@@ -355,3 +372,59 @@ class TestSweepOutsideMarketHours:
         mgr._executor.cancel_order.assert_not_awaited()
         assert "order-001" in mgr.open_orders
         assert mgr.open_orders["order-001"]["reprice_count"] == 0
+
+
+class TestEntriesWorkTheWholeSession:
+    """Execution has no quote feed, so an unfilled entry must work until the
+    close cancel, as the backtest's DAY limit does. On 2026-10-26 TSLA was
+    "aged" at 09:36, 10:36 and 11:36 ET and cancelled at 12:36; on 10-16 an
+    LLY limit cancelled the same way traded at 14:45."""
+
+    def _mgr(self) -> OrderManager:
+        executor = AsyncMock()
+        executor.cancel_order = AsyncMock(return_value=True)
+        return OrderManager(
+            executor=executor,
+            redis_client=AsyncMock(),
+            db_session=MagicMock(),
+            reprice_interval_minutes=60,
+            max_reprice_attempts=3,
+        )
+
+    def _open_order(self, mgr: OrderManager, *, reprice_count: int) -> None:
+        now = datetime.now(timezone.utc)
+        mgr.open_orders["order-001"] = {
+            "ticker": "TSLA",
+            "quantity": 4,
+            "limit_price": 372.22,
+            "placed_at": now - timedelta(hours=20),
+            "last_repriced_at": now - timedelta(hours=2),
+            "reprice_count": reprice_count,
+            "recommendation_id": "rec-001",
+            "order_type": "limit",
+        }
+
+    @pytest.mark.parametrize("hour,minute", [(9, 36), (12, 36), (14, 45), (15, 40)])
+    def test_an_unquoted_limit_is_left_working_through_the_session(self, hour, minute):
+        mgr = self._mgr()
+        self._open_order(mgr, reprice_count=0)
+
+        assert mgr.check_unfilled_orders({}, _at(hour, minute)) == []
+
+    def test_an_order_already_at_the_attempt_cap_is_not_cancelled_early(self):
+        """An order aged before this change carries its count across a
+        restart-free deploy; without a quote the cap no longer applies."""
+        mgr = self._mgr()
+        self._open_order(mgr, reprice_count=3)
+
+        assert mgr.check_unfilled_orders({}, _at(12, 40)) == []
+
+    async def test_an_unquoted_limit_is_cancelled_in_the_last_15_minutes(self):
+        mgr = self._mgr()
+        self._open_order(mgr, reprice_count=0)
+
+        cancelled = await mgr.sweep_unfilled_orders({}, _at(15, 47))
+
+        assert cancelled == 1
+        mgr._executor.cancel_order.assert_awaited_once_with("order-001")
+        assert "order-001" not in mgr.open_orders

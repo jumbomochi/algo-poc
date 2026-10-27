@@ -9,7 +9,10 @@ import pytest
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 
-from services.execution.runner import ExecutionServiceRunner
+from services.execution.runner import (
+    UNFILLED_SWEEP_INTERVAL_SECONDS,
+    ExecutionServiceRunner,
+)
 from services.portfolio_accounting.projector import FillProjector
 from shared.config import AppConfig, ExecutionConfig, IBConfig
 from shared.models import (
@@ -1712,12 +1715,18 @@ class TestUnfilledSweepDriver:
     async def test_maybe_run_unfilled_sweep_respects_interval(self, runner):
         runner._market_calendar = MagicMock()
         runner._order_manager.sweep_unfilled_orders = AsyncMock(return_value=0)
-        interval = runner._reprice_interval_seconds
+        interval = UNFILLED_SWEEP_INTERVAL_SECONDS
 
         assert await runner.maybe_run_unfilled_sweep(now=1000.0) is True
         assert await runner.maybe_run_unfilled_sweep(now=1000.0 + interval - 1) is False
         assert await runner.maybe_run_unfilled_sweep(now=1000.0 + interval + 1) is True
         assert runner._order_manager.sweep_unfilled_orders.await_count == 2
+
+    def test_the_sweep_runs_inside_the_close_cancel_window(self):
+        """The close cancel fires only in a session's last 15 minutes; a sweep
+        cadence as long as that window can step over it, as the 60-minute one
+        did every session (unfilled entries then died at IB's expiry)."""
+        assert UNFILLED_SWEEP_INTERVAL_SECONDS < 15 * 60
 
     @pytest.mark.asyncio
     async def test_sweep_skipped_without_market_calendar(self, runner):

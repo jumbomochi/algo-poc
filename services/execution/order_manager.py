@@ -683,6 +683,14 @@ class OrderManager:
         3. If unfilled for longer than reprice_interval_minutes -> reprice
         4. Otherwise -> no action
 
+        Rules 2 and 3 need a quote for the ticker. Without one a "reprice"
+        leaves the limit where it was, so counting it toward rule 2 only
+        cancelled an unchanged order three passes after the open — 12:36 ET —
+        while the backtest and the rolling shadow let the same DAY limit work
+        the whole session (``BacktestRunner``: an entry fills if the day's low
+        reaches its limit). On 2026-10-16 that lost an LLY entry whose limit
+        traded at 14:45. With no quote an order now works until rule 1.
+
         Every rule here is an INTRA-SESSION one: each asks some form of "this
         order has had its chance to fill and did not". Outside regular trading
         hours no order can fill, so none of them may run — the sweep sits out
@@ -749,6 +757,10 @@ class OrderManager:
                 )
                 continue
 
+            # No quote, nothing to reprice to: keep the limit working.
+            if ticker not in current_prices:
+                continue
+
             # Rule 2: Cancel if max reprice attempts reached
             if info["reprice_count"] >= self._max_reprice_attempts:
                 actions.append(
@@ -771,7 +783,7 @@ class OrderManager:
             if time_since_last >= timedelta(
                 minutes=self._reprice_interval_minutes
             ):
-                new_price = current_prices.get(ticker, info["limit_price"])
+                new_price = current_prices[ticker]
                 actions.append(
                     OrderAction(
                         order_id=order_id,
@@ -799,12 +811,13 @@ class OrderManager:
         """Apply the unfilled-order decisions from :meth:`check_unfilled_orders`.
 
         Cancels orders that are near close or past the reprice-attempt limit
-        (freeing their reservation once IB reports the cancellation). Repricing
-        needs a live quote — which the execution service has no feed for — so a
-        reprice decision only advances the order's bookkeeping, letting a
-        persistently-unfilled limit progress to the max-attempts cancel instead
-        of silently dying at IB session expiry. Returns the number of orders
-        cancelled.
+        (freeing their reservation once IB reports the cancellation). The
+        execution service has no quote feed and passes none, so in production
+        only the close cancel fires: an unfilled limit works the session and
+        is cancelled in its last 15 minutes rather than left to die at IB's
+        session expiry. A reprice decision (only made with a quote) still just
+        advances the order's bookkeeping; nothing sends a new price to IB.
+        Returns the number of orders cancelled.
         """
         cancelled = 0
         for action in self.check_unfilled_orders(current_prices, market_calendar):
@@ -821,11 +834,11 @@ class OrderManager:
                         "Failed to cancel unfilled order",
                         order_id=action.order_id,
                     )
-            else:  # reprice — no live quote feed, so only advance bookkeeping
+            else:  # reprice — no order modification yet, so only bookkeeping
                 info["reprice_count"] += 1
                 info["last_repriced_at"] = datetime.now(timezone.utc)
                 self._logger.info(
-                    "Unfilled limit aged (no quote feed to reprice)",
+                    "Unfilled limit aged (repricing not implemented)",
                     order_id=action.order_id,
                     reprice_count=info["reprice_count"],
                 )
