@@ -42,6 +42,16 @@
 # slot or a running IB-client job, and it never runs twice for one outage.
 # While a 1100 lasts, the re-alert is hourly during US market hours.
 #
+# 2026-10-28: the lockout guard above refused every rejection alike, but IB
+# rejects only one kind. IBC's daily auto-restart re-logs in with a session
+# token ("Re-starting session"), and IB turned that down on 10-21, 10-23, 10-26
+# and 10-28 while accepting it on the other days; a fresh launch ("Starting
+# session:") logs in with the password and has been accepted every time. Each
+# token rejection was an outage until a human noticed (10-28: 14:00 to 19:14).
+# A rejection whose session began with "Re-starting session" now gets ONE
+# fresh-login kickstart, outside the same blackouts as the 1100 restart. If the
+# fresh login is rejected too, the guard holds as before.
+#
 # Wire via launchd with StartInterval (300s). See deploy/launchd/.
 #
 # NO DEAD-MAN: covered by others, at both ends (KAN-56 coverage review). This
@@ -101,6 +111,11 @@ CONN_RESTART_VERIFY_SECS=900
 # restart produced, is the same outage coming back. Later than this it is a new
 # outage on that Gateway and may be restarted for.
 CONN_RESTART_SAME_OUTAGE_SECS=3600
+# The fresh-login restart record (restarted_at, outcome). One restart per
+# cooldown, whatever the IBC log says afterwards: IBC's token re-login happens
+# once a day, so a second rejection inside this window is the same outage.
+AUTH_RESTART_MARKER="$HOME/ibc/.gateway_auth_restarted"
+AUTH_RESTART_COOLDOWN_SECS=$((12 * 3600))
 # launchd jobs that hold an IB API session of their own. A restart under them
 # would break a paper run mid-decision or a 5h refresh fetch.
 IB_CLIENT_JOBS="local.algo-paper-trading local.algo-pipeline-report local.algo-backtest-refresh"
@@ -408,22 +423,54 @@ ibc_login_rejected() {
         | grep -qE "Unrecognized Username or Password|Too many failed login attempts"
 }
 
+# How the newest IBC session's login went, from the last session line on:
+#   auto-rejected   IBC's daily auto-restart (token re-login), then rejected
+#   fresh-rejected  a fresh launch (password login), then rejected
+#   locked-out      IB said "Too many failed login attempts"
+#   pending         no rejection since the session began
+#   unknown         no session line in the log
+# Only auto-rejected is ever restarted for.
+ibc_session_login() {
+    local latest
+    latest=$(ls -t "$LOG_DIR"/ibc-*.txt 2>/dev/null | head -1)
+    [ -n "$latest" ] || { echo unknown; return 0; }
+    awk '
+        /IBC: Re-starting session/                { kind = "auto";  bad = ""; next }
+        /IBC: Starting session/                   { kind = "fresh"; bad = ""; next }
+        /Too many failed login attempts/          { bad = "locked-out"; next }
+        /Unrecognized Username or Password/       { if (bad == "") bad = "rejected"; next }
+        END {
+            if (kind == "")              print "unknown"
+            else if (bad == "locked-out") print bad
+            else if (bad == "rejected")  print kind "-rejected"
+            else                         print "pending"
+        }' "$latest"
+}
+
+# The one way this script restarts the Gateway.
+kickstart_gateway() {
+    "$ALGO_LAUNCHCTL_BIN" kickstart -k "gui/$(id -u)/$GW_LABEL" >> "$LOG_FILE" 2>&1
+}
+
+# `key=value` out of a restart record ($1), or "" if absent.
+record_field() {
+    sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1
+}
+
+# Set one field of a restart record ($1) in place, keeping the others.
+set_record_field() {
+    local file="$1" key="$2" value="$3" tmp
+    [ -f "$file" ] || return 0
+    tmp="$file.tmp.$$"
+    { grep -v "^$key=" "$file" 2>/dev/null; printf '%s=%s\n' "$key" "$value"; } \
+        > "$tmp" && mv "$tmp" "$file"
+}
+
 # --------------------------------------------------------------------------
 # KAN-118: restart a Gateway stuck in a sustained Error 1100, once
 # --------------------------------------------------------------------------
-# `key=value` out of the restart record, or "" if absent.
-restart_marker_field() {
-    sed -n "s/^$1=//p" "$CONN_RESTART_MARKER" 2>/dev/null | head -1
-}
-
-# Set one field of the restart record in place, keeping the others.
-set_restart_marker_field() {
-    local key="$1" value="$2" tmp
-    [ -f "$CONN_RESTART_MARKER" ] || return 0
-    tmp="$CONN_RESTART_MARKER.tmp.$$"
-    { grep -v "^$key=" "$CONN_RESTART_MARKER" 2>/dev/null; printf '%s=%s\n' "$key" "$value"; } \
-        > "$tmp" && mv "$tmp" "$CONN_RESTART_MARKER"
-}
+restart_marker_field() { record_field "$CONN_RESTART_MARKER" "$1"; }
+set_restart_marker_field() { set_record_field "$CONN_RESTART_MARKER" "$1" "$2"; }
 
 # "HH:MM" of an epoch, for pages. Falls back to the bare epoch.
 hhmm_of() {
@@ -542,7 +589,7 @@ conn_restart_gateway() {
     printf 'restarted_pid=%s\nrestarted_at=%s\nlost_at=%s\noutcome=pending\n' \
         "$gw_pid" "$now" "$lost_at" > "$CONN_RESTART_MARKER"
     echo "$(ts): IB Error 1100 sustained ${age}s (port $PORT up, execution up, latch validated for pid $gw_pid) — kickstarting $GW_LABEL (KAN-118, once per outage)" >> "$LOG_FILE"
-    "$ALGO_LAUNCHCTL_BIN" kickstart -k "gui/$(id -u)/$GW_LABEL" >> "$LOG_FILE" 2>&1
+    kickstart_gateway
     rc=$?
     if [ "$rc" -ne 0 ]; then
         set_restart_marker_field outcome failed
@@ -551,6 +598,44 @@ conn_restart_gateway() {
         return 0
     fi
     telegram "⚠️ IB Gateway was in Error 1100 (no server connectivity) for ~$((age / 60)) min with port $PORT up — the watchdog has RESTARTED it, once for this outage. It will report whether it came back."
+}
+
+# --------------------------------------------------------------------------
+# A rejected daily re-login: one fresh-login restart
+# --------------------------------------------------------------------------
+auth_restart_field() { record_field "$AUTH_RESTART_MARKER" "$1"; }
+
+# Prints restart, wait <text> or refuse <text>, as conn_restart_decision does.
+# Asked only when ibc_session_login says auto-rejected.
+auth_restart_decision() {
+    local r_at reason
+    r_at="$(auth_restart_field restarted_at)"
+    case "$r_at" in ''|*[!0-9]*) r_at="" ;; esac
+    if [ -n "$r_at" ] && [ $(( $(now_epoch) - r_at )) -lt "$AUTH_RESTART_COOLDOWN_SECS" ]; then
+        echo "refuse it already restarted the Gateway with a fresh login at $(hhmm_of "$r_at"), and the login is still being rejected"; return 0
+    fi
+    if reason="$(restart_blackout_reason)"; then
+        echo "wait restart deferred: $reason. It will then restart the Gateway with a fresh login"; return 0
+    fi
+    echo "restart"
+}
+
+# Kickstart for a fresh login, recorded first so a watchdog killed mid-call
+# cannot restart the same rejection twice.
+auth_restart_gateway() {
+    local rc
+    printf 'restarted_at=%s\noutcome=pending\n' "$(now_epoch)" > "$AUTH_RESTART_MARKER"
+    echo "$(ts): IB rejected IBC's daily re-login in $LATEST_GW_LOG — kickstarting $GW_LABEL for a fresh login (once per outage)" >> "$LOG_FILE"
+    kickstart_gateway
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        set_record_field "$AUTH_RESTART_MARKER" outcome failed
+        echo "$(ts): fresh-login kickstart FAILED (launchctl exit $rc) — not retrying for this outage" >> "$LOG_FILE"
+        telegram "🚨 IB rejected the Gateway's daily re-login (port $PORT down), and the watchdog's fresh-login restart FAILED: launchctl kickstart exited $rc. It will not retry. A human needs to restart the Gateway."
+        touch "$AUTH_MARKER"
+        return 0
+    fi
+    telegram "⚠️ IB rejected the Gateway's daily re-login (IBC's auto-restart; port $PORT down). The watchdog has RESTARTED it with a fresh login, once for this outage. It will report whether that login is accepted."
 }
 
 # KAN-118: page how a restart turned out, once. $1 = recovered | failed,
@@ -564,7 +649,13 @@ conn_restart_outcome() {
 
 if nc -z -G 3 127.0.0.1 "$PORT" 2>/dev/null; then
     # Up — clear pending strikes. Only log/alert on a state change.
-    if [ -f "$MARKER" ] || [ -f "$AUTH_MARKER" ]; then
+    if [ "$(auth_restart_field outcome)" = "pending" ]; then
+        # The fresh login was accepted. This replaces the generic all-clear.
+        set_record_field "$AUTH_RESTART_MARKER" outcome recovered
+        echo "$(ts): port $PORT recovered after the fresh-login restart" >> "$LOG_FILE"
+        telegram "✅ IB Gateway is back after the watchdog's fresh-login restart at $(hhmm_of "$(auth_restart_field restarted_at)"): port $PORT is up. Execution reconnects on its own timer."
+        rm -f "$MARKER" "$AUTH_MARKER"
+    elif [ -f "$MARKER" ] || [ -f "$AUTH_MARKER" ]; then
         echo "$(ts): port $PORT recovered" >> "$LOG_FILE"
         [ -f "$AUTH_MARKER" ] && telegram "✅ IB Gateway recovered: port $PORT is up again after the login problem."
         rm -f "$MARKER" "$AUTH_MARKER"
@@ -737,11 +828,42 @@ fi
 # into that state hammers IB with failed logins — refuse and alert instead.
 LATEST_GW_LOG=$(ls -t "$LOG_DIR"/ibc-*.txt 2>/dev/null | head -1)
 if ibc_login_rejected; then
+    SESSION_LOGIN="$(ibc_session_login)"
+    AUTH_DECISION=""
+    if [ "$SESSION_LOGIN" = "auto-rejected" ]; then
+        AUTH_DECISION="$(auth_restart_decision)"
+        if [ "$AUTH_DECISION" = "restart" ]; then
+            auth_restart_gateway
+            exit 0
+        fi
+    fi
+    # Rejected after our fresh-login restart: that IS the restart's outcome,
+    # so it pages now rather than after the throttle.
+    FORCE_ALERT=""
+    if [ "$(auth_restart_field outcome)" = "pending" ]; then
+        case "$SESSION_LOGIN" in
+            *-rejected|locked-out)
+                set_record_field "$AUTH_RESTART_MARKER" outcome failed
+                FORCE_ALERT=1 ;;
+        esac
+    fi
+    case "$AUTH_DECISION" in
+        wait\ *)
+            AUTH_ACTION="Watchdog: ${AUTH_DECISION#* }." ;;
+        refuse\ *)
+            AUTH_ACTION="Watchdog will NOT restart it again: ${AUTH_DECISION#* }. Manual re-login needed." ;;
+        *)
+            if [ -n "$FORCE_ALERT" ]; then
+                AUTH_ACTION="That includes the fresh login the watchdog restarted it for at $(hhmm_of "$(auth_restart_field restarted_at)"), so it will NOT restart it again — repeated failed logins risk an IB lockout. Manual re-login needed."
+            else
+                AUTH_ACTION="Watchdog will NOT restart it — repeated failed logins risk an IB lockout. Manual re-login needed."
+            fi ;;
+    esac
     # Alert immediately, then RE-ALERT on the escalating schedule while
     # unresolved — a single missed message cost two paper-record days
     # (2026-07-07..09), and a flat 12h cadence cost the 2026-08-21 session.
     REALERT_SECS="$(auth_realert_secs)"
-    if need_alert "$AUTH_MARKER" "$REALERT_SECS"; then
+    if [ -n "$FORCE_ALERT" ] || need_alert "$AUTH_MARKER" "$REALERT_SECS"; then
         read -r SECS_TO_RUN RUN_WDAY <<< "$(paper_run_countdown)"
         RUN_HHMM="$(printf '%02d:%02d' "$PAPER_RUN_HOUR" "$PAPER_RUN_MIN")"
         if [ "$SECS_TO_RUN" -ge 86400 ] && [ "$RUN_WDAY" != "-" ]; then
@@ -759,7 +881,7 @@ if ibc_login_rejected; then
             MSG_RUN="The ${PAPER_RUN_HOUR}:$(printf '%02d' "$PAPER_RUN_MIN") paper run is in ${MINS_TO_RUN} min"
         fi
         echo "$(ts): AUTH FAILURE in $LATEST_GW_LOG — refusing to kickstart; alerted operator (re-alert ${REALERT_SECS}s, ${LOG_RUN})" >> "$LOG_FILE"
-        telegram "🚨 IB Gateway login is being REJECTED (port $PORT down). Watchdog will NOT restart it — repeated failed logins risk an IB lockout. Manual re-login needed. ${MSG_RUN} and will abort unless this is fixed."
+        telegram "🚨 IB Gateway login is being REJECTED (port $PORT down). ${AUTH_ACTION} ${MSG_RUN} and will abort unless this is fixed."
         touch "$AUTH_MARKER"
     fi
     # NOTE (KAN-62): $MARKER is deliberately NOT removed here. It is the
@@ -781,7 +903,7 @@ if [ -f "$MARKER" ] && [ -n "$R_AT" ] && [ "$(restart_marker_field outcome)" = "
     echo "$(ts): port $PORT down 2 consecutive checks, but the Gateway was restarted for Error 1100 at $(hhmm_of "$R_AT") — holding the kickstart until $((CONN_RESTART_VERIFY_SECS / 60)) min after it" >> "$LOG_FILE"
 elif [ -f "$MARKER" ]; then
     echo "$(ts): port $PORT down 2 consecutive checks — kickstarting $GW_LABEL" >> "$LOG_FILE"
-    "$ALGO_LAUNCHCTL_BIN" kickstart -k "gui/$(id -u)/$GW_LABEL" >> "$LOG_FILE" 2>&1
+    kickstart_gateway
     rm -f "$MARKER"            # reset; next run confirms recovery (or strikes again)
     telegram "⚠️ IB Gateway watchdog: port $PORT was down ~10 min with no auth error in the log — kickstarted the Gateway. Will confirm recovery next check."
 else
