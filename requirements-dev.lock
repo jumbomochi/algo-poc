@@ -88,7 +88,7 @@ markupsafe==3.0.3
     # via mako
 mdurl==0.1.2
     # via markdown-it-py
-msgpack==1.2.1
+msgpack==1.2.3
     # via cachecontrol
 narwhals==2.24.0
     # via
