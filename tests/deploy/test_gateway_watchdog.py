@@ -1304,11 +1304,12 @@ def test_a_validated_1100_past_thirty_minutes_restarts_the_gateway_once(stuck):
 
 
 def test_the_restart_path_is_the_one_the_port_down_path_uses(stuck):
-    """Same launchctl verb and target as the two-strike port-down kickstart, so
-    there is one way this script restarts the Gateway, not two."""
+    """Every restart path goes through one kickstart helper, so there is one way
+    this script restarts the Gateway."""
     stuck.run()
     text = WATCHDOG.read_text()
-    assert text.count('kickstart -k "gui/$(id -u)/$GW_LABEL"') == 2
+    assert text.count('kickstart -k "gui/$(id -u)/$GW_LABEL"') == 1
+    assert text.count("kickstart_gateway\n") + text.count("kickstart_gateway;") == 3
 
 
 def test_under_thirty_minutes_it_only_alerts(host):
@@ -1710,3 +1711,160 @@ def test_every_ib_client_job_is_a_real_launchd_label():
     assert m
     for label in m.group(1).split():
         assert (REPO / "deploy/launchd" / f"{label}.plist").exists(), label
+
+
+# ---------------------------------------------------------------------------
+# A rejected daily re-login gets one fresh-login restart
+# ---------------------------------------------------------------------------
+# IBC's daily auto-restart re-logs in with a session token ("Re-starting
+# session"), and IB rejects that re-login on some days and not others: 10-21,
+# 10-23 and 10-26 at 23:55, then 10-28 at 14:00, the day after the same 14:00
+# restart had worked. A fresh launch ("Starting session:") logs in with the
+# password and has been accepted every time, including 10-24 and 10-28 by
+# hand. The lockout guard refused both alike, so each rejection was an outage
+# until a human noticed (10-28: 14:00 to 19:14).
+
+# The 2026-10-28 lines, verbatim.
+AUTO_REJECTED = (
+    "2026-10-28 14:00:05:561 IBC: Re-starting session\n"
+    "2026-10-28 14:00:05:565 IBC: Starting Gateway\n"
+    "2026-10-28 14:00:09:201 IBC: detected dialog entitled: Unrecognized Username"
+    " or Password; event=Opened\n"
+)
+FRESH_START = (
+    "2026-10-28 14:15:01:320 IBC: Starting session: will exit if login dialog is"
+    " not displayed within 60 seconds\n"
+    "2026-10-28 14:15:01:325 IBC: Starting Gateway\n"
+)
+FRESH_REJECTED = FRESH_START + (
+    "2026-10-28 14:15:05:000 IBC: detected dialog entitled: Unrecognized Username"
+    " or Password; event=Opened\n"
+)
+# Wednesday 14:20 SGT: just past the auto-restart blackout (13:50–14:15).
+AFTER_AUTO_RESTART = datetime(2026, 10, 28, 14, 20).timestamp()
+AUTH_RESTART_MARKER = "ibc/.gateway_auth_restarted"
+
+
+def _auth_restart_record(host: Host) -> dict[str, str]:
+    path = host.home / AUTH_RESTART_MARKER
+    if not path.exists():
+        return {}
+    return dict(ln.split("=", 1) for ln in path.read_text().splitlines() if "=" in ln)
+
+
+@pytest.fixture()
+def rejected(host) -> Host:
+    """The 10-28 state: port down, the daily re-login rejected, 14:20."""
+    host.port_up = False
+    host.ibc_log_text = AUTO_REJECTED
+    host.now = AFTER_AUTO_RESTART
+    return host
+
+
+def test_a_rejected_daily_re_login_is_restarted_with_a_fresh_login(rejected):
+    rejected.run()
+
+    assert _kickstarts(rejected) == [KICKSTART]
+    body = " ".join(rejected.messages())
+    assert "RESTARTED it with a fresh login" in body, body
+    record = _auth_restart_record(rejected)
+    assert record == {"restarted_at": str(int(rejected.now)), "outcome": "pending"}
+
+
+@pytest.mark.parametrize("log", [
+    FRESH_REJECTED,                                   # the password itself
+    AUTH_LOG,                                         # no session line at all
+    AUTO_REJECTED.replace("Unrecognized Username or Password",
+                          "Too many failed login attempts"),
+])
+def test_any_other_rejection_keeps_the_lockout_guard(rejected, log):
+    """Only a token re-login is restarted for. A rejected password, a log with
+    no session line, and IB's lockout message all stay alert-only."""
+    rejected.ibc_log_text = log
+    rejected.down_marker.touch()
+    rejected.run()
+
+    assert _kickstarts(rejected) == []
+    assert "Manual re-login needed" in " ".join(rejected.messages())
+
+
+def test_a_rejected_fresh_login_is_paged_at_once_and_not_retried(rejected):
+    rejected.run()
+    rejected.clear_messages()
+    rejected.auth_marker.touch()        # a throttle must not delay this page
+
+    rejected.ibc_log_text = AUTO_REJECTED + FRESH_REJECTED
+    rejected.now += 300
+    rejected.run()
+    rejected.now += 300
+    rejected.run()
+
+    assert _kickstarts(rejected) == [KICKSTART]
+    body = " ".join(rejected.messages())
+    assert "fresh login" in body and "Manual re-login needed" in body, body
+    assert _auth_restart_record(rejected)["outcome"] == "failed"
+
+
+def test_a_restart_that_left_the_token_rejection_in_place_is_not_repeated(rejected):
+    """Backstop for a fresh session that never logs its session line: the
+    record caps it at one restart per outage, whatever the log says."""
+    rejected.run()
+    rejected.now += 300
+    rejected.run()
+
+    assert _kickstarts(rejected) == [KICKSTART]
+    assert "already restarted the Gateway with a fresh login at 14:20" in " ".join(
+        rejected.messages())
+
+
+def test_the_restart_waits_out_ibcs_own_restart_window(rejected):
+    """The rejection lands at 14:00:09, inside the auto-restart blackout."""
+    rejected.now = datetime(2026, 10, 28, 14, 3).timestamp()
+    rejected.run()
+    assert _kickstarts(rejected) == []
+    body = " ".join(rejected.messages())
+    assert "restart deferred" in body and "fresh login" in body, body
+
+    rejected.now = datetime(2026, 10, 28, 14, 15).timestamp()
+    rejected.run()
+    assert _kickstarts(rejected) == [KICKSTART]
+
+
+def test_recovery_after_the_fresh_login_restart_is_paged_once(rejected):
+    rejected.run()
+    rejected.clear_messages()
+
+    rejected.port_up = True
+    rejected.ibc_log_text = AUTO_REJECTED + FRESH_START + "IBC: Login has completed\n"
+    rejected.now += 300
+    rejected.run()
+    rejected.now += 300
+    rejected.run()
+
+    msgs = rejected.messages()
+    assert len(msgs) == 1 and "fresh-login restart at 14:20" in msgs[0], msgs
+    assert _auth_restart_record(rejected)["outcome"] == "recovered"
+
+
+def test_the_next_days_rejection_is_restarted_for_again(rejected):
+    rejected.run()
+    rejected.port_up = True
+    rejected.now += 300
+    rejected.run()
+
+    rejected.port_up = False
+    rejected.now = AFTER_AUTO_RESTART + 86_400
+    rejected.run()
+
+    assert _kickstarts(rejected) == [KICKSTART, KICKSTART]
+
+
+def test_a_failed_fresh_login_kickstart_is_paged_and_not_retried(rejected):
+    rejected.kickstart_rc = 113
+    rejected.run()
+    assert "FAILED" in " ".join(rejected.messages())
+    assert _auth_restart_record(rejected)["outcome"] == "failed"
+
+    rejected.now += 300
+    rejected.run()
+    assert _kickstarts(rejected) == [KICKSTART]

@@ -619,7 +619,7 @@ rm ~/Library/LaunchAgents/local.algo-divergence-monitor.plist
 Runs `gateway_watchdog.sh` every **5 minutes** (`StartInterval` 300s). Checks
 the API port (7497 paper); after **two consecutive** failures (~10 min down) it
 `launchctl kickstart -k`s the `local.ibc-gateway` job. The two-strike logic
-rides over the legitimate ~1-min nightly auto-restart (23:55) and weekly
+rides over the legitimate ~1-min daily auto-restart (14:00 SGT) and weekly
 cold-restart blips instead of fighting them.
 
 **Auth-failure refusal:** before any kickstart the newest IBC gateway log is
@@ -627,6 +627,21 @@ checked for `Unrecognized Username or Password` / `Too many failed login
 attempts`. If present, the watchdog **refuses to restart** (restarting loops
 failed logins into an IB rate-limit — the 2026-07-01 incident: 30 rejected
 attempts), alerts, and waits for a human re-login. It alerts again on recovery.
+
+**Except a rejected daily re-login, which gets one fresh-login restart
+(2026-10-28).** IBC's daily auto-restart re-logs in with a session token (its
+log says `IBC: Re-starting session`); a fresh launch logs in with the password
+(`IBC: Starting session:`). Every rejection in the IBC logs from 2026-08-03 to
+2026-10-28, twelve in all, followed a token re-login, and no fresh login was
+ever rejected (17 accepted). The guard treated both alike, so each was an
+outage until a human noticed (10-28: 14:00 to 19:14). When the newest
+session began with `Re-starting session` and was rejected with `Unrecognized
+Username or Password`, the watchdog now kickstarts the Gateway once, outside
+the same blackouts as the Error 1100 restart (so not before 14:15), and records
+it in `~/ibc/.gateway_auth_restarted`. A rejected fresh login, `Too many
+failed login attempts`, a log with no session line, or a second rejection
+within 12h of that restart keep the refusal above. The restart, its recovery
+or its failure are each paged once.
 
 **Escalating re-alert while the login is rejected (KAN-62).** The refusal is
 right; the flat 12h re-alert around it was not. On 2026-08-20 the auto-restart's
