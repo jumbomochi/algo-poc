@@ -604,4 +604,6 @@ Risk alerts appear in `--status` output when aggregate equity drops below thresh
 
 Crash entry freeze is applied as a wrapper (`make_crash_freeze_signals_fn`) around each strategy's signal function. The tail-risk hedge continues operating during crashes, providing downside protection.
 
+The tail-risk hedge reads its own regime series, `compute_hedge_regime_by_date` (v2, adopted 2026-10-30, `docs/decisions/tail-risk-hedge-v2-2026-10.md`). It has the same 60%/40% thresholds with a 5-point hysteresis band: leaving bull needs breadth at or below 55%, and leaving bear needs it at or above 45%. It has no crash label: a crash keeps the bear basket. Before v2, the hedge sold everything on a crash day and rotated its whole basket whenever breadth crossed a threshold by one ticker.
+
 Bear-regime stop tightening reduces trailing stop percentages by 2pp (e.g., 10% -> 8%, 12% -> 10%) to lock in gains faster during volatile conditions. Crash regime uses even tighter stops (4% trailing, 2% max loss) via REGIME_PARAMS.

@@ -241,7 +241,7 @@ trip trigger 2 first. That is expected, not a defect in the budget.
 |---|---|
 | Divergence | `BREACH` for 10 consecutive sessions against the epoch manifest's baseline id |
 | Drawdown | sleeve equity decline exceeds **21.95%** |
-| Signal staleness | IB daily bars unavailable for **more than 5 consecutive** sessions for any of the five instruments, **or** the breadth regime unavailable for the same span — the sleeve's entire allocation is a function of regime, so a missing regime defaults it to the `bull` basket (GLD/TLT) and silently removes the hedge |
+| Signal staleness | IB daily bars unavailable for **more than 5 consecutive** sessions for any of the five instruments, **or** the breadth regime unavailable for the same span — the sleeve's entire allocation is a function of regime, so a missing regime defaults it to the `bull` basket (GLD/TLT) and silently removes the hedge. Since v2 (2026-10-30) the sleeve reads a hysteretic copy of the same breadth (`compute_hedge_regime_by_date`), so a missing breadth series removes both |
 | Safety incident | any halt, unattributed order, or silent failure traced to this sleeve |
 
 **Demotion:** one stage. Re-promotion via the pipeline.

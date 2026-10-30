@@ -21,7 +21,12 @@ from tests.scripts import kan116_live_scenario as scenario
 GOLDEN = Path(__file__).parent / "fixtures" / "kan116_live_signals_6b93d6a.json"
 
 
-def test_the_live_roster_signals_exactly_as_before_kan116() -> None:
+def test_the_live_roster_signals_exactly_as_before_kan116(monkeypatch) -> None:
+    # The golden predates tail-risk hedge v2, whose regime comes from the bars
+    # rather than the scenario's scripted one; v1 is the hedge it recorded.
+    import scripts.run_paper as run_paper
+
+    monkeypatch.setattr(run_paper, "PAPER_HEDGE_VARIANT", "v1")
     expected = json.loads(GOLDEN.read_text())
     actual = scenario.live_signals()
 

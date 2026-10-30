@@ -671,6 +671,30 @@ REGIME_PARAMS = {
 }
 
 
+def compute_breadth_by_date(
+    bars_by_ticker: dict[str, list[dict]],
+    ma_period: int = 200,
+) -> dict:
+    """Share of tickers closing above their ``ma_period``-day MA, per date.
+
+    A ticker counts from its ``ma_period``-th bar onwards, so the denominator
+    is the set of tickers with enough history on that date.
+    """
+    above_ma: dict[Any, list[bool]] = {}
+    for ticker, bars in bars_by_ticker.items():
+        if len(bars) < ma_period:
+            continue
+        closes = [b["close"] for b in bars]
+        dates = [b["date"] for b in bars]
+        ma = np.convolve(closes, np.ones(ma_period) / ma_period, mode="valid")
+        for i, ma_val in enumerate(ma):
+            d = dates[ma_period - 1 + i]
+            if d not in above_ma:
+                above_ma[d] = []
+            above_ma[d].append(closes[ma_period - 1 + i] > ma_val)
+    return {d: sum(above) / len(above) for d, above in above_ma.items()}
+
+
 def compute_regime_by_date(
     bars_by_ticker: dict[str, list[dict]],
     ma_period: int = 200,
@@ -685,22 +709,8 @@ def compute_regime_by_date(
     Bear: <40% above their 200-day MA.
     Crash: <10% above their 200-day MA (>90% below).
     """
-    above_ma: dict[Any, list[bool]] = {}
-    for ticker, bars in bars_by_ticker.items():
-        if len(bars) < ma_period:
-            continue
-        closes = [b["close"] for b in bars]
-        dates = [b["date"] for b in bars]
-        ma = np.convolve(closes, np.ones(ma_period) / ma_period, mode="valid")
-        for i, ma_val in enumerate(ma):
-            d = dates[ma_period - 1 + i]
-            if d not in above_ma:
-                above_ma[d] = []
-            above_ma[d].append(closes[ma_period - 1 + i] > ma_val)
-
     regime_by_date = {}
-    for d, above_list in above_ma.items():
-        breadth = sum(above_list) / len(above_list)
+    for d, breadth in compute_breadth_by_date(bars_by_ticker, ma_period).items():
         if breadth > bull_threshold:
             regime_by_date[d] = "bull"
         elif breadth < crash_threshold:
@@ -711,6 +721,91 @@ def compute_regime_by_date(
             regime_by_date[d] = "neutral"
 
     return regime_by_date
+
+
+#: Tail-risk hedge variants for --hedge-variant: the hysteresis band of the
+#: hedge's own regime, or None for the plain labels every sleeve reads.
+#: v2 and its band are pre-registered in
+#: docs/decisions/tail-risk-hedge-v2-2026-10.md; changing either here is a new
+#: trial, not an edit.
+TAIL_RISK_HEDGE_VARIANTS: dict[str, float | None] = {
+    "v1": None,
+    "v2": 0.05,
+    "diag-crash": 0.0,
+}
+
+#: The variant the paper run, its shadow replay and the weekly refresh trade.
+#: v2 since 2026-10-30, when it passed the record's decision rule. One constant
+#: so the live sleeve, the divergence monitor's replay and the refreshed
+#: baseline cannot drift apart.
+PAPER_HEDGE_VARIANT = "v2"
+
+
+def compute_hedge_regime_by_date(
+    breadth_by_date: dict,
+    band: float,
+    bull_threshold: float = 0.60,
+    bear_threshold: float = 0.40,
+) -> dict:
+    """Label each date bull/neutral/bear for the tail-risk hedge, with hysteresis.
+
+    The thresholds are compute_regime_by_date's, with two differences:
+
+    * There is no ``crash`` label. A crash is a deeper bear, and the hedge
+      keeps its bear basket through one instead of selling everything.
+    * The regime changes only when breadth is beyond the current regime's
+      edge by ``band``: leaving bull needs breadth at or below
+      ``bull_threshold - band``, leaving bear needs it at or above
+      ``bear_threshold + band``. Breadth that sits on a threshold therefore
+      holds the label it had instead of flipping it on one ticker. A band of
+      0 gives compute_regime_by_date's labels with crash read as bear.
+
+    The first date takes its plain label, so the series depends on where it
+    starts until breadth makes its first decisive crossing.
+    """
+    def plain(breadth: float) -> str:
+        if breadth > bull_threshold:
+            return "bull"
+        if breadth < bear_threshold:
+            return "bear"
+        return "neutral"
+
+    # Rounded so that 0.60 - 0.05 is 0.55 and not 0.5499999999999999.
+    leave_bull = round(bull_threshold - band, 9)
+    leave_bear = round(bear_threshold + band, 9)
+    enter_bull = round(bull_threshold + band, 9)
+    enter_bear = round(bear_threshold - band, 9)
+
+    regime_by_date: dict = {}
+    current: str | None = None
+    for d in sorted(breadth_by_date):
+        breadth = breadth_by_date[d]
+        if current is None:
+            current = plain(breadth)
+        elif current == "bull":
+            if breadth <= leave_bull:
+                current = plain(breadth)
+        elif current == "bear":
+            if breadth >= leave_bear:
+                current = plain(breadth)
+        elif breadth > enter_bull or breadth < enter_bear:
+            current = plain(breadth)
+        regime_by_date[d] = current
+    return regime_by_date
+
+
+def hedge_regime_for_variant(
+    variant: str,
+    bars_by_ticker: dict[str, list[dict]],
+    regime_by_date: dict,
+) -> dict:
+    """The regime series the tail-risk hedge reads under ``variant``."""
+    band = TAIL_RISK_HEDGE_VARIANTS[variant]
+    if band is None:
+        return regime_by_date
+    return compute_hedge_regime_by_date(
+        compute_breadth_by_date(bars_by_ticker), band=band
+    )
 
 
 class SkipLedger:
@@ -2889,6 +2984,15 @@ def main():
              "A non-v1 run is recorded in the artifact's config.",
     )
     parser.add_argument(
+        "--hedge-variant",
+        choices=list(TAIL_RISK_HEDGE_VARIANTS),
+        default=PAPER_HEDGE_VARIANT,
+        help="docs/decisions/tail-risk-hedge-v2-2026-10.md. The default "
+             f"({PAPER_HEDGE_VARIANT}) is what the paper run trades; v1 is the "
+             "pre-2026-10-30 incumbent; diag-crash is a diagnostic, never a "
+             "candidate. Recorded in the artifact's config.",
+    )
+    parser.add_argument(
         "--universe-snapshots",
         default=None,
         help="Path to a point-in-time index membership JSON "
@@ -3185,11 +3289,16 @@ def main():
         trailing_stop_pct=0.06,
         regime_by_date=regime_by_date,
     )
+    if args.hedge_variant != PAPER_HEDGE_VARIANT:
+        print(f"  Tail-risk hedge variant {args.hedge_variant} "
+              f"(research; not the paper run's {PAPER_HEDGE_VARIANT})")
     tail_risk_signals_fn = make_tail_risk_hedge_signals_fn(
         whole_shares=args.whole_shares,
         skip_ledger=skip_ledgers["tail_risk_hedge"],
         portfolio_context=books["tail_risk_hedge"],
-        regime_by_date=regime_by_date,
+        regime_by_date=hedge_regime_for_variant(
+            args.hedge_variant, bars_by_ticker, regime_by_date
+        ),
         position_size_pct=0.25,
         initial_capital=args.capital * fractions.get("tail_risk_hedge", SLEEVE_ALLOCATIONS["tail_risk_hedge"]),
     )
@@ -3438,6 +3547,8 @@ def main():
         # Present only when not the incumbent, like data_degraded: an artifact
         # without the key is v1, the strategy the paper run trades.
         base_config["momentum_variant"] = args.momentum_variant
+    # Always present: an artifact without the key predates v2 and is v1.
+    base_config["hedge_variant"] = args.hedge_variant
     if args.ml_filter:
         base_config["ml_filter"] = {
             "model": args.ml_filter,
