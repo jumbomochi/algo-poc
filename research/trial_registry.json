@@ -104,6 +104,24 @@
           "objective": "return"
         }
       ]
+    },
+    {
+      "searched_at": "2026-10-30",
+      "what": "Tail-risk hedge v2: a 5-point hysteresis band on the hedge's own breadth regime, and the bear basket kept through a crash instead of selling everything. One pre-registered candidate; band fixed before any P&L run, not swept. diag-crash (crash fix only) is a declared non-candidate",
+      "n_trials": 2,
+      "source": "docs/decisions/tail-risk-hedge-v2-2026-10.md",
+      "trials": [
+        {
+          "name": "tail_risk_hedge_v2",
+          "sharpe": null,
+          "objective": "insurance"
+        },
+        {
+          "name": "tail_risk_hedge_diag_crash",
+          "sharpe": null,
+          "objective": "insurance"
+        }
+      ]
     }
   ]
 }
