@@ -109,3 +109,86 @@ refreshed baseline keep trading the same strategy.
   series started. A paper run with one or two years of bars and a ten-year
   backtest can disagree until breadth makes its first decisive crossing, after
   which they agree.
+
+## Results (2026-10-30)
+
+All runs use the bars of `output/backtest_multi_20261027_114332.json` and the
+flags above. **v1 reproduces the artifact exactly**: 367 trades, end equity
+USD 10,517.22, an identical daily curve. Rebuilding the artifact's six-sleeve
+aggregate from its sleeve curves matches to 3e-11, so the account splice is
+exact.
+
+### Verdict: v2 PASSES all three rules
+| | Trades | Rebought ≤ 4 d | Commissions | Total return | Sharpe | Sleeve max DD | Stress sum | Account max DD |
+|---|---|---|---|---|---|---|---|---|
+| v1 (incumbent) | 367 | 252 | $734 | −18.0% | −0.465 | 19.9% | −2.0% | 15.62% |
+| **v2 (candidate)** | **93** | **45** | **$186** | **+1.4%** | **0.053** | **16.3%** | **+4.9%** | **15.23%** |
+| diag-crash | 254 | 153 | $508 | −7.6% | −0.090 | 21.4% | −0.7% | 15.33% |
+
+1. Churn: 252 → 45 (−82%; the rule needs −50%). **Pass.**
+2. Crash payoff: stress sum −2.0% → +4.9%. **Pass.**
+3. Account drawdown: 15.62% → 15.23% (the rule allows up to 16.12%). **Pass.**
+
+### The registered runs are confounded, and a clean window still passes
+v2's GLD is one lot bought on 2016-11-03 and **never sold**: 0 GLD trades in
+ten years, while GLD went from about $123 to about $380. This comes from
+existing behaviour, not from the band:
+
+- Breadth needs 200 bars, so the regime series starts on 2017-08-16. Before
+  that, the sleeve reads the missing regime as `bull` and buys GLD and TLT.
+- A held lot is sold on a regime change when the regime *at its entry date*
+  differs from today's. A lot entered before the series starts has no entry
+  regime, so the lookup falls back to today's regime and never registers a
+  change.
+- GLD is in every basket, so only a day with no basket sells it. In v1 that
+  was the crash day 2018-12-24. v2 has no such day, so the 2016 lot is held
+  to the end.
+
+This affects the backtest only: every live lot's entry date falls inside the
+paper run's regime series. To separate it from the change being tested, all
+three variants were run again with `--start-date 2017-08-16`, so that no lot
+is opened before the regime exists. This is a **post-hoc diagnostic**, run
+after the registered results were seen. It is reported beside the verdict
+and does not replace it.
+
+| From 2017-08-16 | Trades | Rebought ≤ 4 d | Commissions | Total return | Sharpe | Sleeve max DD | Stress sum | Account max DD |
+|---|---|---|---|---|---|---|---|---|
+| v1 | 404 | 287 | $808 | −19.0% | −0.495 | 20.2% | −2.4% | 15.63% |
+| **v2** | **151** | **101** | **$302** | **−11.1%** | **−0.243** | **18.4%** | **+6.9%** | **15.20%** |
+| diag-crash | 390 | 282 | $780 | −24.2% | −0.560 | 25.4% | +0.1% | 15.32% |
+
+On the clean window v2 still passes all three rules (churn −65%, stress sum
++9.3 points, account drawdown −0.43 points). It is a little less than half
+as costly as v1 (−11% against −19%), not the break-even the registered run
+shows.
+
+### Per stress window
+| Sleeve return | 2018-09-20 → 12-24 | 2020-02-19 → 03-23 | 2022-01-03 → 10-12 | 2025-02-19 → 04-08 |
+|---|---|---|---|---|
+| v1 (clean) | +2.4% | +0.9% | −5.8% | +0.2% |
+| v2 (clean) | +0.1% | +4.5% | −1.6% | +3.8% |
+| diag-crash (clean) | +2.4% | +3.7% | −6.2% | +0.2% |
+
+- **The band does most of the work.** diag-crash alone does help the COVID
+  window (+3.7% against +0.9%), because it keeps the bear basket. But it
+  also holds that basket through the April 2020 rebound, and its total
+  return and drawdown are the worst of the three.
+- **The band costs speed in a slow slide.** In 2018 Q4 v2 entered bear later,
+  because it needed breadth below 35%, and it made +0.1% where v1 made +2.4%.
+  In the two fast drawdowns (2020, 2025) and the long one (2022) it did
+  better.
+- **The account effect is small** (−0.4 points of drawdown), because the hedge
+  is 12.8% of the book. Most of the gain is in the sleeve's own cost: about
+  250 fewer round trips, and about $500 less commission on a $12,830 sleeve.
+
+### Decision
+Adopted in paper, per the decision rule. Adopting v2 is a correctness fix,
+not a claim that the sleeve has an edge. Its objective stays `insurance`.
+`tail_risk_hedge_v2` is entered in `research/trial_registry.json` at its
+registered Sharpe (0.053), and diag-crash at its own (−0.090).
+
+**Follow-up, not done here:** a lot entered before the regime series begins
+is never sold by a regime change, as described above. In the weekly refresh
+this makes v2's ten-year hedge figure look better than the strategy is,
+because the 2016 GLD lot is held throughout. Fixing it would change v1's and
+v2's backtests, so it needs its own record.

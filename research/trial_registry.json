@@ -113,12 +113,12 @@
       "trials": [
         {
           "name": "tail_risk_hedge_v2",
-          "sharpe": null,
+          "sharpe": 0.053,
           "objective": "insurance"
         },
         {
           "name": "tail_risk_hedge_diag_crash",
-          "sharpe": null,
+          "sharpe": -0.09,
           "objective": "insurance"
         }
       ]
