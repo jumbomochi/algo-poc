@@ -99,3 +99,41 @@ def test_v1_reads_the_plain_series_every_sleeve_reads():
 def test_the_pre_registered_band_is_five_points():
     # docs/decisions/tail-risk-hedge-v2-2026-10.md: changing it is a new trial.
     assert TAIL_RISK_HEDGE_VARIANTS == {"v1": None, "v2": 0.05, "diag-crash": 0.0}
+
+
+def test_the_paper_hedge_reads_the_banded_series(monkeypatch):
+    """run_paper builds the live sleeve and its shadow replay; both trade v2."""
+    import scripts.run_paper as run_paper
+    from tests.backtest.books import empty_context
+
+    day = START + timedelta(days=30)
+    bars = [
+        {"date": START + timedelta(days=i), "open": 30.0, "high": 30.0,
+         "low": 30.0, "close": 30.0, "volume": 1_000_000}
+        for i in range(31)
+    ]
+    plain = {day: "bull"}
+    calls = []
+
+    def banded(variant, bars_by_ticker, regime_by_date):
+        calls.append((variant, regime_by_date))
+        return {day: "bear"}
+
+    monkeypatch.setattr(run_paper, "hedge_regime_for_variant", banded)
+    portfolios = run_paper.build_portfolios(
+        capital=100_000.0,
+        bars_by_ticker={"SH": bars},
+        regime_by_date=plain,
+        fundamentals_lookup=lambda ticker, as_of: None,
+        earnings_lookup=lambda ticker, as_of: None,
+        portfolio_contexts={
+            name: empty_context() for name in run_paper.CAPITAL_ALLOCATIONS
+        },
+    )
+
+    assert calls == [(run_paper.PAPER_HEDGE_VARIANT, plain)]
+    assert run_paper.PAPER_HEDGE_VARIANT == "v2"
+    # SH is in the bear basket only: a buy means the hedge read the banded series.
+    signal = portfolios["tail_risk_hedge"].signals_fn("SH", bars)
+    assert signal is not None and signal["action"] == "buy"
+    assert signal["signals"]["regime"] == "bear"

@@ -52,11 +52,13 @@ from shared.models.equity_snapshot import EquitySnapshot
 from scripts.paper_state import PaperTradingState
 from scripts.run_backtest import (
     BEAR_TICKERS,
+    PAPER_HEDGE_VARIANT,
     PortfolioConfig,
     UNIVERSE_REGISTRY,
     compute_regime_by_date,
     fetch_bars_from_ib,
     get_union_universe,
+    hedge_regime_for_variant,
     make_crash_freeze_signals_fn,
     make_earnings_drift_signals_fn,
     make_ml_shadow_signals_fn,
@@ -686,7 +688,11 @@ def build_portfolios(
         name="tail_risk_hedge",
         capital=tr_cap,
         signals_fn=make_tail_risk_hedge_signals_fn(
-            regime_by_date=regime_by_date,
+            # Its own banded series (docs/decisions/tail-risk-hedge-v2-2026-10.md);
+            # the other sleeves and the crash freeze keep the plain one.
+            regime_by_date=hedge_regime_for_variant(
+                PAPER_HEDGE_VARIANT, bars_by_ticker, regime_by_date
+            ),
             initial_capital=tr_cap,
             portfolio_context=_context("tail_risk_hedge"),
             **tr_params,

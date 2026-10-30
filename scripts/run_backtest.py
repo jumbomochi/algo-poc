@@ -734,6 +734,12 @@ TAIL_RISK_HEDGE_VARIANTS: dict[str, float | None] = {
     "diag-crash": 0.0,
 }
 
+#: The variant the paper run, its shadow replay and the weekly refresh trade.
+#: v2 since 2026-10-30, when it passed the record's decision rule. One constant
+#: so the live sleeve, the divergence monitor's replay and the refreshed
+#: baseline cannot drift apart.
+PAPER_HEDGE_VARIANT = "v2"
+
 
 def compute_hedge_regime_by_date(
     breadth_by_date: dict,
@@ -2980,11 +2986,11 @@ def main():
     parser.add_argument(
         "--hedge-variant",
         choices=list(TAIL_RISK_HEDGE_VARIANTS),
-        default="v1",
-        help="Research only (docs/decisions/tail-risk-hedge-v2-2026-10.md). "
-             "v1 is the incumbent the paper run trades; v2 is the "
-             "pre-registered candidate; diag-crash is a diagnostic, never a "
-             "candidate. A non-v1 run is recorded in the artifact's config.",
+        default=PAPER_HEDGE_VARIANT,
+        help="docs/decisions/tail-risk-hedge-v2-2026-10.md. The default "
+             f"({PAPER_HEDGE_VARIANT}) is what the paper run trades; v1 is the "
+             "pre-2026-10-30 incumbent; diag-crash is a diagnostic, never a "
+             "candidate. Recorded in the artifact's config.",
     )
     parser.add_argument(
         "--universe-snapshots",
@@ -3283,8 +3289,9 @@ def main():
         trailing_stop_pct=0.06,
         regime_by_date=regime_by_date,
     )
-    if args.hedge_variant != "v1":
-        print(f"  Tail-risk hedge variant {args.hedge_variant} (research; not the paper run's v1)")
+    if args.hedge_variant != PAPER_HEDGE_VARIANT:
+        print(f"  Tail-risk hedge variant {args.hedge_variant} "
+              f"(research; not the paper run's {PAPER_HEDGE_VARIANT})")
     tail_risk_signals_fn = make_tail_risk_hedge_signals_fn(
         whole_shares=args.whole_shares,
         skip_ledger=skip_ledgers["tail_risk_hedge"],
@@ -3540,8 +3547,8 @@ def main():
         # Present only when not the incumbent, like data_degraded: an artifact
         # without the key is v1, the strategy the paper run trades.
         base_config["momentum_variant"] = args.momentum_variant
-    if args.hedge_variant != "v1":
-        base_config["hedge_variant"] = args.hedge_variant
+    # Always present: an artifact without the key predates v2 and is v1.
+    base_config["hedge_variant"] = args.hedge_variant
     if args.ml_filter:
         base_config["ml_filter"] = {
             "model": args.ml_filter,

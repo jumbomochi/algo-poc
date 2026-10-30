@@ -55,6 +55,9 @@ class _RecordingBook(RunnerBook):
 
 def _roster(bars, regime, monkeypatch, book_cls):
     monkeypatch.setattr(run_paper, "RunnerBook", book_cls)
+    # v1 reads the injected regime; v2 would derive its own from these bars
+    # and leave the scripted turns (tail-risk rotation) unexercised.
+    monkeypatch.setattr(run_paper, "PAPER_HEDGE_VARIANT", "v1")
     return run_paper.build_portfolios(
         capital=100_000.0,
         bars_by_ticker=bars,
