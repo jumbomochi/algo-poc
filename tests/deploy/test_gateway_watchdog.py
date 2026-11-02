@@ -1436,6 +1436,8 @@ def test_no_restart_inside_a_blackout(host, when, jobs, reason):
     assert _kickstarts(host) == []
     body = " ".join(host.messages())
     assert "restart deferred" in body and reason in body, body
+    if not jobs:
+        assert "until " in body, body
 
 
 @pytest.mark.parametrize(
@@ -1823,11 +1825,23 @@ def test_the_restart_waits_out_ibcs_own_restart_window(rejected):
     rejected.run()
     assert _kickstarts(rejected) == []
     body = " ".join(rejected.messages())
-    assert "restart deferred" in body and "fresh login" in body, body
+    assert "until 14:15" in body and "with a fresh login, once" in body, body
 
     rejected.now = datetime(2026, 10, 28, 14, 15).timestamp()
     rejected.run()
     assert _kickstarts(rejected) == [KICKSTART]
+
+
+def test_a_deferred_restart_pages_when_it_is_due_and_asks_nothing(rejected):
+    """2026-11-01: the 14:04 page said the watchdog would NOT restart and the
+    run would abort unless fixed; it restarted at 14:19 on its own."""
+    rejected.now = datetime(2026, 11, 1, 14, 4).timestamp()
+    rejected.run()
+
+    [page] = rejected.messages()
+    assert "Nothing to do yet" in page and "until 14:15" in page, page
+    assert "NOT" not in page and "abort" not in page and "Manual" not in page, page
+    assert "refusing to kickstart" not in rejected.watchdog_log()
 
 
 def test_recovery_after_the_fresh_login_restart_is_paged_once(rejected):

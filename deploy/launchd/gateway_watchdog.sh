@@ -505,16 +505,18 @@ restart_blackout_reason() {
     fi
     read -r w h m s <<< "$whms"
     sod=$(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+    # A window's end as hh:mm, so a page can say when the restart is due.
+    until_of() { printf '%02d:%02d' $(( $1 / 3600 % 24 )) $(( $1 % 3600 / 60 )); }
 
     # IBC's own daily restart, and its weekly cold restart: 10 min before to
     # 15 min after, so the two can never stack.
     win=$(( IBC_AUTO_RESTART_HOUR * 3600 + IBC_AUTO_RESTART_MIN * 60 ))
     if [ "$sod" -ge $(( win - 600 )) ] && [ "$sod" -lt $(( win + 900 )) ]; then
-        echo "IBC's daily auto-restart ($(printf '%02d:%02d' "$IBC_AUTO_RESTART_HOUR" "$IBC_AUTO_RESTART_MIN")) is due or in progress"; return 0
+        echo "IBC's daily auto-restart ($(printf '%02d:%02d' "$IBC_AUTO_RESTART_HOUR" "$IBC_AUTO_RESTART_MIN")) is due or in progress, until $(until_of $(( win + 900 )))"; return 0
     fi
     win=$(( IBC_COLD_RESTART_HOUR * 3600 + IBC_COLD_RESTART_MIN * 60 ))
     if [ "$w" -eq "$IBC_COLD_RESTART_WDAY" ] && [ "$sod" -ge $(( win - 600 )) ] && [ "$sod" -lt $(( win + 900 )) ]; then
-        echo "IBC's weekly cold restart (Sun $(printf '%02d:%02d' "$IBC_COLD_RESTART_HOUR" "$IBC_COLD_RESTART_MIN")) is due or in progress"; return 0
+        echo "IBC's weekly cold restart (Sun $(printf '%02d:%02d' "$IBC_COLD_RESTART_HOUR" "$IBC_COLD_RESTART_MIN")) is due or in progress, until $(until_of $(( win + 900 )))"; return 0
     fi
 
     # The paper run's slot: 5 min before it to 15 min after, on the days it
@@ -522,7 +524,7 @@ restart_blackout_reason() {
     win=$(( PAPER_RUN_HOUR * 3600 + PAPER_RUN_MIN * 60 ))
     for rd in $PAPER_RUN_WEEKDAYS; do
         if [ $(( rd % 7 )) -eq "$w" ] && [ "$sod" -ge $(( win - 300 )) ] && [ "$sod" -lt $(( win + 900 )) ]; then
-            echo "the $(printf '%02d:%02d' "$PAPER_RUN_HOUR" "$PAPER_RUN_MIN") paper run's slot is open"; return 0
+            echo "the $(printf '%02d:%02d' "$PAPER_RUN_HOUR" "$PAPER_RUN_MIN") paper run's slot is open, until $(until_of $(( win + 900 )))"; return 0
         fi
     done
 
@@ -615,7 +617,7 @@ auth_restart_decision() {
         echo "refuse it already restarted the Gateway with a fresh login at $(hhmm_of "$r_at"), and the login is still being rejected"; return 0
     fi
     if reason="$(restart_blackout_reason)"; then
-        echo "wait restart deferred: $reason. It will then restart the Gateway with a fresh login"; return 0
+        echo "wait $reason. The watchdog will then restart the Gateway with a fresh login, once, and report whether IB accepts it"; return 0
     fi
     echo "restart"
 }
@@ -848,8 +850,6 @@ if ibc_login_rejected; then
         esac
     fi
     case "$AUTH_DECISION" in
-        wait\ *)
-            AUTH_ACTION="Watchdog: ${AUTH_DECISION#* }." ;;
         refuse\ *)
             AUTH_ACTION="Watchdog will NOT restart it again: ${AUTH_DECISION#* }. Manual re-login needed." ;;
         *)
@@ -880,8 +880,17 @@ if ibc_login_rejected; then
             LOG_RUN="${MINS_TO_RUN} min to the ${PAPER_RUN_HOUR}:$(printf '%02d' "$PAPER_RUN_MIN") run"
             MSG_RUN="The ${PAPER_RUN_HOUR}:$(printf '%02d' "$PAPER_RUN_MIN") paper run is in ${MINS_TO_RUN} min"
         fi
-        echo "$(ts): AUTH FAILURE in $LATEST_GW_LOG — refusing to kickstart; alerted operator (re-alert ${REALERT_SECS}s, ${LOG_RUN})" >> "$LOG_FILE"
-        telegram "🚨 IB Gateway login is being REJECTED (port $PORT down). ${AUTH_ACTION} ${MSG_RUN} and will abort unless this is fixed."
+        case "$AUTH_DECISION" in
+            wait\ *)
+                # A restart is coming: say so, and ask nothing of the operator.
+                # On 2026-11-01 this page read "will abort unless this is
+                # fixed" fifteen minutes before the watchdog fixed it.
+                echo "$(ts): IB rejected IBC's daily re-login in $LATEST_GW_LOG — ${AUTH_DECISION#* }; alerted operator (re-alert ${REALERT_SECS}s, ${LOG_RUN})" >> "$LOG_FILE"
+                telegram "⚠️ IB rejected the Gateway's daily re-login (port $PORT down). Nothing to do yet: ${AUTH_DECISION#* }." ;;
+            *)
+                echo "$(ts): AUTH FAILURE in $LATEST_GW_LOG — refusing to kickstart; alerted operator (re-alert ${REALERT_SECS}s, ${LOG_RUN})" >> "$LOG_FILE"
+                telegram "🚨 IB Gateway login is being REJECTED (port $PORT down). ${AUTH_ACTION} ${MSG_RUN} and will abort unless this is fixed." ;;
+        esac
         touch "$AUTH_MARKER"
     fi
     # NOTE (KAN-62): $MARKER is deliberately NOT removed here. It is the
