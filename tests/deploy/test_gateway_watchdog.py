@@ -1914,6 +1914,14 @@ def _token_refresh_record(host: Host) -> dict[str, str]:
     return dict(ln.split("=", 1) for ln in path.read_text().splitlines() if "=" in ln)
 
 
+def _autorestart_token(host: Host) -> Path:
+    """Where the Gateway leaves its token: ~/Jts/<profile>/autorestart."""
+    path = host.home / "Jts" / "ighhcjbdagjmhldichdlgbcnofihnfpjelanhkng" / "autorestart"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("")
+    return path
+
+
 @pytest.fixture()
 def token(host) -> Host:
     """The 11-04 state: port up, the day's token re-login accepted, 14:20."""
@@ -1931,6 +1939,33 @@ def test_a_token_session_is_replaced_with_a_fresh_login_silently(token):
         "refreshed_at": str(int(token.now)), "outcome": "pending"}
 
 
+def test_the_token_is_removed_before_the_kickstart(token):
+    """2026-08-02 00:15: a brand-new IBC launch found the token and re-used it.
+    A kickstart that left it in place would be the second token login IB
+    rejects, and the old ibcstart.sh could relaunch from it too."""
+    left = _autorestart_token(token)
+    token.run()
+
+    assert not left.exists()
+    assert _kickstarts(token) == [KICKSTART]
+    assert "removed IB's auto-restart token" in token.watchdog_log()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_a_token_that_cannot_be_removed_means_no_restart(token):
+    left = _autorestart_token(token)
+    left.parent.chmod(0o500)
+    try:
+        token.run()
+    finally:
+        left.parent.chmod(0o700)
+
+    assert _kickstarts(token) == []
+    [page] = token.messages()
+    assert "did NOT restart" in page and "OFF" in page, page
+    assert _token_refresh_record(token)["outcome"] == "failed"
+
+
 def test_a_planned_restart_that_logs_in_fresh_stays_silent(token):
     token.run()
     token.ibc_log_text = TOKEN_SESSION + FRESH_SESSION
@@ -1944,20 +1979,36 @@ def test_a_planned_restart_that_logs_in_fresh_stays_silent(token):
     assert _token_refresh_record(token)["outcome"] == "fresh"
 
 
-def test_a_planned_restart_back_on_a_token_is_paged_once_and_not_repeated(token):
-    """The token file is consumed on use, so a kickstart should log in fresh.
-    If it ever does not, the prevention is not working: say so, and do not
-    loop restarts on it."""
+def test_a_planned_restart_back_on_a_token_is_paged_once_and_turns_itself_off(token):
+    """A prevention that is not working must not keep restarting a healthy
+    Gateway, on a 12h timer or any other."""
     token.run()
     token.ibc_log_text = TOKEN_SESSION + TOKEN_SESSION
     for _ in range(3):
         token.now += 300
         token.run()
+    for day in (1, 2):                                  # later token sessions
+        token.now = AFTER_TOKEN_RESTART + day * 86_400
+        token.run()
 
     assert _kickstarts(token) == [KICKSTART]
     [page] = token.messages()
-    assert "session token" in page, page
+    assert "session token" in page and "OFF" in page, page
     assert _token_refresh_record(token)["outcome"] == "token"
+
+
+def test_a_rejection_after_a_planned_restart_is_attributed_to_it(token):
+    token.run()
+    token.port_up = False
+    token.ibc_log_text = TOKEN_SESSION + FRESH_REJECTED
+    token.now += 300
+    token.run()
+
+    body = " ".join(token.messages())
+    assert "planned fresh-login restart at 14:20" in body, body
+    assert "Manual re-login needed" in body, body
+    assert _token_refresh_record(token)["outcome"] == "rejected"
+    assert _kickstarts(token) == [KICKSTART]
 
 
 @pytest.mark.parametrize("log", [
@@ -1974,8 +2025,11 @@ def test_only_a_logged_in_token_session_is_restarted(token, log):
 
 @pytest.mark.parametrize("when, jobs", [
     (datetime(2026, 11, 4, 14, 5), []),                 # IBC's restart window
+    (datetime(2026, 11, 4, 20, 0), []),                 # the cutoff
     (datetime(2026, 11, 4, 22, 0), []),                 # US session open
+    (datetime(2026, 11, 5, 5, 0), []),                  # the close, before the run
     (datetime(2026, 11, 5, 5, 20), []),                 # the paper run's slot
+    (datetime(2026, 11, 5, 9, 0), []),                  # morning, before 14:00
     (datetime(2026, 11, 4, 16, 0), ["local.algo-pipeline-report"]),
     (datetime(2026, 11, 8, 14, 16), []),                # Sun: cold restart at 14:30
 ])
@@ -1988,10 +2042,11 @@ def test_the_planned_restart_waits_and_says_nothing(token, when, jobs):
 
 
 @pytest.mark.parametrize("when", [
-    datetime(2026, 11, 4, 14, 15),                      # the window's end
+    datetime(2026, 11, 4, 14, 15),                      # the window's start
+    datetime(2026, 11, 4, 19, 55),                      # just before the cutoff
     datetime(2026, 11, 8, 14, 45),                      # Sun, cold restart missed
 ])
-def test_the_planned_restart_goes_ahead_outside_every_wait(token, when):
+def test_the_planned_restart_goes_ahead_inside_its_hours(token, when):
     token.now = when.timestamp()
     token.run()
     assert _kickstarts(token) == [KICKSTART]
@@ -2003,14 +2058,15 @@ def test_a_live_1100_is_left_to_the_connectivity_restart(token):
     assert _kickstarts(token) == []
 
 
-def test_a_failed_planned_kickstart_is_paged_and_not_retried(token):
+def test_a_failed_planned_kickstart_is_paged_and_turns_itself_off(token):
     token.kickstart_rc = 113
     token.run()
     [page] = token.messages()
-    assert "failed" in page and "113" in page, page
+    assert "failed" in page and "113" in page and "OFF" in page, page
     assert _token_refresh_record(token)["outcome"] == "failed"
 
-    token.now += 300
+    token.kickstart_rc = 0
+    token.now = AFTER_TOKEN_RESTART + 86_400
     token.run()
     assert _kickstarts(token) == [KICKSTART]
 
