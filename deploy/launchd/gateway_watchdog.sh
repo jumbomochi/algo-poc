@@ -52,6 +52,14 @@
 # fresh-login kickstart, outside the same blackouts as the 1100 restart. If the
 # fresh login is rejected too, the guard holds as before.
 #
+# 2026-11-05: the rejection is predictable. From 10-24 to 11-05, five cycles
+# running, IB accepted exactly one token re-login after each fresh login and
+# rejected the next, so the 14:00 restart failed every other day. A healthy
+# session that a token re-login produced is now replaced with a fresh login
+# once, after IBC's restart window and outside US market hours, so each 14:00
+# re-login is the first since a fresh login. Silent unless the restart fails or
+# the Gateway comes back on a token anyway.
+#
 # Wire via launchd with StartInterval (300s). See deploy/launchd/.
 #
 # NO DEAD-MAN: covered by others, at both ends (KAN-56 coverage review). This
@@ -116,6 +124,10 @@ CONN_RESTART_SAME_OUTAGE_SECS=3600
 # once a day, so a second rejection inside this window is the same outage.
 AUTH_RESTART_MARKER="$HOME/ibc/.gateway_auth_restarted"
 AUTH_RESTART_COOLDOWN_SECS=$((12 * 3600))
+# The planned fresh-login record (refreshed_at, outcome): one per token session.
+# The cooldown is what keeps a restart that came back on a token from looping.
+TOKEN_REFRESH_MARKER="$HOME/ibc/.gateway_token_refreshed"
+TOKEN_REFRESH_COOLDOWN_SECS=$((12 * 3600))
 # launchd jobs that hold an IB API session of their own. A restart under them
 # would break a paper run mid-decision or a 5h refresh fetch.
 IB_CLIENT_JOBS="local.algo-paper-trading local.algo-pipeline-report local.algo-backtest-refresh"
@@ -447,6 +459,21 @@ ibc_session_login() {
         }' "$latest"
 }
 
+# How the newest IBC session logged in, once it has: "token" (IBC's daily
+# auto-restart) or "fresh" (a password login). Nothing while the login is in
+# progress or after a rejection, which belongs to ibc_session_login above.
+ibc_logged_in_session() {
+    local latest
+    latest=$(ls -t "$LOG_DIR"/ibc-*.txt 2>/dev/null | head -1)
+    [ -n "$latest" ] || return 0
+    awk '
+        /IBC: Re-starting session/ { kind = "token"; state = "pending"; next }
+        /IBC: Starting session/    { kind = "fresh"; state = "pending"; next }
+        /Unrecognized Username or Password|Too many failed login attempts/ { state = "rejected"; next }
+        /IBC: Login has completed/ { if (state == "pending") state = "in"; next }
+        END { if (kind != "" && state == "in") print kind }' "$latest"
+}
+
 # The one way this script restarts the Gateway.
 kickstart_gateway() {
     "$ALGO_LAUNCHCTL_BIN" kickstart -k "gui/$(id -u)/$GW_LABEL" >> "$LOG_FILE" 2>&1
@@ -640,6 +667,68 @@ auth_restart_gateway() {
     telegram "⚠️ IB rejected the Gateway's daily re-login (IBC's auto-restart; port $PORT down). The watchdog has RESTARTED it with a fresh login, once for this outage. It will report whether that login is accepted."
 }
 
+# --------------------------------------------------------------------------
+# A token session: replace it with a fresh login before IB refuses the next
+# --------------------------------------------------------------------------
+token_refresh_field() { record_field "$TOKEN_REFRESH_MARKER" "$1"; }
+
+# Prints restart, or wait <text> / skip <text>. Asked only while the port is up,
+# no Error 1100 latch is present, and the running session is a token one.
+token_refresh_decision() {
+    local r_at reason whms w h m s sod
+    r_at="$(token_refresh_field refreshed_at)"
+    case "$r_at" in ''|*[!0-9]*) r_at="" ;; esac
+    if [ -n "$r_at" ] && [ $(( $(now_epoch) - r_at )) -lt "$TOKEN_REFRESH_COOLDOWN_SECS" ]; then
+        echo "skip it already restarted the Gateway for a fresh login at $(hhmm_of "$r_at")"; return 0
+    fi
+    if reason="$(restart_blackout_reason)"; then
+        echo "wait $reason"; return 0
+    fi
+    if in_us_market_hours; then
+        echo "wait a US session may be open"; return 0
+    fi
+    # On Sunday the cold restart later in the day is itself a fresh login.
+    whms="$(algo_local_wday_hms "$(now_epoch)")" || { echo "wait the local time of day cannot be read"; return 0; }
+    read -r w h m s <<< "$whms"
+    sod=$(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+    if [ "$w" -eq "$IBC_COLD_RESTART_WDAY" ] \
+        && [ "$sod" -lt $(( IBC_COLD_RESTART_HOUR * 3600 + IBC_COLD_RESTART_MIN * 60 + 900 )) ]; then
+        echo "wait IBC's weekly cold restart later today logs in fresh"; return 0
+    fi
+    echo "restart"
+}
+
+# Replace a healthy token session with a fresh login, once. The record is
+# written before the kickstart, as auth_restart_gateway's is. Silent on the
+# expected path: the operator hears only if it fails, or if the Gateway came
+# back on a token (the restart did not do what it is for).
+token_refresh() {
+    local session rc
+    session="$(ibc_logged_in_session)"
+    if [ "$(token_refresh_field outcome)" = "pending" ] && [ -n "$session" ]; then
+        set_record_field "$TOKEN_REFRESH_MARKER" outcome "$session"
+        if [ "$session" = "fresh" ]; then
+            echo "$(ts): the planned restart logged in fresh" >> "$LOG_FILE"
+        else
+            echo "$(ts): WARNING - the planned restart came back on a token re-login; tomorrow's 14:00 re-login may be rejected" >> "$LOG_FILE"
+            telegram "⚠️ The watchdog's planned fresh-login restart of the IB Gateway came back on IBC's session token instead of a password login, so it did not reset what IB counts. Port $PORT is up. Tomorrow's 14:00 re-login may be rejected; the watchdog will restart it then as before."
+        fi
+        return 0
+    fi
+    [ "$session" = "token" ] || return 0
+    [ "$(token_refresh_decision)" = "restart" ] || return 0
+
+    printf 'refreshed_at=%s\noutcome=pending\n' "$(now_epoch)" > "$TOKEN_REFRESH_MARKER"
+    echo "$(ts): the Gateway is running on IBC's token re-login — kickstarting $GW_LABEL for a fresh login, so tomorrow's re-login is the first since one" >> "$LOG_FILE"
+    kickstart_gateway
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        set_record_field "$TOKEN_REFRESH_MARKER" outcome failed
+        echo "$(ts): planned fresh-login kickstart FAILED (launchctl exit $rc) — not retrying today" >> "$LOG_FILE"
+        telegram "⚠️ The watchdog's planned fresh-login restart of the IB Gateway failed: launchctl kickstart exited $rc. It will not retry today. If port $PORT goes down, the usual port-down handling takes over; otherwise tomorrow's 14:00 re-login may be rejected."
+    fi
+}
+
 # KAN-118: page how a restart turned out, once. $1 = recovered | failed,
 # $2 = the page. No-op unless a restart is awaiting its outcome.
 conn_restart_outcome() {
@@ -815,6 +904,8 @@ if nc -z -G 3 127.0.0.1 "$PORT" 2>/dev/null; then
         telegram "✅ IB Gateway server connectivity restored (Error 1100 cleared)."
         rm -f "$CONN_ALERT_MARKER"
     fi
+    # Healthy, so a planned restart may run. A live 1100 is KAN-118's.
+    [ -f "$CONN_MARKER" ] || token_refresh
     exit 0
 fi
 

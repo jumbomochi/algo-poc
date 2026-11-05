@@ -643,6 +643,20 @@ failed login attempts`, a log with no session line, or a second rejection
 within 12h of that restart keep the refusal above. The restart, its recovery
 or its failure are each paged once.
 
+**And the rejection is now prevented (2026-11-05).** It is predictable. From
+10-24 to 11-05, five cycles in a row, IB accepted exactly one token re-login
+after each fresh login and rejected the next, so the restart above fired
+every other day with three pages each time. When the port is up, no Error 1100
+latch is present and the newest IBC session is a token one (`Re-starting
+session` followed by `Login has completed`), the watchdog kickstarts the
+Gateway once for a fresh login. That makes every 14:00 re-login the first
+since a fresh one. It waits out the same blackouts as the other restarts (so
+normally it runs at about 14:15), any US session, and on Sunday the 14:30 cold
+restart, which is itself a fresh login. It records the restart in
+`~/ibc/.gateway_token_refreshed` and does it once per 12h. It is silent unless
+the kickstart fails, or the Gateway comes back on a token anyway, which means
+IBC's token file outlived the kickstart and the prevention is not working.
+
 **Escalating re-alert while the login is rejected (KAN-62).** The refusal is
 right; the flat 12h re-alert around it was not. On 2026-08-20 the auto-restart's
 re-login was rejected at 23:55, the watchdog alerted once at 23:59:56, and the
