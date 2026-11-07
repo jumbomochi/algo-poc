@@ -52,6 +52,14 @@
 # fresh-login kickstart, outside the same blackouts as the 1100 restart. If the
 # fresh login is rejected too, the guard holds as before.
 #
+# 2026-11-05: the rejection is predictable. From 10-24 to 11-05, five cycles
+# running, IB accepted exactly one token re-login after each fresh login and
+# rejected the next, so the 14:00 restart failed every other day. A healthy
+# session that a token re-login produced is now replaced with a fresh login
+# once, after IBC's restart window and outside US market hours, so each 14:00
+# re-login is the first since a fresh login. Silent unless the restart fails or
+# the Gateway comes back on a token anyway.
+#
 # Wire via launchd with StartInterval (300s). See deploy/launchd/.
 #
 # NO DEAD-MAN: covered by others, at both ends (KAN-56 coverage review). This
@@ -116,6 +124,18 @@ CONN_RESTART_SAME_OUTAGE_SECS=3600
 # once a day, so a second rejection inside this window is the same outage.
 AUTH_RESTART_MARKER="$HOME/ibc/.gateway_auth_restarted"
 AUTH_RESTART_COOLDOWN_SECS=$((12 * 3600))
+# The planned fresh-login record (refreshed_at, outcome). One restart per 12h,
+# and none at all after an outcome other than "fresh" until a human deletes it.
+TOKEN_REFRESH_MARKER="$HOME/ibc/.gateway_token_refreshed"
+TOKEN_REFRESH_COOLDOWN_SECS=$((12 * 3600))
+# The planned restart runs only between IBC's restart window and this hour
+# (SGT): hours clear of the 21:30 US open and the 05:15 run. A token session
+# still running at the cutoff is left for the rejection path tomorrow.
+TOKEN_REFRESH_CUTOFF_HOUR=20
+# Where the Gateway leaves its auto-restart token (IBC's tws_settings_path).
+# ibcstart.sh logs in with it whenever it finds one, a brand-new launch
+# included (2026-08-02 00:15), so a fresh login means removing it first.
+TWS_SETTINGS_DIR="$HOME/Jts"
 # launchd jobs that hold an IB API session of their own. A restart under them
 # would break a paper run mid-decision or a 5h refresh fetch.
 IB_CLIENT_JOBS="local.algo-paper-trading local.algo-pipeline-report local.algo-backtest-refresh"
@@ -447,6 +467,21 @@ ibc_session_login() {
         }' "$latest"
 }
 
+# How the newest IBC session logged in, once it has: "token" (IBC's daily
+# auto-restart) or "fresh" (a password login). Nothing while the login is in
+# progress or after a rejection, which belongs to ibc_session_login above.
+ibc_logged_in_session() {
+    local latest
+    latest=$(ls -t "$LOG_DIR"/ibc-*.txt 2>/dev/null | head -1)
+    [ -n "$latest" ] || return 0
+    awk '
+        /IBC: Re-starting session/ { kind = "token"; state = "pending"; next }
+        /IBC: Starting session/    { kind = "fresh"; state = "pending"; next }
+        /Unrecognized Username or Password|Too many failed login attempts/ { state = "rejected"; next }
+        /IBC: Login has completed/ { if (state == "pending") state = "in"; next }
+        END { if (kind != "" && state == "in") print kind }' "$latest"
+}
+
 # The one way this script restarts the Gateway.
 kickstart_gateway() {
     "$ALGO_LAUNCHCTL_BIN" kickstart -k "gui/$(id -u)/$GW_LABEL" >> "$LOG_FILE" 2>&1
@@ -640,6 +675,94 @@ auth_restart_gateway() {
     telegram "⚠️ IB rejected the Gateway's daily re-login (IBC's auto-restart; port $PORT down). The watchdog has RESTARTED it with a fresh login, once for this outage. It will report whether that login is accepted."
 }
 
+# --------------------------------------------------------------------------
+# A token session: replace it with a fresh login before IB refuses the next
+# --------------------------------------------------------------------------
+token_refresh_field() { record_field "$TOKEN_REFRESH_MARKER" "$1"; }
+
+# Prints restart, or wait <text> / skip <text>. Asked only while the port is up,
+# no Error 1100 latch is present, and the running session is a token one.
+token_refresh_decision() {
+    local r_at outcome reason whms w h m s sod open
+    outcome="$(token_refresh_field outcome)"
+    case "$outcome" in
+        token|failed|rejected)
+            echo "skip planned restarts are off since one ended '$outcome'; delete $TOKEN_REFRESH_MARKER to turn them back on"; return 0 ;;
+    esac
+    r_at="$(token_refresh_field refreshed_at)"
+    case "$r_at" in ''|*[!0-9]*) r_at="" ;; esac
+    if [ -n "$r_at" ] && [ $(( $(now_epoch) - r_at )) -lt "$TOKEN_REFRESH_COOLDOWN_SECS" ]; then
+        echo "skip it already restarted the Gateway for a fresh login at $(hhmm_of "$r_at")"; return 0
+    fi
+    if reason="$(restart_blackout_reason)"; then
+        echo "wait $reason"; return 0
+    fi
+    # Daytime only: from the end of IBC's daily restart window to the cutoff,
+    # and on Sunday from the end of the cold restart, itself a fresh login.
+    whms="$(algo_local_wday_hms "$(now_epoch)")" || { echo "wait the local time of day cannot be read"; return 0; }
+    read -r w h m s <<< "$whms"
+    sod=$(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+    open=$(( IBC_AUTO_RESTART_HOUR * 3600 + IBC_AUTO_RESTART_MIN * 60 + 900 ))
+    if [ "$w" -eq "$IBC_COLD_RESTART_WDAY" ]; then
+        open=$(( IBC_COLD_RESTART_HOUR * 3600 + IBC_COLD_RESTART_MIN * 60 + 900 ))
+    fi
+    if [ "$sod" -lt "$open" ] || [ "$sod" -ge $(( TOKEN_REFRESH_CUTOFF_HOUR * 3600 )) ]; then
+        echo "wait outside the planned-restart hours"; return 0
+    fi
+    echo "restart"
+}
+
+# Remove the Gateway's auto-restart token so the kickstart logs in with the
+# password. Without this ibcstart.sh finds the token and re-uses it, and the
+# old ibcstart.sh, surviving the SIGTERM, can relaunch from it as well. IBC
+# deletes these files itself when it finds more than one. Fails if any remain.
+remove_autorestart_token() {
+    local f
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        rm -f "$f" && echo "$(ts): removed IB's auto-restart token $f" >> "$LOG_FILE"
+    done <<< "$(find "$TWS_SETTINGS_DIR" -mindepth 2 -maxdepth 2 -type f -name autorestart 2>/dev/null)"
+    [ -z "$(find "$TWS_SETTINGS_DIR" -mindepth 2 -maxdepth 2 -type f -name autorestart 2>/dev/null)" ]
+}
+
+# Replace a healthy token session with a fresh login, once. The record is
+# written before the kickstart, as auth_restart_gateway's is. Silent on the
+# expected path. Any other outcome is paged once and turns planned restarts
+# off until a human deletes the record: a prevention that is not working must
+# not keep restarting a healthy Gateway.
+token_refresh() {
+    local session rc
+    session="$(ibc_logged_in_session)"
+    if [ "$(token_refresh_field outcome)" = "pending" ] && [ -n "$session" ]; then
+        set_record_field "$TOKEN_REFRESH_MARKER" outcome "$session"
+        if [ "$session" = "fresh" ]; then
+            echo "$(ts): the planned restart logged in fresh" >> "$LOG_FILE"
+        else
+            echo "$(ts): WARNING - the planned restart came back on a token re-login; planned restarts are now off" >> "$LOG_FILE"
+            telegram "⚠️ The watchdog's planned fresh-login restart of the IB Gateway came back on IBC's session token, so it did not do what it is for. Port $PORT is up. Planned restarts are now OFF; tomorrow's 14:00 re-login may be rejected, and the watchdog will restart it then as before. To turn them back on: rm $TOKEN_REFRESH_MARKER"
+        fi
+        return 0
+    fi
+    [ "$session" = "token" ] || return 0
+    [ "$(token_refresh_decision)" = "restart" ] || return 0
+
+    printf 'refreshed_at=%s\noutcome=pending\n' "$(now_epoch)" > "$TOKEN_REFRESH_MARKER"
+    if ! remove_autorestart_token; then
+        set_record_field "$TOKEN_REFRESH_MARKER" outcome failed
+        echo "$(ts): could not remove IB's auto-restart token under $TWS_SETTINGS_DIR — not restarting; planned restarts are now off" >> "$LOG_FILE"
+        telegram "⚠️ The watchdog could not remove IB's auto-restart token under $TWS_SETTINGS_DIR, so it did NOT restart the Gateway (a restart would have re-used the token). Nothing is down. Planned restarts are now OFF; to turn them back on: rm $TOKEN_REFRESH_MARKER"
+        return 0
+    fi
+    echo "$(ts): the Gateway is running on IBC's token re-login — kickstarting $GW_LABEL for a fresh login, so tomorrow's re-login is the first since one" >> "$LOG_FILE"
+    kickstart_gateway
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        set_record_field "$TOKEN_REFRESH_MARKER" outcome failed
+        echo "$(ts): planned fresh-login kickstart FAILED (launchctl exit $rc) — planned restarts are now off" >> "$LOG_FILE"
+        telegram "⚠️ The watchdog's planned fresh-login restart of the IB Gateway failed: launchctl kickstart exited $rc. If port $PORT goes down, the usual port-down handling takes over. Planned restarts are now OFF; to turn them back on: rm $TOKEN_REFRESH_MARKER"
+    fi
+}
+
 # KAN-118: page how a restart turned out, once. $1 = recovered | failed,
 # $2 = the page. No-op unless a restart is awaiting its outcome.
 conn_restart_outcome() {
@@ -815,6 +938,8 @@ if nc -z -G 3 127.0.0.1 "$PORT" 2>/dev/null; then
         telegram "✅ IB Gateway server connectivity restored (Error 1100 cleared)."
         rm -f "$CONN_ALERT_MARKER"
     fi
+    # Healthy, so a planned restart may run. A live 1100 is KAN-118's.
+    [ -f "$CONN_MARKER" ] || token_refresh
     exit 0
 fi
 
@@ -831,6 +956,13 @@ fi
 LATEST_GW_LOG=$(ls -t "$LOG_DIR"/ibc-*.txt 2>/dev/null | head -1)
 if ibc_login_rejected; then
     SESSION_LOGIN="$(ibc_session_login)"
+    # A rejection right after a planned restart is the watchdog's own doing:
+    # say so once, and stop planned restarts. The paths below handle the login.
+    if [ "$(token_refresh_field outcome)" = "pending" ]; then
+        set_record_field "$TOKEN_REFRESH_MARKER" outcome rejected
+        echo "$(ts): the login rejected below followed the planned fresh-login restart; planned restarts are now off" >> "$LOG_FILE"
+        telegram "⚠️ The login IB is rejecting came right after the watchdog's planned fresh-login restart at $(hhmm_of "$(token_refresh_field refreshed_at)"), on a Gateway that was healthy. Planned restarts are now OFF; to turn them back on: rm $TOKEN_REFRESH_MARKER"
+    fi
     AUTH_DECISION=""
     if [ "$SESSION_LOGIN" = "auto-rejected" ]; then
         AUTH_DECISION="$(auth_restart_decision)"

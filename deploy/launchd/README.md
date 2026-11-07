@@ -643,6 +643,34 @@ failed login attempts`, a log with no session line, or a second rejection
 within 12h of that restart keep the refusal above. The restart, its recovery
 or its failure are each paged once.
 
+**And the rejection is now prevented (2026-11-05).** It is predictable. From
+10-24 to 11-05, five cycles in a row, IB accepted exactly one token re-login
+after each fresh login and rejected the next, so the restart above fired
+every other day with three pages each time. When the port is up, no Error 1100
+latch is present and the newest IBC session is a token one (`Re-starting
+session` followed by `Login has completed`), the watchdog kickstarts the
+Gateway once for a fresh login. That makes every 14:00 re-login the first
+since a fresh one.
+
+- **It removes the token first.** The Gateway leaves it at
+  `~/Jts/<profile>/autorestart`, and `ibcstart.sh` logs in with it whenever it
+  finds one, a brand-new launch included (2026-08-02 00:15). The old
+  `ibcstart.sh` also survives the kickstart's SIGTERM and would relaunch from
+  it. IBC deletes these files itself when it finds more than one. If the file
+  cannot be removed, there is no restart.
+- **Daytime only.** It runs from 14:15 (the end of IBC's restart window; on
+  Sunday 14:45, after the cold restart, which is itself a fresh login) to
+  20:00 SGT, outside the usual blackouts. That keeps it clear of the US
+  session, the close and the 05:15 run. A token session that is still running
+  at 20:00 is left for tomorrow's rejection path.
+- **One outcome page at most, then off.** It records each restart in
+  `~/ibc/.gateway_token_refreshed`, once per 12h, and is silent when the
+  Gateway logs in fresh.
+  - If the kickstart fails, the token cannot be removed, the Gateway comes back
+    on a token, or IB rejects the login that follows, it pages once and turns
+    planned restarts off.
+  - Delete the record to turn them back on.
+
 **Escalating re-alert while the login is rejected (KAN-62).** The refusal is
 right; the flat 12h re-alert around it was not. On 2026-08-20 the auto-restart's
 re-login was rejected at 23:55, the watchdog alerted once at 23:59:56, and the
