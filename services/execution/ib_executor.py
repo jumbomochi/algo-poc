@@ -238,6 +238,23 @@ class BrokerSessionChangedError(RuntimeError):
     """The IB session changed under a resolution that expected another one."""
 
 
+def placed_order_quantity(trade: Any) -> float | None:
+    """The size of the order IB was given, or None when it says nothing.
+
+    ib_insync's ``Order`` defaults ``totalQuantity`` to 0.0, so a value that
+    is not a positive, finite number is no size at all. The projector uses
+    this to see that an order risk downsized is complete; a guess here could
+    complete a real partial, so anything doubtful is left out.
+    """
+    try:
+        quantity = float(getattr(getattr(trade, "order", None), "totalQuantity"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not math.isfinite(quantity) or quantity <= 0:
+        return None
+    return quantity
+
+
 class OrderSkippedError(RuntimeError):
     """Raised when an order cannot be placed as sized (e.g. a fractional
     quantity rounds to zero whole shares on an account without fractional
@@ -891,6 +908,7 @@ class IBExecutor:
                     commission_fx_base_per_trading
                 ),
                 "order_done": trade.isDone(),
+                "order_quantity": placed_order_quantity(trade),
             }
             if not self._seen_live(exec_id):
                 payload["recovery_source"] = RECOVERY_SOURCE_SWEEP

@@ -166,6 +166,12 @@ class FillMessage(StreamSerializable):
     # True when IB reports the order terminal on this fill. Lets the projector
     # terminalize a whole-share-rounded order (placed < requested) as FILLED.
     order_done: bool = False
+    # The size of the order IB was given (its totalQuantity), when known. Risk
+    # can scale a buy below the intent's requested quantity and the oversell
+    # cap can shrink an exit, so an order can be complete well short of the
+    # intent; this lets the projector see that. Additive optional field, no
+    # CURRENT_SCHEMA_VERSION bump.
+    order_quantity: float | None = None
     # Provenance. None = live execDetails callback. "ib_execution_sweep" =
     # recovered by the daily sweep (KAN-87). Additive optional field with a
     # default, so per the evolution rule at the top of this module it does

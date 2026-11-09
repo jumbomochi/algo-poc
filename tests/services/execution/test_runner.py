@@ -954,6 +954,29 @@ class TestDurableExecutionIdentity:
         assert payload["portfolio"] == "momentum"
 
     @pytest.mark.asyncio
+    async def test_published_fill_carries_the_placed_order_size(
+        self, durable_runner
+    ):
+        """The projector can only see that a risk-downsized order is complete
+        if the fill says how big the order IB was given was."""
+        runner, ledger = durable_runner
+        seed_approved_intent(ledger, ib_order_id="9")
+        runner.restore_pending_orders()
+
+        await runner.handle_ib_fill({
+            "execution_id": "e-placed", "account_id": "DUN551088",
+            "timestamp": BROKER_TIME,
+            "order_id": "9", "con_id": 265598, "ticker": "AAPL",
+            "exchange": "SMART", "currency": "USD", "side": "buy",
+            "quantity": 4.0, "cumulative_quantity": 4.0,
+            "fill_price": 149.5, "commission": 0.1, "order_done": True,
+            "order_quantity": 4.0,
+        })
+
+        _, payload = runner._redis.publish.call_args.args
+        assert FillMessage.from_stream_dict(payload).order_quantity == 4.0
+
+    @pytest.mark.asyncio
     async def test_cancellation_before_commission_still_projects_fill_once(
         self, durable_runner, ledger_session
     ):

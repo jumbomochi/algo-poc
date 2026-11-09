@@ -1352,6 +1352,7 @@ class ExecutionServiceRunner:
             exchange=fill_info.get("exchange"),
             currency=fill_info.get("currency"),
             order_done=bool(fill_info.get("order_done", False)),
+            order_quantity=fill_info.get("order_quantity"),
             recovery_source=fill_info.get("recovery_source"),
         )
         local_effect = None

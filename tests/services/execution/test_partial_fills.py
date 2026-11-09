@@ -150,6 +150,7 @@ class TestIBExecutionIdentity:
         trade.fillEvent = Event("fill")
         trade.commissionReportEvent = Event("commission")
         trade.statusEvent = StatusEvent()
+        trade.order.totalQuantity = 10
         fill = MagicMock()
         fill.execution.execId = "exec-1"
         fill.execution.acctNumber = "DUN551088"
@@ -195,6 +196,7 @@ class TestIBExecutionIdentity:
             "commission_trading": 0.2,
             "commission_fx_base_per_trading": None,
             "order_done": False,
+            "order_quantity": 10.0,
         }
 
     @pytest.mark.asyncio
