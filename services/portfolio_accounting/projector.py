@@ -221,7 +221,12 @@ class FillProjector:
             # bucket.
             sector=lookup_sector(intent.symbol),
         )
-        self._advance_intent(intent, cumulative, order_done=fill.order_done)
+        self._advance_intent(
+            intent,
+            cumulative,
+            order_done=fill.order_done,
+            order_quantity=fill.order_quantity,
+        )
         execution.projection_applied = True
         self.session.flush()
 
@@ -481,7 +486,12 @@ class FillProjector:
         )
 
     def _advance_intent(
-        self, intent: OrderIntent, cumulative: float, *, order_done: bool = False
+        self,
+        intent: OrderIntent,
+        cumulative: float,
+        *,
+        order_done: bool = False,
+        order_quantity: float | None = None,
     ) -> None:
         intent.filled_quantity = max(float(intent.filled_quantity), cumulative)
         if intent.status in {
@@ -501,12 +511,24 @@ class FillProjector:
         # also marks done (isDone() is True for Cancelled too): a 40/100
         # cancelled order must stay PARTIALLY_FILLED so the status path can
         # terminalize it CANCELLED. Only a shortfall < 1 share is rounding.
+        #
+        # The same holds when the order IB was given is smaller than the intent
+        # by whole shares: risk scaled a buy down (APH 2026-10-31: 14.06
+        # requested, 4 placed, 4 filled) or the oversell cap shrank an exit.
+        # Reaching the placed size completes the order whatever the intent
+        # asked for. Only a smaller placed size counts; a larger one is not a
+        # target the intent can complete on.
         shortfall = intent.requested_quantity - cumulative
         fully_filled = isclose(cumulative, intent.requested_quantity)
         rounding_complete = order_done and 0 < shortfall < 1.0
+        placed_complete = (
+            order_quantity is not None
+            and 0 < order_quantity < intent.requested_quantity
+            and (cumulative > order_quantity or isclose(cumulative, order_quantity))
+        )
         new_status = (
             OrderStatus.FILLED
-            if fully_filled or rounding_complete
+            if fully_filled or rounding_complete or placed_complete
             else OrderStatus.PARTIALLY_FILLED
         )
         self._ledger.transition(intent.recommendation_id, new_status)

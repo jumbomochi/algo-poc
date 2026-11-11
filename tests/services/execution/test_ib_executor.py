@@ -39,6 +39,7 @@ async def capture_fill_payload(
     commission: float,
     commission_currency: str,
     account_values: list[object] | None,
+    order_quantity: object = 2.0,
 ) -> dict[str, object]:
     executor = IBExecutor("h", 7497, 1)
     executor._ib = MagicMock()
@@ -51,6 +52,7 @@ async def capture_fill_payload(
     trade.commissionReportEvent = Event()
     trade.statusEvent = Event()
     trade.isDone.return_value = False
+    trade.order.totalQuantity = order_quantity
     fill = SimpleNamespace(
         execution=SimpleNamespace(
             execId="exec-1",
@@ -98,6 +100,35 @@ async def test_usd_commission_maps_one_to_one_without_fx_rate():
     assert payload["commission_trading"] == pytest.approx(1.25)
     assert payload["commission_fx_base_per_trading"] is None
     assert payload["timestamp"] == EXECUTED_AT
+
+
+@pytest.mark.asyncio
+async def test_fill_payload_carries_the_size_of_the_order_ib_was_given():
+    """Risk can scale a buy below its intent; the projector needs the placed
+    size to know the order is complete (APH, 2026-10-31)."""
+    payload = await capture_fill_payload(
+        commission=1.25,
+        commission_currency="USD",
+        account_values=[],
+        order_quantity=4.0,
+    )
+
+    assert payload["order_quantity"] == 4.0
+
+
+@pytest.mark.parametrize("unusable", [None, 0, 0.0, -1.0, float("nan"), "x"])
+@pytest.mark.asyncio
+async def test_an_unusable_order_size_is_left_out_rather_than_guessed(unusable):
+    """ib_insync's Order defaults totalQuantity to 0.0. A size that is not a
+    positive number says nothing, and must not complete an intent."""
+    payload = await capture_fill_payload(
+        commission=1.25,
+        commission_currency="USD",
+        account_values=[],
+        order_quantity=unusable,
+    )
+
+    assert payload["order_quantity"] is None
 
 
 @pytest.mark.asyncio

@@ -105,6 +105,7 @@ def make_fill(
     exchange: str = "SMART",
     timestamp: datetime = NOW,
     order_done: bool = False,
+    order_quantity: float | None = None,
 ) -> FillMessage:
     if commission_trading is None and commission_currency == "USD":
         commission_trading = commission
@@ -128,6 +129,7 @@ def make_fill(
         exchange=exchange,
         currency="USD",
         order_done=order_done,
+        order_quantity=order_quantity,
     )
 
 
@@ -716,6 +718,106 @@ def test_material_partial_then_done_stays_partial_not_filled(session, projector)
     assert projector.apply(
         make_fill(quantity=40, cumulative=40, order_done=True)
     ) is True
+
+    intent = ledger.get("rec-1")
+    session.rollback()
+    assert intent.status == OrderStatus.PARTIALLY_FILLED.value
+    session.rollback()
+
+
+def test_a_risk_downsized_order_that_fills_its_placed_size_is_filled(
+    session, projector
+):
+    """2026-10-31, APH: the intent asked for 14.0584, risk scaled it to 4.98,
+    execution placed 4 and all 4 filled. The shortfall against the intent is
+    10 shares, so neither the exact-fill rule nor the sub-one-share rounding
+    rule applied, and the intent stuck PARTIALLY_FILLED. The next run read it
+    as ``order_missing_at_ib`` and blocked every buy. The size IB was actually
+    asked for is the one the fill completes."""
+    seed_intent(session, quantity=14.0584, status=OrderStatus.SUBMITTED)
+    ledger = OrderLedger(session)
+
+    assert projector.apply(make_fill(
+        quantity=4, cumulative=4, order_done=True, order_quantity=4,
+    )) is True
+
+    intent = ledger.get("rec-1")
+    session.rollback()
+    assert intent.status == OrderStatus.FILLED.value
+    assert ledger.active_reservations("momentum") == 0
+    session.rollback()
+
+
+def test_a_capped_exit_that_fills_its_placed_size_is_filled(session, projector):
+    """The KAN-10 oversell cap places fewer shares than the exit intent asked
+    for. Left PARTIALLY_FILLED, the intent would mute the position's later
+    stop-loss exits for as long as it stood."""
+    seed_intent(session, quantity=10, status=OrderStatus.SUBMITTED)
+    projector.apply(make_fill(quantity=10, cumulative=10, order_done=True))
+    seed_intent_sell = OrderIntent(
+        recommendation_id="rec-sell",
+        account_id="DU12345",
+        mode="paper",
+        portfolio="momentum",
+        con_id=265598,
+        symbol="AAPL",
+        exchange="SMART",
+        currency="USD",
+        action="SELL",
+        requested_quantity=12,
+        limit_price=None,
+        order_type="MKT",
+        reserved_notional=0,
+        filled_quantity=0,
+        status=OrderStatus.SUBMITTED.value,
+        ib_order_id="43",
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    session.add(seed_intent_sell)
+    session.commit()
+    ledger = OrderLedger(session)
+
+    assert projector.apply(make_fill(
+        "e-sell", recommendation_id="rec-sell", order_id="43", side="sell",
+        quantity=10, cumulative=10, order_done=True, order_quantity=10,
+    )) is True
+
+    intent = ledger.get("rec-sell")
+    session.rollback()
+    assert intent.status == OrderStatus.FILLED.value
+
+
+def test_a_downsized_order_cancelled_short_of_its_placed_size_stays_partial(
+    session, projector
+):
+    """The placed size only completes an order that reaches it. 4 of 10
+    placed shares, then a cancel, is a real partial: it must stay
+    PARTIALLY_FILLED so the status path terminalizes it CANCELLED."""
+    seed_intent(session, quantity=14.0584, status=OrderStatus.SUBMITTED)
+    ledger = OrderLedger(session)
+
+    assert projector.apply(make_fill(
+        quantity=4, cumulative=4, order_done=True, order_quantity=10,
+    )) is True
+
+    intent = ledger.get("rec-1")
+    session.rollback()
+    assert intent.status == OrderStatus.PARTIALLY_FILLED.value
+    session.rollback()
+
+
+def test_a_placed_size_above_the_intent_cannot_complete_it_early(
+    session, projector
+):
+    """A placed size larger than the intent is not a smaller target, so it
+    changes nothing: the intent completes on its own requested quantity."""
+    seed_intent(session, quantity=10, status=OrderStatus.SUBMITTED)
+    ledger = OrderLedger(session)
+
+    assert projector.apply(make_fill(
+        quantity=6, cumulative=6, order_done=False, order_quantity=12,
+    )) is True
 
     intent = ledger.get("rec-1")
     session.rollback()
