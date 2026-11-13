@@ -108,3 +108,86 @@ sleeve's reason, the way live suppresses a stop while a sell is working.
 None is registered. The overlay fires about 2.7 times a year on this sleeve,
 so a 60-session forward window would hold zero or one event and could not
 judge it.
+
+## Results (2026-11-13)
+
+**Inputs (as pre-registered):**
+- **Bars:** `output/backtest_multi_20261110_113936.json`, sha256 `46701c26…3112`.
+- **Caches:** a snapshot of the deploy clone's `data/cache` taken 2026-11-13 10:15 SGT:
+
+  | File | sha256 |
+  |---|---|
+  | `fundamentals.json` | `7fc692f1…b0cb` |
+  | `earnings.json` | `ab5e2f8a…df07` |
+  | `earnings_calendar.json` | `acabe344…c8e` |
+
+- **Membership:** `data/universe/sp500_membership.json`, sha256 `41742abe…3344`.
+- **Flags:** the refresh's own, all six sleeves.
+
+**Control:** run A reproduces the 11-10 record exactly for five of the six
+sleeves, quality_value included (0.892 / 182.8% / 19.7% / 515 trades).
+earnings_drift differs (0.420 against 0.376) because its earnings cache has
+been refreshed daily since 11-10. It is the same in all three runs.
+
+### quality_value
+| | Sharpe | Return | Max DD | Trades | `risk_stop` exits (P&L) | Re-bought ≤ 5 sessions | Commission | DSR (n=10) | D10 |
+|---|---|---|---|---|---|---|---|---|---|
+| A, none (record) | 0.892 | 182.8% | 19.7% | 515 | 0 | — | $1,033 | 0.94 | FAIL |
+| **B, 15% (live today)** | **0.813** | **160.3%** | **20.8%** | **572** | **34 (−$4,806)** | **28** | **$1,150** | **0.82** | **FAIL** |
+| C, 30% | 0.876 | 175.2% | 19.4% | 525 | 5 (−$1,484) | 3 | $1,055 | 0.93 | FAIL |
+
+- **The 15% stop costs quality_value without buying protection.** Sharpe
+  falls 0.08 and return 22 points, and max drawdown is *worse* (20.8% against
+  19.7%).
+- **The sleeve buys straight back.** 28 of the 34 stopped positions were
+  re-bought within five sessions, the NVDA pattern. Most stops therefore sold
+  near a low and bought back near it, paying two commissions and the gap.
+- **Holdout (gate-invalid, 113 sessions from 2026-06-01):** 0.26 for A, 0.19
+  for C, 0.04 for B. The direction matches the full sample.
+- **D10:** all three FAIL. Quality_value's verdict of record is unchanged, as
+  pre-registered.
+
+### Verdict under the decision rule
+B's figures are 0.813 Sharpe and 20.8% max drawdown, so an alternative needs
+Sharpe ≥ 0.813 and max drawdown ≤ 22.8%.
+- **A qualifies:** 0.892, 19.7%.
+- **C qualifies:** 0.876, 19.4%.
+
+**Rule 4 applies: recommend C, a 30% account stop for quality_value.** It
+keeps almost all of A's figures, and it keeps a guard against the delisted
+falling knives these bars cannot contain. Changing live is a separate change
+and the operator's call (rule 8).
+
+### Other sleeves (diagnostics, not candidates; rule 7)
+| Sleeve | A Sharpe / DD | B (15%) Sharpe / DD | C (30%) Sharpe / DD | `risk_stop` exits B / C |
+|---|---|---|---|---|
+| momentum | 0.524 / 29.8% | identical | identical | 0 / 0 |
+| thematic_momentum | 0.543 / 48.6% | identical | identical | 0 / 0 |
+| sector_rotation | 0.535 / 23.6% | 0.499 / 23.0% | 0.447 / 24.0% | 9 / 3 |
+| earnings_drift | 0.420 / 23.0% | 0.418 / 25.9% | 0.413 / 25.0% | 51 / 6 |
+| tail_risk_hedge | 0.120 / 15.9% | −0.183 / 17.4% | 0.113 / 16.3% | 22 / 2 |
+| **All six (aggregate)** | 0.674 / 17.0% | 0.641 / 16.2% | 0.654 / 16.7% | |
+
+- **momentum and thematic_momentum never reach 15% from their high.** Their
+  own stops (8% max loss, the MA cross) always fire first.
+- **Where the 15% stop does fire, it lowers every sleeve's Sharpe.**
+  - **tail_risk_hedge:** the stop sells hedge instruments in the drawdowns
+    they exist for, then the sleeve buys them back (20 of 22 within five
+    sessions). Sharpe falls from 0.12 to −0.18.
+  - **sector_rotation and earnings_drift:** both lose Sharpe, and
+    earnings_drift's max drawdown is 2.9 points worse.
+- **For the whole account,** the 15% stop trims max drawdown by 0.8 points,
+  at the cost of 0.03 Sharpe and 7 points of return.
+- **None of this licenses a change for those sleeves.** Each needs its own
+  record. It does say the 15% account stop was set without a backtest, and
+  that the per-sleeve setting rule 8 calls for has uses beyond quality_value.
+
+### Limits
+- **The bars exclude delisted names** (coverage BLOCKED at 8.75% excluded).
+  These are the cases a stop exists for, so every "stop costs" figure leans
+  towards holding. That is why rule 4 prefers C.
+- **The run is gate-invalid.** D10 was evaluated against scratch copies of
+  the holdout registry, with their recorded evaluations cleared, so no split
+  was spent.
+- **The exploratory event study preceded this record.** It is disclosed
+  above and in the trial registry. 30% was not among the levels it looked at.

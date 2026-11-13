@@ -131,12 +131,12 @@
       "trials": [
         {
           "name": "quality_value_risk_stop_15",
-          "sharpe": null,
+          "sharpe": 0.813,
           "objective": "return"
         },
         {
           "name": "quality_value_risk_stop_30",
-          "sharpe": null,
+          "sharpe": 0.876,
           "objective": "return"
         }
       ]
