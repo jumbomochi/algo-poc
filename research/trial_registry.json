@@ -122,6 +122,24 @@
           "objective": "insurance"
         }
       ]
+    },
+    {
+      "searched_at": "2026-11-13",
+      "what": "quality_value under the risk service's account trailing stop, modelled in the backtest for the first time: 15% (what live runs) and 30% (catastrophe-only), against the record without it. Levels fixed before any overlay run, not swept. An exploratory event study (12/15/20/25% triggers, forward returns only) preceded this entry and is disclosed in the source",
+      "n_trials": 2,
+      "source": "docs/decisions/qv-risk-stop-overlay-2026-11.md",
+      "trials": [
+        {
+          "name": "quality_value_risk_stop_15",
+          "sharpe": null,
+          "objective": "return"
+        },
+        {
+          "name": "quality_value_risk_stop_30",
+          "sharpe": null,
+          "objective": "return"
+        }
+      ]
     }
   ]
 }
