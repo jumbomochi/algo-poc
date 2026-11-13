@@ -2900,6 +2900,19 @@ def _create_backtest_shadow_recorders(
         return {}
 
 
+def risk_stop_pct_arg(raw: str) -> float:
+    """``--risk-stop-pct``: a trailing-stop percentage strictly inside (0, 100)."""
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {raw!r}") from None
+    if not 0.0 < value < 100.0:  # also refuses nan
+        raise argparse.ArgumentTypeError(
+            f"must be a percentage in (0, 100), got {raw!r}"
+        )
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run algo-poc backtest with IB data")
     parser.add_argument("--tickers", type=int, default=50,
@@ -2991,6 +3004,17 @@ def main():
              f"({PAPER_HEDGE_VARIANT}) is what the paper run trades; v1 is the "
              "pre-2026-10-30 incumbent; diag-crash is a diagnostic, never a "
              "candidate. Recorded in the artifact's config.",
+    )
+    parser.add_argument(
+        "--risk-stop-pct",
+        type=risk_stop_pct_arg,
+        default=None,
+        help="Research only (docs/decisions/qv-risk-stop-overlay-2026-11.md). "
+             "Model the risk service's account trailing stop, which sells any "
+             "holding this many percent below its high since entry (live: "
+             "risk.stop_loss_trailing_pct, 15). Applies to every sleeve run. "
+             "Off by default, as every artifact before it; when set it is "
+             "recorded in the artifact's config.",
     )
     parser.add_argument(
         "--universe-snapshots",
@@ -3217,6 +3241,8 @@ def main():
     mom_regime, mom_rank_exit_n = MOMENTUM_VARIANTS[args.momentum_variant]
     if args.momentum_variant != "v1":
         print(f"  Momentum variant {args.momentum_variant} (research; not the paper run's v1)")
+    if args.risk_stop_pct is not None:
+        print(f"  Account trailing stop modelled at {args.risk_stop_pct:g}% (research)")
     mom_signals_fn = make_momentum_signals_fn(
         regime_by_date=regime_by_date if mom_regime else None,
         rank_exit_n=mom_rank_exit_n,
@@ -3427,6 +3453,7 @@ def main():
             initial_capital=pc.capital,
             whole_shares=args.whole_shares,
             skip_ledger=skip_ledgers[name],
+            risk_stop_pct=args.risk_stop_pct,
         )
         results[name] = runner.run(
             bars_by_ticker,
@@ -3549,6 +3576,10 @@ def main():
         base_config["momentum_variant"] = args.momentum_variant
     # Always present: an artifact without the key predates v2 and is v1.
     base_config["hedge_variant"] = args.hedge_variant
+    if args.risk_stop_pct is not None:
+        # Present only when modelled: an artifact without the key has no
+        # account trailing stop, as every artifact before it.
+        base_config["risk_stop_pct"] = args.risk_stop_pct
     if args.ml_filter:
         base_config["ml_filter"] = {
             "model": args.ml_filter,

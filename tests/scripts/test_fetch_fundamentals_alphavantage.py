@@ -415,7 +415,12 @@ def test_no_key_is_an_error_before_any_request(tmp_path, capsys):
 
 def test_the_main_entry_writes_a_cache_the_lookup_reads(tmp_path, capsys):
     av = FakeAV()
-    av.add("A", {"2026-06-30": {"ni": 50, "eq": 500}})
+    # Relative to today, not a calendar date: a quarter is captured only within
+    # capture_window_days (135) of its period end, so a fixed 2026-06-30 stopped
+    # being written on 2026-11-12. 60 days back is inside that window, and with
+    # the 45-day filing lag it is available to the lookup today.
+    period_end = (date.today() - timedelta(days=60)).isoformat()
+    av.add("A", {period_end: {"ni": 50, "eq": 500}})
     code = ff.main(["--tickers", "A", "--cache-dir", str(tmp_path), "--min-interval", "0", "--budget", "6"],
                    transport=av, env={"ALPHAVANTAGE_API_KEY": KEY})
     out = capsys.readouterr().out
