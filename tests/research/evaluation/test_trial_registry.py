@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+from pathlib import Path
 
 import pytest
 
@@ -113,10 +114,21 @@ def test_more_recorded_trials_than_declared_is_rejected(tmp_path):
         load_trial_registry(_registry(tmp_path / "r.json", [_trial("a", 0.1), _trial("b", 0.2)], 1))
 
 
-def test_committed_registry_reproduces_the_d22_figure():
+def test_committed_registry_reproduces_the_d22_figure(tmp_path):
     """docs/decisions/sr-star-spread-2026-10.md: 12 return-objective trials on
-    record plus a 0.64 candidate, n = 14, gives SR* 0.649 annualised."""
-    sample = spread_sharpes({}, periods_per_year=252.0) + [0.64 / _ROOT]
+    record plus a 0.64 candidate, n = 14, gives SR* 0.649 annualised.
+
+    The registry as it stood on D22's date (2026-10-22): every later search
+    adds trials, which is the point of the registry, and must not move a
+    figure already decided on."""
+    committed = json.loads(
+        (Path(__file__).parents[3] / "research" / "trial_registry.json").read_text()
+    )
+    as_of_d22 = [e for e in committed["entries"] if e["searched_at"] <= "2026-10-22"]
+    _write(tmp_path / "d22.json", as_of_d22)
+    sample = spread_sharpes(
+        {}, periods_per_year=252.0, path=tmp_path / "d22.json"
+    ) + [0.64 / _ROOT]
     assert len(sample) == 13
     assert expected_max_sharpe(sample, 14) * _ROOT == pytest.approx(0.649, abs=0.001)
 

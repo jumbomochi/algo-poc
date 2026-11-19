@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 # stats. Five sessions distinguishes a delisting from an ordinary data gap.
 DELISTING_STALE_SESSIONS = 5
 
+# Exit reason of a position sold by the modelled account trailing stop
+# (``BacktestRunner(risk_stop_pct=...)``), as distinct from any sleeve's own.
+RISK_STOP_EXIT_REASON = "risk_stop"
+
 
 @dataclass
 class BacktestResult:
@@ -108,6 +112,7 @@ class BacktestRunner:
         whole_shares: bool = False,
         skip_ledger: Any = None,
         cash_buffer_bps: float = DEFAULT_SLEEVE_CASH_BUFFER_BPS,
+        risk_stop_pct: float | None = None,
     ) -> None:
         self.executor = executor
         self.initial_capital = initial_capital
@@ -125,6 +130,16 @@ class BacktestRunner:
         # take cash below zero here. At the defaults (25 bps buffer, slippage
         # 10-25 bps) the two are the same number.
         self.cash_buffer_bps = float(cash_buffer_bps)
+        # The risk service's account trailing stop (live's
+        # ``risk.stop_loss_trailing_pct``), which sells any holding whose mark
+        # falls this far below its high since entry. None, the default, leaves
+        # it out, as every run before
+        # docs/decisions/qv-risk-stop-overlay-2026-11.md did.
+        if risk_stop_pct is not None and not 0.0 < risk_stop_pct < 100.0:
+            raise ValueError(
+                f"risk_stop_pct must be in (0, 100), got {risk_stop_pct}"
+            )
+        self.risk_stop_pct = risk_stop_pct
 
     def run(
         self,
@@ -549,6 +564,26 @@ class BacktestRunner:
                     nav += mark * lot.quantity
                     if bar is not None:
                         lot.peak_price = max(lot.peak_price, mark)
+
+            # The account trailing stop, after the close has raised each high,
+            # as live's risk check follows update_peak_prices. A trigger is a
+            # market sell at the next open. A sell already queued keeps its
+            # reason, as live suppresses the stop while a sell is working.
+            if self.risk_stop_pct is not None:
+                for ticker, lots in positions.items():
+                    bar = bars_by_date.get((ticker, current_date))
+                    if bar is None or ticker in pending_exits:
+                        continue
+                    decision = risk_engine.check_stop_loss(
+                        ticker=ticker,
+                        current_price=bar["close"],
+                        highest_price_since_entry=max(
+                            lot.peak_price for lot in lots
+                        ),
+                        stop_loss_trailing_pct=self.risk_stop_pct,
+                    )
+                    if not decision.approved:
+                        pending_exits[ticker] = RISK_STOP_EXIT_REASON
             portfolio_values.append(nav)
             dates.append(current_date)
             if (
