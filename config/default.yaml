@@ -102,7 +102,13 @@ risk:
   # 150, thematic_momentum 120, the rest 100) are left as they were: above 100
   # they cannot bind, because cash binds first.
   total_exposure_limit_pct: 150.0
-  stop_loss_trailing_pct: 15.0        # trailing stop %
+  stop_loss_trailing_pct: 15.0        # trailing stop %, every sleeve not overridden below
+  # Per-sleeve overrides of stop_loss_trailing_pct, judged against each sleeve's
+  # own high since entry. Each entry needs a decision record; a sleeve not
+  # listed uses the default. Broker-native stops (execution.broker_stops_enabled)
+  # do not support overrides yet, and the config refuses the combination.
+  stop_loss_trailing_pct_by_sleeve:
+    quality_value: 30.0               # docs/decisions/qv-risk-stop-overlay-2026-11.md
   drawdown_pause_pct: 10.0            # pause new buys
   drawdown_circuit_breaker_pct: 20.0  # liquidate all
   soft_ceiling_pct: 7.0               # notify only

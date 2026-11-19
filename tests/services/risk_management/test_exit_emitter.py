@@ -1511,3 +1511,195 @@ def test_every_risk_exit_is_labelled_for_the_oversell_guard():
         if not keys & RISK_EXIT_ADJUSTMENT_KEYS
     ]
     assert unlabelled == []
+
+
+# --- Per-sleeve trailing-stop thresholds ------------------------------------
+# docs/decisions/qv-risk-stop-overlay-2026-11.md: quality_value stops at 30%,
+# every other sleeve at the 15% default. The trigger is judged per identity
+# scope, against that scope's own high, so two sleeves holding one ticker can
+# disagree.
+
+
+def _scope(portfolio: str, *, high: float, ticker: str = "AAPL",
+           con_id: int = 111, quantity: float = 10.0) -> Position:
+    position = _position(ticker, portfolio=portfolio, con_id=con_id,
+                         quantity=quantity)
+    position.highest_price_since_entry = high
+    return position
+
+
+@pytest.fixture()
+def per_sleeve_book(mock_redis):
+    """Build a runner whose ledger holds ``positions``, with quality_value's
+    stop at 30% and the account default at 15%.
+
+    The in-memory book is what the periodic refresh builds
+    (``shared/position_loader.py``): one row per ticker, its high the max
+    across every sleeve. That max is what the stop used to judge each sleeve
+    against."""
+    config = MagicMock(spec=AppConfig)
+    config.mode = "paper"
+    config.risk = RiskConfig(
+        stop_loss_trailing_pct_by_sleeve={"quality_value": 30.0}
+    )
+    config.currency = CurrencyConfig()
+
+    def build(*positions: Position, marks: dict[str, float]):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        session = Session(engine)
+        book: dict[str, dict] = {}
+        for position in positions:
+            session.add(position)
+            row = book.setdefault(position.ticker, {
+                "quantity": 0.0, "sector": "Technology",
+                "highest_price_since_entry": 0.0,
+            })
+            row["quantity"] += position.quantity
+            row["highest_price_since_entry"] = max(
+                row["highest_price_since_entry"], position.highest_price_since_entry
+            )
+        session.commit()
+        runner = RiskServiceRunner(
+            config=config,
+            redis_client=mock_redis,
+            db_session=session,
+            order_ledger=OrderLedger(session),
+        )
+        runner._portfolio.nav = 100_000
+        runner._portfolio.positions = book
+        runner._current_prices = dict(marks)
+        return runner, session
+
+    return build
+
+
+def _stop_alert_contexts(mock_redis) -> list[dict]:
+    return [
+        json.loads(call.args[1]["context"])
+        for call in mock_redis.publish.call_args_list
+        if call.args[0] == "stream:alerts"
+        and call.args[1].get("event_type") == "stop_loss_triggered"
+    ]
+
+
+class TestPerSleeveStopThresholds:
+    @pytest.mark.asyncio
+    async def test_quality_value_holds_through_a_20_percent_fall(
+        self, per_sleeve_book, mock_redis
+    ):
+        # protects: quality_value is not sold between 15% and 30% off its high.
+        # fails_when: the scan judges quality_value at the 15% account default.
+        # no_claim: sqlite ledger and a mocked Redis stand in for Postgres and
+        #   the stream; the in-memory book is set by hand, not by the refresh.
+        runner, session = per_sleeve_book(
+            _scope("quality_value", high=100.0), marks={"AAPL": 80.0}
+        )
+
+        await runner.run_stop_loss_check()
+
+        assert _intents(session) == []
+        assert _stop_alert_contexts(mock_redis) == []
+
+    @pytest.mark.asyncio
+    async def test_quality_value_stops_at_30_percent_for_its_whole_scope(
+        self, per_sleeve_book, mock_redis
+    ):
+        # protects: the 30% threshold still sells, the whole scope, once.
+        # fails_when: quality_value is exempted rather than given 30%.
+        # no_claim: as above; execution and the fill are not exercised.
+        runner, session = per_sleeve_book(
+            _scope("quality_value", high=100.0, quantity=12.0),
+            marks={"AAPL": 70.0},
+        )
+
+        await runner.run_stop_loss_check()
+
+        (intent,) = _intents(session)
+        assert intent.portfolio == "quality_value"
+        assert intent.requested_quantity == pytest.approx(12.0)
+
+    @pytest.mark.asyncio
+    async def test_two_sleeves_holding_one_ticker_can_split(
+        self, per_sleeve_book, mock_redis
+    ):
+        # protects: a 16% fall stops momentum (15%) and not quality_value (30%).
+        # fails_when: one ticker-level decision exits every sleeve holding it.
+        # no_claim: as above.
+        runner, session = per_sleeve_book(
+            _scope("momentum", high=100.0),
+            _scope("quality_value", high=100.0, quantity=30.0),
+            marks={"AAPL": 84.0},
+        )
+
+        await runner.run_stop_loss_check()
+
+        (intent,) = _intents(session)
+        assert intent.portfolio == "momentum"
+        assert intent.requested_quantity == pytest.approx(10.0)
+
+    @pytest.mark.asyncio
+    async def test_each_sleeve_is_judged_against_its_own_high(
+        self, per_sleeve_book, mock_redis
+    ):
+        # protects: quality_value, bought later at 90, is judged against 90.
+        # fails_when: it is judged against momentum's 120, the ticker max,
+        #   which at 84 is a 30% fall and would sell it.
+        # no_claim: as above.
+        runner, session = per_sleeve_book(
+            _scope("momentum", high=120.0),
+            _scope("quality_value", high=90.0, quantity=30.0),
+            marks={"AAPL": 84.0},
+        )
+
+        await runner.run_stop_loss_check()
+
+        (intent,) = _intents(session)
+        assert intent.portfolio == "momentum"
+
+    @pytest.mark.asyncio
+    async def test_the_alert_names_the_sleeve_and_its_threshold(
+        self, per_sleeve_book, mock_redis
+    ):
+        # protects: the page says which threshold fired for which sleeve.
+        # fails_when: the alert omits threshold_pct, or reports the default.
+        # no_claim: delivery to Telegram is not exercised.
+        runner, _session = per_sleeve_book(
+            _scope("quality_value", high=100.0), marks={"AAPL": 70.0}
+        )
+
+        await runner.run_stop_loss_check()
+
+        (context,) = _stop_alert_contexts(mock_redis)
+        assert context["portfolio"] == "quality_value"
+        assert float(context["threshold_pct"]) == 30.0
+
+    @pytest.mark.asyncio
+    async def test_one_scan_loads_the_targets_once(
+        self, per_sleeve_book, mock_redis, monkeypatch
+    ):
+        # protects: the scan reads the positions table once, not per ticker.
+        # fails_when: targets are loaded inside the per-ticker loop.
+        # no_claim: query cost on Postgres is not measured.
+        runner, _session = per_sleeve_book(
+            _scope("momentum", high=100.0, ticker="AAPL", con_id=111),
+            _scope("quality_value", high=100.0, ticker="AAPL", con_id=111),
+            _scope("momentum", high=100.0, ticker="MSFT", con_id=222),
+            _scope("sector_rotation", high=100.0, ticker="XLK", con_id=333),
+            marks={"AAPL": 84.0, "MSFT": 84.0, "XLK": 84.0},
+        )
+        calls = []
+        real = runner_module.load_liquidation_targets
+
+        def counting(*args, **kwargs):
+            calls.append(kwargs)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(runner_module, "load_liquidation_targets", counting)
+
+        await runner.run_stop_loss_check()
+
+        assert len(calls) == 1
+        assert {i.portfolio for i in _intents(_session)} == {
+            "momentum", "sector_rotation",
+        }

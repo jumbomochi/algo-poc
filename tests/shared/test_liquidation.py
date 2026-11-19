@@ -43,12 +43,13 @@ def add_position(
     exchange="SMART",
     currency="USD",
     status="open",
+    high=115.0,
 ):
     session.add(Position(
         ticker=ticker, portfolio=portfolio, account_id=account_id,
         con_id=con_id, exchange=exchange, currency=currency, quantity=qty,
         avg_entry_price=100.0, current_price=110.0, peak_price=115.0,
-        highest_price_since_entry=115.0, sector="Tech",
+        highest_price_since_entry=high, sector="Tech",
         opened_at=NOW, status=status,
     ))
     session.flush()
@@ -161,6 +162,27 @@ class TestLoadLiquidationTargets:
             "ticker", "quantity", "con_id", "account_id",
             "exchange", "currency", "portfolio",
         }
+
+
+    def test_with_high_carries_the_scopes_own_high_across_its_lots(self, session):
+        """The per-sleeve stop judges each scope against its own high: the max
+        over that scope's lots, not over every sleeve holding the ticker."""
+        add_position(session, portfolio="momentum", qty=5.0, high=95.0)
+        add_position(session, portfolio="momentum", qty=5.0, high=110.0)
+        add_position(session, portfolio="quality_value", qty=3.0, high=90.0)
+
+        rows = by_scope(load_liquidation_targets(session, with_high=True))
+
+        momentum = rows[("DUN551088", "momentum", 265598)]
+        assert momentum["highest_price_since_entry"] == 110.0
+        assert momentum["quantity"] == 10.0
+        assert rows[("DUN551088", "quality_value", 265598)]["highest_price_since_entry"] == 90.0
+
+    def test_without_with_high_the_row_shape_stays_seven_keys(self, session):
+        add_position(session)
+
+        (row,) = load_liquidation_targets(session, with_high=False)
+        assert "highest_price_since_entry" not in row
 
 
 class TestExitIntentId:
