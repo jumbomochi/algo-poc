@@ -260,7 +260,7 @@ Enforcement column: **auto** = system acts (buy paused) without a human;
 |---|---:|---|---|
 | Position entry limit | 5% of NAV | `position_entry_limit_pct` | auto |
 | Sector concentration | 20% of NAV | `sector_concentration_pct` | auto |
-| Trailing stop-loss | 15% | `stop_loss_trailing_pct` | emit (T2); executes with T1 |
+| Trailing stop-loss, from each sleeve's own high since entry | 15%; quality_value 30% ([decision](../decisions/qv-risk-stop-overlay-2026-11.md)) | `stop_loss_trailing_pct`, `stop_loss_trailing_pct_by_sleeve` | emit (T2); executes with T1 |
 | Drawdown — pause new buys | 10% | `drawdown_pause_pct` | auto (T2: on book equity) |
 | Drawdown — circuit breaker (liquidate all) | 20% | `drawdown_circuit_breaker_pct` | auto (T1: halts + liquidates) |
 | Position soft ceiling (notify) | 7% | `soft_ceiling_pct` | alert |
