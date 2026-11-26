@@ -71,7 +71,12 @@ def exit_intent_id(
     )
 
 
-def load_liquidation_targets(session: Session, *, account_id: str | None = None) -> list[dict[str, Any]]:
+def load_liquidation_targets(
+    session: Session,
+    *,
+    account_id: str | None = None,
+    with_high: bool = False,
+) -> list[dict[str, Any]]:
     """Return open positions to flatten, aggregated by broker identity scope
     ``{account_id, portfolio, con_id}``, with the contract fields an
     :class:`OrderIntent` needs (con_id/exchange/currency/portfolio).
@@ -90,7 +95,10 @@ def load_liquidation_targets(session: Session, *, account_id: str | None = None)
     both missing a con_id in the same sleeve cannot collapse into one row; for a
     populated con_id it is redundant (a con_id identifies one contract).
 
-    Optionally scoped to ``account_id``.
+    Optionally scoped to ``account_id``. ``with_high`` adds an eighth key,
+    ``highest_price_since_entry``: the max over the scope's lots, so the
+    trailing stop can judge each sleeve against its own high rather than the
+    highest high of every sleeve holding the ticker.
     """
     stmt = select(Position).where(Position.status == "open")
     if account_id is not None:
@@ -110,6 +118,15 @@ def load_liquidation_targets(session: Session, *, account_id: str | None = None)
                 "currency": row.currency,
                 "portfolio": row.portfolio,
             }
+            if with_high:
+                aggregated[key]["highest_price_since_entry"] = float(
+                    row.highest_price_since_entry
+                )
         else:
             agg["quantity"] += float(row.quantity)
+            if with_high:
+                agg["highest_price_since_entry"] = max(
+                    agg["highest_price_since_entry"],
+                    float(row.highest_price_since_entry),
+                )
     return list(aggregated.values())

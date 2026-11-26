@@ -9,12 +9,18 @@ from datetime import date
 
 from pydantic import BaseModel, Field, model_validator
 
+from shared.universe import ACTIVE_SLEEVES
+
 
 class RiskConfig(BaseModel):
     position_entry_limit_pct: float = 5.0
     sector_concentration_pct: float = 20.0
     total_exposure_limit_pct: float = 150.0
     stop_loss_trailing_pct: float = 15.0
+    # Per-sleeve overrides of stop_loss_trailing_pct; a sleeve not listed uses
+    # the default. Each entry needs a decision record (quality_value:
+    # docs/decisions/qv-risk-stop-overlay-2026-11.md).
+    stop_loss_trailing_pct_by_sleeve: dict[str, float] = Field(default_factory=dict)
     drawdown_pause_pct: float = 10.0
     drawdown_circuit_breaker_pct: float = 20.0
     soft_ceiling_pct: float = 7.0
@@ -27,6 +33,38 @@ class RiskConfig(BaseModel):
     portfolio_beta_alert_threshold: float = 1.5
     correlation_alert_threshold: float = 0.7
     correlation_min_lookback_days: int = 60
+
+    @model_validator(mode="after")
+    def _stop_thresholds_are_percentages_of_known_sleeves(self) -> "RiskConfig":
+        if not 0.0 < self.stop_loss_trailing_pct < 100.0:
+            raise ValueError(
+                "risk.stop_loss_trailing_pct must be in (0, 100), got "
+                f"{self.stop_loss_trailing_pct}"
+            )
+        for sleeve, pct in self.stop_loss_trailing_pct_by_sleeve.items():
+            # A misspelled sleeve would match no position and leave that
+            # sleeve on the default with nothing to say so.
+            if sleeve not in ACTIVE_SLEEVES:
+                raise ValueError(
+                    f"risk.stop_loss_trailing_pct_by_sleeve names {sleeve!r}, "
+                    f"which is not a sleeve; the sleeves are {ACTIVE_SLEEVES}"
+                )
+            if not 0.0 < pct < 100.0:
+                raise ValueError(
+                    f"risk.stop_loss_trailing_pct_by_sleeve[{sleeve!r}] must be "
+                    f"in (0, 100), got {pct}"
+                )
+        return self
+
+    def stop_loss_pct_for(self, portfolio: str | None) -> float:
+        """The trailing-stop threshold for ``portfolio``: its override when it
+        has one, otherwise the account default. ``None`` (an unattributed
+        scope) and synthetic ``_``-prefixed portfolios get the default."""
+        if portfolio is None:
+            return self.stop_loss_trailing_pct
+        return self.stop_loss_trailing_pct_by_sleeve.get(
+            portfolio, self.stop_loss_trailing_pct
+        )
 
 
 class ExecutionConfig(BaseModel):
@@ -474,6 +512,27 @@ class AppConfig(BaseModel):
             and self.currency.minimum_settled_usd_reserve <= 0
         ):
             raise ValueError("live entries require a positive settled USD reserve")
+        return self
+
+    @model_validator(mode="after")
+    def refuse_broker_stops_with_per_sleeve_thresholds(self) -> AppConfig:
+        # BrokerStopManager rests every protective stop at the account default
+        # (services/execution/runner.py), so with an override it would place a
+        # 15% stop at IB under a sleeve the risk service holds to 30%.
+        if not self.execution.broker_stops_enabled:
+            return self
+        differing = sorted(
+            sleeve
+            for sleeve, pct in self.risk.stop_loss_trailing_pct_by_sleeve.items()
+            if pct != self.risk.stop_loss_trailing_pct
+        )
+        if differing:
+            raise ValueError(
+                "execution.broker_stops_enabled does not support "
+                "risk.stop_loss_trailing_pct_by_sleeve yet: broker stops would "
+                f"rest at {self.risk.stop_loss_trailing_pct}% for {differing}. "
+                "Make BrokerStopManager per-sleeve first."
+            )
         return self
 
 

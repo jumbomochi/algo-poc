@@ -126,6 +126,12 @@ class RiskServiceRunner:
             drawdown_pause_pct=risk_cfg.drawdown_pause_pct,
             drawdown_circuit_breaker_pct=risk_cfg.drawdown_circuit_breaker_pct,
         )
+        # The operator's check after a rebuild that the override is live.
+        self._logger.info(
+            "Stop-loss thresholds",
+            default=risk_cfg.stop_loss_trailing_pct,
+            by_sleeve=risk_cfg.stop_loss_trailing_pct_by_sleeve,
+        )
         # Durable kill switch: persist halts so a restart stays halted
         # (fail-closed) instead of silently resuming trading (review 1.1).
         halt_store = (
@@ -1934,28 +1940,41 @@ class RiskServiceRunner:
     async def run_stop_loss_check(self) -> None:
         """Check all positions for trailing stop-loss triggers.
 
-        The trigger is a price fact, so it is evaluated once per ticker against
-        the trailing high. The *exit* is per identity scope: each sleeve holding
-        the ticker is flattened through its own ledgered intent, because that is
-        the only form execution can route.
+        The trigger is judged per identity scope: each sleeve holding a ticker
+        is measured against its *own* high since entry and its own threshold
+        (``risk.stop_loss_trailing_pct_by_sleeve``, else the account default),
+        so a ticker held by two sleeves can stop one out and not the other
+        (docs/decisions/qv-risk-stop-overlay-2026-11.md). Each triggered scope
+        is flattened through its own ledgered intent, because that is the only
+        form execution can route.
+
+        Without a ledger (unit paths) there is no per-sleeve identity to read:
+        the ticker's in-memory high is judged at the account default, as before.
         """
+        targets_by_ticker = self._stop_loss_targets_by_ticker()
         for ticker, pos_data in self._portfolio.positions.items():
             if not isinstance(pos_data, dict):
                 continue
             current_price = self._current_prices.get(ticker)
-            highest = pos_data.get("highest_price_since_entry", current_price)
-            if current_price is None or highest is None:
+            if current_price is None:
                 continue
 
-            decision = self._engine.check_stop_loss(
-                ticker=ticker,
-                current_price=current_price,
-                highest_price_since_entry=highest,
-            )
-            if decision.approved:
-                continue
+            for target in targets_by_ticker.get(ticker, []):
+                highest = target["highest_price_since_entry"]
+                if highest is None:
+                    continue
+                threshold_pct = self._config.risk.stop_loss_pct_for(
+                    target.get("portfolio")
+                )
+                decision = self._engine.check_stop_loss(
+                    ticker=ticker,
+                    current_price=current_price,
+                    highest_price_since_entry=highest,
+                    stop_loss_trailing_pct=threshold_pct,
+                )
+                if decision.approved:
+                    continue
 
-            for target in self._exit_targets(ticker):
                 plan = self._plan_exit("stop-loss", target)
                 published = await self._emit_ledgered_exit(
                     "stop-loss",
@@ -1986,8 +2005,45 @@ class RiskServiceRunner:
                         # nobody sent is worse than no number at all.
                         "quantity": published,
                         "portfolio": target.get("portfolio"),
+                        "threshold_pct": threshold_pct,
                     },
                 )
+
+    def _stop_loss_targets_by_ticker(self) -> dict[str, list[dict[str, Any]]]:
+        """Identity-scoped rows with each scope's own high, grouped by ticker,
+        loaded once per scan.
+
+        Without a ledger there is no DB to resolve against: each in-memory
+        ticker becomes one unattributed row carrying the ticker's high, which
+        ``stop_loss_pct_for(None)`` judges at the account default and the
+        emitter publishes unbacked, exactly as it did before.
+        """
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        if self._order_ledger is None:
+            for ticker, pos in self._portfolio.positions.items():
+                if not isinstance(pos, dict):
+                    continue
+                grouped[ticker] = [
+                    {
+                        "ticker": ticker,
+                        "quantity": pos.get("quantity", 0),
+                        "con_id": None,
+                        "account_id": None,
+                        "exchange": None,
+                        "currency": None,
+                        "portfolio": None,
+                        "highest_price_since_entry": pos.get(
+                            "highest_price_since_entry",
+                            self._current_prices.get(ticker),
+                        ),
+                    }
+                ]
+            return grouped
+        rows = load_liquidation_targets(self._order_ledger.session, with_high=True)
+        self._order_ledger.session.rollback()
+        for row in rows:
+            grouped.setdefault(row["ticker"], []).append(row)
+        return grouped
 
     async def run_periodic_risk_checks(self) -> None:
         """Drive the intraday safety controls the daily sleeve run does not.
